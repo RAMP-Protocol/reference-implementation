@@ -1,0 +1,34 @@
+version: "2"
+
+sql:
+  - engine: "postgresql"
+    schema: "src/exchange/internal/db/migrations"
+    queries: "src/exchange/internal/db/queries"
+    gen:
+      go:
+        out: "src/exchange/internal/db/sqlc"
+        package: "sqlc"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: false
+        emit_enum_valid_method: true
+        emit_empty_slices: true
+        emit_prepared_queries: false
+        emit_methods_with_db_argument: false
+
+  - engine: "postgresql"
+    schema: "src/broker/internal/db/migrations"
+    queries: "src/broker/internal/db/queries"
+    gen:
+      go:
+        out: "src/broker/internal/db/sqlc"
+        package: "sqlc"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: false
+        emit_enum_valid_method: true
+        emit_empty_slices: true
+        emit_prepared_queries: false
+        emit_methods_with_db_argument: false

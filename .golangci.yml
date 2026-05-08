@@ -1,0 +1,127 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+severity:
+  default: error
+
+linters:
+  default: none
+  enable:
+    # Correctness
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - nilerr
+    - noctx
+    - wastedassign
+
+    # Security
+    - gosec
+
+    # Style / complexity / size
+    - cyclop
+    - funlen
+    - gocognit
+    - gocyclo
+    - lll
+    - maintidx
+    - nestif
+    - revive
+    - unconvert
+    - unparam
+    - misspell
+    - prealloc
+    - gocritic
+
+    # Architecture
+    - depguard
+  settings:
+    cyclop:
+      max-complexity: 15
+    funlen:
+      lines: 80
+      statements: 50
+      ignore-comments: true
+    gocognit:
+      min-complexity: 20
+    gocyclo:
+      min-complexity: 15
+    lll:
+      line-length: 120
+      tab-width: 1
+    maintidx:
+      under: 20
+    nestif:
+      min-complexity: 5
+    gosec:
+      excludes:
+        - G104 # handled by errcheck
+    revive:
+      rules:
+        - name: var-naming
+        - name: exported
+        - name: package-comments
+        - name: file-length-limit
+          arguments:
+            - max: 500
+              skipBlankLines: false
+              skipComments: false
+    depguard:
+      rules:
+        no-circular-internal:
+          deny:
+            # Services must not depend on each other.
+            - pkg: "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange"
+              desc: "broker must not import exchange internals; use protocol via Connect-Go"
+            - pkg: "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker"
+              desc: "exchange must not import broker internals; use protocol via Connect-Go"
+          files:
+            - "!**/src/broker/**"
+            - "!**/src/exchange/**"
+
+  exclusions:
+    rules:
+      # Relax a few size/security lints inside tests only.
+      - path: _test\.go
+        linters:
+          - gosec
+          - gocyclo
+          - gocognit
+          - funlen
+          - lll
+          - maintidx
+      # Generated code is exempt across the board.
+      - path: 'proto/gen/'
+        linters:
+          - revive
+          - unused
+          - staticcheck
+          - errcheck
+          - gosec
+          - lll
+          - gocritic
+          - govet
+      - path: 'internal/db/sqlc/'
+        linters:
+          - revive
+          - unused
+          - gosec
+          - lll
+          - gocritic
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

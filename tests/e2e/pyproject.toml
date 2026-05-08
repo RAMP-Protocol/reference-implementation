@@ -1,0 +1,15 @@
+[project]
+name = "ramp-e2e"
+version = "0.0.1"
+description = "Full-stack E2E harness for the RAMP demo (docker-compose)."
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28",
+    "psycopg[binary]>=3.2",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["harness"]

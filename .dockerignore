@@ -1,0 +1,56 @@
+# Shared .dockerignore — trims the Docker build context aggressively so
+# every service Dockerfile starts with just the source it needs.
+.git
+.github
+.gitlab
+.beads
+.contextgit
+.claude
+.devstack
+.gocache
+.idea
+.vscode
+.DS_Store
+*.md
+!proto/CHANGELOG.md
+
+# Build output
+bin/
+dist/
+logs/
+
+# Virtualenvs + caches
+.venv
+**/__pycache__/
+**/.ruff_cache/
+**/.mypy_cache/
+**/.pytest_cache/
+**/node_modules/
+**/.wrangler/
+**/.turbo/
+
+# src/edge/ is shared with the fastly-edge image which imports @ramp/edge;
+# only exclude generated outputs, not the source.
+src/edge/node_modules/
+src/edge/dist/
+src/edge/.wrangler/
+src/mcp/.venv/
+src/mcp/**/__pycache__/
+
+# Legacy / paused workstreams (not needed in any container)
+derive-ensemble/
+docs/
+pkg/
+scripts/
+analysis/
+analysis-*
+ec-br-*
+mathweb/
+# tests/ is mostly unused by service images, but tests/e2e/ IS needed by
+# the runner image. Exclude everything under tests/ except tests/e2e/.
+tests/*
+!tests/e2e/
+
+# Large binary assets
+RAMP*.pdf
+*.pdf

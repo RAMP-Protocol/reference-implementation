@@ -1,0 +1,17 @@
+---
+# Broker marketplace bootstrap. Each entry is reconciled into broker.marketplaces
+# on startup. Add / remove entries here to change which Exchanges the Broker
+# routes through. Trust level drives ranking; only VERIFIED and PREFERRED
+# marketplaces are used in production flows.
+marketplaces:
+  # The deployed RAMP demo Exchange. demo.ramp-protocol.org/.well-known/ramp.json
+  # advertises this domain; the Broker probes the manifest, matches the domain
+  # against this row, and routes ExecuteTransaction calls to the endpoint.
+  - id: ramp-demo-exchange
+    domain: exchange.demo.ramp-protocol.org
+    endpoint: https://exchange.demo.ramp-protocol.org
+    trust_level: VERIFIED
+    priority: 100
+    supported_profiles:
+      - licensed_ai_training
+      - ai_search

@@ -1,0 +1,20 @@
+# Fastly Compute project for local E2E. Not deployed — `fastly compute serve`
+# runs this WASM under Viceroy inside the aws-edge-shim-style container.
+manifest_version = 3
+name = "ramp-fastly-edge"
+description = "RAMP edge verifier on Fastly Compute (WASM)"
+authors = ["ramp-demo"]
+language = "javascript"
+service_id = ""
+
+[scripts]
+build = "node build.mjs"
+
+[local_server]
+  [local_server.backends]
+    [local_server.backends.exchange]
+    url = "http://exchange:8081"
+    [local_server.backends.publisher]
+    url = "http://publisher:80"
+
+[setup]

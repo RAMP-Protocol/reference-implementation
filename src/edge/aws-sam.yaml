@@ -1,0 +1,44 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: RAMP edge Lambda@Edge bot-redirect handler (viewer-request)
+
+Parameters:
+  ExchangeUrl:
+    Type: String
+  MarketplaceManifestUrl:
+    Type: String
+  JwksUrl:
+    Type: String
+
+Resources:
+  RampEdgeFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ramp-edge
+      Handler: aws-lambda.handler
+      Runtime: nodejs20.x
+      CodeUri: dist/aws/
+      MemorySize: 128
+      Timeout: 5
+      Role: !GetAtt RampEdgeRole.Arn
+      AutoPublishAlias: live
+      Environment:
+        Variables:
+          EXCHANGE_URL: !Ref ExchangeUrl
+          MARKETPLACE_MANIFEST_URL: !Ref MarketplaceManifestUrl
+          JWKS_URL: !Ref JwksUrl
+
+  RampEdgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole

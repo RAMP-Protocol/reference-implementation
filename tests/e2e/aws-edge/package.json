@@ -1,0 +1,11 @@
+{
+  "name": "@ramp/aws-edge-shim",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "CloudFront canned-policy signed-URL verifier, used as an offline stand-in for a real CloudFront distribution in the RAMP demo compose E2E.",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

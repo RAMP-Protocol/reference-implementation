@@ -1,0 +1,94 @@
+[project]
+name = "ramp-mcp-shim"
+version = "0.0.1"
+description = "MCP shim exposing ramp_fetch to agentic harnesses; forwards to Broker."
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.9.0",
+    "cryptography>=44.0.0",
+]
+
+[project.scripts]
+ramp-mcp = "ramp_mcp_shim.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ramp_mcp_shim"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.9.0",
+    "mypy>=1.14.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "respx>=0.22.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",       # pyflakes, pycodestyle
+    "I",                 # isort
+    "N",                 # naming
+    "UP",                # pyupgrade
+    "B",                 # bugbear
+    "A",                 # builtins shadowing
+    "C4",                # comprehensions
+    "SIM",               # simplify
+    "PERF",              # performance
+    "FURB",              # refurb
+    "RUF",               # ruff-specific
+    "PL",                # pylint (includes PLR091x size limits)
+    "ASYNC",             # async
+    "S",                 # bandit security
+    "TCH",               # type-checking blocks
+    "ARG",               # unused-arg
+    "RET",               # return-value
+    "PTH",               # pathlib over os.path
+    "TID",               # tidy imports
+]
+ignore = [
+    "S101",     # asserts in tests are fine (per-file override keeps them there)
+]
+
+[tool.ruff.lint.pylint]
+# Hard caps — violations fail lint.
+max-args = 6
+max-branches = 12
+max-returns = 6
+max-statements = 50
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.ruff.lint.flake8-tidy-imports]
+# No cross-service imports. MCP shim must not import from exchange/broker/edge.
+# (Left as a placeholder — banned-module-level-imports is exact-match; we rely
+#  on this repo layout where src/mcp has no path access to src/{broker,exchange}.)
+
+[tool.ruff.lint.per-file-ignores]
+# Tests are allowed more args + asserts, but still keep size limits.
+"tests/**" = ["S", "PLR2004", "PLR0913"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+warn_unused_ignores = true
+warn_unreachable = true
+disallow_any_unimported = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

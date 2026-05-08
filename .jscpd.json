@@ -1,0 +1,23 @@
+{
+  "threshold": 0,
+  "minLines": 20,
+  "minTokens": 100,
+  "reporters": ["console", "html"],
+  "output": "./logs/jscpd",
+  "absolute": false,
+  "gitignore": true,
+  "format": ["go", "typescript", "javascript", "python"],
+  "path": ["src", "internal"],
+  "ignore": [
+    "**/node_modules/**",
+    "**/gen/**",
+    "**/dist/**",
+    "**/*.pb.go",
+    "**/*_pb.ts",
+    "**/*connect.go",
+    "**/internal/db/sqlc/**",
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/cmd/server/main.go"
+  ]
+}

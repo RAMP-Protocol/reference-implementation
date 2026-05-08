@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ramp
+      POSTGRES_PASSWORD: ramp
+      POSTGRES_DB: ramp
+    ports:
+      # Override by setting RAMP_PG_PORT in the environment (or via --env-file
+      # from scripts/devstack.sh). Default 55432 avoids clashing with local
+      # Postgres or testcontainers running on 5432.
+      - "${RAMP_PG_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ramp -d ramp"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "${RAMP_REDIS_PORT:-56379}:6379"
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+# Named volumes are scoped by docker compose project name (`-p <project>`),
+# so two concurrent projects get independent data dirs automatically.
+volumes:
+  pgdata:
+  redisdata:

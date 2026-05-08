@@ -1,0 +1,46 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env
+.env.local
+*.tsbuildinfo
+coverage/
+.turbo/
+.derive-ensemble/
+
+# Go
+bin/
+*.test
+*.out
+.gocache/
+
+# Python (mcp-tool)
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# jscpd reports
+logs/jscpd/
+
+# devstack per-project state (random ports, volume IDs)
+.devstack/
+
+# Secrets
+*.key
+*.pem
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.aider*

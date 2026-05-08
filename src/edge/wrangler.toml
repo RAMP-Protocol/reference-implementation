@@ -1,0 +1,14 @@
+name = "ramp-edge"
+main = "src/entries/cloudflare.ts"
+compatibility_date = "2025-01-15"
+compatibility_flags = ["nodejs_compat"]
+
+# Inject JWKS + exchange URLs via `wrangler secret put` or the dashboard.
+# [vars]
+# EXCHANGE_URL = "https://exchange.example.com"
+# MARKETPLACE_MANIFEST_URL = "https://exchange.example.com/.well-known/ramp-marketplace.json"
+# JWKS_URL = "https://exchange.example.com/.well-known/jwks.json"
+# RSL_BODY = "# RSL hint"
+# ACME_TOKENS_JSON = "{}"
+
+# KV for single-use URL enforcement is deferred post-v1.

@@ -1,0 +1,15 @@
+authors = ["RAMP"]
+description = "RAMP edge verifier (Fastly Compute)"
+language = "javascript"
+manifest_version = 3
+name = "ramp-edge-fastly"
+service_id = ""
+
+[scripts]
+build = "npm run build:fastly"
+
+[local_server]
+[local_server.env_vars]
+EXCHANGE_URL = "http://localhost:8080"
+MARKETPLACE_MANIFEST_URL = "http://localhost:8080/.well-known/ramp-marketplace.json"
+JWKS_URL = "http://localhost:8080/.well-known/jwks.json"
