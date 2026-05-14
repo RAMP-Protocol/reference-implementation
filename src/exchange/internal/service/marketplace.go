@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
@@ -61,9 +62,10 @@ type MarketplaceService struct {
 	keyStore     signing.KeyStore
 	cfg          MarketplaceConfig
 
-	idemMu  sync.Mutex
-	idemHit map[string]string // tx_request_id -> transaction_id (LRU-bounded)
-	idemSeq []string
+	txGroup  singleflight.Group
+	idemMu   sync.Mutex
+	idemHit  map[string]string // tx_request_id -> transaction_id (LRU-bounded)
+	idemRing lruRing
 }
 
 // MarketplaceDeps bundles the wiring dependencies.
@@ -94,6 +96,7 @@ func NewMarketplaceService(d MarketplaceDeps) *MarketplaceService {
 		keyStore:     d.KeyStore,
 		cfg:          d.Config.withDefaults(),
 		idemHit:      map[string]string{},
+		idemRing:     newLRURing(d.Config.withDefaults().IdempotencyLRU),
 	}
 }
 
@@ -166,9 +169,13 @@ func (s *MarketplaceService) buildOffer(entry repo.CatalogEntry) (*rampv1.Offer,
 func strPtr(s string) *string { return &s }
 
 // ExecuteTransaction verifies, authorizes billing, writes the transaction log
-// in a transaction, then returns the signed URL. Write-before-sign is
-// enforced: the signed URL hash lands in the DB in the same transaction as
-// all other transaction fields, and the URL is only returned after commit.
+// in a transaction, then returns the signed URL. The URL is only returned
+// after the DB commit succeeds (commit-before-return). Any failure after
+// billing authorization triggers a compensating Cancel so no balance is lost.
+//
+// Concurrent requests with the same tx_request_id are collapsed via
+// singleflight: only one goroutine runs the body; the rest receive the same
+// result without touching billing or the DB.
 func (s *MarketplaceService) ExecuteTransaction(
 	ctx context.Context,
 	req *rampv1.TransactionRequest,
@@ -176,8 +183,27 @@ func (s *MarketplaceService) ExecuteTransaction(
 	if err := s.validateTxRequest(req); err != nil {
 		return nil, err
 	}
-	if rec, found := s.idempotencyHit(req.GetId()); found {
-		return nil, exchange.Newf(exchange.KindIdempotent, "tx_request_id already processed: %s", rec)
+	v, err, _ := s.txGroup.Do(req.GetId(), func() (any, error) {
+		return s.executeTransactionInner(ctx, req)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*rampv1.TransactionResponse), nil
+}
+
+func (s *MarketplaceService) executeTransactionInner(
+	ctx context.Context,
+	req *rampv1.TransactionRequest,
+) (resp *rampv1.TransactionResponse, returnErr error) {
+	if txID, found := s.idempotencyHit(req.GetId()); found {
+		return nil, exchange.Newf(exchange.KindIdempotent, "tx_request_id already processed: %s", txID)
+	}
+	if existing, err := s.transactions.ByRequestID(ctx, req.GetId()); err == nil {
+		s.idempotencyRecord(req.GetId(), existing.TransactionID)
+		return nil, exchange.Newf(exchange.KindIdempotent, "tx_request_id already processed: %s", existing.TransactionID)
+	} else if !errors.Is(err, repo.ErrTransactionNotFound) {
+		return nil, exchange.Wrap(exchange.KindInternal, err, "idempotency check")
 	}
 
 	resourceID := req.GetOfferId()
@@ -200,6 +226,11 @@ func (s *MarketplaceService) ExecuteTransaction(
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if returnErr != nil {
+			_ = s.billing.Cancel(ctx, auth.BillingID)
+		}
+	}()
 	// Pre-generate the transaction_id so it can be embedded as an audit
 	// query param in the signed URL before signing. Lambda@Edge logs the
 	// querystring verbatim, so an access-log row carries the same tx_id
@@ -247,7 +278,7 @@ type persistInput struct {
 	signedURLSignature string // signature substring extracted from the issued URL
 }
 
-func (s *MarketplaceService) persistTransaction(ctx context.Context, in persistInput) (repo.TransactionRecord, error) {
+func (s *MarketplaceService) persistTransaction(ctx context.Context, in persistInput) (*repo.TransactionRecord, error) {
 	txID := in.txID
 	if txID == "" {
 		// Fallback for any caller that hasn't been updated; preserves
@@ -256,7 +287,7 @@ func (s *MarketplaceService) persistTransaction(ctx context.Context, in persistI
 	}
 	obligationID := uuid.NewString()
 	agentHash := sha256.Sum256([]byte(in.req.GetRequester().GetId() + "|" + in.req.GetId()))
-	var rec repo.TransactionRecord
+	var rec *repo.TransactionRecord
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		created, err := s.transactions.Create(ctx, tx, repo.TransactionRecord{
 			TransactionID:      txID,
@@ -288,7 +319,7 @@ func (s *MarketplaceService) persistTransaction(ctx context.Context, in persistI
 		return err
 	})
 	if err != nil {
-		return repo.TransactionRecord{}, exchange.Wrap(exchange.KindInternal, err, "write transaction")
+		return nil, exchange.Wrap(exchange.KindInternal, err, "write transaction")
 	}
 	return rec, nil
 }

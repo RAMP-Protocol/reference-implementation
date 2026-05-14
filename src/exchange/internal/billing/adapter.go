@@ -10,8 +10,15 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
+	"time"
 )
+
+// reservationTTL is the maximum lifetime of an unreleased billing reservation.
+// Slots older than this are reclaimed by sweepExpired so a process crash or
+// logic bug cannot grow the reserved map without bound.
+const reservationTTL = 15 * time.Minute
 
 // Amount is the currency-normalized value transferred in a single operation.
 // Stored as big.Rat to avoid float rounding when aggregating balances.
@@ -49,6 +56,7 @@ type AuthorizeResult struct {
 type Adapter interface {
 	Authorize(ctx context.Context, req AuthorizeRequest) (AuthorizeResult, error)
 	Record(ctx context.Context, billingID string, consumedQuantity int64) error
+	Cancel(ctx context.Context, billingID string) error
 	GetBalance(ctx context.Context, agentID string) (Amount, error)
 	GetQuota(ctx context.Context, agentID string) (int64, error)
 }
@@ -61,7 +69,7 @@ var ErrUnknownBillingID = errors.New("billing: unknown billing id")
 // for scrappy-demo and testing. Balances are per-agent; authorization
 // deducts balance immediately and holds the reservation until Record.
 type InMemoryAdapter struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	balances map[string]Amount // agent_id -> remaining balance
 	quotas   map[string]int64  // agent_id -> remaining quota (unit-agnostic)
 	reserved map[string]reserved
@@ -70,9 +78,10 @@ type InMemoryAdapter struct {
 }
 
 type reserved struct {
-	AgentID string
-	Amount  Amount
-	Qty     int64
+	ExpiresAt time.Time
+	Amount    Amount
+	AgentID   string
+	Qty       int64
 }
 
 // InMemoryOptions seeds an InMemoryAdapter.
@@ -102,12 +111,31 @@ func NewInMemoryAdapter(opts InMemoryOptions) *InMemoryAdapter {
 	return a
 }
 
+// sweepExpired reclaims reservations older than reservationTTL, restoring
+// balance and quota. Must be called with a.mu held for writing.
+func (a *InMemoryAdapter) sweepExpired(now time.Time) {
+	for id, r := range a.reserved {
+		if now.Before(r.ExpiresAt) {
+			continue
+		}
+		bal := a.balances[r.AgentID]
+		bal.Value.Add(bal.Value, r.Amount.Value)
+		a.balances[r.AgentID] = bal
+		if _, hasQuota := a.quotas[r.AgentID]; hasQuota {
+			a.quotas[r.AgentID] += r.Qty
+		}
+		delete(a.reserved, id)
+	}
+}
+
 // Authorize holds funds for the transaction. Denies on unknown agent,
 // zero/negative request, currency mismatch, insufficient balance, or
 // exhausted quota.
 func (a *InMemoryAdapter) Authorize(_ context.Context, req AuthorizeRequest) (AuthorizeResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	a.sweepExpired(time.Now())
 
 	bal, ok := a.balances[req.AgentID]
 	if !ok {
@@ -116,7 +144,7 @@ func (a *InMemoryAdapter) Authorize(_ context.Context, req AuthorizeRequest) (Au
 	if req.Quantity <= 0 {
 		return AuthorizeResult{Approved: false, Reason: "non-positive quantity"}, nil
 	}
-	if bal.Currency != req.UnitCost.Currency {
+	if !strings.EqualFold(bal.Currency, req.UnitCost.Currency) {
 		return AuthorizeResult{Approved: false, Reason: "currency mismatch"}, nil
 	}
 	charge := new(big.Rat).Mul(req.UnitCost.Value, big.NewRat(req.Quantity, 1))
@@ -135,9 +163,10 @@ func (a *InMemoryAdapter) Authorize(_ context.Context, req AuthorizeRequest) (Au
 	a.nextIdx++
 	id := fmt.Sprintf("%s%06d", a.idPrefix, a.nextIdx)
 	a.reserved[id] = reserved{
-		AgentID: req.AgentID,
-		Amount:  Amount{Value: charge, Currency: req.UnitCost.Currency},
-		Qty:     req.Quantity,
+		AgentID:   req.AgentID,
+		Amount:    Amount{Value: charge, Currency: req.UnitCost.Currency},
+		Qty:       req.Quantity,
+		ExpiresAt: time.Now().Add(reservationTTL),
 	}
 	return AuthorizeResult{BillingID: id, Approved: true}, nil
 }
@@ -156,10 +185,28 @@ func (a *InMemoryAdapter) Record(_ context.Context, billingID string, _ int64) e
 	return nil
 }
 
-// GetBalance returns the current available balance for an agent.
-func (a *InMemoryAdapter) GetBalance(_ context.Context, agentID string) (Amount, error) {
+// Cancel reverses a reservation made by Authorize. Restores balance and quota.
+func (a *InMemoryAdapter) Cancel(_ context.Context, billingID string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	res, ok := a.reserved[billingID]
+	if !ok {
+		return ErrUnknownBillingID
+	}
+	bal := a.balances[res.AgentID]
+	bal.Value.Add(bal.Value, res.Amount.Value)
+	a.balances[res.AgentID] = bal
+	if _, hasQuota := a.quotas[res.AgentID]; hasQuota {
+		a.quotas[res.AgentID] += res.Qty
+	}
+	delete(a.reserved, billingID)
+	return nil
+}
+
+// GetBalance returns the current available balance for an agent.
+func (a *InMemoryAdapter) GetBalance(_ context.Context, agentID string) (Amount, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	bal, ok := a.balances[agentID]
 	if !ok {
 		return Amount{}, fmt.Errorf("billing: unknown agent %q", agentID)
@@ -172,7 +219,7 @@ func (a *InMemoryAdapter) GetBalance(_ context.Context, agentID string) (Amount,
 // and reports 0; callers that need to distinguish should not call GetQuota
 // unless they first checked via the configuration layer).
 func (a *InMemoryAdapter) GetQuota(_ context.Context, agentID string) (int64, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return a.quotas[agentID], nil
 }

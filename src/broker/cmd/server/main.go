@@ -9,7 +9,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -50,9 +49,6 @@ func run(logger *slog.Logger) error {
 	}, logger)
 	if err != nil {
 		return fmt.Errorf("db setup: %w", err)
-	}
-	if pool == nil {
-		return errors.New("BROKER_DSN is required")
 	}
 	defer pool.Close()
 

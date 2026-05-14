@@ -14,15 +14,16 @@ import (
 
 // TransactionRecord is the domain view of a transaction_log row.
 type TransactionRecord struct {
+	Expiry             time.Time
+	CreatedAt          time.Time
+	AgentIdentityHash  []byte
+	SignedURLHash      []byte
 	TransactionID      string
 	TxRequestID        string
 	TenantID           string
 	AgentID            string
 	ResourceID         string
 	OfferID            string
-	AgentIdentityHash  []byte
-	SignedURLHash      []byte
-	Expiry             time.Time
 	BillingID          string
 	UnitCostDecimal    string // canonical decimal representation
 	Currency           string
@@ -30,14 +31,13 @@ type TransactionRecord struct {
 	DenialReason       string
 	OfferSignature     string // verbatim, as the agent presented it
 	SignedURLSignature string // verbatim signature substring extracted from the issued URL
-	CreatedAt          time.Time
 }
 
 // TransactionRepo is the write-before-sign contract for transaction log rows.
 type TransactionRepo interface {
-	Create(ctx context.Context, tx pgx.Tx, rec TransactionRecord) (TransactionRecord, error)
-	ByRequestID(ctx context.Context, txRequestID string) (TransactionRecord, error)
-	ByID(ctx context.Context, transactionID string) (TransactionRecord, error)
+	Create(ctx context.Context, tx pgx.Tx, rec TransactionRecord) (*TransactionRecord, error)
+	ByRequestID(ctx context.Context, txRequestID string) (*TransactionRecord, error)
+	ByID(ctx context.Context, transactionID string) (*TransactionRecord, error)
 }
 
 // ErrTransactionNotFound signals an idempotency probe miss.
@@ -50,11 +50,11 @@ func NewTransactionRepo(q sqlc.Querier) TransactionRepo { return &transactionRep
 
 type transactionRepo struct{ q sqlc.Querier }
 
-func (r *transactionRepo) Create(ctx context.Context, tx pgx.Tx, rec TransactionRecord) (TransactionRecord, error) {
+func (r *transactionRepo) Create(ctx context.Context, tx pgx.Tx, rec TransactionRecord) (*TransactionRecord, error) {
 	qtx := sqlc.New(tx)
 	unitCost, err := numericFromDecimal(rec.UnitCostDecimal)
 	if err != nil {
-		return TransactionRecord{}, err
+		return nil, err
 	}
 	row, err := qtx.CreateTransaction(ctx, sqlc.CreateTransactionParams{
 		TransactionID:      rec.TransactionID,
@@ -75,37 +75,37 @@ func (r *transactionRepo) Create(ctx context.Context, tx pgx.Tx, rec Transaction
 		SignedUrlSignature: pgText(rec.SignedURLSignature),
 	})
 	if err != nil {
-		return TransactionRecord{}, fmt.Errorf("create transaction: %w", err)
+		return nil, fmt.Errorf("create transaction: %w", err)
 	}
 	return transactionFromRow(row), nil
 }
 
-func (r *transactionRepo) ByRequestID(ctx context.Context, txRequestID string) (TransactionRecord, error) {
+func (r *transactionRepo) ByRequestID(ctx context.Context, txRequestID string) (*TransactionRecord, error) {
 	row, err := r.q.GetTransactionByRequestID(ctx, txRequestID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return TransactionRecord{}, ErrTransactionNotFound
+			return nil, ErrTransactionNotFound
 		}
-		return TransactionRecord{}, fmt.Errorf("get transaction by request id: %w", err)
+		return nil, fmt.Errorf("get transaction by request id: %w", err)
 	}
 	return transactionFromRow(row), nil
 }
 
 // ByID returns the transaction_log row for a given transaction_id (PK).
 // Used by the /admin/ledger endpoint that backs `make ledger TX=<id>`.
-func (r *transactionRepo) ByID(ctx context.Context, transactionID string) (TransactionRecord, error) {
+func (r *transactionRepo) ByID(ctx context.Context, transactionID string) (*TransactionRecord, error) {
 	row, err := r.q.GetTransactionByID(ctx, transactionID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return TransactionRecord{}, ErrTransactionNotFound
+			return nil, ErrTransactionNotFound
 		}
-		return TransactionRecord{}, fmt.Errorf("get transaction by id: %w", err)
+		return nil, fmt.Errorf("get transaction by id: %w", err)
 	}
 	return transactionFromRow(row), nil
 }
 
-func transactionFromRow(row sqlc.RampTransactionLog) TransactionRecord {
-	rec := TransactionRecord{
+func transactionFromRow(row sqlc.RampTransactionLog) *TransactionRecord {
+	rec := &TransactionRecord{
 		TransactionID:      row.TransactionID,
 		TxRequestID:        row.TxRequestID,
 		TenantID:           row.TenantID,

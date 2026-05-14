@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"log/slog"
 
@@ -17,13 +18,11 @@ type SetupOptions struct {
 	PoolConfig      Config
 }
 
-// Setup opens a pool and applies embedded migrations. If DSN is empty it
-// returns (nil, nil) — callers can operate DB-less when configuration is
-// absent (useful for early demo phases).
+// Setup opens a pool and applies embedded migrations. Returns an error if DSN
+// is empty — callers must supply a non-empty DSN.
 func Setup(ctx context.Context, opts SetupOptions, logger *slog.Logger) (*pgxpool.Pool, error) {
 	if opts.DSN == "" {
-		logger.Info("database disabled: no DSN set")
-		return nil, nil
+		return nil, fmt.Errorf("db: DSN is required")
 	}
 	cfg := opts.PoolConfig
 	cfg.DSN = opts.DSN

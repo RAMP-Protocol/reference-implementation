@@ -138,7 +138,7 @@ func entryFromProto(tenantID string, e *rampv1.ResourceEntry) (repo.CatalogEntry
 	if id == "" {
 		id = uuid.NewString()
 	}
-	pricing := defaultPricing(e)
+	pricing := pricingForEntry(e)
 	pjson, err := json.Marshal(pricing)
 	if err != nil {
 		return repo.CatalogEntry{}, fmt.Errorf("marshal pricing: %w", err)
@@ -165,11 +165,12 @@ type PricingDoc struct {
 	EstQty   int32   `json:"estimated_quantity,omitempty"`
 }
 
-// defaultPricing fills in reasonable defaults for the scrappy demo: per-access
-// pricing at $0.05 denominated in USD, estimated_quantity carried through when
-// the catalog push supplied it.
-func defaultPricing(e *rampv1.ResourceEntry) PricingDoc {
-	return PricingDoc{
+// pricingForEntry returns a PricingDoc for a catalog entry. If the entry
+// carries pricing overrides in ext["pricing"] (a Struct with any subset of
+// model/rate/currency/unit_cost/unit keys), those values take precedence;
+// anything missing falls back to the demo defaults.
+func pricingForEntry(e *rampv1.ResourceEntry) PricingDoc {
+	doc := PricingDoc{
 		Model:    rampv1.PricingModel_PRICING_MODEL_PER_ACCESS.String(),
 		Rate:     0.05,
 		Currency: "USD",
@@ -177,4 +178,33 @@ func defaultPricing(e *rampv1.ResourceEntry) PricingDoc {
 		Unit:     "access",
 		EstQty:   e.GetEstimatedQuantity(),
 	}
+	ext := e.GetExt()
+	if ext == nil {
+		return doc
+	}
+	pv := ext.GetFields()["pricing"]
+	if pv == nil {
+		return doc
+	}
+	sv := pv.GetStructValue()
+	if sv == nil {
+		return doc
+	}
+	fields := sv.GetFields()
+	if s := fields["model"].GetStringValue(); s != "" {
+		doc.Model = s
+	}
+	if s := fields["currency"].GetStringValue(); s != "" {
+		doc.Currency = s
+	}
+	if n := fields["unit_cost"].GetNumberValue(); n != 0 {
+		doc.UnitCost = n
+	}
+	if n := fields["rate"].GetNumberValue(); n != 0 {
+		doc.Rate = n
+	}
+	if s := fields["unit"].GetStringValue(); s != "" {
+		doc.Unit = s
+	}
+	return doc
 }

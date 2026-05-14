@@ -124,17 +124,20 @@ func (p *Prober) fetch(ctx context.Context, domain string) (Result, error) {
 	req.Header.Set("Accept", "application/json")
 	resp, err := p.client.Do(req)
 	if err != nil {
+		// Transient network failure — do not cache so the next call retries.
 		p.logger.InfoContext(ctx, "ramp.json fetch failed", "domain", domain, "err", err)
-		return Result{Present: false, FetchedAt: time.Now().UTC()}, nil
+		return Result{}, fmt.Errorf("probe: fetch %s: %w", domain, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
+		// Definitive absence of ramp.json — safe to cache.
 		return Result{Present: false, FetchedAt: time.Now().UTC()}, nil
 	}
 	if resp.StatusCode >= 400 {
+		// Transient or unexpected server error — do not cache.
 		p.logger.InfoContext(ctx, "ramp.json non-200",
 			"domain", domain, "status", resp.StatusCode)
-		return Result{Present: false, FetchedAt: time.Now().UTC()}, nil
+		return Result{}, fmt.Errorf("probe: status %d for %s", resp.StatusCode, domain)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {

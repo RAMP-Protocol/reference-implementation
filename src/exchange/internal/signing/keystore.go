@@ -31,15 +31,15 @@ func NewInMemoryKeyStore() *InMemoryKeyStore {
 // PutEd25519 stores an Ed25519 key pair under ref.
 func (s *InMemoryKeyStore) PutEd25519(ref string, pub ed25519.PublicKey, priv ed25519.PrivateKey) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.ed25[ref] = ed25519KeyPair{Public: pub, Private: priv}
-	s.mu.Unlock()
 }
 
 // PutRSA stores an RSA key under ref.
 func (s *InMemoryKeyStore) PutRSA(ref string, priv *rsa.PrivateKey) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.rsaKey[ref] = priv
-	s.mu.Unlock()
 }
 
 // Ed25519 implements KeyStore.

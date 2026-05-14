@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -55,6 +54,3 @@ func OpenForTest(tb testing.TB, ctx context.Context, dsn string) *pgxpool.Pool {
 	}
 	return pool
 }
-
-// NewSilentLogger returns a logger suitable for tests (discards output).
-var _ = fmt.Sprintf

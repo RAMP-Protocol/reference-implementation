@@ -15,7 +15,7 @@ import (
 // Migrate applies up-migrations from an embedded fs onto the given DSN.
 // tableName controls where migration state is tracked (use per-schema names so
 // each service owns its own tracking table).
-func Migrate(migrations fs.FS, subdir, dsn, tableName string, logger *slog.Logger) error {
+func Migrate(migrations fs.FS, subdir, dsn, tableName string, logger *slog.Logger) (retErr error) {
 	src, err := iofs.New(migrations, subdir)
 	if err != nil {
 		return fmt.Errorf("iofs source: %w", err)
@@ -57,9 +57,15 @@ func Migrate(migrations fs.FS, subdir, dsn, tableName string, logger *slog.Logge
 		srcErr, dbErr := m.Close()
 		if srcErr != nil {
 			logger.Warn("migrate source close", "err", srcErr)
+			if retErr == nil {
+				retErr = fmt.Errorf("migrate source close: %w", srcErr)
+			}
 		}
 		if dbErr != nil {
 			logger.Warn("migrate db close", "err", dbErr)
+			if retErr == nil {
+				retErr = fmt.Errorf("migrate db close: %w", dbErr)
+			}
 		}
 	}()
 

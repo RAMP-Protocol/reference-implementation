@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"time"
 
 	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
@@ -39,20 +40,17 @@ func (s *MarketplaceService) idempotencyHit(txRequestID string) (string, bool) {
 }
 
 // idempotencyRecord stores the tx_request_id → transaction_id mapping,
-// evicting the oldest entry when the LRU is full.
+// evicting the oldest entry when the ring is full.
 func (s *MarketplaceService) idempotencyRecord(txRequestID, txID string) {
 	s.idemMu.Lock()
 	defer s.idemMu.Unlock()
 	if _, exists := s.idemHit[txRequestID]; exists {
 		return
 	}
-	if len(s.idemSeq) >= s.cfg.IdempotencyLRU && s.cfg.IdempotencyLRU > 0 {
-		oldest := s.idemSeq[0]
-		s.idemSeq = s.idemSeq[1:]
-		delete(s.idemHit, oldest)
+	if evicted, ok := s.idemRing.push(txRequestID); ok {
+		delete(s.idemHit, evicted)
 	}
 	s.idemHit[txRequestID] = txID
-	s.idemSeq = append(s.idemSeq, txRequestID)
 }
 
 // verifyOffer rebuilds the same offer shape used at discovery time and
@@ -142,7 +140,7 @@ func (s *MarketplaceService) mintSignedURL(
 // across the scrappy demo pipeline — the Broker and Edge pick it up there.
 func (s *MarketplaceService) buildTxResponse(
 	req *rampv1.TransactionRequest,
-	rec repo.TransactionRecord,
+	rec *repo.TransactionRecord,
 	signed signing.SignedURL,
 	pricing PricingDoc,
 ) *rampv1.TransactionResponse {
@@ -151,8 +149,12 @@ func (s *MarketplaceService) buildTxResponse(
 	ext, _ := structpb.NewStruct(map[string]any{
 		"signed_url": signed.URL,
 	})
+	unitCostAmt, _ := billing.NewAmount(fmt.Sprintf("%.8f", pricing.UnitCost), pricing.Currency)
+	qtyRat := new(big.Rat).SetInt64(int64(maxInt32(pricing.EstQty, 1)))
+	totalRat := new(big.Rat).Mul(unitCostAmt.Value, qtyRat)
+	totalFloat, _ := totalRat.Float64()
 	cost := &rampv1.Cost{
-		Amount:   pricing.UnitCost * float64(maxInt32(pricing.EstQty, 1)),
+		Amount:   totalFloat,
 		Currency: pricing.Currency,
 		UnitCost: &unitCost,
 	}
@@ -179,4 +181,33 @@ func maxInt32(v, fallback int32) int32 {
 		return fallback
 	}
 	return v
+}
+
+// lruRing is a fixed-capacity ring buffer of string keys used by the
+// idempotency cache to track eviction order without growing the backing array.
+type lruRing struct {
+	buf  []string
+	head int // index of the oldest slot
+	n    int // number of filled slots
+}
+
+func newLRURing(cap int) lruRing {
+	return lruRing{buf: make([]string, cap)}
+}
+
+// push appends key. When full, overwrites the oldest slot and returns the
+// evicted key (ok == true); otherwise returns ("", false).
+func (r *lruRing) push(key string) (evicted string, ok bool) {
+	if len(r.buf) == 0 {
+		return "", false
+	}
+	if r.n == len(r.buf) {
+		evicted = r.buf[r.head]
+		r.buf[r.head] = key
+		r.head = (r.head + 1) % len(r.buf)
+		return evicted, true
+	}
+	r.buf[(r.head+r.n)%len(r.buf)] = key
+	r.n++
+	return "", false
 }

@@ -42,6 +42,7 @@ class StackURLs(NamedTuple):
     broker: str
     edge: str
     aws_edge: str
+    fastly_edge: str
     mcp: str
 
 
@@ -53,6 +54,7 @@ def _default_urls() -> StackURLs:
             broker="http://broker:8082",
             edge="http://edge:8787",
             aws_edge="http://aws-edge:8788",
+            fastly_edge="http://fastly-edge:7676",
             mcp="http://mcp:8000",
         )
     return StackURLs(
@@ -60,6 +62,7 @@ def _default_urls() -> StackURLs:
         broker="http://127.0.0.1:18082",
         edge="http://127.0.0.1:18787",
         aws_edge="http://127.0.0.1:18788",
+        fastly_edge="http://127.0.0.1:17676",
         mcp="http://127.0.0.1:18000",
     )
 
@@ -103,6 +106,7 @@ def compose_stack() -> Iterator[StackURLs]:
         _wait_healthy(f"{STACK_URLS.broker}/healthz")
         _wait_healthy(f"{STACK_URLS.edge}/healthz")
         _wait_healthy(f"{STACK_URLS.aws_edge}/healthz")
+        _wait_healthy(f"{STACK_URLS.fastly_edge}/healthz")
         yield STACK_URLS
     finally:
         if not reuse and os.environ.get("RAMP_E2E_KEEP_UP") != "1":

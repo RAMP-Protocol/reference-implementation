@@ -95,14 +95,16 @@ func Wrap(kind Kind, cause error, msg string) *Error {
 }
 
 // ToConnect converts any error into a connect.Error, preserving Kind mapping
-// when err is a *exchange.Error. Non-domain errors are surfaced as Internal.
+// when err is a *exchange.Error. Only Kind + Message are sent over the wire;
+// the wrapped cause (which may contain DSN fragments or SQL detail) is never
+// forwarded to callers. Non-domain errors surface as generic Internal.
 func ToConnect(err error) *connect.Error {
 	if err == nil {
 		return nil
 	}
 	var de *Error
 	if errors.As(err, &de) {
-		return connect.NewError(de.Kind.ConnectCode(), de)
+		return connect.NewError(de.Kind.ConnectCode(), errors.New(de.Message))
 	}
-	return connect.NewError(connect.CodeInternal, err)
+	return connect.NewError(connect.CodeInternal, errors.New("internal error"))
 }
