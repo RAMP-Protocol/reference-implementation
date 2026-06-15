@@ -22,10 +22,10 @@ PI_TF_ROOT="${PI_TERRAFORM_ROOT:-$(cd "${REPO_ROOT}/../pi-terraform" 2>/dev/null
 STAGING="/tmp/ramp-demo-keys"
 CF_PUBLIC_PEM_PATH="AWS/global/aws-ramp-demo-cloudfront/keys/ramp-demo-public-key.pem"
 
-# Locked to the <DEPLOYER_PROFILE> profile: the only profile authorized for ramp-demo.
+# Locked to the cdn-poc profile: the only profile authorized for ramp-demo.
 # Override with `RAMP_AWS_PROFILE=<other>` only if you've explicitly extended
 # another profile's IAM to cover the ramp-demo supplemental policy.
-: "${RAMP_AWS_PROFILE:=<DEPLOYER_PROFILE>}"
+: "${RAMP_AWS_PROFILE:=cdn-poc}"
 export AWS_PROFILE="${RAMP_AWS_PROFILE}"
 : "${AWS_REGION:=us-east-1}"
 export AWS_REGION

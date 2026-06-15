@@ -8,7 +8,7 @@ import (
 )
 
 func TestMemoryService_CheckThenRecord(t *testing.T) {
-	s := budget.NewMemory()
+	s := budget.NewMemory(nil)
 	ctx := context.Background()
 
 	dec, err := s.Check(ctx, "lic-1", 1000)
@@ -35,7 +35,7 @@ func TestMemoryService_CheckThenRecord(t *testing.T) {
 }
 
 func TestMemoryService_Exhaustion(t *testing.T) {
-	s := budget.NewMemory()
+	s := budget.NewMemory(nil)
 	ctx := context.Background()
 	if err := s.Record(ctx, "lic-2", 1200); err != nil {
 		t.Fatalf("Record: %v", err)
@@ -53,7 +53,7 @@ func TestMemoryService_Exhaustion(t *testing.T) {
 }
 
 func TestSelect_NilClientPicksMemory(t *testing.T) {
-	got := budget.Select(nil, 0)
+	got := budget.Select(nil, 0, nil)
 	if _, ok := got.(*budget.MemoryService); !ok {
 		t.Fatalf("expected MemoryService, got %T", got)
 	}

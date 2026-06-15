@@ -135,7 +135,7 @@ describe('verifyEd25519SignedUrl', () => {
     const url = await signUrl(ORIGIN, kp.privateKey, {
       exp: Math.floor(now / 1000) + 300,
       kid: 'k1',
-      agent: encodeBase64Url(agentBytes),
+      agentId: encodeBase64Url(agentBytes),
     });
     const res = await verifyEd25519SignedUrl(url, {
       resolveKey: async () => kp.publicKey,

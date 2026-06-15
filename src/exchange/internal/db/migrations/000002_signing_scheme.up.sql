@@ -8,9 +8,9 @@ CREATE TYPE ramp.signing_scheme AS ENUM (
 );
 
 ALTER TABLE ramp.tenants
-    ADD COLUMN signing_scheme         ramp.signing_scheme NOT NULL DEFAULT 'ED25519',
-    ADD COLUMN rsa_key_ref            TEXT,
-    ADD COLUMN cloudfront_key_pair_id TEXT;
+    ADD COLUMN signing_scheme         ramp.signing_scheme NOT NULL DEFAULT 'ED25519', -- ED25519 (default) for Cloudflare/Fastly tenants; AWS_CLOUDFRONT_RSA for AWS-fronted publishers
+    ADD COLUMN rsa_key_ref            TEXT,                                           -- pointer to the RSA private key (e.g. AWS Secrets Manager ARN); NULL for ED25519 tenants
+    ADD COLUMN cloudfront_key_pair_id TEXT;                                           -- the CloudFront Trusted Key Group key-pair id paired with rsa_key_ref
 
 -- RSA scheme requires both the private-key pointer and the CloudFront key-pair
 -- ID. Ed25519 tenants leave both nullable. Enforced in SQL so bad writes cannot

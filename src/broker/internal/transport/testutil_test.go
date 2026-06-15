@@ -5,24 +5,19 @@ package transport_test
 import (
 	"context"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"connectrpc.com/connect"
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
-	"github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1/rampv1connect"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 	"github.com/redis/go-redis/v9"
-	"github.com/testcontainers/testcontainers-go"
-	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
-	"github.com/testcontainers/testcontainers-go/wait"
-	"google.golang.org/protobuf/types/known/structpb"
 
 	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	brokerdb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/db"
 )
 
@@ -31,7 +26,7 @@ import (
 func setupPostgres(tb testing.TB, ctx context.Context) string {
 	tb.Helper()
 	dsn := sharedb.StartPostgres(tb, ctx)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := testutil.DiscardLogger()
 	pool, err := sharedb.Setup(ctx, sharedb.SetupOptions{
 		DSN:             dsn,
 		Migrations:      brokerdb.Migrations,
@@ -45,34 +40,13 @@ func setupPostgres(tb testing.TB, ctx context.Context) string {
 	return dsn
 }
 
-// startRedis boots a redis testcontainer and returns a *redis.Client ready to use.
+// startRedis is a thin shim around testutil.StartRedis kept so the call sites
+// already inside this _test.go file (and the integration test next door) do
+// not need to be rewritten. The actual implementation lives in
+// internal/testutil/redis.go — see review finding L17.
 func startRedis(tb testing.TB, ctx context.Context) *redis.Client {
 	tb.Helper()
-	c, err := tcredis.Run(ctx, "redis:7-alpine",
-		testcontainers.WithWaitStrategy(wait.ForLog("Ready to accept connections").WithStartupTimeout(30*time.Second)),
-	)
-	if err != nil {
-		tb.Fatalf("start redis: %v", err)
-	}
-	tb.Cleanup(func() {
-		if termErr := c.Terminate(context.Background()); termErr != nil {
-			tb.Logf("terminate redis: %v", termErr)
-		}
-	})
-	conn, err := c.ConnectionString(ctx)
-	if err != nil {
-		tb.Fatalf("redis conn string: %v", err)
-	}
-	opts, err := redis.ParseURL(conn)
-	if err != nil {
-		tb.Fatalf("parse redis url: %v", err)
-	}
-	client := redis.NewClient(opts)
-	if pingErr := client.Ping(ctx).Err(); pingErr != nil {
-		tb.Fatalf("redis ping: %v", pingErr)
-	}
-	tb.Cleanup(func() { _ = client.Close() })
-	return client
+	return testutil.StartRedis(tb, ctx)
 }
 
 // -----------------------------------------------------------------------------
@@ -105,29 +79,64 @@ type mockExchange struct {
 	offerUnitCost   float64
 	signedURL       string
 	denyTransaction bool
+	// scopeRestricted makes DiscoverResources return an empty Offers slice
+	// plus an OfferGroup with OFFER_ABSENCE_REASON_SCOPE_INSUFFICIENT, the
+	// shape an Exchange uses to advertise a resource the caller's scopes
+	// don't cover.
+	scopeRestricted bool
+	// offerEstimatedQuantity, when > 0, is set as the offer's
+	// Pricing.EstimatedQuantity. The Broker relay echoes this value as
+	// Usage.ConsumedQuantity on the synthesised UsageReport so tests can
+	// pin that the relay actually populated the payload.
+	offerEstimatedQuantity int32
+	// lastReport captures the most-recent UsageReport seen by ReportUsage so
+	// tests can assert the full payload (e.g. Usage.ConsumedQuantity is what
+	// the broker relay populated). Without this, a finger-counter on
+	// reportCalls cannot pin the contract.
+	lastReport *rampv1.UsageReport
 }
 
 func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request[rampv1.ResourceQuery]) (*connect.Response[rampv1.ResourceResponse], error) {
 	m.mu.Lock()
 	m.discoverCalls++
 	cost := m.offerUnitCost
+	scopeRestricted := m.scopeRestricted
 	m.mu.Unlock()
+	if scopeRestricted {
+		absence := rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_SCOPE_INSUFFICIENT
+		uri := "https://acme.example/article-42"
+		if uris := req.Msg.GetRequester().GetUris(); len(uris) > 0 {
+			uri = uris[0]
+		}
+		return connect.NewResponse(&rampv1.ResourceResponse{
+			Ver: "0.3",
+			Id:  req.Msg.GetId(),
+			OfferGroups: []*rampv1.OfferGroup{{
+				Uri:           uri,
+				AbsenceReason: &absence,
+			}},
+		}), nil
+	}
 	pricing := &rampv1.Pricing{Rate: cost, Currency: "USD", UnitCost: &cost}
+	if est := m.offerEstimatedQuantity; est > 0 {
+		pricing.EstimatedQuantity = &est
+	}
 	url := "https://acme.example/article-42"
+	offer := &rampv1.Offer{
+		OfferId:            "offer-1",
+		Pricing:            pricing,
+		DeliveryMethod:     rampv1.DeliveryMethod_DELIVERY_METHOD_INSTRUCTIONS,
+		Signature:          "sig-x",
+		SignatureAlgorithm: "EdDSA",
+		Identity: &rampv1.ResourceIdentity{
+			CanonicalUrl: &url,
+		},
+		Reporting: &rampv1.ReportingObligation{Required: true},
+	}
 	return connect.NewResponse(&rampv1.ResourceResponse{
-		Ver: "0.3",
-		Id:  req.Msg.GetId(),
-		Offers: []*rampv1.Offer{{
-			OfferId:            "offer-1",
-			Pricing:            pricing,
-			DeliveryMethod:     rampv1.DeliveryMethod_DELIVERY_METHOD_INSTRUCTIONS,
-			Signature:          "sig-x",
-			SignatureAlgorithm: "EdDSA",
-			Identity: &rampv1.ResourceIdentity{
-				CanonicalUrl: &url,
-			},
-			Reporting: &rampv1.ReportingObligation{Required: true},
-		}},
+		Ver:    "0.3",
+		Id:     req.Msg.GetId(),
+		Offers: []*rampv1.Offer{offer},
 	}), nil
 }
 
@@ -145,20 +154,25 @@ func (m *mockExchange) ExecuteTransaction(_ context.Context, req *connect.Reques
 	}
 	txID := "tx-" + req.Msg.GetId()
 	billID := "bill-" + req.Msg.GetId()
-	ext, _ := structpb.NewStruct(map[string]any{"signed_url": m.signedURL})
+	// Mirror production buildTxResponse: surface the signed URL on the canonical
+	// retrieval_endpoint field (TransactionResponse field 18) that extractSignedURL
+	// reads. Copy to a local so the returned message does not alias the
+	// mutex-guarded struct field.
+	signedURL := m.signedURL
 	return connect.NewResponse(&rampv1.TransactionResponse{
-		Ver:           "0.3",
-		Id:            req.Msg.GetId(),
-		TransactionId: &txID,
-		BillingId:     &billID,
-		Cost:          &rampv1.Cost{Amount: m.offerUnitCost, Currency: "USD"},
-		Ext:           ext,
+		Ver:               "0.3",
+		Id:                req.Msg.GetId(),
+		TransactionId:     &txID,
+		BillingId:         &billID,
+		Cost:              &rampv1.Cost{Amount: m.offerUnitCost, Currency: "USD"},
+		RetrievalEndpoint: &signedURL,
 	}), nil
 }
 
 func (m *mockExchange) ReportUsage(_ context.Context, req *connect.Request[rampv1.UsageReport]) (*connect.Response[rampv1.UsageReportResponse], error) {
 	m.mu.Lock()
 	m.reportCalls++
+	m.lastReport = req.Msg
 	m.mu.Unlock()
 	return connect.NewResponse(&rampv1.UsageReportResponse{Accepted: true, ReportId: "rep-" + req.Msg.GetId()}), nil
 }
@@ -194,7 +208,7 @@ func startProviderFixture(tb testing.TB, exchangeEndpoint string) *httptest.Serv
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_, _ = io.WriteString(w, `{"ver":"0.3","provider":"acme.example","exchanges":[{"domain":"mp.acme.example","endpoint":"`+exchangeEndpoint+`","supported_profiles":["ramp-news-v1"]}]}`)
+		_, _ = io.WriteString(w, `{"ver":"1.0","role":"ROLE_PUBLISHER","domain":"acme.example","exchanges":[{"domain":"mp.acme.example","endpoint":"`+exchangeEndpoint+`","relationship":"PROVIDER_RELATIONSHIP_DIRECT"}],"supported_profiles":["ramp-news-v1"]}`)
 	}))
 	tb.Cleanup(srv.Close)
 	return srv

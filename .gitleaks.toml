@@ -1,0 +1,39 @@
+# Gitleaks configuration for the public reference implementation.
+#
+# Extends the default ruleset (real secrets still fail the scan) and allowlists
+# two categories so the secret-scan gate stays meaningful instead of drowning
+# in false positives:
+#
+#   1. Build/test artifacts — virtualenvs, node_modules, bytecode. These are
+#      gitignored and never appear in `git ls-files`, so they are never
+#      published; they only exist on disk after a local `make`/test run. The
+#      scanner walks the filesystem, so it would otherwise flag example keys
+#      embedded in third-party libraries (authlib, pyjwt, cryptography, …).
+#
+#   2. Throwaway demo / e2e / conformance key material. Public keys, test
+#      seeds, and a CloudFront key-pair id (a public identifier). These sign
+#      nothing in production — they exist so the e2e stack and cross-language
+#      conformance tests run out-of-the-box. The real production signing key
+#      is never committed.
+#
+# A genuine private key added anywhere outside these paths still fails the gate.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Build/test artifacts (never published) + throwaway demo key material (no production secrets)."
+paths = [
+  # Build/test artifacts — gitignored, never published.
+  '''(^|/)\.venv/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)__pycache__/''',
+  '''\.pyc$''',
+  # Throwaway demo / e2e / conformance key material (public keys + test seeds).
+  '''(^|/)deploy/publisher-keys/[^/]*\.json$''',
+  '''(^|/)deploy/broker/keys\.json$''',
+  '''(^|/)tests/e2e/harness/fixtures/[^/]*\.json$''',
+  '''(^|/)testdata/[^/]*\.json$''',
+  '''(^|/)tests/e2e/harness/seed\.py$''',
+  '''(^|/)scripts/mint-signed-url\.py$''',
+]

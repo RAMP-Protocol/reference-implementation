@@ -1,0 +1,8 @@
+{
+  "kid": "agent-nobilling-e2e",
+  "kty": "OKP",
+  "crv": "Ed25519",
+  "alg": "EdDSA",
+  "private_key": "Ilc0DPDGaq0qW5zqSQwQz6YHnUweFUtvEUZs7MSldVk",
+  "public_key": "nzisHwOt_aXA79xAQH-xFEFKBtVPp4k57OVnl9msl3s"
+}

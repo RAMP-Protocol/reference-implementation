@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	connect "connectrpc.com/connect"
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 )
 
 // TestSmoke walks the full scrappy-demo happy path.
@@ -16,13 +16,19 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 	h := newTestHarness(t)
 	ctx := h.ctx
 
-	// 1. PushResources via CatalogService.
+	// 1. PushResources via CatalogService. EstimatedQuantity is set so the
+	// reporting-side tolerance check has something to compare against — the
+	// new zero-estimate-rejects-non-zero-consumed rule means
+	// EstimatedQuantity must be non-zero whenever the smoke path reports
+	// a non-zero ConsumedQuantity.
+	smokeEstimated := int32(50)
 	pushResp, err := h.catalogClient.PushResources(ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
 		TenantId: h.tenantID,
-		CallerId: "test-caller",
+		CallerId: "agent-test",
 		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.tenantDomain,
-			Path:   "/articles/hello",
+			Domain:            h.tenantDomain,
+			Path:              "/articles/hello",
+			EstimatedQuantity: &smokeEstimated,
 		}},
 	}))
 	if err != nil {
@@ -54,7 +60,7 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 		t.Fatalf("offer signature not populated: %+v", offer)
 	}
 
-	// 3. ExecuteTransaction. Signed URL lands in ext["signed_url"].
+	// 3. ExecuteTransaction. Signed URL lands on the canonical retrieval_endpoint.
 	offerID := offer.GetOfferId()
 	offerSig := offer.GetSignature()
 	execResp, err := h.exchangeClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
@@ -72,15 +78,7 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 	if execResp.Msg.GetTransactionId() == "" {
 		t.Fatal("transaction id empty")
 	}
-	signedURL := ""
-	if ext := execResp.Msg.GetExt(); ext != nil {
-		if v, ok := ext.GetFields()["signed_url"]; ok {
-			signedURL = v.GetStringValue()
-		}
-	}
-	if signedURL == "" {
-		t.Fatal("signed_url missing from ext")
-	}
+	signedURL := extractSignedURL(t, execResp.Msg)
 	if _, err := url.Parse(signedURL); err != nil {
 		t.Fatalf("signed url parse: %v", err)
 	}
@@ -97,7 +95,7 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 		t.Fatalf("report: %v", err)
 	}
 
-	assertObligationReceived(t, ctx, h, execResp.Msg.GetTransactionId())
+	assertObligationState(t, h, execResp.Msg.GetTransactionId(), "RECEIVED", "VALIDATED")
 }
 
 // assertTransactionLogged verifies the transaction_log row exists by
@@ -113,16 +111,5 @@ func assertTransactionLogged(t *testing.T, ctx context.Context, h *testHarness, 
 	}
 	if len(row.SignedUrlHash) != 32 {
 		t.Fatalf("signed_url_hash len = %d", len(row.SignedUrlHash))
-	}
-}
-
-func assertObligationReceived(t *testing.T, ctx context.Context, h *testHarness, transactionID string) {
-	t.Helper()
-	ob, err := h.queries.GetObligationByTransaction(ctx, transactionID)
-	if err != nil {
-		t.Fatalf("GetObligationByTransaction: %v", err)
-	}
-	if string(ob.State) != "RECEIVED" {
-		t.Fatalf("state = %s", ob.State)
 	}
 }

@@ -24,6 +24,9 @@ type CatalogEntry struct {
 // CatalogRepo is the narrow contract CatalogService needs.
 type CatalogRepo interface {
 	Upsert(ctx context.Context, e CatalogEntry) (CatalogEntry, error)
+	// UpsertTx runs the same upsert inside an open transaction so a batch of
+	// entries commits atomically (Arch rule 7).
+	UpsertTx(ctx context.Context, tx pgx.Tx, e CatalogEntry) (CatalogEntry, error)
 	ListAll(ctx context.Context) ([]CatalogEntry, error)
 	ByID(ctx context.Context, resourceID string) (CatalogEntry, error)
 }
@@ -37,7 +40,17 @@ func NewCatalogRepo(q sqlc.Querier) CatalogRepo { return &catalogRepo{q: q} }
 type catalogRepo struct{ q sqlc.Querier }
 
 func (r *catalogRepo) Upsert(ctx context.Context, e CatalogEntry) (CatalogEntry, error) {
-	row, err := r.q.UpsertCatalogEntry(ctx, sqlc.UpsertCatalogEntryParams{
+	return upsertCatalog(ctx, r.q, e)
+}
+
+func (r *catalogRepo) UpsertTx(ctx context.Context, tx pgx.Tx, e CatalogEntry) (CatalogEntry, error) {
+	return upsertCatalog(ctx, sqlc.New(tx), e)
+}
+
+// upsertCatalog performs the upsert against any sqlc.Querier — the pool-bound
+// querier (Upsert) or a tx-bound one created via sqlc.New(tx) (UpsertTx).
+func upsertCatalog(ctx context.Context, q sqlc.Querier, e CatalogEntry) (CatalogEntry, error) {
+	row, err := q.UpsertCatalogEntry(ctx, sqlc.UpsertCatalogEntryParams{
 		ResourceID:     e.ResourceID,
 		TenantID:       e.TenantID,
 		Uri:            e.URI,

@@ -14,30 +14,68 @@ import (
 
 // TransactionRecord is the domain view of a transaction_log row.
 type TransactionRecord struct {
-	TransactionID      string
-	TxRequestID        string
-	TenantID           string
-	AgentID            string
-	ResourceID         string
-	OfferID            string
-	AgentIdentityHash  []byte
-	SignedURLHash      []byte
-	Expiry             time.Time
-	BillingID          string
-	UnitCostDecimal    string // canonical decimal representation
-	Currency           string
-	ConsumedUnit       string
-	DenialReason       string
-	OfferSignature     string // verbatim, as the agent presented it
-	SignedURLSignature string // verbatim signature substring extracted from the issued URL
-	CreatedAt          time.Time
+	TransactionID     string
+	TxRequestID       string
+	TenantID          string
+	AgentID           string
+	ResourceID        string
+	OfferID           string
+	AgentIdentityHash []byte
+	SignedURLHash     []byte
+	Expiry            time.Time
+	BillingID         string
+	UnitCostDecimal   string // canonical decimal representation
+	Currency          string
+	ConsumedUnit      string
+	DenialReason      string
+	CreatedAt         time.Time
+}
+
+// PersistTxIntent carries the fields needed to mint a transaction-log row
+// AND its companion reporting-obligation row in the same transaction. The
+// service builds the intent once and both repos consume their own subset;
+// each repo owns the column-shape for its table.
+type PersistTxIntent struct {
+	// Identifiers
+	TransactionID string
+	TxRequestID   string
+	ObligationID  string
+
+	// Tenant / caller binding
+	TenantID string
+	AgentID  string
+
+	// Catalog binding (resource_id and offer_id are the same value for v1)
+	ResourceID string
+	OfferID    string
+
+	// Audit + signed-URL evidence
+	AgentIdentityHash []byte
+	SignedURLHash     []byte
+	Expiry            time.Time
+
+	// Billing / pricing
+	BillingID       string
+	UnitCostDecimal string
+	Currency        string
+
+	// Reporting-obligation columns
+	State             ObligationState
+	WindowSeconds     int32
+	Deadline          time.Time
+	RequiredFields    []string
+	EstimatedQuantity int64
+	QuantityTolerance float64
 }
 
 // TransactionRepo is the write-before-sign contract for transaction log rows.
 type TransactionRepo interface {
 	Create(ctx context.Context, tx pgx.Tx, rec TransactionRecord) (TransactionRecord, error)
+	// CreateForOffer mints a transaction-log row from a PersistTxIntent.
+	// Equivalent to building a TransactionRecord inline and calling Create,
+	// but keeps the column-shape mapping inside the repo.
+	CreateForOffer(ctx context.Context, tx pgx.Tx, intent PersistTxIntent) (TransactionRecord, error)
 	ByRequestID(ctx context.Context, txRequestID string) (TransactionRecord, error)
-	ByID(ctx context.Context, transactionID string) (TransactionRecord, error)
 }
 
 // ErrTransactionNotFound signals an idempotency probe miss.
@@ -57,27 +95,47 @@ func (r *transactionRepo) Create(ctx context.Context, tx pgx.Tx, rec Transaction
 		return TransactionRecord{}, err
 	}
 	row, err := qtx.CreateTransaction(ctx, sqlc.CreateTransactionParams{
-		TransactionID:      rec.TransactionID,
-		TxRequestID:        rec.TxRequestID,
-		TenantID:           rec.TenantID,
-		AgentID:            rec.AgentID,
-		ResourceID:         rec.ResourceID,
-		OfferID:            rec.OfferID,
-		AgentIdentityHash:  rec.AgentIdentityHash,
-		SignedUrlHash:      rec.SignedURLHash,
-		Expiry:             pgtype.Timestamptz{Time: rec.Expiry, Valid: true},
-		BillingID:          pgText(rec.BillingID),
-		UnitCost:           unitCost,
-		Currency:           rec.Currency,
-		ConsumedUnit:       pgText(rec.ConsumedUnit),
-		DenialReason:       nullDenial(rec.DenialReason),
-		OfferSignature:     pgText(rec.OfferSignature),
-		SignedUrlSignature: pgText(rec.SignedURLSignature),
+		TransactionID:     rec.TransactionID,
+		TxRequestID:       rec.TxRequestID,
+		TenantID:          rec.TenantID,
+		AgentID:           rec.AgentID,
+		ResourceID:        rec.ResourceID,
+		OfferID:           rec.OfferID,
+		AgentIdentityHash: rec.AgentIdentityHash,
+		SignedUrlHash:     rec.SignedURLHash,
+		Expiry:            pgtype.Timestamptz{Time: rec.Expiry, Valid: true},
+		BillingID:         pgText(rec.BillingID),
+		UnitCost:          unitCost,
+		Currency:          rec.Currency,
+		ConsumedUnit:      pgText(rec.ConsumedUnit),
+		DenialReason:      nullDenial(rec.DenialReason),
 	})
 	if err != nil {
 		return TransactionRecord{}, fmt.Errorf("create transaction: %w", err)
 	}
 	return transactionFromRow(row), nil
+}
+
+// CreateForOffer projects a PersistTxIntent onto a TransactionRecord and
+// delegates to Create. The repo owns the field-mapping so the service no
+// longer constructs TransactionRecord literals at the call site.
+func (r *transactionRepo) CreateForOffer(
+	ctx context.Context, tx pgx.Tx, intent PersistTxIntent,
+) (TransactionRecord, error) {
+	return r.Create(ctx, tx, TransactionRecord{
+		TransactionID:     intent.TransactionID,
+		TxRequestID:       intent.TxRequestID,
+		TenantID:          intent.TenantID,
+		AgentID:           intent.AgentID,
+		ResourceID:        intent.ResourceID,
+		OfferID:           intent.OfferID,
+		AgentIdentityHash: intent.AgentIdentityHash,
+		SignedURLHash:     intent.SignedURLHash,
+		Expiry:            intent.Expiry,
+		BillingID:         intent.BillingID,
+		UnitCostDecimal:   intent.UnitCostDecimal,
+		Currency:          intent.Currency,
+	})
 }
 
 func (r *transactionRepo) ByRequestID(ctx context.Context, txRequestID string) (TransactionRecord, error) {
@@ -91,46 +149,31 @@ func (r *transactionRepo) ByRequestID(ctx context.Context, txRequestID string) (
 	return transactionFromRow(row), nil
 }
 
-// ByID returns the transaction_log row for a given transaction_id (PK).
-// Used by the /admin/ledger endpoint that backs `make ledger TX=<id>`.
-func (r *transactionRepo) ByID(ctx context.Context, transactionID string) (TransactionRecord, error) {
-	row, err := r.q.GetTransactionByID(ctx, transactionID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return TransactionRecord{}, ErrTransactionNotFound
-		}
-		return TransactionRecord{}, fmt.Errorf("get transaction by id: %w", err)
-	}
-	return transactionFromRow(row), nil
-}
-
 func transactionFromRow(row sqlc.RampTransactionLog) TransactionRecord {
 	rec := TransactionRecord{
-		TransactionID:      row.TransactionID,
-		TxRequestID:        row.TxRequestID,
-		TenantID:           row.TenantID,
-		AgentID:            row.AgentID,
-		ResourceID:         row.ResourceID,
-		OfferID:            row.OfferID,
-		AgentIdentityHash:  row.AgentIdentityHash,
-		SignedURLHash:      row.SignedUrlHash,
-		BillingID:          textOrEmpty(row.BillingID),
-		Currency:           row.Currency,
-		ConsumedUnit:       textOrEmpty(row.ConsumedUnit),
-		OfferSignature:     textOrEmpty(row.OfferSignature),
-		SignedURLSignature: textOrEmpty(row.SignedUrlSignature),
+		TransactionID:     row.TransactionID,
+		TxRequestID:       row.TxRequestID,
+		TenantID:          row.TenantID,
+		AgentID:           row.AgentID,
+		ResourceID:        row.ResourceID,
+		OfferID:           row.OfferID,
+		AgentIdentityHash: row.AgentIdentityHash,
+		SignedURLHash:     row.SignedUrlHash,
+		BillingID:         textOrEmpty(row.BillingID),
+		Currency:          row.Currency,
+		ConsumedUnit:      textOrEmpty(row.ConsumedUnit),
 	}
 	if row.Expiry.Valid {
 		rec.Expiry = row.Expiry.Time
-	}
-	if row.CreatedAt.Valid {
-		rec.CreatedAt = row.CreatedAt.Time
 	}
 	if dec, err := decimalFromNumeric(row.UnitCost); err == nil {
 		rec.UnitCostDecimal = dec
 	}
 	if row.DenialReason.Valid {
 		rec.DenialReason = string(row.DenialReason.RampDenialReason)
+	}
+	if row.CreatedAt.Valid {
+		rec.CreatedAt = row.CreatedAt.Time
 	}
 	return rec
 }

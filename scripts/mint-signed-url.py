@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 DEFAULT_KEY_PATH = Path("/tmp/ramp-demo-keys/rsa-private.pem")
-DEFAULT_KEY_PAIR_ID = "<CLOUDFRONT_KEY_PAIR_ID>"
+DEFAULT_KEY_PAIR_ID = "KH7UF1IVJPWAU"
 DEFAULT_TTL_SECONDS = 3600
 
 

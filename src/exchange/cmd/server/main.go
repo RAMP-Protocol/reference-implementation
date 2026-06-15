@@ -8,20 +8,29 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 
-	rampconnect "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1/rampv1connect"
+	connect "connectrpc.com/connect"
+	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
-	"github.com/jackc/pgx/v5/pgtype"
-
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	exchangedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
@@ -59,249 +68,299 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	// Single Ed25519 keypair for both offer signing and demo URL signing so the
-	// JWKS endpoint publishes a public key the edge worker can verify both with.
-	// See keys.go for env-vs-generate resolution (RAMP_ED25519_PRIVATE_PEM).
-	demoPub, demoPriv, err := resolveEd25519Key(logger)
+	keys, err := setupDemoKeys(logger)
 	if err != nil {
 		return err
 	}
-	offerSigner, err := signing.NewEd25519Signer(demoPub, demoPriv)
-	if err != nil {
-		return err
-	}
-	keystore := signing.NewInMemoryKeyStore()
-	demoKeyRef := runhttp.EnvOr("RAMP_DEMO_ED25519_KEY_REF", "exchange-primary")
-	keystore.PutEd25519(demoKeyRef, demoPub, demoPriv)
+	offerSigner, keystore := keys.offerSigner, keys.keystore
 
-	// RSA key for the AWS_CLOUDFRONT_RSA tenant scheme. The public key PEM is
-	// served at /admin/keys/rsa-public.pem so a local CloudFront-compat verifier
-	// (aws-edge shim) can bootstrap without any AWS credentials.
-	demoRSARef := runhttp.EnvOr("RAMP_DEMO_RSA_KEY_REF", "cf-rsa-primary")
-	rsaPriv, err := resolveRSAKey(logger)
-	if err != nil {
-		return err
-	}
-	keystore.PutRSA(demoRSARef, rsaPriv)
+	// One SSRF-guarded HTTP client backs every outbound .well-known fetch:
+	// agent registration, catalog contributor-authz, and the broker revocation
+	// poll. It refuses loopback/link-local/private destinations unless
+	// RAMP_FETCH_INSECURE_ALLOW_PRIVATE is set (compose/dev only).
+	fetchClient := rampwellknown.NewGuardedClientFromEnv()
 
 	queries := sqlc.New(pool)
-	catalogSvc := service.NewCatalogService(repo.NewCatalogRepo(queries))
+	agentRegistry := agentreg.New(agentreg.Config{Repo: repo.NewAgentRepo(queries), HTTP: fetchClient})
+	// EXCHANGE_CATALOG_URI_SCHEME defaults to https; compose overrides to http
+	// so catalog URIs route through the in-network edge worker.
+	service.SetCatalogURIScheme(runhttp.EnvOr("EXCHANGE_CATALOG_URI_SCHEME", ""))
+	catalogSvc := service.NewCatalogService(
+		repo.NewCatalogRepo(queries), agentRegistry, newManifestCache(fetchClient), db.PoolRunner{Pool: pool},
+	)
 	if err := catalogSvc.Bootstrap(ctx); err != nil {
 		return err
 	}
-	mp := service.NewMarketplaceService(service.MarketplaceDeps{
-		Pool:         pool,
-		Catalog:      catalogSvc,
-		Tenants:      repo.NewTenantRepo(queries),
-		Agents:       repo.NewAgentRepo(queries),
-		Transactions: repo.NewTransactionRepo(queries),
-		Obligations:  repo.NewObligationRepo(queries),
-		Billing:      newBillingAdapter(logger),
-		OfferSigner:  offerSigner,
-		KeyStore:     keystore,
-		Config: service.MarketplaceConfig{
-			Marketplace: runhttp.EnvOr("EXCHANGE_DOMAIN", "exchange.ramp.local"),
-		},
+	exchangeSvc := buildExchange(buildSvcDeps{
+		pool:        pool,
+		queries:     queries,
+		catalog:     catalogSvc,
+		offerSigner: offerSigner,
+		keystore:    keystore,
+		billing:     selectBillingAdapter(logger),
 	})
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", healthzHandler(pool))
-	mux.HandleFunc("POST /admin/catalog/reload", catalogReloadHandler(catalogSvc, logger))
-	mux.HandleFunc("POST /admin/seed", seedHandler(queries, catalogSvc, logger))
-	mux.HandleFunc("GET /admin/catalog", catalogListHandler(repo.NewCatalogRepo(queries)))
-	mux.HandleFunc("GET /admin/keys/rsa-public.pem", rsaPublicKeyHandler(&rsaPriv.PublicKey))
-	mux.HandleFunc("GET /admin/ledger", ledgerHandler(
-		repo.NewTransactionRepo(queries),
-		repo.NewObligationRepo(queries),
-		repo.NewTenantRepo(queries),
-	))
-	registerConnect(mux, mp, catalogSvc)
-	registerWellKnown(mux, offerSigner)
+	mux := buildMux(muxDeps{
+		pool:          pool,
+		exchange:      exchangeSvc,
+		catalog:       catalogSvc,
+		agentRegistry: agentRegistry,
+		offerSigner:   offerSigner,
+	})
 
-	wrapped := transport.RequestIDMiddleware(logger, mux)
+	wrapped, err := buildWrapped(ctx, logger, mux, fetchClient)
+	if err != nil {
+		return err
+	}
 	runhttp.Serve("exchange", runhttp.EnvOr("EXCHANGE_ADDR", ":8081"), wrapped, logger)
 	return nil
 }
 
-// rsaPublicKeyHandler serves the current demo RSA public key in PEM form so
-// a local CloudFront-compatible verifier can bootstrap without AWS creds.
-// Unauth, demo-only; production routes this via IAM + Secrets Manager.
-func rsaPublicKeyHandler(pub *rsa.PublicKey) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		der, err := x509.MarshalPKIXPublicKey(pub)
+// buildSvcDeps groups the inputs buildExchange needs so the
+// run() call site stays under the funlen cap.
+type buildSvcDeps struct {
+	pool        *pgxpool.Pool
+	queries     *sqlc.Queries
+	catalog     *service.CatalogService
+	offerSigner *signing.Ed25519Signer
+	keystore    *signing.InMemoryKeyStore
+	billing     billing.Adapter
+}
+
+// buildExchange wires the ExchangeService that serves the canonical
+// DiscoverResources / ExecuteTransaction / ReportUsage RPCs. The deprecated
+// OffersService (ye6f-9 ListOffers / AcceptOffer / Report) was removed in
+// W3 of t3vk.
+func buildExchange(d buildSvcDeps) *service.ExchangeService {
+	return service.NewExchangeService(service.ExchangeDeps{
+		TxRunner:     db.PoolRunner{Pool: d.pool},
+		Catalog:      d.catalog,
+		Tenants:      repo.NewTenantRepo(d.queries),
+		Agents:       repo.NewAgentRepo(d.queries),
+		Transactions: repo.NewTransactionRepo(d.queries),
+		Obligations:  repo.NewObligationRepo(d.queries),
+		Billing:      d.billing,
+		OfferSigner:  d.offerSigner,
+		KeyStore:     d.keystore,
+		Clk:          clock.System{},
+		Config: service.ExchangeConfig{
+			Exchange: runhttp.EnvOr("EXCHANGE_DOMAIN", "exchange.ramp.local"),
+		},
+	})
+}
+
+// demoKeys bundles the Ed25519 + RSA key material setupDemoKeys returns; a
+// struct keeps the run() call site readable and within line-length limits.
+type demoKeys struct {
+	offerSigner *signing.Ed25519Signer
+	keystore    *signing.InMemoryKeyStore
+	rsaPriv     *rsa.PrivateKey
+	rsaKid      string
+}
+
+// setupDemoKeys resolves the demo Ed25519 + RSA key material used by offer
+// signing, URL signing, and the AWS_CLOUDFRONT_RSA tenant scheme. Extracted
+// from run() to keep run() under the funlen cap.
+func setupDemoKeys(logger *slog.Logger) (*demoKeys, error) {
+	demoPub, demoPriv, err := resolveEd25519Key(logger)
+	if err != nil {
+		return nil, err
+	}
+	offerSigner, err := signing.NewEd25519Signer(demoPub, demoPriv)
+	if err != nil {
+		return nil, err
+	}
+	keystore := signing.NewInMemoryKeyStore()
+	demoKeyRef := runhttp.EnvOr("RAMP_DEMO_ED25519_KEY_REF", "exchange-primary")
+	keystore.PutEd25519(demoKeyRef, demoPub, demoPriv)
+	demoRSARef := runhttp.EnvOr("RAMP_DEMO_RSA_KEY_REF", "cf-rsa-primary")
+	rsaPriv, err := resolveRSAKey(logger)
+	if err != nil {
+		return nil, err
+	}
+	keystore.PutRSA(demoRSARef, rsaPriv)
+	return &demoKeys{offerSigner: offerSigner, keystore: keystore, rsaPriv: rsaPriv, rsaKid: demoRSARef}, nil
+}
+
+// buildWrapped builds the Exchange's final HTTP handler stack —
+// RequestIDMiddleware + RFC 9421 httpsig.Middleware +
+// CatalogSignatureMiddleware + mux — keeping run() below the funlen cap.
+//
+// The global httpsig middleware resolves keyids against the RAMP_KEYS_FILE
+// JWKS (Broker relay, registered exchanges). Every /ramp.* request MUST
+// be signed (see exchangeGlobalSigRequestPredicate); CatalogService paths
+// run their own per-contributor signer in CatalogHandler.verifyCallerSignature
+// (with lazy ramp.json self-signup) and are excluded from this gate.
+// Integration tests mirror this wiring via startExchangeServer (T10).
+//
+// The biscuit/JWT transport middlewares (EntitlementMiddleware,
+// AgentJWTMiddleware) were removed in e2k7h.7 alongside the entire
+// entitlement/delegation surface; identity for v1 is the RFC 9421
+// signature keyid, full stop.
+func buildWrapped(
+	ctx context.Context, logger *slog.Logger, mux http.Handler, fetchClient rampwellknown.HTTPDoer,
+) (http.Handler, error) {
+	resolver, replay, err := buildHTTPSigDeps(ctx, logger, fetchClient)
+	if err != nil {
+		return nil, err
+	}
+	inner := transport.CatalogSignatureMiddleware(mux)
+	sig := httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{
+		RequestPredicate: exchangeGlobalSigRequestPredicate,
+		OnError:          transport.LogHTTPSigReject,
+	}, inner)
+	return transport.RequestIDMiddleware(logger, sig), nil
+}
+
+// exchangeGlobalSigRequestPredicate decides whether a request must clear
+// the static-resolver httpsig gate. Every non-Catalog /ramp.* request
+// MUST be signed and MUST be verified — RFC 9421 is the universal
+// transport-layer authentication. Catalog paths are excluded only
+// because CatalogSignatureMiddleware runs a different signer further
+// down the stack (per-contributor with lazy ramp.json self-signup);
+// they are still verified, just via a different mechanism. Paths
+// outside the /ramp.* namespace (healthz, /.well-known, etc.) are
+// public.
+func exchangeGlobalSigRequestPredicate(r *http.Request) bool {
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/ramp.v1.CatalogService/") {
+		return false
+	}
+	return strings.HasPrefix(path, "/ramp.")
+}
+
+// buildHTTPSigDeps constructs the RFC 9421 KeyResolver + ReplayStore used by
+// the httpsig middleware. Keys are loaded from the JWKS file at
+// RAMP_KEYS_FILE (default deploy/broker/keys.json) — in the v1 demo both
+// Broker and Exchange read the same file, which carries agent pubkeys AND
+// the Broker-relay pubkey disambiguated by kid prefix. Redis, when REDIS_URL
+// is set, backs the replay store; otherwise an in-memory store is used.
+func buildHTTPSigDeps(
+	ctx context.Context, logger *slog.Logger, fetchClient rampwellknown.HTTPDoer,
+) (httpsig.KeyResolver, httpsig.ReplayStore, error) {
+	keysFile := runhttp.EnvOr("RAMP_KEYS_FILE", "deploy/broker/keys.json")
+	var redisCli *redis.Client
+	if dsn := runhttp.EnvOr("REDIS_URL", ""); dsn != "" {
+		opts, err := redis.ParseURL(dsn)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return nil, nil, err
 		}
-		w.Header().Set("Content-Type", "application/x-pem-file")
-		_ = pem.Encode(w, &pem.Block{Type: "PUBLIC KEY", Bytes: der})
+		redisCli = redis.NewClient(opts)
+		if pingErr := redisCli.Ping(ctx).Err(); pingErr != nil {
+			_ = redisCli.Close()
+			return nil, nil, pingErr
+		}
+		logger.Info("httpsig: redis replay store ready", "addr", opts.Addr)
 	}
-}
-
-// seedRequest is the body shape for POST /admin/seed — a one-shot demo helper
-// that inserts tenants + agents + catalog rows and then rebuilds the radix
-// trie. Gated to the admin path and intended for local / demo deployments only.
-type seedRequest struct {
-	Tenants []seedTenant  `json:"tenants"`
-	Agents  []seedAgent   `json:"agents"`
-	Catalog []seedCatalog `json:"catalog"`
-}
-
-// seedAgent registers a row in ramp.agents so transaction_log FK lookups
-// resolve. Demo-only — production agents register via DCR / a separate
-// onboarding flow that captures their public key for signature verification.
-type seedAgent struct {
-	AgentID       string `json:"agent_id"`
-	PublicKey     string `json:"public_key"`     // base64 (PEM strip-down) or any opaque tag
-	ManifestURL   string `json:"manifest_url"`
-	RequesterType string `json:"requester_type"` // AGENT | HUMAN_TOOL | SERVICE | DELEGATED | RESEARCH
-}
-
-type seedTenant struct {
-	TenantID            string `json:"tenant_id"`
-	Domain              string `json:"domain"`
-	HmacSecretRef       string `json:"hmac_secret_ref"`
-	Ed25519KeyRef       string `json:"ed25519_key_ref"`
-	SigningScheme       string `json:"signing_scheme"`
-	RSAKeyRef           string `json:"rsa_key_ref"`
-	CloudFrontKeyPairID string `json:"cloudfront_key_pair_id"`
-}
-
-type seedCatalog struct {
-	ResourceID     string          `json:"resource_id"`
-	TenantID       string          `json:"tenant_id"`
-	URI            string          `json:"uri"`
-	URIPrefix      string          `json:"uri_prefix"`
-	Pricing        json.RawMessage `json:"pricing"`
-	LicensingRules json.RawMessage `json:"licensing_rules"`
-	DeliveryMethod string          `json:"delivery_method"`
-}
-
-// seedHandler inserts tenants + catalog entries and rebuilds the radix trie.
-// Duplicate tenant inserts are tolerated (logged, not fatal); catalog entries
-// use Upsert so re-seeding is idempotent.
-func seedHandler(queries sqlc.Querier, catalogSvc *service.CatalogService, logger *slog.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req seedRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		for _, t := range req.Tenants {
-			scheme := sqlc.RampSigningScheme(t.SigningScheme)
-			if scheme == "" {
-				scheme = sqlc.RampSigningSchemeED25519
-			}
-			_, err := queries.InsertTenant(r.Context(), sqlc.InsertTenantParams{
-				TenantID:            t.TenantID,
-				Domain:              t.Domain,
-				HmacSecretRef:       t.HmacSecretRef,
-				Ed25519KeyRef:       t.Ed25519KeyRef,
-				ReportingPolicy:     []byte("{}"),
-				SigningScheme:       scheme,
-				RsaKeyRef:           pgtype.Text{String: t.RSAKeyRef, Valid: t.RSAKeyRef != ""},
-				CloudfrontKeyPairID: pgtype.Text{String: t.CloudFrontKeyPairID, Valid: t.CloudFrontKeyPairID != ""},
-			})
-			if err != nil {
-				logger.WarnContext(r.Context(), "seed: insert tenant skipped", "tenant_id", t.TenantID, "err", err)
-			}
-		}
-		for _, a := range req.Agents {
-			rt := sqlc.RampRequesterType(a.RequesterType)
-			if rt == "" {
-				rt = sqlc.RampRequesterType("AGENT")
-			}
-			if _, err := queries.UpsertAgent(r.Context(), sqlc.UpsertAgentParams{
-				AgentID:       a.AgentID,
-				PublicKey:     []byte(a.PublicKey),
-				ManifestUrl:   pgtype.Text{String: a.ManifestURL, Valid: a.ManifestURL != ""},
-				RequesterType: rt,
-			}); err != nil {
-				logger.ErrorContext(r.Context(), "seed: upsert agent", "agent_id", a.AgentID, "err", err)
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-		for _, c := range req.Catalog {
-			pricing := []byte(c.Pricing)
-			if len(pricing) == 0 {
-				pricing = []byte("{}")
-			}
-			rules := []byte(c.LicensingRules)
-			if len(rules) == 0 {
-				rules = []byte("{}")
-			}
-			dm := sqlc.RampDeliveryMethod(c.DeliveryMethod)
-			if dm == "" {
-				dm = sqlc.RampDeliveryMethodDIRECT
-			}
-			if _, err := queries.UpsertCatalogEntry(r.Context(), sqlc.UpsertCatalogEntryParams{
-				ResourceID:     c.ResourceID,
-				TenantID:       c.TenantID,
-				Uri:            c.URI,
-				UriPrefix:      c.URIPrefix,
-				Pricing:        pricing,
-				LicensingRules: rules,
-				DeliveryMethod: dm,
-			}); err != nil {
-				logger.ErrorContext(r.Context(), "seed: upsert catalog", "resource_id", c.ResourceID, "err", err)
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-		if err := catalogSvc.Bootstrap(r.Context()); err != nil {
-			logger.ErrorContext(r.Context(), "seed: bootstrap", "err", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
+	static, replay, err := httpsig.Wireup(httpsig.WireupOptions{
+		KeysFile:    keysFile,
+		Redis:       redisCli,
+		RedisPrefix: "httpsig:exchange:replay:",
+	})
+	if err != nil {
+		return nil, nil, err
 	}
+	return wellKnownAwareResolver(ctx, static, fetchClient, logger), replay, nil
 }
 
-// catalogListHandler exposes GET /admin/catalog — flat JSON dump of catalog rows
-// (no paging, demo-only). Pricing + licensing columns are returned as raw JSON
-// so consumers see the shape the service stored.
-func catalogListHandler(r repo.CatalogRepo) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
-		rows, err := r.ListAll(req.Context())
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		type row struct {
-			ResourceID     string          `json:"resource_id"`
-			TenantID       string          `json:"tenant_id"`
-			URI            string          `json:"uri"`
-			URIPrefix      string          `json:"uri_prefix"`
-			Pricing        json.RawMessage `json:"pricing"`
-			LicensingRules json.RawMessage `json:"licensing_rules"`
-			DeliveryMethod string          `json:"delivery_method"`
-		}
-		out := make([]row, 0, len(rows))
-		for _, e := range rows {
-			out = append(out, row{
-				ResourceID: e.ResourceID, TenantID: e.TenantID,
-				URI: e.URI, URIPrefix: e.URIPrefix,
-				Pricing: json.RawMessage(e.PricingJSON), LicensingRules: json.RawMessage(e.LicensingJSON),
-				DeliveryMethod: e.DeliveryMethod,
-			})
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out)
+// wellKnownAwareResolver wraps the static RAMP_KEYS_FILE resolver. When
+// EXCHANGE_BROKER_WELLKNOWN_URL is set, a revocation-aware rampwellknown.Loader
+// bound to that URL is consulted first — so a kid the Broker has revoked (or
+// whose validity window has lapsed) is rejected even if the bootstrap file
+// still lists it — with the static resolver remaining the fallback for kids the
+// well-known document does not carry or when it is momentarily unreachable.
+// Unset (the default) returns the static resolver unchanged; the demo + e2e
+// continue to resolve purely from the pre-shared file. RAMP_KEYS_FILE removal
+// is the forward step (follow-up 13.F1) once well-known resolution is primary.
+//
+// The loader's revocation poller is started on ctx (lifetime of the process):
+// without it, a kid revoked after the manifest is cached would keep verifying
+// for the full manifest TTL rather than within one poll interval.
+func wellKnownAwareResolver(
+	ctx context.Context, static httpsig.KeyResolver, fetchClient rampwellknown.HTTPDoer, logger *slog.Logger,
+) httpsig.KeyResolver {
+	url := runhttp.EnvOr("EXCHANGE_BROKER_WELLKNOWN_URL", "")
+	if url == "" {
+		return static
 	}
+	poll := envDuration("EXCHANGE_REVOCATION_POLL_INTERVAL", 0)
+	loader := rampwellknown.NewLoader(rampwellknown.LoaderOptions{
+		Fetch:        rampwellknown.FetchOptions{Client: fetchClient},
+		PollInterval: poll,
+		ManifestTTL:  envDuration("EXCHANGE_MANIFEST_TTL", 0),
+		Logger:       logger,
+	})
+	go loader.Run(ctx)
+	revocationAware := httpsig.ResolverFunc(func(ctx context.Context, keyID string) (ed25519.PublicKey, error) {
+		pub, err := loader.LookupKey(ctx, url, keyID)
+		switch {
+		case err == nil:
+			return pub, nil
+		case errors.Is(err, rampwellknown.ErrKeyRevoked), errors.Is(err, rampwellknown.ErrKeyExpired):
+			return nil, err // authoritative negative — do not fall through to the file
+		default:
+			// Unknown here, or the document is unreachable/malformed: defer to
+			// the static fallback by reporting the kid as unknown.
+			return nil, fmt.Errorf("%w: %w", httpsig.ErrUnknownKey, err)
+		}
+	})
+	logger.Info("httpsig: well-known revocation-aware resolution enabled",
+		"well_known_url", url, "poll_interval", poll)
+	return httpsig.NewCompositeResolver(revocationAware, static)
 }
 
-// catalogReloadHandler exposes POST /admin/catalog/reload for demo / E2E use.
-// Triggers CatalogService.Bootstrap to rebuild the in-process radix trie from
-// the current DB contents. Production deployments would gate this behind IAM
-// and require authentication; here it is unauth (demo only).
-func catalogReloadHandler(c *service.CatalogService, logger *slog.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if err := c.Bootstrap(r.Context()); err != nil {
-			logger.ErrorContext(r.Context(), "catalog reload failed", "err", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
+// envDuration parses a Go duration from name, returning def on absent/invalid/
+// negative input. Used to compress the revocation poll cadence + manifest TTL
+// in tests; a zero return lets the Loader apply its proto-mandated defaults.
+func envDuration(name string, def time.Duration) time.Duration {
+	raw := runhttp.EnvOr(name, "")
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return def
+	}
+	return d
+}
+
+// muxDeps collects everything buildMux needs so run() can stay linear and
+// tests can assemble the Exchange's HTTP surface without booting real services.
+type muxDeps struct {
+	pool          interface{ Ping(context.Context) error }
+	exchange      *service.ExchangeService
+	catalog       *service.CatalogService
+	agentRegistry agentreg.Registry
+	offerSigner   *signing.Ed25519Signer
+}
+
+// buildMux wires the Exchange's HTTP surface: healthz, Connect-Go RPCs, the
+// well-known endpoints, and the public agents/register route. Admin-plane
+// endpoints have been removed (design-demo-bootstrap.md §9); any request to
+// /admin/* falls through to http.ServeMux's 404.
+func buildMux(d muxDeps) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthzHandler(d.pool))
+	registerConnect(mux, d.exchange, d.catalog, d.agentRegistry)
+	registerWellKnown(mux, d.offerSigner)
+	transport.NewAgentsRegisterHandler(d.agentRegistry, transport.AgentsRegisterOptions{}).
+		RegisterRoutes(mux)
+	return mux
+}
+
+// selectBillingAdapter chooses the Adapter at boot. RAMP_BILLING_ADAPTER=free
+// (default) returns billing.FreeAdapter{}; the always-approve zero-state
+// adapter appropriate for demo / wholesale tiers. =inmemory returns the
+// prepaid-balance InMemoryAdapter seeded from EXCHANGE_BILLING_SEED. Unknown
+// values fall back to free with a warning.
+func selectBillingAdapter(logger *slog.Logger) billing.Adapter {
+	switch kind := runhttp.EnvOr("RAMP_BILLING_ADAPTER", "free"); kind {
+	case "free":
+		return billing.FreeAdapter{}
+	case "inmemory":
+		return newBillingAdapter(logger)
+	default:
+		logger.Warn("RAMP_BILLING_ADAPTER unknown value; using free", "value", kind)
+		return billing.FreeAdapter{}
 	}
 }
 
@@ -335,23 +394,60 @@ func newBillingAdapter(logger *slog.Logger) *billing.InMemoryAdapter {
 	return billing.NewInMemoryAdapter(seed)
 }
 
-func registerConnect(mux *http.ServeMux, m *service.MarketplaceService, c *service.CatalogService) {
-	path, h := rampconnect.NewExchangeServiceHandler(transport.NewExchangeHandler(m))
+func registerConnect(
+	mux *http.ServeMux,
+	m *service.ExchangeService,
+	c *service.CatalogService,
+	reg agentreg.Registry,
+) {
+	base := transport.NewExchangeHandler(m)
+	// Override Connect's default JSON codec so scalar zero values
+	// appear in the wire output. The default protojson behavior omits
+	// them, which hides zero-valued observables (e.g. unit_cost=0) that
+	// agents and obligation tests depend on.
+	codecOpt := connect.WithCodec(transport.EmitUnpopulatedJSONCodec())
+	path, h := rampconnect.NewExchangeServiceHandler(base, codecOpt)
 	mux.Handle(path, h)
-	cpath, ch := rampconnect.NewCatalogServiceHandler(transport.NewCatalogHandler(c))
+	cpath, ch := rampconnect.NewCatalogServiceHandler(transport.NewCatalogHandler(c, reg), codecOpt)
 	mux.Handle(cpath, ch)
 }
 
 func registerWellKnown(mux *http.ServeMux, signer *signing.Ed25519Signer) {
-	wk := wellknown.New(wellknown.Manifest{
-		Exchange:           runhttp.EnvOr("EXCHANGE_DOMAIN", "exchange.ramp.local"),
-		Version:            "1.0",
-		ExchangeServiceURL: "/ramp.v1.ExchangeService",
-		CatalogServiceURL:  "/ramp.v1.CatalogService",
-		JWKSURL:            "/marketplace/v1/keys",
-		BaseCurrency:       "USD",
-	}, signer.PublicKey(), "exchange-primary")
+	now := clock.System{}.Now()
+	hops := exchangeMaxIntermediaryHops()
+	wk, err := wellknown.New(wellknown.Config{
+		Domain:              runhttp.EnvOr("EXCHANGE_DOMAIN", "exchange.ramp.local"),
+		Endpoint:            "/ramp.v1.ExchangeService",
+		CatalogEndpoint:     "/ramp.v1.CatalogService",
+		BaseCurrency:        "USD",
+		SupportedProfiles:   []string{"ramp-news-v1"},
+		MaxIntermediaryHops: &hops,
+		OfferKeyID:          runhttp.EnvOr("RAMP_DEMO_ED25519_KEY_REF", "exchange-primary"),
+		OfferKey:            signer.PublicKey(),
+		KeyNotBefore:        now,
+		KeyNotAfter:         now.Add(10 * 365 * 24 * time.Hour),
+	})
+	if err != nil {
+		panic(err)
+	}
 	wk.RegisterRoutes(mux)
+}
+
+// exchangeMaxIntermediaryHops reads EXCHANGE_MAX_INTERMEDIARY_HOPS (default 4):
+// the chain-depth tolerance the Exchange publishes so Brokers can prune before
+// forwarding (RAMP WellKnownManifest.max_intermediary_hops). Vacuous at the
+// current single-hop depth; declared so multi-hop deployments inherit a bound.
+func exchangeMaxIntermediaryHops() int32 {
+	const def int32 = 4
+	raw := runhttp.EnvOr("EXCHANGE_MAX_INTERMEDIARY_HOPS", "")
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 || n > 1<<20 {
+		return def
+	}
+	return int32(n) //nolint:gosec // bounded to [0, 2^20] above
 }
 
 func healthzHandler(pool interface{ Ping(context.Context) error }) http.HandlerFunc {
@@ -371,4 +467,19 @@ func healthzOnly(pool interface{ Ping(context.Context) error }) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler(pool))
 	return mux
+}
+
+// newManifestCache builds the publisher-manifest cache over the shared
+// SSRF-guarded fetch client. Honors RAMP_MANIFEST_FETCH_{SCHEME,PORT} for
+// docker-compose / local-dev stacks; production leaves both unset (defaults to
+// https + scheme-default port). ExpectRole pins every fetched manifest to
+// ROLE_PUBLISHER so a misrouted document (e.g. an agent or exchange manifest)
+// is rejected at the cache.
+func newManifestCache(client rampwellknown.HTTPDoer) *rampwellknown.Cache {
+	return rampwellknown.NewCache(rampwellknown.CacheOptions{
+		Client:     client,
+		Scheme:     runhttp.EnvOr("RAMP_MANIFEST_FETCH_SCHEME", ""),
+		Port:       runhttp.EnvOr("RAMP_MANIFEST_FETCH_PORT", ""),
+		ExpectRole: rampwellknown.RolePublisher,
+	})
 }

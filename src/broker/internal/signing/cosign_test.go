@@ -7,7 +7,7 @@ import (
 	"encoding/base64"
 	"testing"
 
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/signing"
 )
@@ -17,7 +17,7 @@ func TestCoSigner_StampIntermediary_AddsHopAndSigns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	signer, err := signing.NewCoSigner("broker.example", "broker-1", priv)
+	signer, err := signing.NewCoSigner("broker.example", "broker-1", priv, nil)
 	if err != nil {
 		t.Fatalf("NewCoSigner: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestCoSigner_StampIntermediary_AddsHopAndSigns(t *testing.T) {
 }
 
 func TestCoSigner_NewCoSigner_RejectsBadKey(t *testing.T) {
-	_, err := signing.NewCoSigner("d", "id", ed25519.PrivateKey([]byte("short")))
+	_, err := signing.NewCoSigner("d", "id", ed25519.PrivateKey([]byte("short")), nil)
 	if err == nil {
 		t.Fatal("expected error for short private key")
 	}
@@ -59,7 +59,7 @@ func TestCoSigner_NewCoSigner_RejectsEmptyDomain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	if _, err := signing.NewCoSigner("", "broker-1", priv); err == nil {
+	if _, err := signing.NewCoSigner("", "broker-1", priv, nil); err == nil {
 		t.Fatal("expected error for empty domain")
 	}
 }
@@ -73,7 +73,7 @@ func TestLoadFromEnv_Seed(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString(seed)
 	t.Setenv("BROKER_ED25519_SEED", encoded)
 
-	signer, err := signing.LoadFromEnv("broker.example", "broker-1")
+	signer, err := signing.LoadFromEnv("broker.example", "broker-1", nil)
 	if err != nil {
 		t.Fatalf("LoadFromEnv: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestLoadFromEnv_Seed(t *testing.T) {
 func TestLoadFromEnv_Ephemeral(t *testing.T) {
 	t.Setenv("BROKER_ED25519_SEED", "")
 	t.Setenv("BROKER_ED25519_KEY_FILE", "")
-	signer, err := signing.LoadFromEnv("broker.example", "broker-1")
+	signer, err := signing.LoadFromEnv("broker.example", "broker-1", nil)
 	if err != nil {
 		t.Fatalf("LoadFromEnv ephemeral: %v", err)
 	}

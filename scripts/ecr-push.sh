@@ -15,7 +15,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 TAG="${TAG:-latest}"
 
-: "${RAMP_AWS_PROFILE:=<DEPLOYER_PROFILE>}"
+: "${RAMP_AWS_PROFILE:=cdn-poc}"
 export AWS_PROFILE="${RAMP_AWS_PROFILE}"
 
 for arg in "$@"; do

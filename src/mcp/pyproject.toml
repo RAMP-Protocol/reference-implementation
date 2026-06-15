@@ -27,6 +27,11 @@ dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.25.0",
     "respx>=0.22.0",
+    # Producer-side schema conformance test (test_wellknown_schema.py): validate
+    # the agent manifest against internal/rampwellknown/schema/ramp-well-known.json,
+    # the same canonical schema the Go consumer and TS edge enforce.
+    "jsonschema>=4.26.0",
+    "types-jsonschema>=4.26.0",
 ]
 
 [tool.uv]
@@ -77,9 +82,25 @@ max-complexity = 12
 # (Left as a placeholder — banned-module-level-imports is exact-match; we rely
 #  on this repo layout where src/mcp has no path access to src/{broker,exchange}.)
 
+# ADR-008 D1 — wall-clock primitives are forbidden inside the policy tree
+# (src/mcp/src/ramp_mcp_shim/). Production code consults the injected
+# ramp_mcp_shim.clock.Clock; only the canonical leaf in clock.py and the
+# test tree may reference these symbols. Per-file overrides below
+# allowlist the leaf and tests.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"datetime.datetime.now".msg = "ADR-008 D1: consult ramp_mcp_shim.clock.Clock.now() instead of datetime.now"
+"datetime.datetime.utcnow".msg = "ADR-008 D1: consult ramp_mcp_shim.clock.Clock.now() instead of datetime.utcnow"
+"time.time".msg = "ADR-008 D1: derive elapsed time from Clock.now() / Clock.monotonic()"
+"time.monotonic".msg = "ADR-008 D1: consult ramp_mcp_shim.clock.Clock.monotonic() instead of time.monotonic"
+
 [tool.ruff.lint.per-file-ignores]
 # Tests are allowed more args + asserts, but still keep size limits.
-"tests/**" = ["S", "PLR2004", "PLR0913"]
+# Tests are also exempt from the wall-clock ban — they construct
+# DeterministicClock from a real wall-clock anchor when needed.
+"tests/**" = ["S", "PLR2004", "PLR0913", "TID251"]
+# The canonical clock leaf is the one production site permitted to call
+# the wall-clock primitives directly (ADR-008 D1 allowlist).
+"src/ramp_mcp_shim/clock.py" = ["TID251"]
 
 [tool.mypy]
 strict = true

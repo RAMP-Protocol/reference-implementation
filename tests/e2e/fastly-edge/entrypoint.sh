@@ -7,7 +7,7 @@
 
 set -eu
 
-REQUIRED="EXCHANGE_URL JWKS_URL ORIGIN_URL PROVIDER EXCHANGES_JSON"
+REQUIRED="EXCHANGE_URL EXCHANGE_MANIFEST_URL ORIGIN_URL PROVIDER EXCHANGES_JSON"
 for name in $REQUIRED; do
   eval "v=\${$name:-}"
   if [ -z "$v" ]; then
@@ -36,12 +36,12 @@ service_id = ""
     format = "inline-toml"
       [local_server.config_stores.ramp_edge.contents]
       EXCHANGE_URL = "${EXCHANGE_URL}"
-      JWKS_URL = "${JWKS_URL}"
       ORIGIN_URL = "${ORIGIN_URL}"
       PROVIDER = "${PROVIDER}"
       EXCHANGES_JSON = $(printf '%s' "$EXCHANGES_JSON" | node -e 'process.stdout.write(JSON.stringify(require("fs").readFileSync(0,"utf8")))')
-      MARKETPLACE_MANIFEST_URL = "${MARKETPLACE_MANIFEST_URL:-}"
+      EXCHANGE_MANIFEST_URL = "${EXCHANGE_MANIFEST_URL:-}"
       RSL_BODY = "${RSL_BODY:-}"
+      CATALOG_CONTRIBUTORS_JSON = $(printf '%s' "${CATALOG_CONTRIBUTORS_JSON:-}" | node -e 'process.stdout.write(JSON.stringify(require("fs").readFileSync(0,"utf8")))')
 
 [setup]
 EOF

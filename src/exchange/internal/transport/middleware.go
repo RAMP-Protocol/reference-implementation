@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/google/uuid"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 )
 
 // contextKey is the local key type used for request-scoped values.
@@ -30,18 +30,22 @@ func WithRequestID(ctx context.Context, id string) context.Context {
 }
 
 // RequestIDMiddleware extracts (or mints) X-Request-ID, annotates the context,
-// writes the header back on the response, and attaches a scoped logger for
-// downstream use via slog.LogAttrs.
+// writes the header back on the response, and attaches a request-id-scoped logger
+// to the context (reqctx.IntoContext) so downstream handlers log with correlation
+// without re-passing the id by hand. The shared body lives in reqctx; this
+// service passes its own WithRequestID context-key setter.
 func RequestIDMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get("X-Request-ID")
-		if id == "" {
-			id = uuid.NewString()
-		}
-		w.Header().Set("X-Request-ID", id)
-		ctx := WithRequestID(r.Context(), id)
-		scoped := logger.With("request_id", id)
-		scoped.DebugContext(ctx, "http request", "method", r.Method, "path", r.URL.Path)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+	return reqctx.RequestIDMiddleware(logger, WithRequestID, next)
+}
+
+// LogHTTPSigReject is the OnError callback for the global RFC 9421 httpsig gate
+// (wired in cmd/server). It logs the rejection through the request-scoped logger
+// so the line carries the request_id RequestIDMiddleware stamped — these are the
+// auth-rejection lines, the highest-value ones to correlate. RequestIDMiddleware
+// is outermost, so r.Context() already carries the scoped logger; reqctx
+// falls back to slog.Default() if a request ever bypasses the middleware. The
+// httpsig interceptor only invokes OnError with a non-nil err.
+func LogHTTPSigReject(r *http.Request, err error) {
+	reqctx.FromContext(r.Context()).WarnContext(r.Context(), "httpsig: reject",
+		"path", r.URL.Path, "err", err.Error())
 }

@@ -2,13 +2,18 @@ package transport
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/broker"
 )
 
@@ -18,17 +23,31 @@ const (
 	requestIDKey ctxKey = "request_id"
 )
 
-// RequestIDMiddleware assigns or propagates an X-Request-ID per request.
-func RequestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get("X-Request-ID")
-		if id == "" {
-			id = uuid.NewString()
-		}
-		w.Header().Set("X-Request-ID", id)
-		ctx := context.WithValue(r.Context(), requestIDKey, id)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+// withRequestID stores id under the broker's request-id context key.
+func withRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, requestIDKey, id)
+}
+
+// RequestIDMiddleware assigns or propagates an X-Request-ID per request and
+// attaches a request-id-scoped logger to the context (reqctx.IntoContext) so
+// downstream handlers log with correlation without re-passing the id, mirroring
+// the Exchange. The shared body lives in reqctx; this service passes its own
+// withRequestID context-key setter.
+func RequestIDMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
+	return reqctx.RequestIDMiddleware(logger, withRequestID, next)
+}
+
+// LogHTTPSigReject is the OnError callback for the broker's global RFC 9421
+// httpsig gate (wired in cmd/server). It logs the rejection through the
+// request-scoped logger so the line carries the request_id RequestIDMiddleware
+// stamped — these are the auth-rejection lines, the highest-value ones to
+// correlate. RequestIDMiddleware is outermost, so r.Context() already carries
+// the scoped logger; reqctx falls back to slog.Default() if a request ever
+// bypasses the middleware. The httpsig interceptor only invokes OnError with a
+// non-nil err.
+func LogHTTPSigReject(r *http.Request, err error) {
+	reqctx.FromContext(r.Context()).WarnContext(r.Context(), "httpsig: reject",
+		"path", r.URL.Path, "err", err.Error())
 }
 
 func requestIDFrom(ctx context.Context) string {
@@ -38,21 +57,35 @@ func requestIDFrom(ctx context.Context) string {
 	return "req-" + uuid.NewString()
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
+// writeProtoJSON renders a proto message as canonical proto-JSON.
+func writeProtoJSON(w http.ResponseWriter, status int, msg proto.Message) {
+	b, err := protojson.Marshal(msg)
+	if err != nil {
+		// Unreachable for the RAMPResponse values this package builds; guard
+		// fails closed without stamping a JSON content-type on an empty body.
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+	_, _ = w.Write(b)
 }
 
-func writeError(w http.ResponseWriter, requestID string, err error) {
+// writeProtoError renders a domain error as a canonical RAMPResponse: the
+// request id plus the error string under ext["ramp.broker.error"], with the
+// HTTP status mapped from the error kind. RAMPResponse has no canonical error
+// field, so the Broker surfaces the cause under its ext namespace.
+func writeProtoError(w http.ResponseWriter, requestID string, err error) {
 	var be *broker.Error
 	if !errors.As(err, &be) {
 		be = broker.Wrapf(broker.KindInternal, err, "")
 	}
-	status := statusFromKind(be.Kind)
-	writeJSON(w, status, ResolveResponse{
-		RequestID: requestID,
-		Error:     fmt.Sprintf("%s: %s", be.Kind, be.Message),
+	ext, _ := structpb.NewStruct(map[string]any{
+		"ramp.broker.error": fmt.Sprintf("%s: %s", be.Kind, be.Message),
+	})
+	writeProtoJSON(w, statusFromKind(be.Kind), &rampv1.RAMPResponse{
+		RequestId: requestID,
+		Ext:       ext,
 	})
 }
 

@@ -1,0 +1,6 @@
+{
+  "alg": "EdDSA",
+  "kid": "examplenews.sub.2026q2",
+  "use": "verify",
+  "private": "kClEZ0f6Smz5XGawZDINMOWmK2y6Ri-OvEnc6OeC2o3pxF5N1FWPvki5TGOG5Ym-GeMGDGJWjLusDDUq9N-WZA"
+}

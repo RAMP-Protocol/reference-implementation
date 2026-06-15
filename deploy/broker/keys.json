@@ -1,0 +1,52 @@
+{
+  "keys": [
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "agent-demo.v1",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "OImlqZqnQ65ZkPEpKgVZjXsz0Kv2mxNY6XN6ApSAblQ"
+    },
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "broker.broker-local.v1",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "gCX76Qe6aRTjVWd2WIFaLtfTzBjA9EFFHUg3pz5AE9s"
+    },
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "test-signer-e2e.v1",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "-J62HVQUfS28zJEOqG_vu0nrc4D9Eo9S2UqiUQTSIUo"
+    },
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "catalog-contributor-e2e",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "QNQ6W8pIwTdPdDUITeKIeDnIClqYeOu99aS7jOTTn60"
+    },
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "agent-e2e",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "5igeb3xWg3MbE3os0CzrTCyZyWuhkDShpZMBVc-ttkA"
+    },
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "agent-nobilling-e2e",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "nzisHwOt_aXA79xAQH-xFEFKBtVPp4k57OVnl9msl3s"
+    }
+  ]
+}

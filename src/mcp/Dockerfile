@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # MCP shim container. FastMCP streamable-HTTP transport bound to 0.0.0.0:8000.
 # Local runs still use stdio (override RAMP_MCP_TRANSPORT=stdio).
 #
@@ -16,13 +15,11 @@ ENV UV_SYSTEM_PYTHON=0 \
 
 # Install deps (frozen against the committed lockfile).
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+RUN uv sync --frozen --no-install-project --no-dev
 
 # Install the shim itself.
 COPY src/ ./src/
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev
 
 # Default to HTTP transport in the container; override for stdio use.
 ENV RAMP_MCP_TRANSPORT=http \

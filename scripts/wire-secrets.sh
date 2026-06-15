@@ -14,7 +14,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PI_TF_ROOT="${PI_TERRAFORM_ROOT:-$(cd "${REPO_ROOT}/../pi-terraform" && pwd)}"
 
-: "${RAMP_AWS_PROFILE:=<DEPLOYER_PROFILE>}"
+: "${RAMP_AWS_PROFILE:=cdn-poc}"
 export AWS_PROFILE="${RAMP_AWS_PROFILE}"
 : "${AWS_REGION:=us-east-1}"
 export AWS_REGION

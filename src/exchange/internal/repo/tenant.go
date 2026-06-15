@@ -25,9 +25,20 @@ type Tenant struct {
 	SigningScheme       string
 	RSAKeyRef           string
 	CloudFrontKeyPairID string
+	// ReportingPolicy carries the raw tenants.reporting_policy JSONB. The
+	// service decodes it (e.g. for default required_fields) close to the
+	// callsite that needs the shape; storing as []byte keeps this repo type
+	// shape-agnostic so adding a policy key does not ripple through every
+	// service that reads a tenant.
+	ReportingPolicy []byte
+	// AllowBrokerRelay is the per-tenant opt-in for broker-on-behalf
+	// reporting. When false, ReportUsage requires the verified httpsig
+	// keyID to equal the obligation's agent_id; when true, a registered
+	// BROKER caller is also accepted.
+	AllowBrokerRelay bool
 }
 
-// TenantRepo is the narrow contract the Marketplace service needs.
+// TenantRepo is the narrow contract the Exchange service needs.
 type TenantRepo interface {
 	ByID(ctx context.Context, tenantID string) (Tenant, error)
 	ByDomain(ctx context.Context, domain string) (Tenant, error)
@@ -72,6 +83,8 @@ func tenantFromRow(row sqlc.RampTenant) Tenant {
 		SigningScheme:       string(row.SigningScheme),
 		RSAKeyRef:           textOrEmpty(row.RsaKeyRef),
 		CloudFrontKeyPairID: textOrEmpty(row.CloudfrontKeyPairID),
+		ReportingPolicy:     row.ReportingPolicy,
+		AllowBrokerRelay:    row.AllowBrokerRelay,
 	}
 }
 

@@ -43,6 +43,8 @@ linters:
 
     # Architecture
     - depguard
+    # ADR-008 D1: time is a port; the wall clock is a leaf.
+    - forbidigo
   settings:
     cyclop:
       max-complexity: 15
@@ -86,9 +88,42 @@ linters:
           files:
             - "!**/src/broker/**"
             - "!**/src/exchange/**"
+    # ADR-008 D1 — wall-clock primitives are forbidden inside the policy
+    # trees. Production code consults the injected clock.Clock; only the
+    # canonical leaf in internal/clock and the production roots that
+    # construct clock.System{} may reference time.Now / time.Since /
+    # time.Until directly. The allowlist below is enforced via per-path
+    # exclusions further down (see "exclusions").
+    forbidigo:
+      analyze-types: false
+      forbid:
+        - pattern: '^time\.Now$'
+          msg: "ADR-008 D1: consult the injected clock.Clock, not time.Now"
+        - pattern: '^time\.Since$'
+          msg: "ADR-008 D1: derive elapsed time from clock.Clock.Now(), not time.Since"
+        - pattern: '^time\.Until$'
+          msg: "ADR-008 D1: derive remaining time from clock.Clock.Now(), not time.Until"
 
   exclusions:
     rules:
+      # ADR-008 D1 forbidigo allowlist: the canonical clock leaf.
+      - path: 'internal/clock/'
+        linters:
+          - forbidigo
+      # Production roots may reference the wall clock when constructing
+      # the system clock or stamping startup-time metadata that does not
+      # gate behaviour at request time.
+      - path: 'src/exchange/cmd/server/'
+        linters:
+          - forbidigo
+      - path: 'src/broker/cmd/server/'
+        linters:
+          - forbidigo
+      # Tests are exempt — they construct deterministic clocks of their
+      # own choosing and may read the wall clock to derive a fixed anchor.
+      - path: _test\.go
+        linters:
+          - forbidigo
       # Relax a few size/security lints inside tests only.
       - path: _test\.go
         linters:
@@ -99,16 +134,6 @@ linters:
           - lll
           - maintidx
       # Generated code is exempt across the board.
-      - path: 'proto/gen/'
-        linters:
-          - revive
-          - unused
-          - staticcheck
-          - errcheck
-          - gosec
-          - lll
-          - gocritic
-          - govet
       - path: 'internal/db/sqlc/'
         linters:
           - revive

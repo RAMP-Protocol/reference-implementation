@@ -10,13 +10,13 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
 )
 
-// DefaultInterval is the polling cadence for marketplace health.
+// DefaultInterval is the polling cadence for exchange health.
 const DefaultInterval = 30 * time.Second
 
-// Refresher periodically probes each marketplace's /healthz and persists the
-// latest healthy bool back to broker.marketplaces.
+// Refresher periodically probes each exchange's /healthz and persists the
+// latest healthy bool back to broker.exchanges.
 type Refresher struct {
-	repo     repo.MarketplaceRepo
+	repo     repo.ExchangeRepo
 	http     *http.Client
 	logger   *slog.Logger
 	interval time.Duration
@@ -25,7 +25,7 @@ type Refresher struct {
 
 // NewRefresher constructs a Refresher. Pass nil for httpClient to use a default.
 func NewRefresher(
-	r repo.MarketplaceRepo, httpClient *http.Client,
+	r repo.ExchangeRepo, httpClient *http.Client,
 	logger *slog.Logger, interval time.Duration,
 ) *Refresher {
 	if httpClient == nil {
@@ -65,7 +65,7 @@ func (r *Refresher) tick(ctx context.Context) {
 		}
 		if setErr := r.repo.SetHealth(ctx, m.ID, healthy); setErr != nil {
 			r.logger.WarnContext(ctx, "registry: set health failed",
-				"marketplace_id", m.ID, "err", setErr)
+				"exchange_id", m.ID, "err", setErr)
 		}
 	}
 }

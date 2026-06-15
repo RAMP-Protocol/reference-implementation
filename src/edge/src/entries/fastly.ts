@@ -16,10 +16,14 @@ function getApp(): App {
   if (cachedApp) return cachedApp;
   const env = parseEnv({
     EXCHANGE_URL: fastlyEnv('EXCHANGE_URL'),
-    MARKETPLACE_MANIFEST_URL: fastlyEnv('MARKETPLACE_MANIFEST_URL'),
-    JWKS_URL: fastlyEnv('JWKS_URL'),
+    EXCHANGE_MANIFEST_URL: fastlyEnv('EXCHANGE_MANIFEST_URL'),
     RSL_BODY: fastlyEnv('RSL_BODY'),
     ACME_TOKENS_JSON: fastlyEnv('ACME_TOKENS_JSON'),
+    RAMP_VERIFY_KEYS: fastlyEnv('RAMP_VERIFY_KEYS'),
+    PROVIDER: fastlyEnv('PROVIDER'),
+    EXCHANGES_JSON: fastlyEnv('EXCHANGES_JSON'),
+    CATALOG_CONTRIBUTORS_JSON: fastlyEnv('CATALOG_CONTRIBUTORS_JSON'),
+    ORIGIN_URL: fastlyEnv('ORIGIN_URL'),
   });
   cachedApp = createApp(buildDeps(env));
   return cachedApp;

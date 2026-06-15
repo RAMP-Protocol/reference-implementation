@@ -1,5 +1,5 @@
 // Package xclient wraps the Connect-Go ExchangeService client. Handlers call
-// Pool.For(endpoint) to get a cached client keyed on the marketplace endpoint,
+// Pool.For(endpoint) to get a cached client keyed on the exchange endpoint,
 // avoiding per-request dial overhead.
 package xclient
 
@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
-	"github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1/rampv1connect"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/broker"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/signing"
@@ -76,7 +76,7 @@ func (p *Pool) DiscoverResources(
 	return call(ctx, client.DiscoverResources, req, p.signer(ctx))
 }
 
-// ExecuteTransaction sends a signed TransactionRequest to the given endpoint.
+// ExecuteTransaction sends a TransactionRequest to the given endpoint.
 func (p *Pool) ExecuteTransaction(
 	ctx context.Context, endpoint string, req *rampv1.TransactionRequest,
 ) (*rampv1.TransactionResponse, error) {

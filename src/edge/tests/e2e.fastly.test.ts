@@ -9,7 +9,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { encodeBase64Url } from '../src/verify.js';
-import { type TestKeypair, generateKeypair, jwks, signUrl } from './helpers/ed25519.js';
+import { type TestKeypair, generateKeypair, manifestWithKeys, signUrl } from './helpers/ed25519.js';
 
 interface FetchEvent {
   request: Request;
@@ -22,8 +22,11 @@ const PUB_ORIGIN = 'https://pub.example.com';
 
 const env: Record<string, string> = {
   EXCHANGE_URL: 'https://exchange.test',
-  MARKETPLACE_MANIFEST_URL: 'https://exchange.test/.well-known/ramp-marketplace.json',
-  JWKS_URL: 'https://exchange.test/.well-known/jwks.json',
+  EXCHANGE_MANIFEST_URL: 'https://exchange.test/.well-known/ramp.json',
+  PROVIDER: 'fastly-edge.test',
+  EXCHANGES_JSON: JSON.stringify([
+    { domain: 'exchange.test', endpoint: 'https://exchange.test', supported_profiles: [] },
+  ]),
   RSL_BODY: '# test rsl',
   ACME_TOKENS_JSON: '{"demo":"response-body"}',
 };
@@ -61,8 +64,8 @@ beforeAll(async () => {
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-    if (url === env.JWKS_URL) {
-      return new Response(JSON.stringify(jwks([keypair.publicJwk])), {
+    if (url === env.EXCHANGE_MANIFEST_URL) {
+      return new Response(JSON.stringify(manifestWithKeys([keypair.publicJwk])), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
@@ -87,8 +90,9 @@ describe('Fastly Compute entry (stubbed runtime)', () => {
   it('serves ramp.json', async () => {
     const res = await invoke(new Request(`${PUB_ORIGIN}/.well-known/ramp.json`));
     expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, string>;
-    expect(body.exchange).toBe('https://exchange.test');
+    const body = (await res.json()) as { role: string; domain: string };
+    expect(body.role).toBe('ROLE_PUBLISHER');
+    expect(body.domain).toBe('fastly-edge.test');
   });
 
   it('blocks bot UA', async () => {

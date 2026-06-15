@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # Fastly Compute runner. Builds a WASM from the Hono app and serves it via
 # `fastly compute serve` (Viceroy under the hood).
 #
@@ -33,8 +32,7 @@ COPY src/edge/src /app/edge-src/src
 # edge-src under /app lets esbuild resolve hono/zod from /app/node_modules.
 RUN node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json'));p.dependencies['@ramp/edge']='file:./edge-src';fs.writeFileSync('package.json',JSON.stringify(p,null,2));"
 
-RUN --mount=type=cache,target=/root/.npm \
-    npm install esbuild@^0.24.2 --no-save \
+RUN npm install esbuild@^0.24.2 --no-save \
     && npm install --no-save
 
 RUN node build.mjs

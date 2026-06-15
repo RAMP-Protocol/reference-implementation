@@ -1,0 +1,8 @@
+{
+  "kid": "agent-e2e",
+  "kty": "OKP",
+  "crv": "Ed25519",
+  "alg": "EdDSA",
+  "private_key": "w7hL11H5IglX1-ABo3QBqS2iHd3Pg2C83eKs-VOLyU0",
+  "public_key": "5igeb3xWg3MbE3os0CzrTCyZyWuhkDShpZMBVc-ttkA"
+}

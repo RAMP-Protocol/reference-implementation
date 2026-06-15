@@ -3,7 +3,7 @@ package selection_test
 import (
 	"testing"
 
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/selection"
 )
@@ -23,16 +23,16 @@ func offerWith(id, canonical string, unitCost float64) *rampv1.Offer {
 func TestDedup_KeepsCheapestPerIdentity(t *testing.T) {
 	cands := []selection.Candidate{
 		{
-			Offer:       offerWith("a1", "https://a/article", 0.05),
-			Marketplace: selection.MarketplaceRef{Domain: "mp1", Trust: "VERIFIED"},
+			Offer:    offerWith("a1", "https://a/article", 0.05),
+			Exchange: selection.ExchangeRef{Domain: "mp1", Trust: "VERIFIED"},
 		},
 		{
-			Offer:       offerWith("a2", "https://a/article", 0.03),
-			Marketplace: selection.MarketplaceRef{Domain: "mp2", Trust: "VERIFIED"},
+			Offer:    offerWith("a2", "https://a/article", 0.03),
+			Exchange: selection.ExchangeRef{Domain: "mp2", Trust: "VERIFIED"},
 		},
 		{
-			Offer:       offerWith("b1", "https://b/article", 0.10),
-			Marketplace: selection.MarketplaceRef{Domain: "mp1", Trust: "VERIFIED"},
+			Offer:    offerWith("b1", "https://b/article", 0.10),
+			Exchange: selection.ExchangeRef{Domain: "mp1", Trust: "VERIFIED"},
 		},
 	}
 	got := selection.Dedup(cands)
@@ -50,12 +50,12 @@ func TestDedup_KeepsCheapestPerIdentity(t *testing.T) {
 func TestRank_TrustBeatsCost(t *testing.T) {
 	cands := []selection.Candidate{
 		{
-			Offer:       offerWith("cheap", "url-a", 0.01),
-			Marketplace: selection.MarketplaceRef{Domain: "mp1", Trust: "DISCOVERED"},
+			Offer:    offerWith("cheap", "url-a", 0.01),
+			Exchange: selection.ExchangeRef{Domain: "mp1", Trust: "DISCOVERED"},
 		},
 		{
-			Offer:       offerWith("expensive", "url-b", 0.05),
-			Marketplace: selection.MarketplaceRef{Domain: "mp2", Trust: "PREFERRED"},
+			Offer:    offerWith("expensive", "url-b", 0.05),
+			Exchange: selection.ExchangeRef{Domain: "mp2", Trust: "PREFERRED"},
 		},
 	}
 	got := selection.Rank(cands)
@@ -67,16 +67,16 @@ func TestRank_TrustBeatsCost(t *testing.T) {
 func TestRank_TieBreakByCostThenPriority(t *testing.T) {
 	cands := []selection.Candidate{
 		{
-			Offer:       offerWith("b", "url-a", 0.05),
-			Marketplace: selection.MarketplaceRef{Domain: "mp1", Trust: "VERIFIED", Priority: 1},
+			Offer:    offerWith("b", "url-a", 0.05),
+			Exchange: selection.ExchangeRef{Domain: "mp1", Trust: "VERIFIED", Priority: 1},
 		},
 		{
-			Offer:       offerWith("a", "url-b", 0.03),
-			Marketplace: selection.MarketplaceRef{Domain: "mp2", Trust: "VERIFIED", Priority: 1},
+			Offer:    offerWith("a", "url-b", 0.03),
+			Exchange: selection.ExchangeRef{Domain: "mp2", Trust: "VERIFIED", Priority: 1},
 		},
 		{
-			Offer:       offerWith("c", "url-c", 0.03),
-			Marketplace: selection.MarketplaceRef{Domain: "mp3", Trust: "VERIFIED", Priority: 5},
+			Offer:    offerWith("c", "url-c", 0.03),
+			Exchange: selection.ExchangeRef{Domain: "mp3", Trust: "VERIFIED", Priority: 5},
 		},
 	}
 	got := selection.Rank(cands)

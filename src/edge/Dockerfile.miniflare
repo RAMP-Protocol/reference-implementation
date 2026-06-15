@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # Miniflare-hosted Cloudflare Workers runtime for local E2E / demo deployments.
 # Builds the runtime-agnostic Hono app via the Cloudflare entry, then serves
 # it with Miniflare on 0.0.0.0:8787.
@@ -9,7 +8,7 @@
 FROM node:22-slim AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --include=dev
+RUN npm ci --include=dev
 COPY . .
 RUN node scripts/build-worker.mjs --out dist/worker.mjs
 

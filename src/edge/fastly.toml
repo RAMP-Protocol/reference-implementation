@@ -11,5 +11,6 @@ build = "npm run build:fastly"
 [local_server]
 [local_server.env_vars]
 EXCHANGE_URL = "http://localhost:8080"
-MARKETPLACE_MANIFEST_URL = "http://localhost:8080/.well-known/ramp-marketplace.json"
-JWKS_URL = "http://localhost:8080/.well-known/jwks.json"
+# Unified manifest: the edge fetches public_keys[] from here to resolve the
+# Ed25519 delivery-URL verify key.
+EXCHANGE_MANIFEST_URL = "http://localhost:8080/.well-known/ramp.json"

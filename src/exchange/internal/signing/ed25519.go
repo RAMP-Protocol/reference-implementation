@@ -15,7 +15,7 @@ import (
 	"errors"
 	"fmt"
 
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"google.golang.org/protobuf/proto"
 )
 

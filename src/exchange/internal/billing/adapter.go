@@ -1,8 +1,41 @@
 // Package billing abstracts the money movement for Exchange transactions.
-// The Adapter is called by the Marketplace service: Authorize reserves funds
-// before the transaction log is written, Record finalizes the charge after
-// the signed URL is handed out, and GetBalance/GetQuota expose state that
-// drives quota-based denial decisions.
+//
+// Protocol sequence (per docs/design/design-exchange.md §ExecuteTransaction):
+//
+//  1. Authorize  — MAY reserve funds against the estimated quantity.
+//  2. Signed URL — minted after Authorize succeeds.
+//  3. WAL write  — transaction row committed to the DB.
+//  4. Record     — confirms the transaction in the billing system, called
+//     synchronously at the end of ExecuteTransaction with the
+//     estimated quantity. Best-effort: failure is logged and
+//     the transaction stays committed.
+//
+// Release is called only when ExecuteTransaction fails AFTER Authorize but
+// BEFORE completion (URL signing failed, persist failed). Never called on the
+// success path. Never called by ReportUsage.
+//
+// Refund reverses a settled charge (post-Record). It has no caller in v1 —
+// the dispute path (proto §2226-2349) is deferred — but it completes the
+// adapter contract so the persisted-ledger adapter (TigerBeetle) does not have
+// to reshape the interface. Internals are adapter-specific: a ledger reverses
+// the capture, a metered adapter books a forward credit, a demo adapter has no
+// charge to reverse and reports ErrRefundUnsupported.
+//
+// ReportUsage is a pure audit endpoint and does not move money. Estimated vs
+// actual quantity reconciliation is the adapter implementation's concern.
+//
+// Idempotency. Every state-changing method takes a caller-supplied
+// idempotencyKey (Authorize via AuthorizeRequest.IdempotencyKey). The key is
+// opt-in: an empty key disables dedup and the call always executes. With a
+// non-empty key:
+//   - Authorize dedups on (AgentID, key) WHILE the resulting hold is live —
+//     a repeat returns the same BillingID without a second reservation. Record
+//     or Release of that hold FREES the key, so a later Authorize with the same
+//     key mints a fresh BillingID. (Freeing on resolve is load-bearing: a hold
+//     voided by Release must not be handed back to a retry, or the subsequent
+//     Record settles nothing and the agent is never charged.)
+//   - Record / Release / Refund are idempotent on (billingID, op, key): a
+//     replay with the same key is a no-op success. Distinct ops do not collide.
 package billing
 
 import (
@@ -10,7 +43,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"sync"
 )
 
 // Amount is the currency-normalized value transferred in a single operation.
@@ -29,13 +61,16 @@ func NewAmount(raw, currency string) (Amount, error) {
 	return Amount{Value: r, Currency: currency}, nil
 }
 
-// AuthorizeRequest captures what the Marketplace needs billing to evaluate.
+// AuthorizeRequest captures what the Exchange needs billing to evaluate.
 type AuthorizeRequest struct {
 	TenantID string
 	AgentID  string
 	UnitCost Amount
 	Quantity int64  // unit count from the Offer (e.g. estimated_quantity)
 	Unit     string // e.g. "tokens", "pages"
+	// IdempotencyKey is the Exchange-supplied dedup anchor (= tx_request.id).
+	// Empty disables Authorize dedup. See the package idempotency contract.
+	IdempotencyKey string
 }
 
 // AuthorizeResult carries the post-authorize state back to the service.
@@ -45,134 +80,84 @@ type AuthorizeResult struct {
 	Reason    string // populated when Approved is false
 }
 
-// Adapter is the narrow interface exchange.MarketplaceService depends on.
+// Adapter is the narrow interface exchange.ExchangeService depends on.
+//
+// Atomicity stance: the service treats every adapter call as a single atomic
+// operation. The service does NOT retry adapter calls and does NOT split a
+// logical action across multiple calls. Idempotency is the adapter
+// implementation's responsibility, keyed as described in the package doc.
 type Adapter interface {
+	// Authorize reserves funds against the estimated quantity. Returns a
+	// BillingID that identifies the reservation for subsequent Record/Release
+	// calls. The reservation MAY hold balance (prepaid model) or simply
+	// validate eligibility (metered model). Balance is not settled until
+	// Record runs. Idempotent on (AgentID, IdempotencyKey) while the hold is
+	// live (see package doc).
 	Authorize(ctx context.Context, req AuthorizeRequest) (AuthorizeResult, error)
-	Record(ctx context.Context, billingID string, consumedQuantity int64) error
+	// Record confirms the transaction in the billing system. Called
+	// synchronously at the end of ExecuteTransaction, post-WAL, post-sign.
+	// Best-effort: the caller logs but does not fail the request on Record
+	// errors. The settled charge is the amount Authorize reserved; the
+	// advisoryQuantity argument is advisory (a metered adapter MAY use it to
+	// submit a delta meter event, but MUST NOT recompute the settled charge
+	// from it). Idempotent on (billingID, idempotencyKey).
+	Record(ctx context.Context, billingID string, advisoryQuantity int64, idempotencyKey string) error
+	// Release cancels a previously authorized hold without recording any
+	// consumption. Called when ExecuteTransaction fails AFTER Authorize but
+	// BEFORE completion (URL signing failed, persist failed). Never called on
+	// the success path, never called by ReportUsage. A second call for an
+	// already-released or already-recorded billingID MUST return
+	// ErrUnknownBillingID, which callers treat as a successful no-op. A replay
+	// with the same idempotencyKey is a no-op success.
+	Release(ctx context.Context, billingID string, idempotencyKey string) error
+	// Refund reverses a previously recorded settlement, in part or full.
+	// Called from the dispute path (deferred in v1); never called on the
+	// success path, by ReportUsage, or by ExecuteTransaction. Idempotent on
+	// (billingID, idempotencyKey). amount MUST be positive and MUST NOT exceed
+	// the recorded charge net of prior refunds (ErrRefundExceedsRecord).
+	// Refunding a held-but-not-recorded billingID returns ErrRefundBeforeRecord;
+	// an unknown billingID returns ErrUnknownBillingID. Adapters with no
+	// post-capture reversal primitive return ErrRefundUnsupported.
+	//
+	// Authorization: callers MUST verify the requesting party is authorised to
+	// dispute this transaction (typically the original paying agent, or an
+	// operator with admin scope) BEFORE invoking Refund. The adapter performs
+	// no authorisation check. The reason string is a free-text dispute memo
+	// (ADR-011 D7 inverse-posting memo); adapters that keep a ledger persist it
+	// for the audit trail.
+	Refund(ctx context.Context, billingID string, amount Amount, reason string, idempotencyKey string) error
 	GetBalance(ctx context.Context, agentID string) (Amount, error)
 	GetQuota(ctx context.Context, agentID string) (int64, error)
 }
 
-// ErrUnknownBillingID is returned by Record when billingID was not issued
-// by this adapter (or was already released).
-var ErrUnknownBillingID = errors.New("billing: unknown billing id")
+// Sentinel errors returned by adapter implementations. Service callers MUST
+// use errors.Is to check; adapter implementations MUST return (or wrap) these
+// exact values. The service maps each to a connect.Code via
+// service.billingErrorKind.
+var (
+	// ErrUnknownBillingID is returned by Record, Release, or Refund when the
+	// billingID was not issued by this adapter, was already recorded, or was
+	// already released. Callers treat it as a successful no-op for Release.
+	ErrUnknownBillingID = errors.New("billing: unknown billing id")
 
-// InMemoryAdapter is a thread-safe prepaid-balance implementation suitable
-// for scrappy-demo and testing. Balances are per-agent; authorization
-// deducts balance immediately and holds the reservation until Record.
-type InMemoryAdapter struct {
-	mu       sync.Mutex
-	balances map[string]Amount // agent_id -> remaining balance
-	quotas   map[string]int64  // agent_id -> remaining quota (unit-agnostic)
-	reserved map[string]reserved
-	nextIdx  uint64
-	idPrefix string
-}
+	// ErrInsufficientBalance is returned by Authorize when available balance
+	// is insufficient (distinct from a soft denial in AuthorizeResult).
+	ErrInsufficientBalance = errors.New("billing: insufficient balance")
 
-type reserved struct {
-	AgentID string
-	Amount  Amount
-	Qty     int64
-}
+	// ErrInvalidAmount is returned by Refund when the amount is non-positive
+	// or the currency does not match the recorded charge.
+	ErrInvalidAmount = errors.New("billing: invalid refund amount")
 
-// InMemoryOptions seeds an InMemoryAdapter.
-type InMemoryOptions struct {
-	Balances map[string]Amount
-	Quotas   map[string]int64
-	IDPrefix string // default "bill-"
-}
+	// ErrRefundBeforeRecord is returned by Refund for a billingID that is held
+	// but not yet recorded — that hold is voided with Release, not Refund.
+	ErrRefundBeforeRecord = errors.New("billing: cannot refund a hold that was not recorded")
 
-// NewInMemoryAdapter creates an adapter with the given seed state.
-func NewInMemoryAdapter(opts InMemoryOptions) *InMemoryAdapter {
-	a := &InMemoryAdapter{
-		balances: map[string]Amount{},
-		quotas:   map[string]int64{},
-		reserved: map[string]reserved{},
-		idPrefix: opts.IDPrefix,
-	}
-	if a.idPrefix == "" {
-		a.idPrefix = "bill-"
-	}
-	for k, v := range opts.Balances {
-		a.balances[k] = Amount{Value: new(big.Rat).Set(v.Value), Currency: v.Currency}
-	}
-	for k, v := range opts.Quotas {
-		a.quotas[k] = v
-	}
-	return a
-}
+	// ErrRefundExceedsRecord is returned by Refund when the cumulative refund
+	// would exceed the recorded charge.
+	ErrRefundExceedsRecord = errors.New("billing: refund exceeds recorded amount")
 
-// Authorize holds funds for the transaction. Denies on unknown agent,
-// zero/negative request, currency mismatch, insufficient balance, or
-// exhausted quota.
-func (a *InMemoryAdapter) Authorize(_ context.Context, req AuthorizeRequest) (AuthorizeResult, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	bal, ok := a.balances[req.AgentID]
-	if !ok {
-		return AuthorizeResult{Approved: false, Reason: "unknown agent"}, nil
-	}
-	if req.Quantity <= 0 {
-		return AuthorizeResult{Approved: false, Reason: "non-positive quantity"}, nil
-	}
-	if bal.Currency != req.UnitCost.Currency {
-		return AuthorizeResult{Approved: false, Reason: "currency mismatch"}, nil
-	}
-	charge := new(big.Rat).Mul(req.UnitCost.Value, big.NewRat(req.Quantity, 1))
-	if bal.Value.Cmp(charge) < 0 {
-		return AuthorizeResult{Approved: false, Reason: "insufficient balance"}, nil
-	}
-	if q, hasQuota := a.quotas[req.AgentID]; hasQuota {
-		if q < req.Quantity {
-			return AuthorizeResult{Approved: false, Reason: "quota exhausted"}, nil
-		}
-		a.quotas[req.AgentID] = q - req.Quantity
-	}
-	bal.Value.Sub(bal.Value, charge)
-	a.balances[req.AgentID] = bal
-
-	a.nextIdx++
-	id := fmt.Sprintf("%s%06d", a.idPrefix, a.nextIdx)
-	a.reserved[id] = reserved{
-		AgentID: req.AgentID,
-		Amount:  Amount{Value: charge, Currency: req.UnitCost.Currency},
-		Qty:     req.Quantity,
-	}
-	return AuthorizeResult{BillingID: id, Approved: true}, nil
-}
-
-// Record finalizes the reservation. In this stub all funds are already
-// deducted at Authorize; Record just drops the hold so GetBalance reflects
-// final state and records the consumed quantity (reserved for future
-// reconciliation with UsageReport).
-func (a *InMemoryAdapter) Record(_ context.Context, billingID string, _ int64) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, ok := a.reserved[billingID]; !ok {
-		return ErrUnknownBillingID
-	}
-	delete(a.reserved, billingID)
-	return nil
-}
-
-// GetBalance returns the current available balance for an agent.
-func (a *InMemoryAdapter) GetBalance(_ context.Context, agentID string) (Amount, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	bal, ok := a.balances[agentID]
-	if !ok {
-		return Amount{}, fmt.Errorf("billing: unknown agent %q", agentID)
-	}
-	return Amount{Value: new(big.Rat).Set(bal.Value), Currency: bal.Currency}, nil
-}
-
-// GetQuota returns the remaining quota for an agent. Zero when the agent
-// has no quota cap configured (the adapter treats "no entry" as unlimited
-// and reports 0; callers that need to distinguish should not call GetQuota
-// unless they first checked via the configuration layer).
-func (a *InMemoryAdapter) GetQuota(_ context.Context, agentID string) (int64, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.quotas[agentID], nil
-}
+	// ErrRefundUnsupported is returned by Refund when the adapter has no native
+	// reverse-transfer primitive (e.g. the demo free tier). Callers escalate to
+	// manual or settlement-level reconciliation.
+	ErrRefundUnsupported = errors.New("billing: refund unsupported by this adapter")
+)

@@ -5,9 +5,9 @@ Description: RAMP edge Lambda@Edge bot-redirect handler (viewer-request)
 Parameters:
   ExchangeUrl:
     Type: String
-  MarketplaceManifestUrl:
-    Type: String
-  JwksUrl:
+  # Absolute URL of the exchange's unified /.well-known/ramp.json. The edge
+  # resolves the Ed25519 delivery-URL verify key from its public_keys[].
+  ExchangeManifestUrl:
     Type: String
 
 Resources:
@@ -25,8 +25,7 @@ Resources:
       Environment:
         Variables:
           EXCHANGE_URL: !Ref ExchangeUrl
-          MARKETPLACE_MANIFEST_URL: !Ref MarketplaceManifestUrl
-          JWKS_URL: !Ref JwksUrl
+          EXCHANGE_MANIFEST_URL: !Ref ExchangeManifestUrl
 
   RampEdgeRole:
     Type: AWS::IAM::Role

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
 // Period granularity. Monthly matches enterprise billing cadence and is
@@ -41,15 +43,20 @@ type Service interface {
 type RedisService struct {
 	client *redis.Client
 	ttl    time.Duration
-	now    func() time.Time
+	clk    clock.Clock
 }
 
 // NewRedis constructs a RedisService; ttl is how long period counters persist.
-func NewRedis(client *redis.Client, ttl time.Duration) *RedisService {
+// clk is the time source consulted to derive the period bucket — production
+// wires clock.System{}, tests inject a DeterministicClock.
+func NewRedis(client *redis.Client, ttl time.Duration, clk clock.Clock) *RedisService {
 	if ttl <= 0 {
 		ttl = 35 * 24 * time.Hour
 	}
-	return &RedisService{client: client, ttl: ttl, now: func() time.Time { return time.Now().UTC() }}
+	if clk == nil {
+		clk = clock.System{}
+	}
+	return &RedisService{client: client, ttl: ttl, clk: clk}
 }
 
 // Check returns the budget decision without mutating state.
@@ -95,19 +102,24 @@ func (s *RedisService) readConsumed(ctx context.Context, key string) (int64, err
 }
 
 func (s *RedisService) key(licenseID string) string {
-	return fmt.Sprintf("budget:%s:%s", licenseID, s.now().Format(periodLayout))
+	return fmt.Sprintf("budget:%s:%s", licenseID, s.clk.Now().Format(periodLayout))
 }
 
 // MemoryService is the in-process fallback used when Redis is not configured.
 type MemoryService struct {
 	mu     sync.Mutex
 	counts map[string]int64
-	now    func() time.Time
+	clk    clock.Clock
 }
 
-// NewMemory constructs a MemoryService.
-func NewMemory() *MemoryService {
-	return &MemoryService{counts: make(map[string]int64), now: func() time.Time { return time.Now().UTC() }}
+// NewMemory constructs a MemoryService. clk drives the period bucket
+// derivation; pass clock.System{} in production, a DeterministicClock
+// in tests.
+func NewMemory(clk clock.Clock) *MemoryService {
+	if clk == nil {
+		clk = clock.System{}
+	}
+	return &MemoryService{counts: make(map[string]int64), clk: clk}
 }
 
 // Check reports the budget decision without mutating state.
@@ -136,13 +148,14 @@ func (s *MemoryService) Record(_ context.Context, licenseID string, costMinor in
 }
 
 func (s *MemoryService) key(licenseID string) string {
-	return fmt.Sprintf("budget:%s:%s", licenseID, s.now().Format(periodLayout))
+	return fmt.Sprintf("budget:%s:%s", licenseID, s.clk.Now().Format(periodLayout))
 }
 
 // Select returns a Service backed by Redis when client != nil, memory otherwise.
-func Select(client *redis.Client, ttl time.Duration) Service {
+// clk is the time source consulted for period-bucket derivation.
+func Select(client *redis.Client, ttl time.Duration, clk clock.Clock) Service {
 	if client == nil {
-		return NewMemory()
+		return NewMemory(clk)
 	}
-	return NewRedis(client, ttl)
+	return NewRedis(client, ttl, clk)
 }

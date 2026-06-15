@@ -13,14 +13,14 @@ import (
 
 // SelectionLogEntry is the domain representation of an audited selection decision.
 type SelectionLogEntry struct {
-	LogID             string
-	RequestID         string
-	AgentID           string
-	Query             string
-	CandidateOffers   any
-	WinnerOfferID     string
-	WinnerMarketplace string
-	Rationale         any
+	LogID           string
+	RequestID       string
+	AgentID         string
+	Query           string
+	CandidateOffers any
+	WinnerOfferID   string
+	WinnerExchange  string
+	Rationale       any
 }
 
 // SelectionLogRepo records append-only broker selection decisions for audit.
@@ -49,14 +49,14 @@ func (r *PgxSelectionLogRepo) RecordSelection(ctx context.Context, entry Selecti
 		return fmt.Errorf("marshal rationale: %w", err)
 	}
 	_, err = r.q.RecordSelection(ctx, sqlc.RecordSelectionParams{
-		LogID:             entry.LogID,
-		RequestID:         entry.RequestID,
-		AgentID:           entry.AgentID,
-		Query:             entry.Query,
-		CandidateOffers:   candidates,
-		WinnerOfferID:     optionalText(entry.WinnerOfferID),
-		WinnerMarketplace: optionalText(entry.WinnerMarketplace),
-		Rationale:         rationale,
+		LogID:           entry.LogID,
+		RequestID:       entry.RequestID,
+		AgentID:         entry.AgentID,
+		Query:           entry.Query,
+		CandidateOffers: candidates,
+		WinnerOfferID:   optionalText(entry.WinnerOfferID),
+		WinnerExchange:  optionalText(entry.WinnerExchange),
+		Rationale:       rationale,
 	})
 	if err != nil {
 		return fmt.Errorf("record selection: %w", err)

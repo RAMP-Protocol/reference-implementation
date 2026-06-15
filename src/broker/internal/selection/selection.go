@@ -1,5 +1,5 @@
 // Package selection implements the Broker's offer deduplication and ranking
-// logic. Handlers fan out DiscoverResources across marketplaces, collect the
+// logic. Handlers fan out DiscoverResources across exchanges, collect the
 // returned Offers, then call Rank() to produce a deterministic selection
 // order. The first entry is the chosen winner; the rest are alternates for
 // audit and logging.
@@ -9,22 +9,22 @@ import (
 	"sort"
 	"strings"
 
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 )
 
-// MarketplaceRef annotates an Offer with its originating marketplace so the
+// ExchangeRef annotates an Offer with its originating exchange so the
 // Broker can record the routing decision.
-type MarketplaceRef struct {
+type ExchangeRef struct {
 	Domain   string
 	Endpoint string
 	Trust    string // DISCOVERED / VERIFIED / PREFERRED / BLOCKED
 	Priority int32
 }
 
-// Candidate pairs an offer with the marketplace it came from.
+// Candidate pairs an offer with the exchange it came from.
 type Candidate struct {
-	Offer       *rampv1.Offer
-	Marketplace MarketplaceRef
+	Offer    *rampv1.Offer
+	Exchange ExchangeRef
 }
 
 // Dedup collapses candidates representing the same underlying resource,
@@ -54,11 +54,11 @@ func Dedup(cands []Candidate) []Candidate {
 // Ordering:
 //  1. Higher trust_level_priority wins  (PREFERRED > VERIFIED > DISCOVERED)
 //  2. Then lower unit_cost wins
-//  3. Then higher marketplace_priority wins
+//  3. Then higher exchange_priority wins
 //  4. Then stable by offer_id for determinism
 func Rank(cands []Candidate) []Candidate {
 	sort.SliceStable(cands, func(i, j int) bool {
-		ti, tj := trustWeight(cands[i].Marketplace.Trust), trustWeight(cands[j].Marketplace.Trust)
+		ti, tj := trustWeight(cands[i].Exchange.Trust), trustWeight(cands[j].Exchange.Trust)
 		if ti != tj {
 			return ti > tj
 		}
@@ -66,8 +66,8 @@ func Rank(cands []Candidate) []Candidate {
 		if ci != cj {
 			return ci < cj
 		}
-		if cands[i].Marketplace.Priority != cands[j].Marketplace.Priority {
-			return cands[i].Marketplace.Priority > cands[j].Marketplace.Priority
+		if cands[i].Exchange.Priority != cands[j].Exchange.Priority {
+			return cands[i].Exchange.Priority > cands[j].Exchange.Priority
 		}
 		return cands[i].Offer.GetOfferId() < cands[j].Offer.GetOfferId()
 	})

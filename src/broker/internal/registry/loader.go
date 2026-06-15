@@ -1,5 +1,5 @@
-// Package registry reconciles marketplace bootstrap entries with the database
-// and refreshes marketplace health in the background.
+// Package registry reconciles exchange bootstrap entries with the database
+// and refreshes exchange health in the background.
 package registry
 
 import (
@@ -14,7 +14,7 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
 )
 
-// BootstrapEntry models one marketplace definition from bootstrap.yaml.
+// BootstrapEntry models one exchange definition from bootstrap.yaml.
 type BootstrapEntry struct {
 	ID                string   `yaml:"id"`
 	Domain            string   `yaml:"domain"`
@@ -26,7 +26,7 @@ type BootstrapEntry struct {
 
 // bootstrapFile is the YAML root shape.
 type bootstrapFile struct {
-	Marketplaces []BootstrapEntry `yaml:"marketplaces"`
+	Exchanges []BootstrapEntry `yaml:"exchanges"`
 }
 
 // LoadFromReader decodes bootstrap entries from an arbitrary reader.
@@ -35,12 +35,12 @@ func LoadFromReader(r io.Reader) ([]BootstrapEntry, error) {
 	if err := yaml.NewDecoder(r).Decode(&file); err != nil {
 		return nil, fmt.Errorf("registry: decode bootstrap: %w", err)
 	}
-	for i := range file.Marketplaces {
-		if err := validate(&file.Marketplaces[i]); err != nil {
+	for i := range file.Exchanges {
+		if err := validate(&file.Exchanges[i]); err != nil {
 			return nil, err
 		}
 	}
-	return file.Marketplaces, nil
+	return file.Exchanges, nil
 }
 
 // LoadFromFile decodes bootstrap entries from path.
@@ -53,10 +53,10 @@ func LoadFromFile(path string) ([]BootstrapEntry, error) {
 	return LoadFromReader(f)
 }
 
-// Reconcile upserts every bootstrap entry into the marketplace repo.
-func Reconcile(ctx context.Context, marketRepo repo.MarketplaceRepo, entries []BootstrapEntry) error {
+// Reconcile upserts every bootstrap entry into the exchange repo.
+func Reconcile(ctx context.Context, exchangeRepo repo.ExchangeRepo, entries []BootstrapEntry) error {
 	for _, e := range entries {
-		_, err := marketRepo.UpsertFromBootstrap(ctx, repo.Marketplace{
+		_, err := exchangeRepo.UpsertFromBootstrap(ctx, repo.Exchange{
 			ID:                e.ID,
 			Domain:            e.Domain,
 			Endpoint:          e.Endpoint,
@@ -73,7 +73,7 @@ func Reconcile(ctx context.Context, marketRepo repo.MarketplaceRepo, entries []B
 
 func validate(e *BootstrapEntry) error {
 	if e.ID == "" {
-		return errors.New("registry: marketplace id is required")
+		return errors.New("registry: exchange id is required")
 	}
 	if e.Domain == "" {
 		return fmt.Errorf("registry: domain is required for %s", e.ID)

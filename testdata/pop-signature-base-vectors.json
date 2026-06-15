@@ -1,0 +1,17 @@
+{
+  "_note": "RFC 9421 proof-of-possession signature-base vectors for the bound-retrieval GET (ADR-013 D2/D4). Pins the byte-identical @target-uri signature base across the TS edge verifier (src/edge/src/pop.ts signatureBase), the Python agent signer (src/mcp ramp_mcp_shim.httpsig.pop_signature_base), and the TS test signer (src/edge/tests/helpers/ed25519.ts). Each entry's expected_base is exactly what the fetcher signs and the edge reconstructs; a divergence in line order, quoting, or the params string rejects every bound fetch. The last vector uses the RFC 8032 Ed25519 test key as the bound agent_id.",
+  "vectors": [
+    {
+      "method": "GET",
+      "url": "https://pub.example.com/article/42?exp=4102444800&sig=abc&agent_id=ogRZbCR5KTrPFCAfuYmCMwj0w7Yuk3Lr6YWQWfpkbf0",
+      "params": "(\"@method\" \"@target-uri\");keyid=\"ogRZbCR5KTrPFCAfuYmCMwj0w7Yuk3Lr6YWQWfpkbf0\";alg=\"ed25519\";created=1700000000;expires=4102444800",
+      "expected_base": "\"@method\": GET\n\"@target-uri\": https://pub.example.com/article/42?exp=4102444800&sig=abc&agent_id=ogRZbCR5KTrPFCAfuYmCMwj0w7Yuk3Lr6YWQWfpkbf0\n\"@signature-params\": (\"@method\" \"@target-uri\");keyid=\"ogRZbCR5KTrPFCAfuYmCMwj0w7Yuk3Lr6YWQWfpkbf0\";alg=\"ed25519\";created=1700000000;expires=4102444800"
+    },
+    {
+      "method": "GET",
+      "url": "https://news.example/p/1?exp=1800000000&sig=zz&agent_id=kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k",
+      "params": "(\"@method\" \"@target-uri\");keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";created=1710000000;expires=1800000000",
+      "expected_base": "\"@method\": GET\n\"@target-uri\": https://news.example/p/1?exp=1800000000&sig=zz&agent_id=kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\n\"@signature-params\": (\"@method\" \"@target-uri\");keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";created=1710000000;expires=1800000000"
+    }
+  ]
+}

@@ -9,7 +9,7 @@ import (
 
 func TestLoadFromReader_ParsesEntries(t *testing.T) {
 	data := []byte(`
-marketplaces:
+exchanges:
   - id: mp-a
     domain: a.example
     endpoint: https://a.example
@@ -34,7 +34,7 @@ marketplaces:
 
 func TestLoadFromReader_DefaultsTrust(t *testing.T) {
 	data := []byte(`
-marketplaces:
+exchanges:
   - id: mp-a
     domain: a.example
     endpoint: https://a.example
@@ -50,7 +50,7 @@ marketplaces:
 
 func TestLoadFromReader_RejectsMissingFields(t *testing.T) {
 	data := []byte(`
-marketplaces:
+exchanges:
   - id: ""
     domain: a.example
     endpoint: https://a.example

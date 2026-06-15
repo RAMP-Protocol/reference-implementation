@@ -1,80 +1,115 @@
 """Pydantic models for the MCP ramp_fetch tool and Broker interaction.
 
-Boundary types — kept separate from transport + tool logic so shape changes
-in the Broker JSON surface stay isolated here.
+These mirror the canonical RAMP proto shapes the Broker now speaks on
+``POST /broker/v1/resolve`` (``RAMPRequest`` → ``RAMPResponse``, proto-JSON).
+Field names are the proto's snake_case; a camelCase alias generator lets the
+models (de)serialize the canonical camelCase wire while the Python attributes
+stay snake_case. Broker-specific signals that ``RAMPResponse`` has no canonical
+field for ride under ``ext`` with ``ramp.broker.*`` keys; the typed accessors on
+``RampResponse`` keep those literals in one place.
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
 
 
-class ResolveRequest(BaseModel):
-    """Body of POST /broker/v1/resolve as the Broker expects it."""
+class _Canonical(BaseModel):
+    """Base for canonical wire models: camelCase on the wire, snake in Python."""
 
-    agent_id: str
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+class Cost(_Canonical):
+    """Canonical Cost message."""
+
+    amount: float
+    currency: str = "USD"
+    unit_cost: float | None = None
+
+
+class Requester(_Canonical):
+    """Canonical Requester sub-message of RAMPRequest."""
+
+    id: str
+    domain: str | None = None
+    type: str = "REQUESTER_TYPE_AGENT"
+    uris: list[str] = Field(default_factory=list)
+    intended_use: list[str] = Field(default_factory=list)
     license_id: str | None = None
+
+
+class RequestConstraints(_Canonical):
+    """Canonical RequestConstraints sub-message of RAMPRequest."""
+
+    period_budget: Cost | None = None
+    max_hops: int | None = None
+
+
+class RampRequest(_Canonical):
+    """Body of POST /broker/v1/resolve — canonical proto RAMPRequest."""
+
+    ver: str = "1.0"
+    id: str
+    requester: Requester
     query: str | None = None
-    uri: str | None = None
-    budget_minor: int | None = None
-    requester_domain: str | None = None
-    intended_use: str | None = None
+    constraints: RequestConstraints | None = None
 
 
-class BudgetState(BaseModel):
-    """Budget audit snippet returned by the Broker."""
+class RampResponse(_Canonical):
+    """Body returned by POST /broker/v1/resolve — canonical proto RAMPResponse.
 
-    limit_minor: int
-    consumed_minor: int
-    remaining_minor: int
-
-
-class CandidateInfo(BaseModel):
-    """One offer candidate evaluated by the Broker's ranker."""
-
-    offer_id: str
-    marketplace_id: str
-    unit_cost: float
-    trust_level: str
-
-
-class ResolveResponse(BaseModel):
-    """Body returned by POST /broker/v1/resolve.
-
-    Either ``signed_url`` or ``bare_url`` is populated depending on whether
-    a marketplace represented the publisher.
+    Only the fields the shim consumes are modelled; the Broker also sends
+    ``cost``/``delivery_method``/``reporting_obligation``/``expires_at`` which
+    Pydantic ignores on parse (extra fields are dropped by default). The
+    Broker-specific signals (licensed flag, winning offer, refusal cause) ride
+    under ``ext`` with ``ramp.broker.*`` keys; the properties below expose them.
     """
 
-    licensed: bool
-    signed_url: str | None = None
-    bare_url: str | None = None
-    transaction_id: str | None = None
-    offer_id: str | None = None
-    marketplace_id: str | None = None
-    request_id: str
-    budget: BudgetState | None = None
-    error: str | None = None
-    candidates: list[CandidateInfo] = Field(default_factory=list)
+    ver: str = ""
+    id: str = ""
+    request_id: str = ""
+    transaction_id: str = ""
+    billing_id: str = ""
+    exchange: str = ""
+    resource_title: str | None = None
+    retrieval_endpoint: str | None = None
+    agent_identity_hash: str | None = None
+    ext: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def licensed(self) -> bool:
+        """True when the Broker delivered a licensed transaction."""
+        return bool(self.ext.get("ramp.broker.licensed", False))
+
+    @property
+    def offer_id(self) -> str | None:
+        """Winning offer id, surfaced under ext (no canonical RAMPResponse field)."""
+        value = self.ext.get("ramp.broker.offer_id")
+        return value if isinstance(value, str) else None
+
+    @property
+    def error(self) -> str | None:
+        """Refusal / upstream error string, surfaced under ext."""
+        value = self.ext.get("ramp.broker.error")
+        return value if isinstance(value, str) else None
 
 
 class RampFetchResult(BaseModel):
     """Agent-facing result of ``ramp_fetch``.
 
-    The MCP shim performs the signed-URL fetch on the agent's behalf, so
-    the agent only sees the resolved content plus audit metadata.
-
-    Cost fields come from the winning candidate the Broker selected — useful
-    for the agent to surface to the human ("I just spent $0.01 on ..."). For
-    the unlicensed path they remain None.
+    The MCP shim performs the signed-URL fetch on the agent's behalf, so the
+    agent only sees the resolved content plus audit metadata. This is the tool's
+    own output contract, independent of the canonical wire shape.
     """
 
     licensed: bool
     content: str | None = None
-    bare_url: str | None = None
     transaction_id: str | None = None
     offer_id: str | None = None
-    marketplace_id: str | None = None
+    exchange_id: str | None = None
     request_id: str | None = None
-    cost: float | None = None
-    currency: str | None = None
     error: str | None = None

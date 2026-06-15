@@ -8,8 +8,72 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    # RFC 9421 signer in tests/e2e/harness/catalog_push.py (PushResources RPC).
+    "cryptography>=44.0.0",
+    # Docker SDK for Python — used by obligation tests that drive container
+    # lifecycle (restart, inspect, exec) directly against the docker socket
+    # instead of shelling out to the docker CLI. Required because the runner
+    # image (tests/e2e/Dockerfile) does NOT carry docker-cli; the SDK reaches
+    # the docker daemon over the bind-mounted socket. See diagnostic
+    # docs/diagnostics/8r0a-eimu-test-runner-no-docker-cli.md §4 (Shape A).
+    "docker>=7.0",
+    # In-tree MCP shim — the obligation tests that drive ramp_fetch use the
+    # public surface (ResolveRequest, RampFetchResult). Both the host venv
+    # and the runner image resolve this via the [tool.uv.sources] path entry
+    # below; the runner re-roots the path to /mcp at build time (see
+    # tests/e2e/Dockerfile and diagnostic
+    # docs/diagnostics/r7frv-canonical-e2e-sweep.md §4 for the convergence
+    # mechanism).
+    "ramp-mcp-shim",
 ]
+
+[tool.uv.sources]
+# Path-based editable install of the in-tree MCP shim. The host venv reads
+# this entry as-is (cwd `tests/e2e/` → `../../src/mcp` resolves to the
+# in-tree shim). The runner image (tests/e2e/Dockerfile) re-roots the path
+# to `/mcp` via a build-time `sed` so the editable install resolves inside
+# the container. Both paths converge on the same installed package; see
+# r7frv diagnostic §4 for the fix mechanism.
+ramp-mcp-shim = { path = "../../src/mcp", editable = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["harness"]
+# ADR-008 D5 — unknown markers fail the run so a typo'd
+# `@pytest.mark.stack_isoaltion("...")` doesn't silently no-op.
+addopts = "--strict-markers"
+strict_markers = true
+markers = [
+    "stack_isolation(mode): declare per-test isolation contract (ADR-008 D5) — one of 'isolated', 'shared-clean-fixtures', 'shared-without-cleanup'",
+]
+
+[dependency-groups]
+# Lint-only dev group. Test execution lives in docker-compose (`make test-e2e`)
+# and does not require these tools; the host-side `make lint` / `make fmt`
+# delegation does. `ruff` here is what `tests/e2e/Makefile` resolves via
+# `uv run ruff …`, closing the lint-coverage gap surfaced by
+# `agentic-content-access-ygdhj` (audit) / `agentic-content-access-gz1uo` (fix).
+dev = [
+    "ruff>=0.9.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+# This is a TEST harness — every file is test infrastructure. The selection
+# below pins ruff's default rule set (E4/E7/E9 + F) explicitly so the host-side
+# `make lint` and the audit-time `ruff check .` referenced in
+# docs/diagnostics/ygdhj-build-tag-pocket-audit.md §2.6 stay aligned. Heavier
+# rule families (PL/SIM/PERF/TCH/I/etc.) are intentionally OFF for the same
+# reason `tests/**` in `src/mcp/pyproject.toml` carries broad exemptions:
+# this tree is harness code, not production logic. Gap closure under
+# agentic-content-access-gz1uo (fix) / agentic-content-access-ygdhj (audit).
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9",  # pycodestyle errors (ruff default subset)
+    "F",               # pyflakes (includes F401 unused-import, F841 unused-local)
+]

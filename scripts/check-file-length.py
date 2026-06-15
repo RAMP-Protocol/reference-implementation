@@ -42,14 +42,12 @@ EXCLUDE_GLOBS = [
     "**/dist/**",
     "**/.wrangler/**",
     "**/.gocache/**",
-    "**/proto/gen/**",
     "**/internal/db/sqlc/**",
     "**/*.pb.go",
     "**/*connect.go",
     "**/*_pb.ts",
     "**/_pb.ts",
     "**/.git/**",
-    "derive-ensemble/**",  # legacy piarch derivation pipeline (paused)
     "pkg/reporting/**",    # legacy experimental code
 ]
 

@@ -16,7 +16,8 @@ import (
 // a DSN string. The container is terminated when the test ends.
 func StartPostgres(tb testing.TB, ctx context.Context) string {
 	tb.Helper()
-	container, err := tcpostgres.Run(ctx,
+	container, err := tcpostgres.Run(
+		ctx,
 		"postgres:16-alpine",
 		tcpostgres.WithDatabase("ramp"),
 		tcpostgres.WithUsername("ramp"),

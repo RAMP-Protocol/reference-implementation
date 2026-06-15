@@ -4,22 +4,22 @@ import (
 	"context"
 
 	connect "connectrpc.com/connect"
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
-	rampconnect "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1/rampv1connect"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
 )
 
-// ExchangeHandler adapts MarketplaceService to the generated
+// ExchangeHandler adapts ExchangeService to the generated
 // rampconnect.ExchangeServiceHandler interface.
 type ExchangeHandler struct {
 	rampconnect.UnimplementedExchangeServiceHandler
-	svc *service.MarketplaceService
+	svc *service.ExchangeService
 }
 
 // NewExchangeHandler wires the handler.
-func NewExchangeHandler(svc *service.MarketplaceService) *ExchangeHandler {
+func NewExchangeHandler(svc *service.ExchangeService) *ExchangeHandler {
 	return &ExchangeHandler{svc: svc}
 }
 

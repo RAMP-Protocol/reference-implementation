@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Verbatim §8.3 demo set: three <content> blocks for the same uri_prefix.
+     Each block declares one licensing option (ai-input-only / indexing-only /
+     ai-training) via its own <permits>/<prohibits>/<payment> directives.
+     PushResources MUST translate this into a single ramp.catalog row with a
+     three-entry licensing_rules JSONB list — see
+     tests/e2e/fixtures/r1/expected_restrictions/{ai-input-only,indexing-only,ai-training}.json
+     for the per-option expected output (used by
+     test_pushresources_translates_rsl_xml_to_licensing_rules_jsonb in
+     tests/e2e/harness/r1/test_license_carries_through.py).
+-->
+<rsl xmlns="https://rslstandard.org/rsl">
+  <content url="/premium/*">
+    <permits type="usage">ai-input</permits>
+    <prohibits type="usage">ai-index ai-train</prohibits>
+    <payment type="crawl" currency="USD" amount="0.02"/>
+  </content>
+  <content url="/premium/*">
+    <permits type="usage">ai-index</permits>
+    <prohibits type="usage">ai-input ai-train</prohibits>
+    <payment type="crawl" currency="USD" amount="0.01"/>
+  </content>
+  <content url="/premium/*">
+    <permits type="usage">ai-train</permits>
+    <prohibits type="usage"></prohibits>
+    <payment type="crawl" currency="USD" amount="0.20"/>
+  </content>
+</rsl>

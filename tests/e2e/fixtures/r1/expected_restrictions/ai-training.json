@@ -1,0 +1,15 @@
+{
+  "option_name": "ai-training",
+  "restrictions": {
+    "permitted_functions": ["ai-train"],
+    "prohibited_functions": [],
+    "permitted_users": [],
+    "permitted_geo": [],
+    "max_display_words": null
+  },
+  "pricing": {
+    "model": "PER_REQUEST",
+    "amount": 0.20,
+    "currency": "USD"
+  }
+}

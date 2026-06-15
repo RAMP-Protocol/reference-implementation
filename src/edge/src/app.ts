@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import type { Context, MiddlewareHandler } from 'hono';
 
-import { type AppDeps, looksLikeBot } from './types.js';
+import { type PopResult, verifyAgentBinding } from './pop.js';
+import { type AppDeps, WELL_KNOWN_PATH, looksLikeBot } from './types.js';
 import { type VerifyResult, verifyEd25519SignedUrl } from './verify.js';
 
 export type AppVariables = { requestId: string };
@@ -26,8 +27,7 @@ const requestIdMiddleware: MiddlewareHandler<{ Variables: AppVariables }> = asyn
 
 function mountWellKnownRoutes(app: App, deps: AppDeps): void {
   app.get('/healthz', (c) => c.text('ok'));
-  app.get('/.well-known/ramp.json', (c) => c.json(deps.manifest));
-  app.get('/.well-known/ramp-verifier.json', (c) => c.json(deps.verifierManifest));
+  app.get(WELL_KNOWN_PATH, (c) => c.json(deps.manifest));
   app.get('/rsl.txt', (c) => c.text(deps.rslBody ?? '', 200, { 'content-type': 'text/plain' }));
   app.get('/.well-known/ramp-verify/:token', (c) => {
     const token = c.req.param('token');
@@ -57,7 +57,43 @@ async function catchallHandler(
   const verify = deps.verify ?? ((raw: string) => defaultVerify(raw, deps));
   const result = await verify(c.req.url);
   if (!result.valid) return handleVerifyResult(c, result);
+
+  const bindingError = await enforceBinding(c, deps, url);
+  if (bindingError) return bindingError;
+
   return passToOrigin(c, deps);
+}
+
+// enforceBinding runs the proof-of-possession check when the verified URL is
+// bound to an agent (carries agent_id) and binding enforcement is explicitly
+// enabled (ADR-013 D1/D6). Returns a 403 Response on failure, or undefined to
+// proceed. Enforcement is OPT-IN: it defaults OFF (bearer security — short TTL
+// + TLS) because v1's MCP→Broker→Exchange topology binds the URL to the proven
+// caller (the broker on the relay path), which the fetching agent cannot prove
+// possession of. Set enforceBinding true only where the fetcher holds the
+// bound key.
+async function enforceBinding(
+  c: Context<{ Variables: AppVariables }>,
+  deps: AppDeps,
+  url: URL,
+): Promise<Response | undefined> {
+  const agentId = url.searchParams.get('agent_id');
+  if (!agentId || deps.enforceBinding !== true) return undefined;
+
+  const verifyBinding = deps.verifyBinding ?? verifyAgentBinding;
+  const pop = await verifyBinding({
+    url: c.req.url,
+    method: c.req.method,
+    headers: c.req.raw.headers,
+    agentId,
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
+  if (!pop.ok) return handlePopResult(c, pop);
+  return undefined;
+}
+
+function handlePopResult(c: Context<{ Variables: AppVariables }>, pop: PopResult): Response {
+  return c.json({ error: 'Agent binding check failed', reason: pop.reason ?? 'unknown' }, 403);
 }
 
 async function passToOrigin(
@@ -96,10 +132,10 @@ function handleVerifyResult(
 
 function denyBot(c: Context<{ Variables: AppVariables }>, deps: AppDeps): Response {
   const headers: Record<string, string> = {
-    'X-Content-Rules': new URL('/.well-known/ramp.json', withProtocol(c.req.url)).toString(),
+    'X-Content-Rules': new URL(WELL_KNOWN_PATH, withProtocol(c.req.url)).toString(),
   };
-  if (deps.manifest.exchange) headers['X-RAMP-Exchange'] = deps.manifest.exchange;
-  return c.json({ error: 'Access denied. Negotiate access via the marketplace.' }, 403, headers);
+  if (deps.exchangeUrl) headers['X-RAMP-Exchange'] = deps.exchangeUrl;
+  return c.json({ error: 'Access denied. Negotiate access via the exchange.' }, 403, headers);
 }
 
 function withProtocol(url: string): string {

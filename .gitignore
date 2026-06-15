@@ -4,10 +4,14 @@ dist/
 .dev.vars
 .env
 .env.local
+
+# RFC 9421 demo agent private key — generated at bootstrap, never committed.
+deploy/mcp/agent-key.json
+# RFC 9421 broker-relay private key — generated at bootstrap, never committed.
+deploy/broker/broker-key.json
 *.tsbuildinfo
 coverage/
 .turbo/
-.derive-ensemble/
 
 # Go
 bin/
@@ -44,3 +48,21 @@ Thumbs.db
 *.swp
 *.swo
 .aider*
+
+# Claude Code harness — per-spawn worktrees from Agent tool isolation: "worktree"
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# Runtime logs and ephemeral reports
+logs/
+.jscpd-reports/
+
+# Stale Go build artifacts at repo root (none should land here)
+/prototype
+/entitlement-mint
+
+# Leftovers from directories whose canonical home moved to the piarch repo
+.derive-ensemble/
+derive-ensemble/
+
+.perles

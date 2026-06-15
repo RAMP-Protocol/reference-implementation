@@ -16,23 +16,19 @@ beforeAll(async () => {
   keypair = await generateKeypair('k1');
   const deps: AppDeps = {
     manifest: {
-      ver: '0.3',
-      provider: 'pub.example.com',
+      ver: '1.0',
+      role: 'ROLE_PUBLISHER',
+      domain: 'pub.example.com',
       exchanges: [
         {
           domain: 'exchange.test',
           endpoint: 'https://exchange.test',
-          supported_profiles: ['ramp-news-v1'],
+          relationship: 'PROVIDER_RELATIONSHIP_DIRECT',
         },
       ],
-      exchange: 'https://exchange.test',
-      marketplace_manifest: 'https://exchange.test/.well-known/ramp-marketplace.json',
+      supported_profiles: ['ramp-news-v1'],
     },
-    verifierManifest: {
-      version: '0.3',
-      jwks_url: 'https://exchange.test/.well-known/jwks.json',
-      signing_algorithms: ['Ed25519'],
-    },
+    exchangeUrl: 'https://exchange.test',
     resolveKey: async (kid) => (kid === 'k1' ? keypair.publicKey : undefined),
     acmeTokens: { demo: 'response-body' },
   };
@@ -80,8 +76,9 @@ describe('AWS Lambda@Edge handler', () => {
   it('serves ramp.json manifest', async () => {
     const result = await lambdaHandler(makeEvent(`${PUB_ORIGIN}/.well-known/ramp.json`));
     expect(result.status).toBe('200');
-    const body = JSON.parse(result.body ?? '') as Record<string, string>;
-    expect(body.exchange).toBe('https://exchange.test');
+    const body = JSON.parse(result.body ?? '') as { role: string; domain: string };
+    expect(body.role).toBe('ROLE_PUBLISHER');
+    expect(body.domain).toBe('pub.example.com');
   });
 
   it('passes through valid signed URL', async () => {

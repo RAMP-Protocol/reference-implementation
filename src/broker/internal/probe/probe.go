@@ -1,218 +1,186 @@
-// Package probe discovers provider ramp.json manifests and caches them.
+// Package probe adapts a per-Broker-instance rampwellknown.Cache to the
+// Broker's pre-existing Probe API.
 //
-// It fetches /.well-known/ramp.json over HTTP for a given domain. Responses
-// are cached for TTL in Redis (when available) or in-process otherwise.
-// Callers use Probe to translate a candidate domain into a Manifest (from
-// which an Exchange endpoint is extracted) OR a well-defined "not found"
-// indication (which triggers the bare-URL fallback in the resolver).
+// v1 requires every publisher to host /.well-known/ramp.json. The probe
+// surfaces two typed error shapes — ErrManifestMissing (the domain
+// returned 404 / no manifest) and ErrProbeFailed (transient fetch,
+// decode, or non-2xx failures). Callers MUST refuse the request with
+// the appropriate canonical absence vocabulary; the broker no longer
+// silently accepts an unmanifested publisher.
 package probe
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 )
 
-// DefaultTTL is applied when the caller does not configure one.
-const DefaultTTL = time.Hour
+// DefaultTTL mirrors rampwellknown.DefaultCacheTTL for callers depending on
+// this symbol.
+const DefaultTTL = rampwellknown.DefaultCacheTTL
 
-// AuthorizedExchange mirrors the proto AuthorizedExchange message. One entry
-// per Exchange that represents the publisher at this domain.
+// AuthorizedExchange is one Exchange the publisher authorizes. The field name
+// is kept for backwards compatibility with existing call sites; wire format
+// matches the manifest's exchanges[] entries (domain/endpoint/relationship).
 type AuthorizedExchange struct {
-	Domain            string   `json:"domain"`
-	Endpoint          string   `json:"endpoint"`
-	SupportedProfiles []string `json:"supported_profiles,omitempty"`
+	Domain            string
+	Endpoint          string
+	SupportedProfiles []string
 }
 
-// Manifest is the subset of /.well-known/ramp.json the Broker needs.
+// Manifest is the Broker's narrow projection of a publisher manifest. It
+// carries only the fields the routing code consults.
 type Manifest struct {
-	Ver       string               `json:"ver"`
-	Provider  string               `json:"provider"`
-	Exchanges []AuthorizedExchange `json:"exchanges"`
+	Ver       string
+	Provider  string
+	Exchanges []AuthorizedExchange
 }
 
-// Result distinguishes the three probe outcomes for downstream branching.
+// Result carries a successfully fetched manifest. Probe returns a typed
+// error (ErrManifestMissing, ErrProbeFailed, ErrInvalidDomain) when the
+// domain has no usable manifest; on the error paths Result is zero-valued.
 type Result struct {
-	// Present is true when a manifest was fetched successfully.
-	Present bool
-	// Manifest is populated when Present is true.
-	Manifest Manifest
-	// FetchedAt is populated when Present is true.
+	Manifest  Manifest
 	FetchedAt time.Time
 }
 
 // ErrInvalidDomain is returned for empty or obviously invalid input.
 var ErrInvalidDomain = errors.New("probe: invalid domain")
 
+// ErrManifestMissing is returned when the publisher's /.well-known/ramp.json
+// is absent (404 / explicit no-manifest). v1 requires every publisher to
+// host ramp.json; callers MUST refuse with the NOT_IN_CATALOG absence
+// reason rather than retry the bare URL.
+var ErrManifestMissing = errors.New("probe: publisher does not host ramp.json")
+
+// ErrProbeFailed wraps a transient fetch / decode / non-2xx failure.
+// Callers MUST refuse with the TEMPORARILY_UNAVAILABLE absence reason —
+// the probe is not authoritative about catalog membership when the
+// upstream is unreachable.
+var ErrProbeFailed = errors.New("probe: ramp.json fetch failed")
+
 // HTTPDoer is the minimal interface the Prober needs from an *http.Client.
-type HTTPDoer interface {
-	Do(req *http.Request) (*http.Response, error)
-}
+type HTTPDoer = rampwellknown.HTTPDoer
 
 // Options tunes the Prober.
 type Options struct {
 	TTL     time.Duration
 	Timeout time.Duration
-	Scheme  string // "https" by default; tests may override.
+	Scheme  string
+	// Clk is the time source consulted to stamp Result.FetchedAt on the
+	// success path and to drive the shared cache's TTL comparisons.
+	// Defaults to clock.System{}.
+	Clk clock.Clock
 }
 
-// Prober fetches and caches ramp.json manifests.
+// manifestGetter is the narrow read the Prober needs from the shared
+// rampwellknown.Cache: fetch a host's publisher manifest, surfacing 404 as
+// rampwellknown.ErrNoManifest. *rampwellknown.Cache satisfies it.
+type manifestGetter interface {
+	Get(ctx context.Context, host string) (*rampwellknown.Manifest, error)
+}
+
+// Prober is a thin adapter over rampwellknown.Cache that translates
+// ErrNoManifest / fetch failures into the typed ErrManifestMissing /
+// ErrProbeFailed surface the Broker resolve handler refuses on.
 type Prober struct {
-	client HTTPDoer
-	redis  *redis.Client
-	mem    *memCache
+	cache  manifestGetter
 	logger *slog.Logger
-	opts   Options
+	clk    clock.Clock
 }
 
-// New constructs a Prober. redisClient may be nil — in that case, an
-// in-process TTL cache is used instead.
-func New(client HTTPDoer, redisClient *redis.Client, logger *slog.Logger, opts Options) *Prober {
-	if opts.TTL <= 0 {
-		opts.TTL = DefaultTTL
+// New constructs a Prober backed by a fresh in-process rampwellknown.Cache.
+// ExpectRole pins fetched manifests to ROLE_PUBLISHER so a misrouted document
+// is rejected before routing. To share one Cache across Probers in the same
+// process, construct the Cache directly and use NewFromCache instead.
+func New(client HTTPDoer, logger *slog.Logger, opts Options) *Prober {
+	if client == nil {
+		// Fail safe: an omitted client gets the SSRF-guarded env client
+		// (mirroring rampwellknown.NewCache), never the unguarded
+		// http.DefaultClient.
+		client = rampwellknown.NewGuardedClientFromEnv()
 	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = 5 * time.Second
+	if logger == nil {
+		logger = slog.Default()
 	}
-	if opts.Scheme == "" {
-		opts.Scheme = "https"
+	if opts.Clk == nil {
+		opts.Clk = clock.System{}
 	}
-	return &Prober{
-		client: client,
-		redis:  redisClient,
-		mem:    newMemCache(),
-		logger: logger,
-		opts:   opts,
-	}
+	cache := rampwellknown.NewCache(rampwellknown.CacheOptions{
+		Client:     client,
+		Scheme:     opts.Scheme,
+		TTL:        opts.TTL,
+		Timeout:    opts.Timeout,
+		Clk:        opts.Clk,
+		ExpectRole: rampwellknown.RolePublisher,
+	})
+	return &Prober{cache: cache, logger: logger, clk: opts.Clk}
 }
 
-// Probe returns the manifest for a domain, fetching or hitting cache as needed.
-// Result.Present == false indicates the bare-URL fallback should be used.
+// NewFromCache wires a Prober onto an externally-owned Cache so Broker and
+// Exchange can share one rampwellknown.Cache instance. clk drives the
+// FetchedAt stamp on the success path; pass clock.System{} in production.
+func NewFromCache(cache *rampwellknown.Cache, logger *slog.Logger, clk clock.Clock) *Prober {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if clk == nil {
+		clk = clock.System{}
+	}
+	return &Prober{cache: cache, logger: logger, clk: clk}
+}
+
+// Probe returns the publisher manifest for a domain, fetching or hitting
+// cache as needed. The success path returns the manifest with a zero
+// error. A domain that does not host ramp.json yields
+// (Result{}, ErrManifestMissing); a transient fetch / decode / non-2xx
+// failure (rampwellknown ErrFetch / ErrSchemaInvalid / ErrRoleMismatch)
+// yields (Result{}, ErrProbeFailed) wrapping the underlying cause.
 func (p *Prober) Probe(ctx context.Context, domain string) (Result, error) {
 	domain = strings.TrimSpace(strings.ToLower(domain))
 	if domain == "" {
 		return Result{}, ErrInvalidDomain
 	}
-	if cached, ok := p.readCache(ctx, domain); ok {
-		return cached, nil
+	m, err := p.cache.Get(ctx, domain)
+	switch {
+	case err == nil:
+		return Result{
+			Manifest:  toBrokerManifest(m),
+			FetchedAt: p.clk.Now(),
+		}, nil
+	case errors.Is(err, rampwellknown.ErrNoManifest):
+		return Result{}, ErrManifestMissing
+	default:
+		p.logger.InfoContext(ctx, "ramp.json probe failed",
+			"domain", domain, "err", err)
+		return Result{}, fmt.Errorf("%w: %w", ErrProbeFailed, err)
 	}
-	res, err := p.fetch(ctx, domain)
-	if err != nil {
-		return Result{}, err
-	}
-	p.writeCache(ctx, domain, res)
-	return res, nil
 }
 
-func (p *Prober) fetch(ctx context.Context, domain string) (Result, error) {
-	url := fmt.Sprintf("%s://%s/.well-known/ramp.json", p.opts.Scheme, domain)
-	reqCtx, cancel := context.WithTimeout(ctx, p.opts.Timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return Result{}, fmt.Errorf("probe: build request: %w", err)
+func toBrokerManifest(m *rampwellknown.Manifest) Manifest {
+	if m == nil {
+		return Manifest{}
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := p.client.Do(req)
-	if err != nil {
-		p.logger.InfoContext(ctx, "ramp.json fetch failed", "domain", domain, "err", err)
-		return Result{Present: false, FetchedAt: time.Now().UTC()}, nil
+	out := Manifest{
+		Ver:       m.GetVer(),
+		Provider:  m.GetDomain(),
+		Exchanges: make([]AuthorizedExchange, 0, len(m.GetExchanges())),
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode == http.StatusNotFound {
-		return Result{Present: false, FetchedAt: time.Now().UTC()}, nil
+	for _, ex := range m.GetExchanges() {
+		out.Exchanges = append(out.Exchanges, AuthorizedExchange{
+			Domain:   ex.GetDomain(),
+			Endpoint: ex.GetEndpoint(),
+			// Supported profiles are a manifest-level field; forward them
+			// unchanged per Exchange entry so Broker routing keeps working
+			// without a schema rev of the broker's view.
+			SupportedProfiles: m.GetSupportedProfiles(),
+		})
 	}
-	if resp.StatusCode >= 400 {
-		p.logger.InfoContext(ctx, "ramp.json non-200",
-			"domain", domain, "status", resp.StatusCode)
-		return Result{Present: false, FetchedAt: time.Now().UTC()}, nil
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	if err != nil {
-		return Result{}, fmt.Errorf("probe: read body: %w", err)
-	}
-	var manifest Manifest
-	if decodeErr := json.Unmarshal(body, &manifest); decodeErr != nil {
-		p.logger.InfoContext(ctx, "ramp.json decode failed",
-			"domain", domain, "err", decodeErr)
-		return Result{Present: false, FetchedAt: time.Now().UTC()}, nil
-	}
-	return Result{Present: true, Manifest: manifest, FetchedAt: time.Now().UTC()}, nil
-}
-
-func (p *Prober) readCache(ctx context.Context, domain string) (Result, bool) {
-	if p.redis != nil {
-		raw, err := p.redis.Get(ctx, cacheKey(domain)).Bytes()
-		if err == nil {
-			var r Result
-			if unmarshalErr := json.Unmarshal(raw, &r); unmarshalErr == nil {
-				return r, true
-			}
-		}
-		return Result{}, false
-	}
-	return p.mem.get(domain)
-}
-
-func (p *Prober) writeCache(ctx context.Context, domain string, r Result) {
-	if p.redis != nil {
-		raw, err := json.Marshal(r)
-		if err == nil {
-			_ = p.redis.Set(ctx, cacheKey(domain), raw, p.opts.TTL).Err()
-		}
-		return
-	}
-	p.mem.set(domain, r, time.Now().Add(p.opts.TTL))
-}
-
-func cacheKey(domain string) string {
-	return "probe:rampjson:" + domain
-}
-
-// -----------------------------------------------------------------------------
-// In-process TTL cache (used when Redis is not configured).
-
-type memCache struct {
-	mu    sync.RWMutex
-	items map[string]memEntry
-}
-
-type memEntry struct {
-	res      Result
-	expireAt time.Time
-}
-
-func newMemCache() *memCache {
-	return &memCache{items: make(map[string]memEntry)}
-}
-
-func (c *memCache) get(domain string) (Result, bool) {
-	c.mu.RLock()
-	entry, ok := c.items[domain]
-	c.mu.RUnlock()
-	if !ok {
-		return Result{}, false
-	}
-	if time.Now().After(entry.expireAt) {
-		c.mu.Lock()
-		delete(c.items, domain)
-		c.mu.Unlock()
-		return Result{}, false
-	}
-	return entry.res, true
-}
-
-func (c *memCache) set(domain string, r Result, expireAt time.Time) {
-	c.mu.Lock()
-	c.items[domain] = memEntry{res: r, expireAt: expireAt}
-	c.mu.Unlock()
+	return out
 }

@@ -3,10 +3,10 @@ import { buildDeps, parseEnv } from '../config.js';
 
 interface Env {
   EXCHANGE_URL: string;
-  MARKETPLACE_MANIFEST_URL: string;
-  JWKS_URL: string;
+  EXCHANGE_MANIFEST_URL: string;
   RSL_BODY?: string;
   ACME_TOKENS_JSON?: string;
+  RAMP_VERIFY_KEYS?: string;
 }
 
 let cachedApp: App | undefined;

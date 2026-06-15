@@ -1,0 +1,15 @@
+{
+  "option_name": "indexing-only",
+  "restrictions": {
+    "permitted_functions": ["ai-index"],
+    "prohibited_functions": ["ai-input", "ai-train"],
+    "permitted_users": [],
+    "permitted_geo": [],
+    "max_display_words": null
+  },
+  "pricing": {
+    "model": "PER_REQUEST",
+    "amount": 0.01,
+    "currency": "USD"
+  }
+}

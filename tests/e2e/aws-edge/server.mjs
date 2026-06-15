@@ -18,14 +18,29 @@
 //   PORT               listen port (default 8788)
 
 import { createHash, createPublicKey, createVerify } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 
+// Shared with the Hono edge worker (src/edge/src/publisher-manifest.mjs, copied
+// into the image at build time) so this shim cannot drift from the canonical
+// publisher-manifest shape. Guarded by tests/e2e/harness/test_manifest_parity.py.
+import { buildPublisherManifest, WELL_KNOWN_PATH } from './publisher-manifest.mjs';
+
 const PORT = Number.parseInt(process.env.PORT ?? '8788', 10);
-const EXCHANGE_URL = required('EXCHANGE_URL');
 const ORIGIN_URL = required('ORIGIN_URL');
 const PROVIDER = required('PROVIDER');
 const EXCHANGES = JSON.parse(required('EXCHANGES_JSON'));
-const KEY_URL = `${EXCHANGE_URL}/admin/keys/rsa-public.pem`;
+// Authorized third-party catalog pushers (optional). Consumed by the Exchange
+// contributor-authz check (rampwellknown.AuthorizesContributor).
+const CATALOG_CONTRIBUTORS = process.env.CATALOG_CONTRIBUTORS_JSON
+  ? JSON.parse(process.env.CATALOG_CONTRIBUTORS_JSON)
+  : [];
+// CloudFront RSA verify key provisioned out-of-band (trusted key group model);
+// the cdn-keys.json route is retired (D4). MUST be the public half of the
+// Exchange's RSA key. Read from RAMP_CF_PUBLIC_PEM, or the file at
+// RAMP_CF_PUBLIC_PEM_FILE (the e2e stack writes an ephemeral key to a shared
+// volume at stack-up rather than committing it).
+const CF_PUBLIC_PEM = pemFromEnvOrFile('RAMP_CF_PUBLIC_PEM');
 
 let publicKey;
 
@@ -38,12 +53,30 @@ function required(name) {
   return v;
 }
 
-async function loadPublicKey() {
-  const res = await fetch(KEY_URL);
-  if (!res.ok) throw new Error(`fetch key ${res.status}`);
-  const pem = await res.text();
-  publicKey = createPublicKey(pem);
-  console.log(`loaded RSA public key from ${KEY_URL}`);
+// pemFromEnvOrFile returns the PEM from <name>, or (when unset) the file at
+// <name>_FILE. Exits when neither is set or the file is unreadable, so a
+// mis-provisioned stack fails fast rather than starting with no verify key.
+function pemFromEnvOrFile(name) {
+  const direct = process.env[name];
+  if (direct) return direct;
+  const file = process.env[`${name}_FILE`];
+  if (!file) {
+    console.error(`missing env ${name} (and ${name}_FILE)`);
+    process.exit(2);
+  }
+  try {
+    const pem = readFileSync(file, 'utf8');
+    console.log(`resolved ${name} from ${name}_FILE (${file})`);
+    return pem;
+  } catch (err) {
+    console.error(`missing env ${name}: ${name}_FILE (${file}) unreadable: ${err}`);
+    process.exit(2);
+  }
+}
+
+function loadPublicKey() {
+  publicKey = createPublicKey(CF_PUBLIC_PEM);
+  console.log('loaded RSA public key');
 }
 
 function cfBase64Decode(s) {
@@ -116,8 +149,12 @@ async function handle(req, res) {
     res.end('ok');
     return;
   }
-  if (url.pathname === '/.well-known/ramp.json') {
-    reply(res, 200, { ver: '0.3', provider: PROVIDER, exchanges: EXCHANGES });
+  if (url.pathname === WELL_KNOWN_PATH) {
+    // Built from the shared canonical builder so this shim cannot drift. Pass
+    // undefined (not an empty array) for no contributors so the field is omitted,
+    // matching buildPublisherManifest's contract.
+    const contributors = CATALOG_CONTRIBUTORS.length > 0 ? CATALOG_CONTRIBUTORS : undefined;
+    reply(res, 200, buildPublisherManifest(PROVIDER, EXCHANGES, contributors));
     return;
   }
   if (req.method !== 'GET') {
@@ -136,7 +173,7 @@ async function handle(req, res) {
   }
 }
 
-await loadPublicKey();
+loadPublicKey();
 const server = createServer((req, res) => {
   handle(req, res).catch((err) => {
     console.error('unhandled', err);

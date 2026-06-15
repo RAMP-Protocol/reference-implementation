@@ -14,10 +14,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"time"
 
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
 // Header is the HTTP header name carrying the detached Broker signature.
@@ -28,10 +29,13 @@ type CoSigner struct {
 	domain   string
 	brokerID string
 	priv     ed25519.PrivateKey
+	clk      clock.Clock
 }
 
 // NewCoSigner constructs a CoSigner. priv must be 64 bytes (ed25519 private key).
-func NewCoSigner(domain, brokerID string, priv ed25519.PrivateKey) (*CoSigner, error) {
+// clk is the time source consulted for the intermediary forwarded_at stamp;
+// pass clock.System{} in production, a deterministic clock in tests.
+func NewCoSigner(domain, brokerID string, priv ed25519.PrivateKey, clk clock.Clock) (*CoSigner, error) {
 	if len(priv) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("signing: private key must be %d bytes, got %d",
 			ed25519.PrivateKeySize, len(priv))
@@ -39,7 +43,10 @@ func NewCoSigner(domain, brokerID string, priv ed25519.PrivateKey) (*CoSigner, e
 	if domain == "" || brokerID == "" {
 		return nil, errors.New("signing: domain and broker ID are required")
 	}
-	return &CoSigner{domain: domain, brokerID: brokerID, priv: priv}, nil
+	if clk == nil {
+		clk = clock.System{}
+	}
+	return &CoSigner{domain: domain, brokerID: brokerID, priv: priv, clk: clk}, nil
 }
 
 // Domain returns the broker's domain.
@@ -56,7 +63,7 @@ func (c *CoSigner) StampIntermediary(req *rampv1.ResourceQuery) (string, error) 
 	if req == nil {
 		return "", errors.New("signing: nil ResourceQuery")
 	}
-	now := time.Now().UTC()
+	now := c.clk.Now()
 	req.Intermediaries = append(req.Intermediaries, &rampv1.IntermediaryHop{
 		Domain:      c.domain,
 		Id:          c.brokerID,
@@ -70,8 +77,10 @@ func (c *CoSigner) StampIntermediary(req *rampv1.ResourceQuery) (string, error) 
 
 // LoadFromEnv reads a base64-encoded ed25519 seed from BROKER_ED25519_SEED
 // or, if absent, a PEM file path from BROKER_ED25519_KEY_FILE. Generates an
-// ephemeral key pair when neither is set (demo-friendly).
-func LoadFromEnv(domain, brokerID string) (*CoSigner, error) {
+// ephemeral key pair when neither is set (demo-friendly). clk is the time
+// source consulted for the intermediary stamp; pass clock.System{} in
+// production wiring.
+func LoadFromEnv(domain, brokerID string, clk clock.Clock) (*CoSigner, error) {
 	if seed := os.Getenv("BROKER_ED25519_SEED"); seed != "" {
 		raw, err := base64.RawURLEncoding.DecodeString(seed)
 		if err != nil {
@@ -82,20 +91,20 @@ func LoadFromEnv(domain, brokerID string) (*CoSigner, error) {
 				ed25519.SeedSize)
 		}
 		priv := ed25519.NewKeyFromSeed(raw)
-		return NewCoSigner(domain, brokerID, priv)
+		return NewCoSigner(domain, brokerID, priv, clk)
 	}
 	if path := os.Getenv("BROKER_ED25519_KEY_FILE"); path != "" {
 		priv, err := loadPEM(path)
 		if err != nil {
 			return nil, err
 		}
-		return NewCoSigner(domain, brokerID, priv)
+		return NewCoSigner(domain, brokerID, priv, clk)
 	}
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate ephemeral key: %w", err)
 	}
-	return NewCoSigner(domain, brokerID, priv)
+	return NewCoSigner(domain, brokerID, priv, clk)
 }
 
 func loadPEM(path string) (ed25519.PrivateKey, error) {

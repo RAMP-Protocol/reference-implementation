@@ -28,13 +28,21 @@ const mf = new Miniflare({
   compatibilityFlags: ['nodejs_compat'],
   bindings: {
     EXCHANGE_URL: requireEnv('EXCHANGE_URL'),
-    JWKS_URL: requireEnv('JWKS_URL'),
-    MARKETPLACE_MANIFEST_URL: requireEnv('MARKETPLACE_MANIFEST_URL'),
+    // EXCHANGE_MANIFEST_URL points at the Exchange's /.well-known/ramp.json;
+    // the worker resolves signed-URL verify keys from its public_keys[]. The
+    // old JWKS_URL binding is gone (jwks.json was collapsed into ramp.json).
+    EXCHANGE_MANIFEST_URL: requireEnv('EXCHANGE_MANIFEST_URL'),
     ORIGIN_URL: requireEnv('ORIGIN_URL'),
     PROVIDER: requireEnv('PROVIDER'),
     EXCHANGES_JSON: requireEnv('EXCHANGES_JSON'),
     RSL_BODY: process.env.RSL_BODY ?? '',
     ACME_TOKENS_JSON: process.env.ACME_TOKENS_JSON ?? '{}',
+    // Optional; enables Gate 2 (CatalogService contributor authorization)
+    // when the deploy lists authorized third-party catalog pushers.
+    CATALOG_CONTRIBUTORS_JSON: process.env.CATALOG_CONTRIBUTORS_JSON ?? '',
+    // Optional D5 pre-provisioned verify keys (inline JWK array). Passed only
+    // when set so the worker falls back to fetching ramp.json otherwise.
+    ...(process.env.RAMP_VERIFY_KEYS ? { RAMP_VERIFY_KEYS: process.env.RAMP_VERIFY_KEYS } : {}),
   },
 });
 

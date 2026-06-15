@@ -1,0 +1,19 @@
+{
+  "ver": "1.0",
+  "role": "ROLE_PUBLISHER",
+  "domain": "publisher",
+  "exchanges": [
+    {
+      "domain": "exchange.e2e.local",
+      "endpoint": "http://exchange:8081",
+      "relationship": "PROVIDER_RELATIONSHIP_DIRECT"
+    }
+  ],
+  "catalog_contributors": [
+    {
+      "domain": "publisher",
+      "relationship": "publisher"
+    }
+  ],
+  "supported_profiles": ["ramp-news-v1"]
+}

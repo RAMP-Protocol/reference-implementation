@@ -1,10 +1,12 @@
 # Local full-stack E2E compose: brings up Postgres, Redis, Exchange, Broker,
-# Miniflare-hosted edge worker, and a mock publisher origin. A pytest harness
-# (tests/e2e/harness/test_full_stack.py) drives the stack end-to-end.
+# Miniflare + Fastly + AWS edges, a mock publisher origin, a publisher-JWKS
+# host, and the MCP shim.
 #
-#   docker compose -f docker-compose.e2e.yml up -d --build
-#   ... run tests ...
-#   docker compose -f docker-compose.e2e.yml down -v
+#   make e2e-up       # docker compose -f docker-compose.e2e.yml up -d --build
+#   make test-e2e     # up → pytest in `runner` service → down
+#   make e2e-down     # docker compose down -v
+#
+# See Wave 0 task agentic-content-access-flsp for scope.
 
 services:
   postgres:
@@ -14,7 +16,12 @@ services:
       POSTGRES_PASSWORD: ramp
       POSTGRES_DB: ramp
     ports:
-      - "15432:5432"
+      # Ephemeral host port — discovered via `docker compose port postgres 5432`.
+      # Lets two parallel worktree stacks coexist on a single Docker daemon
+      # (h9gy). Container port stays 5432.
+      - target: 5432
+        published: 0
+        mode: host
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ramp -d ramp"]
       interval: 2s
@@ -40,6 +47,64 @@ services:
       timeout: 3s
       retries: 20
 
+
+  # ───── Publisher JWKS host (catalog-contributor pubkey manifest) ─────
+  # Plain-HTTP host that serves the catalog-contributor's
+  # /.well-known/ramp.json (§6.6 schema) so the
+  # CatalogSignatureMiddleware self-signup path can resolve the
+  # contributor's pubkey. The entrypoint reads the Ed25519 private key
+  # fixture under /keys and publishes the corresponding pubkey on every
+  # cold start.
+  #
+  # The service is reached via the `examplenews` network alias matching
+  # the contributor fixture's domain, so URL templating
+  # (http://examplenews/.well-known/ramp.json) lands on this service.
+  publisher-jwks:
+    build:
+      context: deploy/publisher-jwks
+      dockerfile: Dockerfile
+    environment:
+      SIGNING_KEY_FILE: "/keys/examplenews-subscription-key.json"
+      SIGNING_KID_OVERRIDE: "examplenews.sub.2026q2"
+    volumes:
+      - ./deploy/publisher-keys:/keys:ro
+    networks:
+      default:
+        aliases:
+          - examplenews
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # One-shot: generate ephemeral signing keys into a shared volume at stack-up so
+  # nothing is committed to git. Mints (a) the AWS_CLOUDFRONT_RSA tenant RSA pair —
+  # the Exchange reads the private half (RAMP_RSA_PRIVATE_PEM_FILE), the aws-edge
+  # CloudFront shim the public half (RAMP_CF_PUBLIC_PEM_FILE); and (b) the Ed25519
+  # offer/URL signing key the Exchange reads via RAMP_ED25519_PRIVATE_PEM_FILE.
+  # The Exchange no longer generates keys in-process (it fails closed when unset),
+  # so this one-shot is what provisions them for the stack. Mirrors the
+  # publisher-jwks cold-start key-derivation idiom.
+  rsa-keygen:
+    image: alpine:3.20
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        apk add --no-cache openssl >/dev/null
+        openssl genrsa -out /rsa-keys/rsa-private.pem 2048
+        openssl rsa -in /rsa-keys/rsa-private.pem -pubout -out /rsa-keys/rsa-public.pem
+        openssl genpkey -algorithm ED25519 -out /rsa-keys/ed25519-private.pem
+        chmod 0444 /rsa-keys/rsa-private.pem /rsa-keys/rsa-public.pem /rsa-keys/ed25519-private.pem
+        echo "rsa-keygen: wrote rsa-private.pem + rsa-public.pem + ed25519-private.pem"
+    volumes:
+      - rsa-keys:/rsa-keys
+    restart: "no"
+
+  # ───── RAMP services ─────────────────────────────────────────────────
   exchange:
     build:
       context: .
@@ -48,27 +113,69 @@ services:
       EXCHANGE_DSN: "postgres://ramp:ramp@postgres:5432/ramp?sslmode=disable"
       EXCHANGE_ADDR: ":8081"
       EXCHANGE_DOMAIN: "exchange.e2e.local"
-      # Pre-seed the in-memory billing adapter so the test agent can transact.
+      # Inmemory billing adapter so the seeded agent-e2e balance is the
+      # authoritative bound for AcceptOffer's billing gate. Defaults to
+      # "free" elsewhere (always-approve); the e2e harness needs a real
+      # deny path so the credit-less-buyer obligation surfaces.
+      RAMP_BILLING_ADAPTER: "inmemory"
       EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"}}'
+      # Local-dev overrides for the manifest-fetch resolver (HTTPS is the
+      # default; compose network is HTTP-only).
+      RAMP_MANIFEST_FETCH_SCHEME: "http"
+      # The SSRF guard on every outbound .well-known fetch (agent registration,
+      # contributor-authz, broker revocation poll) blocks private/loopback hosts
+      # by default; the compose network is private + http, so permit it here.
+      # MUST stay unset in production.
+      RAMP_FETCH_INSECURE_ALLOW_PRIVATE: "1"
+      # Activate revocation-aware key resolution: the Exchange polls the Broker's
+      # well-known + invalidation_url so a Broker-revoked relay kid is rejected
+      # even while it is still listed in the bootstrap keys file. Resolution
+      # falls back to the static keys.json when the document is unreachable.
+      EXCHANGE_BROKER_WELLKNOWN_URL: "http://broker:8082/.well-known/ramp.json"
+      # EXCHANGE_CATALOG_URI_SCHEME overrides the https:// default that
+      # entryFromProto materializes into stored catalog URIs. Compose-internal
+      # traffic is http-only; production leaves this unset.
+      EXCHANGE_CATALOG_URI_SCHEME: "http"
+      # RAMP_KEYS_FILE (shared httpsig key set, read by Exchange + Broker).
+      RAMP_KEYS_FILE: "/keys/keys.json"
+      # RSA private key for the AWS_CLOUDFRONT_RSA tenant scheme, read from a file
+      # the rsa-keygen one-shot writes into a shared volume at stack-up (the key
+      # is no longer committed to git). The aws-edge CloudFront shim reads the
+      # matching public half from the same volume — mirroring a CloudFront trusted
+      # key group now that the cdn-keys.json route is retired (D4). Production
+      # sources tenant signing keys from a secret store.
+      RAMP_RSA_PRIVATE_PEM_FILE: "/rsa-keys/rsa-private.pem"
+      # Ed25519 offer/URL signing key, also written by the rsa-keygen one-shot.
+      # The Exchange fails closed when no key is configured (it no longer mints an
+      # ephemeral key in-process), so this file injection is mandatory for the
+      # stack. Production wires RAMP_ED25519_PRIVATE_PEM from Secrets Manager.
+      RAMP_ED25519_PRIVATE_PEM_FILE: "/rsa-keys/ed25519-private.pem"
+    volumes:
+      - ./deploy/broker:/keys:ro
+      - rsa-keys:/rsa-keys:ro
     depends_on:
       postgres:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "/exchange", "--help"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+      publisher-jwks:
+        condition: service_healthy
+      rsa-keygen:
+        condition: service_completed_successfully
+    # No healthcheck: distroless image ships only the /exchange binary — no
+    # shell, no wget/curl. Downstream services use depends_on:service_started.
     ports:
-      - "18081:8081"
+      # Ephemeral host port — discovered via `docker compose port exchange 8081`
+      # (h9gy: parallel-worktree-stack support).
+      - target: 8081
+        published: 0
+        mode: host
 
   broker:
     build:
       context: .
       dockerfile: src/broker/Dockerfile
     extra_hosts:
-      # On Linux, Docker doesn't auto-wire this; make it explicit so the Broker
-      # can probe edge URIs authored with host.docker.internal in CI.
+      # On Linux, Docker doesn't auto-wire this; make it explicit so the
+      # Broker can probe edge URIs authored with host.docker.internal.
       - "host.docker.internal:host-gateway"
     environment:
       BROKER_DSN: "postgres://ramp:ramp@postgres:5432/ramp?sslmode=disable"
@@ -76,9 +183,29 @@ services:
       BROKER_ADDR: ":8082"
       BROKER_ID: "broker-e2e"
       BROKER_DOMAIN: "broker.e2e.local"
-      # Compose network is HTTP-only; override from default https.
       RAMP_PROBE_SCHEME: "http"
-      # EXA_API_KEY deliberately empty — pytest drives the flow with direct URIs.
+      # The SSRF guard on the publisher-probe fetch blocks private/loopback hosts
+      # by default; the compose publisher (and host.docker.internal probe target)
+      # are internal http hosts, so permit it here. MUST stay unset in production.
+      RAMP_FETCH_INSECURE_ALLOW_PRIVATE: "1"
+      # Publish the revocation channel: the Broker manifest advertises this
+      # invalidation_url and serves a KeyInvalidationList at the route. No
+      # BROKER_INVALIDATION_FILE is mounted, so the served list is the empty
+      # (nothing-revoked) baseline; an operator revokes a kid by mounting a file.
+      BROKER_INVALIDATION_URL: "http://broker:8082/.well-known/ramp-invalidations.json"
+      # Shared httpsig key set (read by Exchange + Broker).
+      BROKER_KEYS_FILE: "/keys/keys.json"
+      # Broker-relay signing key — without this the Broker ships unsigned
+      # Exchange calls and the Exchange's httpsig middleware rejects them.
+      # The keypair is a committed harness fixture (deploy/broker/broker-key.json
+      # is gitignored as private material, so it would be absent on a fresh
+      # checkout/CI); its pubkey is pinned in deploy/broker/keys.json under kid
+      # broker.broker-local.v1 so the Exchange verifies the relay signature.
+      BROKER_RELAY_KEY_FILE: "/relay/broker-key.json"
+      # EXA_API_KEY deliberately empty — pytest drives with direct URIs.
+    volumes:
+      - ./deploy/broker:/keys:ro
+      - ./tests/e2e/harness/fixtures/broker_relay_key.json:/relay/broker-key.json:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,7 +214,11 @@ services:
       exchange:
         condition: service_started
     ports:
-      - "18082:8082"
+      # Ephemeral host port — discovered via `docker compose port broker 8082`
+      # (h9gy: parallel-worktree-stack support).
+      - target: 8082
+        published: 0
+        mode: host
 
   edge:
     build:
@@ -95,25 +226,40 @@ services:
       dockerfile: Dockerfile.miniflare
     environment:
       EXCHANGE_URL: "http://exchange:8081"
-      # Edge's `keys.ts` doesn't use the default JWKS path — it fetches whatever
-      # JWKS_URL points at. The Exchange serves its JWKS at /marketplace/v1/keys.
-      JWKS_URL: "http://exchange:8081/marketplace/v1/keys"
-      MARKETPLACE_MANIFEST_URL: "http://exchange:8081/.well-known/ramp-marketplace.json"
+      EXCHANGE_MANIFEST_URL: "http://exchange:8081/.well-known/ramp.json"
       ORIGIN_URL: "http://publisher:80"
       PROVIDER: "edge.e2e.local"
       EXCHANGES_JSON: '[{"domain":"exchange.e2e.local","endpoint":"http://exchange:8081","supported_profiles":["ramp-news-v1"]}]'
+      # Authorized catalog pushers. The e2e harness seeds an ed25519 keypair
+      # for `catalog-contributor-e2e`, pre-registers it in ramp.agents, and
+      # uses it to sign PushResources RPCs — exercising the same production
+      # code path (no /admin/catalog/reload shortcut).
+      CATALOG_CONTRIBUTORS_JSON: '[{"domain":"catalog-contributor-e2e","relationship":"harness"}]'
       RSL_BODY: "# e2e rsl"
     depends_on:
       exchange:
         condition: service_started
       publisher:
         condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'node -e "require(''http'').get(''http://127.0.0.1:8787/.well-known/ramp.json'', r => process.exit(r.statusCode===200?0:1)).on(''error'', () => process.exit(1))"'
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
     ports:
-      - "18787:8787"
+      # Ephemeral host port — discovered via `docker compose port edge 8787`
+      # (h9gy: parallel-worktree-stack support).
+      - target: 8787
+        published: 0
+        mode: host
 
   fastly-edge:
-    # Fastly Compute runtime via Viceroy (`fastly compute serve`). Same Hono
-    # app as the Miniflare edge, compiled to WASM via @fastly/js-compute.
+    # Fastly Compute runtime via Viceroy (`fastly compute serve`). Same
+    # Hono app as the Miniflare edge, compiled to WASM via
+    # @fastly/js-compute.
     build:
       context: .
       dockerfile: tests/e2e/fastly-edge/Dockerfile
@@ -121,38 +267,87 @@ services:
         - linux/amd64
     environment:
       EXCHANGE_URL: "http://exchange:8081"
-      JWKS_URL: "http://exchange:8081/marketplace/v1/keys"
-      MARKETPLACE_MANIFEST_URL: "http://exchange:8081/.well-known/ramp-marketplace.json"
+      EXCHANGE_MANIFEST_URL: "http://exchange:8081/.well-known/ramp.json"
       ORIGIN_URL: "http://publisher:80"
       PROVIDER: "fastly-edge.e2e.local"
       EXCHANGES_JSON: '[{"domain":"exchange.e2e.local","endpoint":"http://exchange:8081","supported_profiles":["ramp-news-v1"]}]'
+      # Authorized catalog pushers. The e2e harness seeds an ed25519 keypair
+      # for `catalog-contributor-e2e`, pre-registers it in ramp.agents, and
+      # uses it to sign PushResources RPCs — exercising the same production
+      # code path (no /admin/catalog/reload shortcut).
+      CATALOG_CONTRIBUTORS_JSON: '[{"domain":"catalog-contributor-e2e","relationship":"harness"}]'
       RSL_BODY: "# e2e rsl fastly"
     depends_on:
       exchange:
         condition: service_started
       publisher:
         condition: service_healthy
+    # Viceroy can report "Listening" before the TCP socket accepts
+    # connections cleanly. Poll ramp.json until the server answers so
+    # downstream services (Exchange manifestcache, runner) don't race it.
+    # Image ships node but no curl/wget, so the probe uses node's http.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'node -e "require(''http'').get(''http://127.0.0.1:7676/.well-known/ramp.json'', r => process.exit(r.statusCode===200?0:1)).on(''error'', () => process.exit(1))"'
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
     ports:
-      - "17676:7676"
+      # Ephemeral host port — discovered via `docker compose port fastly-edge 7676`
+      # (h9gy: parallel-worktree-stack support).
+      - target: 7676
+        published: 0
+        mode: host
 
   aws-edge:
-    # CloudFront canned-policy signed-URL verifier stand-in. Proves the RSA
-    # chain round-trip locally without requiring a real CloudFront distro.
+    # CloudFront canned-policy signed-URL verifier stand-in. Proves the
+    # RSA chain round-trip locally without a real CloudFront distro. Built from
+    # the repo root so the shared src/edge/src/publisher-manifest.mjs builder can
+    # be copied into the image (the shim imports it rather than duplicating it).
     build:
-      context: tests/e2e/aws-edge
+      context: .
+      dockerfile: tests/e2e/aws-edge/Dockerfile
     environment:
       EXCHANGE_URL: "http://exchange:8081"
       ORIGIN_URL: "http://publisher:80"
       PROVIDER: "aws-edge.e2e.local"
       EXCHANGES_JSON: '[{"domain":"exchange.e2e.local","endpoint":"http://exchange:8081","supported_profiles":["ramp-news-v1"]}]'
+      # Authorized catalog pushers. The e2e harness seeds an ed25519 keypair
+      # for `catalog-contributor-e2e`, pre-registers it in ramp.agents, and
+      # uses it to sign PushResources RPCs — exercising the same production
+      # code path (no /admin/catalog/reload shortcut).
+      CATALOG_CONTRIBUTORS_JSON: '[{"domain":"catalog-contributor-e2e","relationship":"harness"}]'
       PORT: "8788"
+      # CloudFront RSA verify key, read from the file the rsa-keygen one-shot
+      # writes into the shared volume — the matching public half of the Exchange's
+      # RAMP_RSA_PRIVATE_PEM_FILE (trusted key group model; the cdn-keys.json
+      # route is retired, D4). No longer committed to git.
+      RAMP_CF_PUBLIC_PEM_FILE: "/rsa-keys/rsa-public.pem"
+    volumes:
+      - rsa-keys:/rsa-keys:ro
     depends_on:
       exchange:
         condition: service_started
       publisher:
         condition: service_healthy
+      rsa-keygen:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'node -e "require(''http'').get(''http://127.0.0.1:8788/.well-known/ramp.json'', r => process.exit(r.statusCode===200?0:1)).on(''error'', () => process.exit(1))"'
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
     ports:
-      - "18788:8788"
+      # Ephemeral host port — discovered via `docker compose port aws-edge 8788`
+      # (h9gy: parallel-worktree-stack support).
+      - target: 8788
+        published: 0
+        mode: host
 
   mcp:
     build:
@@ -168,7 +363,11 @@ services:
       broker:
         condition: service_started
     ports:
-      - "18000:8000"
+      # Ephemeral host port — discovered via `docker compose port mcp 8000`
+      # (h9gy: parallel-worktree-stack support).
+      - target: 8000
+        published: 0
+        mode: host
 
   runner:
     # Opt-in: `docker compose --profile test run --rm runner` executes the suite.
@@ -181,20 +380,41 @@ services:
       RAMP_E2E_KEEP_UP: "1"
       RAMP_E2E_IN_NETWORK: "1"
       RAMP_E2E_COMPOSE_FILE: "/runner/docker-compose.e2e.yml"
+      # The in-process MCP shim (test_00_failure_07, test_mcp_ramp_fetch) signs
+      # /broker/v1/resolve with this key. kid == agent-e2e == the resolve
+      # agent_id, so the Broker's self-act gate (verified keyID == req.AgentID)
+      # admits it. The fixture ships in the runner image at /runner/harness.
+      RAMP_AGENT_KEY_FILE: "/runner/harness/fixtures/agent_e2e_key.json"
     volumes:
       - ./docker-compose.e2e.yml:/runner/docker-compose.e2e.yml:ro
+      # fixtures is :rw on the runner so seed_stack can write the
+      # catalog-contributor keypair (catalog_push.generate_contributor_key)
+      # to the shared volume the first time it runs. Subsequent runs reuse
+      # it. Other services that consume the volume keep it :ro.
+      - fixtures:/fixtures:rw
+      # Docker socket bind: lets obligation tests drive container lifecycle
+      # (restart, inspect, exec) via the docker-py SDK without depending on
+      # a docker CLI in the runner image. See diagnostic
+      # docs/diagnostics/8r0a-eimu-test-runner-no-docker-cli.md §4 (Shape A).
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       exchange:
         condition: service_started
       broker:
         condition: service_started
       edge:
-        condition: service_started
+        condition: service_healthy
       aws-edge:
-        condition: service_started
+        condition: service_healthy
       fastly-edge:
-        condition: service_started
+        condition: service_healthy
       mcp:
         condition: service_started
       postgres:
         condition: service_healthy
+
+volumes:
+  fixtures:
+  # Ephemeral RSA keypair written by rsa-keygen at stack-up (never committed);
+  # private half read by the Exchange, public half by the aws-edge shim.
+  rsa-keys:

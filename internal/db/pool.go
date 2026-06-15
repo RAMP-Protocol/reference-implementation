@@ -97,3 +97,21 @@ func Ping(ctx context.Context, pool *pgxpool.Pool) error {
 func WithTx(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) error {
 	return pgx.BeginFunc(ctx, pool, fn)
 }
+
+// TxRunner is the narrow port services depend on to open a transaction.
+// Decouples service code from *pgxpool.Pool so the pool stays in wiring
+// (cmd/server) and tests can substitute alternatives without booting a real
+// pool. Satisfies CLAUDE.md Rule 7 (explicit transactional boundaries) +
+// Rule 3 (interface segregation at ports).
+type TxRunner interface {
+	WithTx(ctx context.Context, fn func(pgx.Tx) error) error
+}
+
+// PoolRunner adapts *pgxpool.Pool to the TxRunner interface. Used at wiring
+// time so the service-side dependency reduces to the narrow TxRunner port.
+type PoolRunner struct{ Pool *pgxpool.Pool }
+
+// WithTx implements TxRunner by delegating to pgx.BeginFunc on the wrapped pool.
+func (p PoolRunner) WithTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	return pgx.BeginFunc(ctx, p.Pool, fn)
+}

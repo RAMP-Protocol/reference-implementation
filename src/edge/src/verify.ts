@@ -21,7 +21,7 @@ const ParamsSchema = z.object({
   sig: z.string().min(1),
   exp: z.string().regex(/^\d+$/),
   kid: z.string().min(1).optional(),
-  agent: z.string().min(1).optional(),
+  agentId: z.string().min(1).optional(),
 });
 
 export interface VerifyDeps {
@@ -38,7 +38,7 @@ export async function verifyEd25519SignedUrl(
   if (!params.ok) {
     return { valid: false, expired: false, reason: params.reason };
   }
-  const { sig, exp, kid, agent } = params.value;
+  const { sig, exp, kid, agentId } = params.value;
 
   const nowSec = Math.floor((deps.now?.() ?? Date.now()) / 1000);
   if (nowSec >= Number(exp)) {
@@ -51,8 +51,8 @@ export async function verifyEd25519SignedUrl(
   }
 
   let agentHash: Uint8Array | undefined;
-  if (agent !== undefined) {
-    const decoded = decodeBase64Url(agent);
+  if (agentId !== undefined) {
+    const decoded = decodeBase64Url(agentId);
     if (!decoded) {
       return { valid: false, expired: false, reason: 'bad_agent_encoding' };
     }
@@ -68,7 +68,10 @@ export async function verifyEd25519SignedUrl(
   const ok = await crypto.subtle.verify('Ed25519', key, sigBytes, message);
 
   if (!ok) {
-    console.error('verify: signature_mismatch', new TextDecoder().decode(message));
+    // Log only the kid + reason. The canonical message embeds the full signed
+    // URL (agent_id, exp, kid) and is attacker-influenced on a high-volume
+    // failed-fetch path, so it must not reach the worker logs.
+    console.error('verify: signature_mismatch', { kid, reason: 'signature_mismatch' });
     return buildResult({ valid: false, expired: false, kid, reason: 'signature_mismatch' });
   }
   return buildResult({ valid: true, expired: false, kid, ...(agentHash && { agentHash }) });
@@ -92,7 +95,7 @@ interface ParsedParams {
   sig: string;
   exp: string;
   kid?: string;
-  agent?: string;
+  agentId?: string;
 }
 
 function parseParams(
@@ -103,11 +106,11 @@ function parseParams(
   const exp = url.searchParams.get('exp');
   if (!exp) return { ok: false, reason: 'missing_exp' };
   const kidRaw = url.searchParams.get('kid');
-  const agentRaw = url.searchParams.get('agent');
+  const agentRaw = url.searchParams.get('agent_id');
 
   const candidate: Record<string, string> = { sig, exp };
   if (kidRaw !== null) candidate.kid = kidRaw;
-  if (agentRaw !== null) candidate.agent = agentRaw;
+  if (agentRaw !== null) candidate.agentId = agentRaw;
 
   const parsed = ParamsSchema.safeParse(candidate);
   if (!parsed.success) {
@@ -115,7 +118,7 @@ function parseParams(
   }
   const value: ParsedParams = { sig: parsed.data.sig, exp: parsed.data.exp };
   if (parsed.data.kid !== undefined) value.kid = parsed.data.kid;
-  if (parsed.data.agent !== undefined) value.agent = parsed.data.agent;
+  if (parsed.data.agentId !== undefined) value.agentId = parsed.data.agentId;
   return { ok: true, value };
 }
 

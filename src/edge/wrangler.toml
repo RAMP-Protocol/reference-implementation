@@ -3,12 +3,16 @@ main = "src/entries/cloudflare.ts"
 compatibility_date = "2025-01-15"
 compatibility_flags = ["nodejs_compat"]
 
-# Inject JWKS + exchange URLs via `wrangler secret put` or the dashboard.
+# Inject exchange URLs via `wrangler secret put` or the dashboard. The edge
+# resolves the Ed25519 delivery-URL verify key from the exchange's unified
+# /.well-known/ramp.json (public_keys[]); set EXCHANGE_MANIFEST_URL to it.
+# Optionally pre-provision the verify key(s) inline via RAMP_VERIFY_KEYS (a JSON
+# array of Ed25519 JWKs) to skip the fetch.
 # [vars]
 # EXCHANGE_URL = "https://exchange.example.com"
-# MARKETPLACE_MANIFEST_URL = "https://exchange.example.com/.well-known/ramp-marketplace.json"
-# JWKS_URL = "https://exchange.example.com/.well-known/jwks.json"
+# EXCHANGE_MANIFEST_URL = "https://exchange.example.com/.well-known/ramp.json"
 # RSL_BODY = "# RSL hint"
 # ACME_TOKENS_JSON = "{}"
+# RAMP_VERIFY_KEYS = "[]"
 
 # KV for single-use URL enforcement is deferred post-v1.

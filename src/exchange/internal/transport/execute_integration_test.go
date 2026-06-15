@@ -3,11 +3,14 @@
 package transport_test
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 
 	connect "connectrpc.com/connect"
-	rampv1 "github.com/postindustria-tech/ramp-protocol/gen/go/ramp/v1"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampthumbprint"
 )
 
 // TestExecuteTransaction_SignatureInvalid asserts that a tampered offer
@@ -18,7 +21,6 @@ func TestExecuteTransaction_SignatureInvalid(t *testing.T) {
 
 	seedCatalog(t, h)
 	offers := discoverFirst(t, h)
-	// tamper signature
 	bogus := offers[0].GetSignature() + "00"
 	offerID := offers[0].GetOfferId()
 
@@ -28,16 +30,7 @@ func TestExecuteTransaction_SignatureInvalid(t *testing.T) {
 		OfferSignature: stringPtr(bogus),
 		Requester:      &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
 	}))
-	if err == nil {
-		t.Fatal("expected signature rejection")
-	}
-	var ce *connect.Error
-	if !connectAs(err, &ce) {
-		t.Fatalf("not connect.Error: %v", err)
-	}
-	if ce.Code() != connect.CodeUnauthenticated {
-		t.Fatalf("code = %v, want Unauthenticated", ce.Code())
-	}
+	assertConnectCode(t, err, connect.CodeUnauthenticated)
 }
 
 // TestExecuteTransaction_BillingDenied confirms denial when the agent has
@@ -49,7 +42,6 @@ func TestExecuteTransaction_BillingDenied(t *testing.T) {
 	offers := discoverFirst(t, h)
 	offer := offers[0]
 
-	// Drain balance so authorize fails.
 	_, _ = h.billing.Authorize(ctx, tenantDrain(t))
 	offerID := offer.GetOfferId()
 	offerSig := offer.GetSignature()
@@ -59,16 +51,7 @@ func TestExecuteTransaction_BillingDenied(t *testing.T) {
 		OfferSignature: stringPtr(offerSig),
 		Requester:      &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
 	}))
-	if err == nil {
-		t.Fatal("expected billing denial")
-	}
-	var ce *connect.Error
-	if !connectAs(err, &ce) {
-		t.Fatalf("not connect.Error: %v", err)
-	}
-	if ce.Code() != connect.CodePermissionDenied {
-		t.Fatalf("code = %v, want PermissionDenied", ce.Code())
-	}
+	assertConnectCode(t, err, connect.CodePermissionDenied)
 }
 
 // TestExecuteTransaction_Idempotency rejects duplicate tx_request_id replays.
@@ -91,18 +74,90 @@ func TestExecuteTransaction_Idempotency(t *testing.T) {
 		t.Fatalf("first call: %v", err)
 	}
 	_, err := h.exchangeClient.ExecuteTransaction(ctx, connect.NewRequest(req))
-	if err == nil {
-		t.Fatal("expected idempotent denial")
+	assertConnectError(t, err, connect.CodeAlreadyExists, "tx_request_id")
+}
+
+// TestExecuteTransaction_SurfacesRetrievalEndpoint pins the canonical wire
+// contract: a successful transaction surfaces the signed delivery URL on the
+// RAMP-native TransactionResponse.retrieval_endpoint field (field 18), not the
+// legacy ext["signed_url"] struct slot, with ExpiresAt carrying its expiry.
+func TestExecuteTransaction_SurfacesRetrievalEndpoint(t *testing.T) {
+	h := newTestHarness(t)
+	ctx := h.ctx
+	seedCatalog(t, h)
+	offers := discoverFirst(t, h)
+	offer := offers[0]
+
+	resp, err := h.exchangeClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
+		Ver: "1.0", Id: "tx-retrieval-endpoint",
+		OfferId:        stringPtr(offer.GetOfferId()),
+		OfferSignature: stringPtr(offer.GetSignature()),
+		Requester:      &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+	}))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
 	}
-	var ce *connect.Error
-	if !connectAs(err, &ce) {
-		t.Fatalf("not connect.Error: %v", err)
+	msg := resp.Msg
+
+	// extractSignedURL asserts retrieval_endpoint is set AND the legacy
+	// ext["signed_url"] carrier is gone. This test additionally pins that the
+	// value is the minted Ed25519 signed URL for the seeded resource and that
+	// ExpiresAt carries its expiry.
+	got := extractSignedURL(t, msg)
+	if !strings.Contains(got, "/articles/hello") {
+		t.Errorf("retrieval_endpoint = %q, want the signed URL for the seeded resource", got)
 	}
-	if ce.Code() != connect.CodeAlreadyExists {
-		t.Fatalf("code = %v, want AlreadyExists", ce.Code())
+	if !strings.Contains(got, "sig=") {
+		t.Errorf("retrieval_endpoint = %q, want an Ed25519 sig query param", got)
 	}
-	if !strings.Contains(ce.Message(), "tx_request_id") {
-		t.Errorf("message = %q", ce.Message())
+	if msg.GetExpiresAt() == nil {
+		t.Error("expires_at not set alongside retrieval_endpoint")
+	}
+}
+
+// TestExecuteTransaction_BindsAgentIdentity pins the delivery-URL identity
+// binding (ADR-013): a successful transaction echoes the RFC 7638 thumbprint of
+// the proven caller key on agent_identity_hash (base64url-no-pad), and embeds
+// the SAME value as the signed URL's agent_id query param. Both the response
+// field and the URL param flow from agentBindingFor's single encode, so this
+// equality is guaranteed at the source, not coincidental (ADR-013 D4).
+func TestExecuteTransaction_BindsAgentIdentity(t *testing.T) {
+	h := newTestHarness(t)
+	ctx := h.ctx
+	seedCatalog(t, h)
+	offers := discoverFirst(t, h)
+	offer := offers[0]
+
+	resp, err := h.exchangeClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
+		Ver: "1.0", Id: "tx-bind",
+		OfferId:        stringPtr(offer.GetOfferId()),
+		OfferSignature: stringPtr(offer.GetSignature()),
+		Requester:      &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+	}))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	msg := resp.Msg
+
+	want, err := rampthumbprint.Thumbprint(h.callerPub)
+	if err != nil {
+		t.Fatalf("expected thumbprint: %v", err)
+	}
+	if got := msg.GetAgentIdentityHash(); got != want {
+		t.Errorf("agent_identity_hash = %q, want base64url thumbprint %q", got, want)
+	}
+	// The wire value must be base64url-no-pad, not the old hex encoding.
+	if strings.ContainsAny(msg.GetAgentIdentityHash(), "+/=") {
+		t.Errorf("agent_identity_hash %q is not base64url-no-pad", msg.GetAgentIdentityHash())
+	}
+
+	signedURL := extractSignedURL(t, msg)
+	parsed, err := url.Parse(signedURL)
+	if err != nil {
+		t.Fatalf("parse retrieval_endpoint: %v", err)
+	}
+	if got := parsed.Query().Get("agent_id"); got != want {
+		t.Errorf("URL agent_id = %q, want %q (must equal agent_identity_hash)", got, want)
 	}
 }
 
@@ -112,7 +167,7 @@ func seedCatalog(t *testing.T, h *testHarness) {
 	t.Helper()
 	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
 		TenantId: h.tenantID,
-		CallerId: "test-caller",
+		CallerId: "agent-test",
 		Entries:  []*rampv1.ResourceEntry{{Domain: h.tenantDomain, Path: "/articles/hello"}},
 	}))
 	if err != nil {
@@ -135,10 +190,4 @@ func discoverFirst(t *testing.T, h *testHarness) []*rampv1.Offer {
 		t.Fatal("no offers returned")
 	}
 	return resp.Msg.GetOffers()
-}
-
-// connectAs is a tiny wrapper around errors.As for *connect.Error to keep
-// the test ergonomics compact.
-func connectAs(err error, target **connect.Error) bool {
-	return ceAs(err, target)
 }

@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # Multi-stage build for the Broker service.
 #
 # Build from repository root:
@@ -7,20 +6,18 @@
 FROM golang:1.26-alpine AS builder
 WORKDIR /build
 
-COPY proto/ ./proto/
+# proto/ was deleted in 9a1b245 — the protocol is now consumed as a
+# published Go module (github.com/RAMP-Protocol/protocol). The legacy
+# `COPY proto/ ./proto/` line broke the build under this stale Dockerfile.
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download
+RUN go mod download
 
 COPY internal/ ./internal/
 COPY src/broker/ ./src/broker/
 
 ENV CGO_ENABLED=0 GOOS=linux
 ARG TARGETARCH
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    GOARCH=${TARGETARCH:-amd64} \
+RUN GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w" \
       -o /out/broker ./src/broker/cmd/server
 

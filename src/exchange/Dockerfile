@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # Multi-stage build for the Exchange service. Distroless runtime keeps the
 # final image under 20 MB with no shell, package manager, or extra users.
 #
@@ -8,14 +7,12 @@
 FROM golang:1.26-alpine AS builder
 WORKDIR /build
 
-# Proto code (includes its own go.mod; resolves the replace directive).
-COPY proto/ ./proto/
-
+# proto/ was deleted in 9a1b245 — the protocol is now consumed as a
+# published Go module (github.com/RAMP-Protocol/protocol). The legacy
+# `COPY proto/ ./proto/` line broke the build under this stale Dockerfile.
 # Root go module + deps.
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download
+RUN go mod download
 
 # Source specific to the Exchange build target.
 COPY internal/ ./internal/
@@ -23,9 +20,7 @@ COPY src/exchange/ ./src/exchange/
 
 ENV CGO_ENABLED=0 GOOS=linux
 ARG TARGETARCH
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    GOARCH=${TARGETARCH:-amd64} \
+RUN GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w" \
       -o /out/exchange ./src/exchange/cmd/server
 
