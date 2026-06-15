@@ -387,9 +387,23 @@ def render(ledger: dict[str, Any], hits: list[EdgeHit], ecs: dict[str, EcsLogHit
     return "\n".join(lines)
 
 
+def _free_hits(args, regions: tuple[str, ...], req_id: str):
+    """Resolve free-index hits from a local fixture (offline) or AWS logs."""
+    import ledger_free
+
+    if args.edge_log_file:
+        return ledger_free.fetch_free_hits_from_fixture(args.edge_log_file, req_id)
+    return ledger_free.fetch_free_hits(req_id, args.log_group, regions, args.profile)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("--tx", required=True, help="transaction_id (UUID)")
+    parser.add_argument("--tx", help="transaction_id (UUID) — paid mode")
+    parser.add_argument("--free", action="store_true", help="free-index mode (join by req_id)")
+    parser.add_argument("--req", help="req_id for --free mode")
+    parser.add_argument("--compare", help="compare paid vs free: 'TX=<tx> REQ=<req>'")
+    parser.add_argument("--bot-jwks", help="bot JWK directory (URL or file) for the --free identity re-check")
+    parser.add_argument("--edge-log-file", help="read edge log lines from a local fixture (offline)")
     parser.add_argument("--exchange", default=os.environ.get("RAMP_EXCHANGE_URL", DEFAULT_EXCHANGE))
     parser.add_argument("--log-group", default=os.environ.get("RAMP_EDGE_LOG_GROUP", DEFAULT_LAMBDA_LOG_GROUP))
     parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE", DEFAULT_AWS_PROFILE))
@@ -399,6 +413,28 @@ def main() -> int:
     args = parser.parse_args()
 
     regions = tuple(r.strip() for r in args.regions.split(",") if r.strip())
+
+    if args.compare:
+        import ledger_free
+
+        kv = dict(part.split("=", 1) for part in args.compare.split() if "=" in part)
+        tx_id, req_id = kv.get("TX", ""), kv.get("REQ", "")
+        free_hits = _free_hits(args, regions, req_id) if req_id else []
+        print(ledger_free.render_compare(free_hits, tx_id))
+        return 0
+
+    if args.free:
+        import ledger_free
+
+        if not args.req:
+            parser.error("--free requires --req <req_id>")
+        free_hits = _free_hits(args, regions, args.req)
+        bot_dir = ledger_free.load_bot_directory(args.bot_jwks)
+        print(ledger_free.render_free(free_hits, bot_dir, assertion))
+        return 0
+
+    if not args.tx:
+        parser.error("one of --tx, --free --req, or --compare is required")
     ledger = fetch_ledger(args.exchange, args.tx)
     hits = fetch_edge_hits(args.tx, args.log_group, regions, args.profile)
     # ECS log group lives in us-east-1 only; Broker + MCP services log there.
