@@ -151,7 +151,7 @@ type seedRequest struct {
 // onboarding flow that captures their public key for signature verification.
 type seedAgent struct {
 	AgentID       string `json:"agent_id"`
-	PublicKey     string `json:"public_key"`     // base64 (PEM strip-down) or any opaque tag
+	PublicKey     string `json:"public_key"` // base64 (PEM strip-down) or any opaque tag
 	ManifestURL   string `json:"manifest_url"`
 	RequesterType string `json:"requester_type"` // AGENT | HUMAN_TOOL | SERVICE | DELEGATED | RESEARCH
 }
@@ -186,67 +186,14 @@ func seedHandler(queries sqlc.Querier, catalogSvc *service.CatalogService, logge
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		for _, t := range req.Tenants {
-			scheme := sqlc.RampSigningScheme(t.SigningScheme)
-			if scheme == "" {
-				scheme = sqlc.RampSigningSchemeED25519
-			}
-			_, err := queries.InsertTenant(r.Context(), sqlc.InsertTenantParams{
-				TenantID:            t.TenantID,
-				Domain:              t.Domain,
-				HmacSecretRef:       t.HmacSecretRef,
-				Ed25519KeyRef:       t.Ed25519KeyRef,
-				ReportingPolicy:     []byte("{}"),
-				SigningScheme:       scheme,
-				RsaKeyRef:           pgtype.Text{String: t.RSAKeyRef, Valid: t.RSAKeyRef != ""},
-				CloudfrontKeyPairID: pgtype.Text{String: t.CloudFrontKeyPairID, Valid: t.CloudFrontKeyPairID != ""},
-			})
-			if err != nil {
-				logger.WarnContext(r.Context(), "seed: insert tenant skipped", "tenant_id", t.TenantID, "err", err)
-			}
+		seedTenants(r.Context(), queries, logger, req.Tenants)
+		if err := seedAgents(r.Context(), queries, logger, req.Agents); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-		for _, a := range req.Agents {
-			rt := sqlc.RampRequesterType(a.RequesterType)
-			if rt == "" {
-				rt = sqlc.RampRequesterType("AGENT")
-			}
-			if _, err := queries.UpsertAgent(r.Context(), sqlc.UpsertAgentParams{
-				AgentID:       a.AgentID,
-				PublicKey:     []byte(a.PublicKey),
-				ManifestUrl:   pgtype.Text{String: a.ManifestURL, Valid: a.ManifestURL != ""},
-				RequesterType: rt,
-			}); err != nil {
-				logger.ErrorContext(r.Context(), "seed: upsert agent", "agent_id", a.AgentID, "err", err)
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-		for _, c := range req.Catalog {
-			pricing := []byte(c.Pricing)
-			if len(pricing) == 0 {
-				pricing = []byte("{}")
-			}
-			rules := []byte(c.LicensingRules)
-			if len(rules) == 0 {
-				rules = []byte("{}")
-			}
-			dm := sqlc.RampDeliveryMethod(c.DeliveryMethod)
-			if dm == "" {
-				dm = sqlc.RampDeliveryMethodDIRECT
-			}
-			if _, err := queries.UpsertCatalogEntry(r.Context(), sqlc.UpsertCatalogEntryParams{
-				ResourceID:     c.ResourceID,
-				TenantID:       c.TenantID,
-				Uri:            c.URI,
-				UriPrefix:      c.URIPrefix,
-				Pricing:        pricing,
-				LicensingRules: rules,
-				DeliveryMethod: dm,
-			}); err != nil {
-				logger.ErrorContext(r.Context(), "seed: upsert catalog", "resource_id", c.ResourceID, "err", err)
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
+		if err := seedCatalogEntries(r.Context(), queries, logger, req.Catalog); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		if err := catalogSvc.Bootstrap(r.Context()); err != nil {
 			logger.ErrorContext(r.Context(), "seed: bootstrap", "err", err)
@@ -255,6 +202,81 @@ func seedHandler(queries sqlc.Querier, catalogSvc *service.CatalogService, logge
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// seedTenants inserts each tenant; failures are logged and skipped (idempotent
+// demo seeding), so it never aborts the seed.
+func seedTenants(ctx context.Context, queries sqlc.Querier, logger *slog.Logger, tenants []seedTenant) {
+	for _, t := range tenants {
+		scheme := sqlc.RampSigningScheme(t.SigningScheme)
+		if scheme == "" {
+			scheme = sqlc.RampSigningSchemeED25519
+		}
+		_, err := queries.InsertTenant(ctx, sqlc.InsertTenantParams{
+			TenantID:            t.TenantID,
+			Domain:              t.Domain,
+			HmacSecretRef:       t.HmacSecretRef,
+			Ed25519KeyRef:       t.Ed25519KeyRef,
+			ReportingPolicy:     []byte("{}"),
+			SigningScheme:       scheme,
+			RsaKeyRef:           pgtype.Text{String: t.RSAKeyRef, Valid: t.RSAKeyRef != ""},
+			CloudfrontKeyPairID: pgtype.Text{String: t.CloudFrontKeyPairID, Valid: t.CloudFrontKeyPairID != ""},
+		})
+		if err != nil {
+			logger.WarnContext(ctx, "seed: insert tenant skipped", "tenant_id", t.TenantID, "err", err)
+		}
+	}
+}
+
+// seedAgents upserts each agent, aborting on the first failure.
+func seedAgents(ctx context.Context, queries sqlc.Querier, logger *slog.Logger, agents []seedAgent) error {
+	for _, a := range agents {
+		rt := sqlc.RampRequesterType(a.RequesterType)
+		if rt == "" {
+			rt = sqlc.RampRequesterType("AGENT")
+		}
+		if _, err := queries.UpsertAgent(ctx, sqlc.UpsertAgentParams{
+			AgentID:       a.AgentID,
+			PublicKey:     []byte(a.PublicKey),
+			ManifestUrl:   pgtype.Text{String: a.ManifestURL, Valid: a.ManifestURL != ""},
+			RequesterType: rt,
+		}); err != nil {
+			logger.ErrorContext(ctx, "seed: upsert agent", "agent_id", a.AgentID, "err", err)
+			return err
+		}
+	}
+	return nil
+}
+
+// seedCatalogEntries upserts each catalog entry, aborting on the first failure.
+func seedCatalogEntries(ctx context.Context, queries sqlc.Querier, logger *slog.Logger, catalog []seedCatalog) error {
+	for _, c := range catalog {
+		pricing := []byte(c.Pricing)
+		if len(pricing) == 0 {
+			pricing = []byte("{}")
+		}
+		rules := []byte(c.LicensingRules)
+		if len(rules) == 0 {
+			rules = []byte("{}")
+		}
+		dm := sqlc.RampDeliveryMethod(c.DeliveryMethod)
+		if dm == "" {
+			dm = sqlc.RampDeliveryMethodDIRECT
+		}
+		if _, err := queries.UpsertCatalogEntry(ctx, sqlc.UpsertCatalogEntryParams{
+			ResourceID:     c.ResourceID,
+			TenantID:       c.TenantID,
+			Uri:            c.URI,
+			UriPrefix:      c.URIPrefix,
+			Pricing:        pricing,
+			LicensingRules: rules,
+			DeliveryMethod: dm,
+		}); err != nil {
+			logger.ErrorContext(ctx, "seed: upsert catalog", "resource_id", c.ResourceID, "err", err)
+			return err
+		}
+	}
+	return nil
 }
 
 // catalogListHandler exposes GET /admin/catalog — flat JSON dump of catalog rows

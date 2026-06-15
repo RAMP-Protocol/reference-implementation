@@ -79,7 +79,7 @@ func ledgerHandler(
 			TxRequestID:        rec.TxRequestID,
 			TenantID:           rec.TenantID,
 			TenantDomain:       tenant.Domain,
-			SigningScheme:      string(tenant.SigningScheme),
+			SigningScheme:      tenant.SigningScheme,
 			AgentID:            rec.AgentID,
 			OfferID:            rec.OfferID,
 			ResourceID:         rec.ResourceID,
