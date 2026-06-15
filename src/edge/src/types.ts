@@ -52,7 +52,7 @@ export interface AppDeps {
    * `freeRules` is the collapsed edge-config projection (D12); `resolveBotKey`
    * resolves a WBA crawler's Ed25519 key (e.g. a JWKS-backed cache against the
    * bot's Signature-Agent directory); `purposeHeader` overrides the default
-   * `ramp-purpose` request header name.
+   * `x-intended-use` request header name.
    */
   freeRules?: readonly FreeRule[];
   resolveBotKey?: (

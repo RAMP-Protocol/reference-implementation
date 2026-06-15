@@ -64,7 +64,7 @@ export interface SignRequestOptions {
   purpose: string;
   keyid: string;
   agent?: string;
-  /** Override the covered component list (default: @authority @path ramp-purpose). */
+  /** Override the covered component list (default: @authority @path x-intended-use). */
   components?: string[];
   /** Override the structured-field tag (default 'web-bot-auth'). */
   tag?: string;
@@ -83,13 +83,13 @@ export async function signRequest(
   opts: SignRequestOptions,
 ): Promise<Record<string, string>> {
   const label = opts.label ?? 'sig1';
-  const purposeHeader = (opts.purposeHeader ?? 'ramp-purpose').toLowerCase();
+  const purposeHeader = (opts.purposeHeader ?? 'x-intended-use').toLowerCase();
   const components = (opts.components ?? ['@authority', '@path', purposeHeader]).map((c) =>
     c.toLowerCase(),
   );
 
   const headers: Record<string, string> = {
-    'ramp-purpose': opts.purpose,
+    'x-intended-use': opts.purpose,
   };
   if (opts.agent !== undefined) headers['signature-agent'] = opts.agent;
 
@@ -116,7 +116,7 @@ export async function signRequest(
   );
 
   const out: Record<string, string> = {
-    'RAMP-Purpose': opts.purpose,
+    'X-Intended-Use': opts.purpose,
     'Signature-Input': `${label}=${paramsString}`,
     Signature: `${label}=:${encodeBase64Url(sig)}:`,
   };

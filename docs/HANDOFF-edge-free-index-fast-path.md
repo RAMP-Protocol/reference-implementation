@@ -43,7 +43,7 @@ Read it if reachable. This note embeds enough to stand alone if it is not. ADR-0
 
 - **D1** — fast path fires on a *term class*, not an actor: `ENUMERATED` + `Pricing{FREE, metering:NONE}` + a single `FUNCTION` restriction (`permitted ⊆ {crawl, ai-index, search}`) + **no** quota/obligation/geo/user-type/critical + empty scopes. Any deviation → full Exchange cycle.
 - **D2** — identity = Web Bot Auth (RFC 9421 Ed25519 request signature; bot keys at a `.well-known` directory). UA strings are advisory only; never authorize a free serve on a UA match.
-- **D3** — acceptance = a **signed purpose header** (provisional `RAMP-Purpose`, AIPREF vocab: `search`/`ai-index`/`crawl`) that **MUST be covered by the signature** (present in `Signature-Input`). Uncovered/absent → not fast-path-eligible.
+- **D3** — acceptance = a **signed purpose header** (provisional `X-Intended-Use`, AIPREF vocab: `search`/`ai-index`/`crawl`) that **MUST be covered by the signature** (present in `Signature-Input`). Uncovered/absent → not fast-path-eligible.
 - **D4** — response carries `Content-Usage` (AIPREF) + a license pointer (data-labels TDL id, immutable) as *notice*; the binding act is D3's signed request, not the response.
 - **D5** — the edge is **pure read** at request time. It reads config; it never writes/refreshes/invalidates it.
 - **D6** — decision ladder: valid WBA sig covering purpose? → fast-path-eligible (allow/deny)? → free term matches path? → serve markdown from cache + record. Any "no" → `403 → Exchange`. Allow/deny gates the *fast path only*, never access.
@@ -87,7 +87,7 @@ So: UA bot-deny + **URL**-signature verification. No RFC 9421 **request**-signat
 ### Item A — Edge WBA-verify fast path (the core, real)
 - **New:** `src/edge/src/wba.ts` — `verifyWebBotAuthRequest({ method, authority, path, headers, resolveBotKey })`:
   - parse `Signature` / `Signature-Input` (tag `web-bot-auth`); read covered component list.
-  - **reject unless** `ramp-purpose` (the purpose header), `@authority`, and `@path` are all in the covered list (this is the keystone — uncovered purpose = no agreement).
+  - **reject unless** `x-intended-use` (the purpose header), `@authority`, and `@path` are all in the covered list (this is the keystone — uncovered purpose = no agreement).
   - build the RFC 9421 signature base over the covered components; `crypto.subtle.verify('Ed25519', botKey, sig, base)`.
   - return `{ valid, kid, purpose, reason }`. Reuse `decodeBase64Url` from `verify.ts`, JWK import from `keys.ts`.
 - **New:** `src/edge/src/freerule.ts` — `matchFreeRule(path, rules)` → `{ licenseId, contentHash, renditionPath } | undefined`. Pure, table-driven (the collapsed rule, D5/D12).
@@ -111,7 +111,7 @@ Pre-stage a `.md` artifact in S3 `ramp-demo-content` for the free path. `passToO
 ### Item D — Demo crawler = the signer (D2/D3, real mechanism)
 - **New:** `scripts/wba-crawl.py` — stdlib + `cryptography` (or PyNaCl), mirroring the ethos of `scripts/mint-signed-url.py`:
   - generate/load an Ed25519 keypair; emit a JWK directory JSON (host it where the edge can fetch it — an S3 object under a Lambda-bypassed path, or a separate static host).
-  - sign a GET over covered components `("@authority" "@path" "ramp-purpose")` with `tag="web-bot-auth"`; send `RAMP-Purpose: ai-index`, `Signature`, `Signature-Input`, `Signature-Agent`.
+  - sign a GET over covered components `("@authority" "@path" "x-intended-use")` with `tag="web-bot-auth"`; send `X-Intended-Use: ai-index`, `Signature`, `Signature-Input`, `Signature-Agent`.
   - print the resulting `req_id` / `sig_prefix` so the ledger can join.
 
 ### Item E — Ledger free mode (D8, reuses real logs)
@@ -128,8 +128,8 @@ Pre-stage a `.md` artifact in S3 `ramp-demo-content` for the free path. `passToO
 ```
 PAID — grounding (ai-input)                          FREE-INDEX (ai-index)
 party     step                                       party   step
-exchange  1. offer issued       offer_sig=…          bot     1. signed intent   RAMP-Purpose=ai-index
-broker    2a. broker routed     ✓ selected exch      bot        (Signature-Input covers @authority @path ramp-purpose)
+exchange  1. offer issued       offer_sig=…          bot     1. signed intent   X-Intended-Use=ai-index
+broker    2a. broker routed     ✓ selected exch      bot        (Signature-Input covers @authority @path x-intended-use)
 exchange  2b. offer accepted    ✓ offer_sig          bot        sig_prefix=AbC…
 exchange  3. ledger row         url_sig=…            edge    2. served + recorded  decision=pass:free-index
 edge      4. signed-URL hit     ✓ url_sig matches    edge       ✓ re-verify sig_prefix vs bot JWK kid=K
@@ -190,7 +190,7 @@ Steps 2–5 need no AWS. Build and prove the whole mechanism on miniflare/fastly
 
 ## 10. Open questions (carry from ADR-015 §"Open questions")
 
-1. Purpose header name + exact covered-component set (`RAMP-Purpose` vs an AIPREF-aligned request construct) — the WG ask, Jira RAMP-41.
+1. Purpose header name + exact covered-component set (`X-Intended-Use` vs an AIPREF-aligned request construct) — the WG ask, Jira RAMP-41.
 2. Markdown hosting + access control (public vs short-TTL signed) and how `content_hash` updates propagate.
 3. Free-tier record: a new `DELIVERY_OUTCOME_FREE_INDEX_SERVED` in the ADR-012 schema vs a separate log (leaning: same log).
 4. Demo-specific: where to host the bot JWK directory; whether to also aim a real Cloudflare-verified WBA client at the endpoint to show third-party interop.

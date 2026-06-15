@@ -38,7 +38,7 @@ describe('verifyWebBotAuthRequest', () => {
     expect(res.keyid).toBe('bot-1');
     expect(res.purpose).toBe('ai-index');
     expect(res.agent).toBe(AGENT);
-    expect(res.covered).toEqual(['@authority', '@path', 'ramp-purpose']);
+    expect(res.covered).toEqual(['@authority', '@path', 'x-intended-use']);
     expect(res.sigPrefix).toBeTruthy();
   });
 
@@ -72,7 +72,7 @@ describe('verifyWebBotAuthRequest', () => {
       path: PATH,
       purpose: 'ai-index',
       keyid: 'bot-1',
-      components: ['@path', 'ramp-purpose'],
+      components: ['@path', 'x-intended-use'],
     });
 
     const res = await verifyWebBotAuthRequest({
@@ -94,7 +94,7 @@ describe('verifyWebBotAuthRequest', () => {
       path: PATH,
       purpose: 'ai-index',
       keyid: 'bot-1',
-      components: ['@authority', 'ramp-purpose'],
+      components: ['@authority', 'x-intended-use'],
     });
 
     const res = await verifyWebBotAuthRequest({
@@ -160,7 +160,7 @@ describe('verifyWebBotAuthRequest', () => {
       purpose: 'ai-index',
       keyid: 'bot-1',
     });
-    headers['RAMP-Purpose'] = 'train-ai'; // tamper the covered header value
+    headers['X-Intended-Use'] = 'train-ai'; // tamper the covered header value
 
     const res = await verifyWebBotAuthRequest({
       method: 'GET',
@@ -248,7 +248,7 @@ describe('verifyWebBotAuthRequest', () => {
       method: 'GET',
       authority: AUTHORITY,
       path: PATH,
-      headers: { Signature: 'sig1=:abc:', 'RAMP-Purpose': 'ai-index' },
+      headers: { Signature: 'sig1=:abc:', 'X-Intended-Use': 'ai-index' },
       resolveBotKey: resolver(kp),
     });
     expect(res.valid).toBe(false);
@@ -263,8 +263,8 @@ describe('verifyWebBotAuthRequest', () => {
       path: PATH,
       headers: {
         'Signature-Input':
-          'sig1=("@authority" "@path" "ramp-purpose");keyid="bot-1";tag="web-bot-auth"',
-        'RAMP-Purpose': 'ai-index',
+          'sig1=("@authority" "@path" "x-intended-use");keyid="bot-1";tag="web-bot-auth"',
+        'X-Intended-Use': 'ai-index',
       },
       resolveBotKey: resolver(kp),
     });
@@ -281,7 +281,7 @@ describe('verifyWebBotAuthRequest', () => {
       headers: {
         'Signature-Input': 'garbage-without-list',
         Signature: 'sig1=:abc:',
-        'RAMP-Purpose': 'ai-index',
+        'X-Intended-Use': 'ai-index',
       },
       resolveBotKey: resolver(kp),
     });

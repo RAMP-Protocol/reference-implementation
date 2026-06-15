@@ -43,7 +43,7 @@ from cryptography.hazmat.primitives.serialization import (
 DEFAULT_KEY_PATH = Path("/tmp/ramp-demo-keys/wba-ed25519-private.pem")
 DEFAULT_PURPOSE = "ai-index"
 DEFAULT_KEYID = "bot-1"
-COVERED = ("@authority", "@path", "ramp-purpose")
+COVERED = ("@authority", "@path", "x-intended-use")
 
 
 def b64url_nopad(raw: bytes) -> str:
@@ -76,7 +76,7 @@ def signature_base(authority: str, path: str, purpose: str, params: str) -> str:
     values = {
         "@authority": authority.lower(),
         "@path": path,
-        "ramp-purpose": purpose,
+        "x-intended-use": purpose,
     }
     lines = [f'"{c}": {values[c]}' for c in COVERED]
     lines.append(f'"@signature-params": {params}')
@@ -95,7 +95,7 @@ def build_signed_headers(
     sig = key.sign(base.encode())
     sig_b64 = base64.b64encode(sig).decode()  # RFC 9421 sf-binary (standard base64)
     headers = {
-        "RAMP-Purpose": purpose,
+        "X-Intended-Use": purpose,
         "Signature-Input": f"sig1={params}",
         "Signature": f"sig1=:{sig_b64}:",
         "Signature-Agent": agent,

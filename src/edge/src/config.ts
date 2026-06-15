@@ -28,7 +28,7 @@ const EnvSchema = z.object({
   /**
    * Free-index fast path (ADR-015), all optional. `BOT_JWKS_URL` is the WBA
    * crawler key directory; `FREE_RULES_JSON` is the collapsed edge-config
-   * ruleset; `PURPOSE_HEADER` overrides the default ramp-purpose header. When
+   * ruleset; `PURPOSE_HEADER` overrides the default x-intended-use header. When
    * absent the fast path is inert.
    */
   BOT_JWKS_URL: z.string().url().optional(),

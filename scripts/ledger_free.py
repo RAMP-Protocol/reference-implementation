@@ -157,7 +157,7 @@ def render_free(hits: list[FreeHit], bot_dir: dict[str, dict[str, Any]], asserti
     lines.append(fmt.format(
         party="bot",
         step="1. signed intent",
-        detail=f"RAMP-Purpose={hit.purpose}  (covers @authority @path ramp-purpose)",
+        detail=f"X-Intended-Use={hit.purpose}  (covers @authority @path x-intended-use)",
         crypto=f"sig_prefix={hit.sig_prefix}",
     ))
     # 2. edge served + recorded — one request, signed access record (D8).

@@ -14,7 +14,7 @@
 import { decodeBase64Url } from './verify.js';
 
 const WEB_BOT_AUTH_TAG = 'web-bot-auth';
-const DEFAULT_PURPOSE_HEADER = 'ramp-purpose';
+const DEFAULT_PURPOSE_HEADER = 'x-intended-use';
 const SIG_PREFIX_LEN = 16;
 
 export type WbaFailure =
@@ -50,7 +50,7 @@ export interface WebBotAuthInput {
   ) => Promise<CryptoKey | undefined>;
   /** Clock for `expires` enforcement (ms since epoch). Defaults to Date.now. */
   now?: () => number;
-  /** Purpose header name. Default 'ramp-purpose'. */
+  /** Purpose header name. Default 'x-intended-use'. */
   purposeHeader?: string;
   /**
    * Components that MUST be covered by the signature for the request to be
@@ -230,7 +230,7 @@ interface ParsedSignatureInput {
 }
 
 // Parse a single-label Signature-Input dictionary entry, e.g.
-//   sig1=("@authority" "@path" "ramp-purpose");created=1700000000;keyid="k1";alg="ed25519";tag="web-bot-auth"
+//   sig1=("@authority" "@path" "x-intended-use");created=1700000000;keyid="k1";alg="ed25519";tag="web-bot-auth"
 // Returns the covered component list plus the exact parameter serialization
 // (everything after `<label>=`) so the signature base can reuse the wire bytes
 // for the @signature-params line rather than re-serializing structured fields.
