@@ -109,6 +109,77 @@ RAMP_E2E_CLOUDFRONT_URL=https://demo.ramp-protocol.org \
 make test-e2e-aws
 ```
 
+## Free-index fast path (Web Bot Auth)
+
+Adds the ADR-015 free-index fast path: a Web-Bot-Auth–signed crawler declaring
+`ai-index` over a free path is served the markdown rendition in **one** edge
+request (no Exchange round-trip) and recorded by its signature. The edge handler
+is built from the reference implementation; only per-deployment config differs
+(Lambda@Edge has no env vars).
+
+### 1. Build the Lambda from the reference handler
+
+```bash
+# from the reference-implementation repo
+cd src/edge && npm install
+node scripts/build-lambda-edge.mjs \
+  --config $PI_TERRAFORM_ROOT/AWS/us-east-1/aws-ramp-demo-lambda/edge-config.mjs \
+  --out    $PI_TERRAFORM_ROOT/AWS/us-east-1/aws-ramp-demo-lambda/aws-lambda-ramp-demo-edge/index.mjs
+```
+
+`edge-config.mjs` carries the demo bot's **public** JWK, the free-rule
+(`/articles/philosophers/* → .md`), the license id, and the mcp/exchange URLs.
+The bot's **private** key stays out of the repo (the crawler holds it).
+
+### 2. Pre-stage renditions + bot directory (S3)
+
+```bash
+# markdown renditions the free path serves (D7 — pre-staged, not pipeline-rendered)
+for f in socrates plato aristotle ...; do
+  aws --profile <DEPLOYER_PROFILE> s3 cp $f.md \
+    s3://ramp-demo-content/articles/philosophers/$f.md
+done
+# publish the bot's JWK directory under the Lambda-bypassed /.well-known path
+scripts/wba-crawl.py https://demo.ramp-protocol.org/x --keyid ramp-demo-bot-1 \
+  --no-send --emit-directory /tmp/bot-directory.json
+aws --profile <DEPLOYER_PROFILE> s3 cp /tmp/bot-directory.json \
+  s3://ramp-demo-content/.well-known/web-bot-auth
+```
+
+Set `contentHash` in `edge-config.mjs` to the sha256 of each staged `.md` and
+rebuild (step 1) so the recorded hash matches what is served.
+
+### 3. Deploy
+
+```bash
+cd $PI_TERRAFORM_ROOT/AWS/us-east-1/aws-ramp-demo-lambda
+AWS_PROFILE=<DEPLOYER_PROFILE> terraform apply   # publishes a new Lambda version; CloudFront re-points
+```
+
+### 4. Drive it + see the collapse
+
+```bash
+# signed crawler gets free content in ONE request
+scripts/wba-crawl.py https://demo.ramp-protocol.org/articles/philosophers/socrates.txt \
+  --purpose ai-index --keyid ramp-demo-bot-1 \
+  --key /tmp/ramp-demo-keys/wba-ed25519-private.pem \
+  --agent https://demo.ramp-protocol.org/.well-known/web-bot-auth
+# -> prints req_id + sig_prefix, GET ... -> 200 (one-request serve)
+
+# the money shot: 6-step paid chain beside the 2-row free chain
+scripts/ledger.py --compare "TX=<a-paid-tx> REQ=<the-free-req-id>"
+scripts/ledger.py --free --req <req-id> --bot-jwks https://demo.ramp-protocol.org/.well-known/web-bot-auth
+```
+
+### Real vs staged (state this in the demo)
+
+| Real | Staged |
+|---|---|
+| RFC 9421 / Ed25519 request-signature verification (`wba.ts`) | crawler identity is our demo bot, not GPTBot |
+| signed purpose declaration + `Signature-Input` coverage enforcement | the free rule is static config, not a catalog projection |
+| signed access record + ledger re-verify of the bot key | the markdown is pre-staged, not pipeline-rendered |
+| edge serve-vs-redirect decision; `Content-Usage` + license labeling | allow/denylist is trivially "our bot" |
+
 ## Tearing it all down
 
 Reverse apply order across the ramp-demo modules only (route53 A-record → cloudfront → lambda → s3 → elasticache → rds → ecs → acm). The legacy `aws-ec2`, `aws-s3`, `aws-lambda`, `aws-cloudfront`, `aws-acm` modules are not involved. CloudFront distro + Lambda@Edge take ~20 min to fully delete because of edge replication.
