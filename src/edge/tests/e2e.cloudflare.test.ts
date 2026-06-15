@@ -2,15 +2,24 @@ import { SELF, fetchMock } from 'cloudflare:test';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { encodeBase64Url } from '../src/verify.js';
-import { type TestKeypair, generateKeypair, jwks, signUrl } from './helpers/ed25519.js';
+import {
+  type TestKeypair,
+  generateKeypair,
+  jwks,
+  signRequest,
+  signUrl,
+} from './helpers/ed25519.js';
 
 const JWKS_URL = 'https://exchange.test/.well-known/jwks.json';
 const PUB_ORIGIN = 'https://pub.example.com';
+const FREE_PATH = '/articles/philosophers/socrates.txt';
 
 let keypair: TestKeypair;
+let botKeypair: TestKeypair;
 
 beforeAll(async () => {
   keypair = await generateKeypair('k1');
+  botKeypair = await generateKeypair('bot-1');
   fetchMock.activate();
   fetchMock.disableNetConnect();
 });
@@ -20,6 +29,11 @@ beforeEach(() => {
     .get('https://exchange.test')
     .intercept({ path: '/.well-known/jwks.json', method: 'GET' })
     .reply(200, jwks([keypair.publicJwk]), { headers: { 'content-type': 'application/json' } })
+    .persist();
+  fetchMock
+    .get('https://bot.test')
+    .intercept({ path: '/.well-known/jwks.json', method: 'GET' })
+    .reply(200, jwks([botKeypair.publicJwk]), { headers: { 'content-type': 'application/json' } })
     .persist();
 });
 
@@ -136,6 +150,65 @@ describe('bot handling without signed URL', () => {
 
   it('missing user-agent is treated as bot', async () => {
     const res = await SELF.fetch(`${PUB_ORIGIN}/article/42`);
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('WBA free-index fast path', () => {
+  it('serves free content in ONE request to a signed ai-index crawler (even with a bot UA)', async () => {
+    const headers = await signRequest(botKeypair.privateKey, {
+      authority: 'pub.example.com',
+      path: FREE_PATH,
+      purpose: 'ai-index',
+      keyid: 'bot-1',
+      agent: 'https://bot.test/.well-known/jwks.json',
+    });
+    const res = await SELF.fetch(`${PUB_ORIGIN}${FREE_PATH}`, {
+      // A bot UA that would normally be 403'd — the WBA signature, not the UA,
+      // is what authorizes the serve.
+      headers: { ...headers, 'user-agent': 'GPTBot/1.0' },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-usage')).toBe('ai-index=y');
+    expect(res.headers.get('x-ramp-license')).toBe('tdl:free-index-v1');
+  });
+
+  it('still 403s an UNSIGNED bot on the same free path', async () => {
+    const res = await SELF.fetch(`${PUB_ORIGIN}${FREE_PATH}`, {
+      headers: { 'user-agent': 'GPTBot/1.0' },
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers.get('x-content-rules')).toBe(
+      'https://pub.example.com/.well-known/ramp.json',
+    );
+  });
+
+  it('does NOT fast-path when the purpose is not covered by the signature', async () => {
+    const headers = await signRequest(botKeypair.privateKey, {
+      authority: 'pub.example.com',
+      path: FREE_PATH,
+      purpose: 'ai-index',
+      keyid: 'bot-1',
+      components: ['@authority', '@path'], // purpose omitted from the signature
+    });
+    const res = await SELF.fetch(`${PUB_ORIGIN}${FREE_PATH}`, {
+      headers: { ...headers, 'user-agent': 'GPTBot/1.0' },
+    });
+    // Falls through the fast path; bot UA -> 403 -> Exchange.
+    expect(res.status).toBe(403);
+  });
+
+  it('does NOT fast-path a signed request to a non-free path', async () => {
+    const path = '/premium/secret.txt';
+    const headers = await signRequest(botKeypair.privateKey, {
+      authority: 'pub.example.com',
+      path,
+      purpose: 'ai-index',
+      keyid: 'bot-1',
+    });
+    const res = await SELF.fetch(`${PUB_ORIGIN}${path}`, {
+      headers: { ...headers, 'user-agent': 'GPTBot/1.0' },
+    });
     expect(res.status).toBe(403);
   });
 });

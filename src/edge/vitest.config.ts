@@ -19,6 +19,12 @@ export default defineWorkersConfig({
             PROVIDER: 'pub.test',
             EXCHANGES_JSON:
               '[{"domain":"exchange.test","endpoint":"https://exchange.test","supported_profiles":["ramp-news-v1"]}]',
+            // Free-index fast path (ADR-015). BOT_JWKS_URL is intercepted in the
+            // WBA test; ORIGIN_URL is intentionally left unset so the fast path
+            // returns 200 + D4 headers without an origin fetch.
+            BOT_JWKS_URL: 'https://bot.test/.well-known/jwks.json',
+            FREE_RULES_JSON:
+              '[{"pathPattern":"/articles/philosophers/*","renditionReplace":["\\\\.txt$",".md"],"licenseId":"tdl:free-index-v1","contentUsage":"ai-index=y","contentHash":"sha256-demo"}]',
           },
         },
       },
