@@ -24,7 +24,7 @@ export default defineWorkersConfig({
             // returns 200 + D4 headers without an origin fetch.
             BOT_JWKS_URL: 'https://bot.test/.well-known/jwks.json',
             FREE_RULES_JSON:
-              '[{"pathPattern":"/articles/philosophers/*","renditionReplace":["\\\\.txt$",".md"],"licenseId":"tdl:free-index-v1","contentUsage":"ai-index=y","contentHash":"sha256-demo"}]',
+              '[{"pathPattern":"/articles/philosophers/*","licenseId":"tdl:free-index-v1","contentUsage":"ai-index=y","contentHash":"sha256-demo"}]',
           },
         },
       },

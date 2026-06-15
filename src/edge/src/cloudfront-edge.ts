@@ -172,7 +172,6 @@ async function tryFreeIndex(
     msg: 'ramp-demo-edge',
     method: request.method,
     uri: request.uri,
-    rendition: free.renditionPath,
     ua: headers['user-agent'] ?? '',
     decision: 'pass:free-index',
     purpose: wba.purpose,
@@ -184,11 +183,9 @@ async function tryFreeIndex(
     req_id: reqId,
   });
 
-  // Serve the hosted markdown rendition in one request: rewrite the origin path
-  // and let CloudFront fetch it from S3. Response labeling (D4 Content-Usage /
-  // license pointer) would be attached at origin-response in production; the
-  // binding act is the signed request above, not the response label.
-  request.uri = free.renditionPath;
+  // Serve the requested free resource in one request (passthrough to origin).
+  // Response labeling (D4 Content-Usage / license pointer) would be attached at
+  // origin-response in production; the binding act is the signed request above.
   return request;
 }
 

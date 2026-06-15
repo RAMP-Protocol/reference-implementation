@@ -15,19 +15,16 @@ export interface FreeRule {
    * wins when several match.
    */
   pathPattern: string;
-  /** Map the requested path to the hosted markdown rendition path (D7). */
-  renditionFor: (path: string) => string;
   /** Immutable license identifier (prefer a data-labels TDL id), for notice (D4). */
   licenseId: string;
   /** AIPREF Content-Usage response header value (D4). */
   contentUsage: string;
-  /** Optional precomputed sha256 of the rendition (static for the demo). */
+  /** Optional precomputed sha256 of the served resource, for the access record. */
   contentHash?: string;
 }
 
 export interface FreeMatch {
   licenseId: string;
-  renditionPath: string;
   contentUsage: string;
   contentHash?: string;
 }
@@ -46,7 +43,6 @@ export function matchFreeRule(path: string, rules: readonly FreeRule[]): FreeMat
 
   const match: FreeMatch = {
     licenseId: best.licenseId,
-    renditionPath: best.renditionFor(path),
     contentUsage: best.contentUsage,
   };
   if (best.contentHash !== undefined) match.contentHash = best.contentHash;

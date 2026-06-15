@@ -36,7 +36,6 @@ const config = {
   freeRules: [
     {
       pathPattern: '/articles/philosophers/*',
-      renditionFor: (p) => p.replace(/\.txt$/, '.md'),
       licenseId: 'tdl:ramp-demo-free-index-v1',
       contentUsage: 'ai-index=y',
       contentHash: '',

@@ -5,24 +5,21 @@ import { type FreeRule, matchFreeRule } from '../src/freerule.js';
 const RULES: FreeRule[] = [
   {
     pathPattern: '/articles/philosophers/*',
-    renditionFor: (p) => p.replace(/\.txt$/, '.md'),
     licenseId: 'tdl:free-index-v1',
     contentUsage: 'ai-index=y',
     contentHash: 'sha256-abc',
   },
   {
     pathPattern: '/articles/philosophers/premium/*',
-    renditionFor: (p) => p,
     licenseId: 'tdl:premium',
     contentUsage: 'ai-index=n',
   },
 ];
 
 describe('matchFreeRule', () => {
-  it('matches a prefix rule and maps the rendition path', () => {
+  it('matches a prefix rule and returns its license + notice', () => {
     const m = matchFreeRule('/articles/philosophers/socrates.txt', RULES);
     expect(m).toBeDefined();
-    expect(m?.renditionPath).toBe('/articles/philosophers/socrates.md');
     expect(m?.licenseId).toBe('tdl:free-index-v1');
     expect(m?.contentUsage).toBe('ai-index=y');
     expect(m?.contentHash).toBe('sha256-abc');
@@ -46,7 +43,6 @@ describe('matchFreeRule', () => {
     const exact: FreeRule[] = [
       {
         pathPattern: '/llms.txt',
-        renditionFor: (p) => p,
         licenseId: 'tdl:free',
         contentUsage: 'ai-index=y',
       },

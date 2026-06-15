@@ -16,7 +16,6 @@ const FREE_PATH = '/articles/philosophers/socrates.txt';
 const FREE_RULES: FreeRule[] = [
   {
     pathPattern: '/articles/philosophers/*',
-    renditionFor: (p) => p.replace(/\.txt$/, '.md'),
     licenseId: 'tdl:free-index-v1',
     contentUsage: 'ai-index=y',
     contentHash: 'sha256-demo',
@@ -77,7 +76,7 @@ function isResult(r: unknown): r is CloudFrontResultResponse {
 }
 
 describe('createCloudFrontHandler', () => {
-  it('fast-paths a signed ai-index crawler: rewrites uri to the rendition + logs pass:free-index', async () => {
+  it('fast-paths a signed ai-index crawler: serves the requested resource + logs pass:free-index', async () => {
     const logs: Record<string, unknown>[] = [];
     const handler = createCloudFrontHandler(makeConfig(logs));
     const headers = await signRequest(bot.privateKey, {
@@ -92,7 +91,8 @@ describe('createCloudFrontHandler', () => {
 
     expect(isResult(result)).toBe(false);
     const req = result as CloudFrontRequest;
-    expect(req.uri).toBe('/articles/philosophers/socrates.md');
+    // Passthrough: the requested URI is served unchanged (one request).
+    expect(req.uri).toBe(FREE_PATH);
 
     const line = logs.at(-1) as Record<string, unknown>;
     expect(line.decision).toBe('pass:free-index');

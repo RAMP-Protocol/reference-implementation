@@ -96,7 +96,6 @@ async function tryFreeIndex(
       msg: 'ramp-edge',
       decision: 'pass:free-index',
       uri: url.pathname,
-      rendition: free.renditionPath,
       purpose: wba.purpose,
       bot_kid: wba.keyid,
       signature_agent: wba.agent,
@@ -107,9 +106,9 @@ async function tryFreeIndex(
     }),
   );
 
-  // Serve the rendition; attach D4 notice headers (Content-Usage + license
-  // pointer). The binding act is the signed request, not these labels.
-  const origin = await passToOrigin(c, deps, free.renditionPath);
+  // Serve the requested free resource; attach D4 notice headers (Content-Usage
+  // + license pointer). The binding act is the signed request, not these labels.
+  const origin = await passToOrigin(c, deps);
   const resp = new Response(origin.body, origin);
   resp.headers.set('Content-Usage', free.contentUsage);
   resp.headers.set('X-RAMP-License', free.licenseId);
@@ -119,12 +118,11 @@ async function tryFreeIndex(
 async function passToOrigin(
   c: Context<{ Variables: AppVariables }>,
   deps: AppDeps,
-  renditionPath?: string,
 ): Promise<Response> {
   if (!deps.originUrl) return c.body(null, 200);
   const incoming = new URL(c.req.url);
   const origin = new URL(deps.originUrl);
-  origin.pathname = renditionPath ?? incoming.pathname;
+  origin.pathname = incoming.pathname;
   origin.search = '';
   const fetcher = deps.fetcher ?? fetch;
   const upstreamReq = new Request(origin.toString(), {

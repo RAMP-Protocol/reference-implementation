@@ -15,7 +15,7 @@
 | Demo crawler/signer (D2/D3, real RFC 9421) | `scripts/wba-crawl.py` (cross-verified against `wba.ts`) |
 | Ledger free mode + compare (D8) | `scripts/ledger.py --free/--compare` + `scripts/ledger_free.py` |
 | Deploy wiring (build prep) | `pi-terraform/.../aws-ramp-demo-lambda/edge-config.mjs` + regenerated `index.mjs` (uncommitted, maintainer review) |
-| Pre-stage `.md` + publish bot directory + `terraform apply` | **maintainer** — see `RUNBOOK-aws-demo.md` §"Free-index fast path" |
+| Publish bot directory + `terraform apply` (edge serves the requested resource; D7 rendition out of scope) | **maintainer** — see `RUNBOOK-aws-demo.md` §"Free-index fast path" |
 
 The original spec follows, unchanged, for context.
 

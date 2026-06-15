@@ -112,10 +112,15 @@ make test-e2e-aws
 ## Free-index fast path (Web Bot Auth)
 
 Adds the ADR-015 free-index fast path: a Web-Bot-Auth–signed crawler declaring
-`ai-index` over a free path is served the markdown rendition in **one** edge
+`ai-index` over a free path is served the requested resource in **one** edge
 request (no Exchange round-trip) and recorded by its signature. The edge handler
 is built from the reference implementation; only per-deployment config differs
 (Lambda@Edge has no env vars).
+
+> Note: the edge serves the resource the crawler requested. ADR-015 D7 (ingestion
+> renders a markdown rendition and the edge serves *that*) is out of scope for
+> this demo — there is no HTML source to render here, so a format swap would be
+> cosmetic. The `FreeRule` carries no rendition mapping.
 
 ### 1. Build the Lambda from the reference handler
 
@@ -128,26 +133,22 @@ node scripts/build-lambda-edge.mjs \
 ```
 
 `edge-config.mjs` carries the demo bot's **public** JWK, the free-rule
-(`/articles/philosophers/* → .md`), the license id, and the mcp/exchange URLs.
+(`/articles/philosophers/*`), the license id, and the mcp/exchange URLs.
 The bot's **private** key stays out of the repo (the crawler holds it).
 
-### 2. Pre-stage renditions + bot directory (S3)
+### 2. Publish the bot JWK directory (S3)
 
 ```bash
-# markdown renditions the free path serves (D7 — pre-staged, not pipeline-rendered)
-for f in socrates plato aristotle ...; do
-  aws --profile <DEPLOYER_PROFILE> s3 cp $f.md \
-    s3://ramp-demo-content/articles/philosophers/$f.md
-done
 # publish the bot's JWK directory under the Lambda-bypassed /.well-known path
+# (needed for Signature-Agent resolution + ledger.py --bot-jwks re-verify)
 scripts/wba-crawl.py https://demo.ramp-protocol.org/x --keyid ramp-demo-bot-1 \
   --no-send --emit-directory /tmp/bot-directory.json
 aws --profile <DEPLOYER_PROFILE> s3 cp /tmp/bot-directory.json \
   s3://ramp-demo-content/.well-known/web-bot-auth
 ```
 
-Set `contentHash` in `edge-config.mjs` to the sha256 of each staged `.md` and
-rebuild (step 1) so the recorded hash matches what is served.
+The free content (`articles/philosophers/*.txt`) is already in the bucket; the
+fast path serves it directly, so no rendition staging is needed.
 
 ### 3. Deploy
 
@@ -177,8 +178,8 @@ scripts/ledger.py --free --req <req-id> --bot-jwks https://demo.ramp-protocol.or
 |---|---|
 | RFC 9421 / Ed25519 request-signature verification (`wba.ts`) | crawler identity is our demo bot, not GPTBot |
 | signed purpose declaration + `Signature-Input` coverage enforcement | the free rule is static config, not a catalog projection |
-| signed access record + ledger re-verify of the bot key | the markdown is pre-staged, not pipeline-rendered |
-| edge serve-vs-redirect decision; `Content-Usage` + license labeling | allow/denylist is trivially "our bot" |
+| signed access record + ledger re-verify of the bot key | no rendition step (D7) — the edge serves the requested resource directly |
+| edge serve decision; `Content-Usage` + license labeling | allow/denylist is trivially "our bot" |
 
 ## Tearing it all down
 

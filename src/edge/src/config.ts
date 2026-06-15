@@ -76,8 +76,6 @@ export function buildDeps(env: EdgeEnv): AppDeps {
 
 const FreeRuleEnvSchema = z.object({
   pathPattern: z.string().min(1),
-  // [regexSource, replacement] applied to map a request path to its rendition.
-  renditionReplace: z.tuple([z.string(), z.string()]).optional(),
   licenseId: z.string().min(1),
   contentUsage: z.string().min(1),
   contentHash: z.string().optional(),
@@ -87,13 +85,8 @@ function parseFreeRules(raw: string | undefined): FreeRule[] | undefined {
   if (!raw) return undefined;
   const parsed = z.array(FreeRuleEnvSchema).parse(JSON.parse(raw));
   return parsed.map((r) => {
-    const replace = r.renditionReplace;
-    const renditionFor = replace
-      ? (p: string) => p.replace(new RegExp(replace[0]), replace[1])
-      : (p: string) => p;
     const rule: FreeRule = {
       pathPattern: r.pathPattern,
-      renditionFor,
       licenseId: r.licenseId,
       contentUsage: r.contentUsage,
     };
