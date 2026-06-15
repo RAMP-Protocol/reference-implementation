@@ -1,3 +1,4 @@
+import type { FreeRule } from './freerule.js';
 import type { VerifyResult } from './verify.js';
 
 export interface AuthorizedExchange {
@@ -44,6 +45,21 @@ export interface AppDeps {
    * Injectable fetcher for tests. Defaults to the runtime's global fetch.
    */
   fetcher?: typeof fetch;
+  /**
+   * Free-index fast path (ADR-015). All optional — when unset the fast path is
+   * inert and the worker behaves exactly as before.
+   *
+   * `freeRules` is the collapsed edge-config projection (D12); `resolveBotKey`
+   * resolves a WBA crawler's Ed25519 key (e.g. a JWKS-backed cache against the
+   * bot's Signature-Agent directory); `purposeHeader` overrides the default
+   * `ramp-purpose` request header name.
+   */
+  freeRules?: readonly FreeRule[];
+  resolveBotKey?: (
+    keyid: string | undefined,
+    agent: string | undefined,
+  ) => Promise<CryptoKey | undefined>;
+  purposeHeader?: string;
 }
 
 export const BOT_UA_PATTERNS: readonly RegExp[] = Object.freeze([

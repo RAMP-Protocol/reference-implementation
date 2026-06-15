@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import type { FreeRule } from './freerule.js';
 import { createKeyCache } from './keys.js';
 import type { AppDeps, AuthorizedExchange, Manifest, VerifierManifest } from './types.js';
 
@@ -24,6 +25,15 @@ const EnvSchema = z.object({
    * Broker reads this to decide which exchanges represent the publisher.
    */
   EXCHANGES_JSON: z.string(),
+  /**
+   * Free-index fast path (ADR-015), all optional. `BOT_JWKS_URL` is the WBA
+   * crawler key directory; `FREE_RULES_JSON` is the collapsed edge-config
+   * ruleset; `PURPOSE_HEADER` overrides the default ramp-purpose header. When
+   * absent the fast path is inert.
+   */
+  BOT_JWKS_URL: z.string().url().optional(),
+  FREE_RULES_JSON: z.string().optional(),
+  PURPOSE_HEADER: z.string().optional(),
 });
 
 export type EdgeEnv = z.infer<typeof EnvSchema>;
@@ -47,6 +57,8 @@ export function buildDeps(env: EdgeEnv): AppDeps {
   };
   const cache = createKeyCache({ jwksUrl: env.JWKS_URL });
   const acmeTokens = parseAcmeTokens(env.ACME_TOKENS_JSON);
+  const freeRules = parseFreeRules(env.FREE_RULES_JSON);
+  const botCache = env.BOT_JWKS_URL ? createKeyCache({ jwksUrl: env.BOT_JWKS_URL }) : undefined;
   return {
     manifest,
     verifierManifest,
@@ -54,7 +66,40 @@ export function buildDeps(env: EdgeEnv): AppDeps {
     ...(env.RSL_BODY !== undefined ? { rslBody: env.RSL_BODY } : {}),
     ...(acmeTokens !== undefined ? { acmeTokens } : {}),
     ...(env.ORIGIN_URL !== undefined ? { originUrl: env.ORIGIN_URL } : {}),
+    ...(freeRules !== undefined ? { freeRules } : {}),
+    ...(botCache !== undefined
+      ? { resolveBotKey: (kid: string | undefined) => botCache.resolve(kid) }
+      : {}),
+    ...(env.PURPOSE_HEADER !== undefined ? { purposeHeader: env.PURPOSE_HEADER } : {}),
   };
+}
+
+const FreeRuleEnvSchema = z.object({
+  pathPattern: z.string().min(1),
+  // [regexSource, replacement] applied to map a request path to its rendition.
+  renditionReplace: z.tuple([z.string(), z.string()]).optional(),
+  licenseId: z.string().min(1),
+  contentUsage: z.string().min(1),
+  contentHash: z.string().optional(),
+});
+
+function parseFreeRules(raw: string | undefined): FreeRule[] | undefined {
+  if (!raw) return undefined;
+  const parsed = z.array(FreeRuleEnvSchema).parse(JSON.parse(raw));
+  return parsed.map((r) => {
+    const replace = r.renditionReplace;
+    const renditionFor = replace
+      ? (p: string) => p.replace(new RegExp(replace[0]), replace[1])
+      : (p: string) => p;
+    const rule: FreeRule = {
+      pathPattern: r.pathPattern,
+      renditionFor,
+      licenseId: r.licenseId,
+      contentUsage: r.contentUsage,
+    };
+    if (r.contentHash !== undefined) rule.contentHash = r.contentHash;
+    return rule;
+  });
 }
 
 function parseAcmeTokens(raw: string | undefined): Record<string, string> | undefined {

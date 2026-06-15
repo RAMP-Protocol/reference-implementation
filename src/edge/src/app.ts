@@ -1,8 +1,10 @@
 import { Hono } from 'hono';
 import type { Context, MiddlewareHandler } from 'hono';
 
+import { matchFreeRule } from './freerule.js';
 import { type AppDeps, looksLikeBot } from './types.js';
 import { type VerifyResult, verifyEd25519SignedUrl } from './verify.js';
+import { verifyWebBotAuthRequest } from './wba.js';
 
 export type AppVariables = { requestId: string };
 
@@ -50,6 +52,8 @@ async function catchallHandler(
   const userAgent = c.req.header('user-agent');
 
   if (!hasSig) {
+    const fast = await tryFreeIndex(c, deps);
+    if (fast) return fast;
     if (looksLikeBot(userAgent)) return denyBot(c, deps);
     return passToOrigin(c, deps);
   }
@@ -60,14 +64,67 @@ async function catchallHandler(
   return passToOrigin(c, deps);
 }
 
+// tryFreeIndex serves the ADR-015 free-index fast path: a WBA-signed crawler
+// declaring a covered purpose over a free-rule path gets the markdown rendition
+// in one request, recorded by its signature. Returns undefined to fall through
+// to the existing bot/human handling. Inert unless fast-path deps are wired.
+async function tryFreeIndex(
+  c: Context<{ Variables: AppVariables }>,
+  deps: AppDeps,
+): Promise<Response | undefined> {
+  if (!deps.resolveBotKey || !deps.freeRules) return undefined;
+  if (!c.req.header('signature') || !c.req.header('signature-input')) return undefined;
+
+  const url = new URL(c.req.url);
+  const wba = await verifyWebBotAuthRequest({
+    method: c.req.method,
+    authority: url.host,
+    path: url.pathname,
+    headers: c.req.raw.headers,
+    resolveBotKey: deps.resolveBotKey,
+    ...(deps.purposeHeader !== undefined ? { purposeHeader: deps.purposeHeader } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
+  if (!wba.valid) return undefined;
+
+  const free = matchFreeRule(url.pathname, deps.freeRules);
+  if (!free) return undefined;
+
+  // biome-ignore lint/suspicious/noConsole: free-index decision log, parity with the deployed edge handler (scanned by ledger.py)
+  console.log(
+    JSON.stringify({
+      msg: 'ramp-edge',
+      decision: 'pass:free-index',
+      uri: url.pathname,
+      rendition: free.renditionPath,
+      purpose: wba.purpose,
+      bot_kid: wba.keyid,
+      signature_agent: wba.agent,
+      sig_prefix: wba.sigPrefix,
+      license_id: free.licenseId,
+      content_hash: free.contentHash ?? '',
+      req_id: c.get('requestId'),
+    }),
+  );
+
+  // Serve the rendition; attach D4 notice headers (Content-Usage + license
+  // pointer). The binding act is the signed request, not these labels.
+  const origin = await passToOrigin(c, deps, free.renditionPath);
+  const resp = new Response(origin.body, origin);
+  resp.headers.set('Content-Usage', free.contentUsage);
+  resp.headers.set('X-RAMP-License', free.licenseId);
+  return resp;
+}
+
 async function passToOrigin(
   c: Context<{ Variables: AppVariables }>,
   deps: AppDeps,
+  renditionPath?: string,
 ): Promise<Response> {
   if (!deps.originUrl) return c.body(null, 200);
   const incoming = new URL(c.req.url);
   const origin = new URL(deps.originUrl);
-  origin.pathname = incoming.pathname;
+  origin.pathname = renditionPath ?? incoming.pathname;
   origin.search = '';
   const fetcher = deps.fetcher ?? fetch;
   const upstreamReq = new Request(origin.toString(), {
