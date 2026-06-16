@@ -354,7 +354,7 @@ print(json.dumps({
                  "cloudfront_key_pair_id": "<CLOUDFRONT_KEY_PAIR_ID>"}],
     "catalog": [{"resource_id": f"philosopher-{s}", "tenant_id": TENANT,
                  "uri": f"{BASE}/{s}.txt", "uri_prefix": f"{BASE}/{s}",
-                 "pricing": {"model": "per_request", "unit_cost": "0.01", "currency": "USD"},
+                 "pricing": {"model": "per_request", "unit_cost": 0.01, "currency": "USD"},
                  "licensing_rules": {"function": "licensed_ai_training",
                                      "attribution": f"Wikipedia: {t}"},
                  "delivery_method": "DIRECT"} for s, t in philosophers]

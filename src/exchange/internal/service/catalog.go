@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync/atomic"
 
 	radix "github.com/armon/go-radix"
@@ -163,6 +165,64 @@ type PricingDoc struct {
 	UnitCost float64 `json:"unit_cost"`
 	Unit     string  `json:"unit"`
 	EstQty   int32   `json:"estimated_quantity,omitempty"`
+}
+
+// UnmarshalJSON tolerates monetary fields encoded as either a JSON number
+// (0.01) or a quoted decimal string ("0.01"). Seed payloads in the wild carry
+// unit_cost both ways, and a single stringy row must not 500 the whole
+// DiscoverResources call when buildOffer unmarshals it.
+func (p *PricingDoc) UnmarshalJSON(data []byte) error {
+	type alias struct {
+		Model    string    `json:"model"`
+		Rate     flexFloat `json:"rate"`
+		Currency string    `json:"currency"`
+		UnitCost flexFloat `json:"unit_cost"`
+		Unit     string    `json:"unit"`
+		EstQty   int32     `json:"estimated_quantity,omitempty"`
+	}
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	p.Model = a.Model
+	p.Rate = float64(a.Rate)
+	p.Currency = a.Currency
+	p.UnitCost = float64(a.UnitCost)
+	p.Unit = a.Unit
+	p.EstQty = a.EstQty
+	return nil
+}
+
+// flexFloat is a float64 that unmarshals from a JSON number or a quoted
+// decimal string. An empty string or null decodes to 0.
+type flexFloat float64
+
+func (f *flexFloat) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+	if data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return nil
+		}
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return fmt.Errorf("parse decimal %q: %w", s, err)
+		}
+		*f = flexFloat(v)
+		return nil
+	}
+	var v float64
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	*f = flexFloat(v)
+	return nil
 }
 
 // defaultPricing fills in reasonable defaults for the scrappy demo: per-access
