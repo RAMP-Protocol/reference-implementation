@@ -12,6 +12,7 @@ deploy/broker/broker-key.json
 *.tsbuildinfo
 coverage/
 .turbo/
+.code-review/
 
 # Go
 bin/
@@ -61,8 +62,18 @@ logs/
 /prototype
 /entitlement-mint
 
+# Compiled service binaries (go build output lands next to main.go as the dir
+# name, e.g. src/broker/cmd/server/server). These are build artifacts, never
+# committed — a 33 MB binary was previously committed by accident.
+**/cmd/server/server
+
 # Leftovers from directories whose canonical home moved to the piarch repo
 .derive-ensemble/
 derive-ensemble/
 
 .perles
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

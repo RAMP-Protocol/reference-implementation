@@ -9,6 +9,16 @@ Wraps an existing httpx transport so every Broker call carries
     Content-Digest: sha-256=:<base64>:
 
 The coverage set matches the Broker / Exchange verifier's required components.
+
+**Multisig forwarding-chain compatibility (ADR-013 D5, RAMP-56):**
+This signer always emits the originating signature `sig1` over the RAMP base
+coverage set. When the Broker relays the request it preserves sig1 and appends a
+chaining sig2 whose covered set is the base set PLUS ``"signature";key="sig1"``,
+so sig2 cryptographically commits to sig1 (RFC 9421 §2.4). The Exchange verifies
+the whole chain and bounds its depth. MCP is always the originating hop and never
+appends to or verifies a chain, so it needs no parameterized-component logic —
+keep it strictly sig1-only. See tests/test_multisig_relay.py for the composition
+proof and cross-references to Go integration tests.
 """
 
 from __future__ import annotations
@@ -32,6 +42,11 @@ from .thumbprint import ed25519_thumbprint
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 _SIGNATURE_TTL_SECONDS = 30
+
+# RAMP coverage set (ADR-001 §2.1) for the originating sig1. MUST match the
+# Broker/Exchange verifiers' required base components. The relaying Broker appends
+# a chaining sig2 whose covered set is this base set PLUS "signature";key="sig1"
+# (RAMP-56 forwarding chain); MCP only ever emits sig1 over this base set.
 _COVERED_COMPONENTS: tuple[str, ...] = (
     "@method",
     "@target-uri",

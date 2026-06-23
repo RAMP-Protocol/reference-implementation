@@ -18,10 +18,20 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
 )
 
-// httpContextKey holds the raw http.Request + body bytes so the CatalogHandler
-// can enforce RFC 9421 signature verification without requiring the service
-// layer to know about transport. Populated by CatalogSignatureMiddleware and
-// consumed by CatalogHandler.PushResources.
+// maxCatalogBodyBytes bounds the PushResources body the signature middleware
+// buffers before any verification. The endpoint is pre-auth (the RFC 9421
+// signature is checked in the handler, not at a gate), so an unbounded read
+// would let an unauthenticated caller exhaust memory (parallels HIGH-01 on the
+// broker relay). 1 MiB is generous for a bulk catalog push while still bounding
+// the DoS surface.
+const maxCatalogBodyBytes int64 = 1 << 20
+
+// httpContextKey holds the raw http.Request + captured body bytes so the
+// CatalogHandler can enforce RFC 9421 signature verification without requiring
+// the service layer to know about transport. Populated by
+// CatalogSignatureMiddleware and consumed by CatalogHandler.PushResources. The
+// captured body is needed because Connect drains request.Body to decode the
+// message before the handler runs, so verification must re-supply the bytes.
 type httpContextKey struct{}
 
 type catalogSignatureCtx struct {
@@ -41,7 +51,10 @@ func CatalogSignatureMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		body, err := io.ReadAll(r.Body)
+		// Bound the read: the endpoint is pre-auth, so an unbounded body would
+		// let an unauthenticated caller exhaust broker memory before the
+		// signature is checked.
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxCatalogBodyBytes))
 		if err != nil {
 			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 			return
@@ -95,10 +108,23 @@ func (h *CatalogHandler) verifyCallerSignature(ctx context.Context, callerID str
 	if !ok || sigCtx == nil {
 		return connect.NewError(connect.CodeInternal, errors.New("catalog: signature middleware missing"))
 	}
-	lookup := func(ctx context.Context, keyID string) (ed25519.PublicKey, error) {
+	// VerifyRequest (not the legacy Verify) so the catalog push is held to the
+	// same RFC 9421 policy as every other signed surface: required covered
+	// components (@method, @target-uri, content-digest, authorization) AND the
+	// created/expires freshness window. The catalog signer already covers that
+	// set and stamps created/expires, so this is a tightening, not a break.
+	resolver := httpsig.ResolverFunc(func(ctx context.Context, keyID string) (ed25519.PublicKey, error) {
 		return h.registry.LookupPublicKey(ctx, keyID)
+	})
+	// Connect already drained request.Body to decode the message, so re-supply
+	// the captured bytes before each verification (VerifyRequest reads the body
+	// off the request to recompute Content-Digest).
+	verify := func() error {
+		sigCtx.request.Body = io.NopCloser(bytes.NewReader(sigCtx.body))
+		_, err := httpsig.VerifyRequest(sigCtx.request, resolver)
+		return err
 	}
-	if _, err := httpsig.Verify(ctx, sigCtx.request, sigCtx.body, lookup); err != nil {
+	if err := verify(); err != nil {
 		if !errors.Is(err, agentreg.ErrUnknown) {
 			return connect.NewError(connect.CodeUnauthenticated, err)
 		}
@@ -106,11 +132,23 @@ func (h *CatalogHandler) verifyCallerSignature(ctx context.Context, callerID str
 			return connect.NewError(connect.CodeUnauthenticated, err)
 		}
 		if regErr := h.registry.RegisterFromManifest(ctx, callerID, callerID); regErr != nil {
-			return connect.NewError(connect.CodeUnauthenticated, regErr)
+			return connectRegisterError(regErr)
 		}
-		if _, err := httpsig.Verify(ctx, sigCtx.request, sigCtx.body, lookup); err != nil {
+		if err := verify(); err != nil {
 			return connect.NewError(connect.CodeUnauthenticated, err)
 		}
 	}
 	return nil
+}
+
+// connectRegisterError maps a RegisterFromManifest failure to a Connect error,
+// splitting a permanent caller fault (Unauthenticated) from a transient upstream
+// fetch failure (Unavailable/retryable). agentreg.IsCallerFault is the single
+// source of that classification, shared with service.mapLazyRegisterError.
+func connectRegisterError(err error) error {
+	code := connect.CodeUnavailable
+	if agentreg.IsCallerFault(err) {
+		code = connect.CodeUnauthenticated
+	}
+	return connect.NewError(code, err)
 }

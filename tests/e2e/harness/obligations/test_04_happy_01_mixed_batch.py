@@ -72,7 +72,7 @@ from ..seed import (
     _resolve_pg_dsn,
     seed_stack,
 )
-from ..signing import AGENT_E2E_KEY_PATH
+from ..signing import AGENT_E2E_KEY_PATH, build_pop_headers
 from .carriers import assert_signed_url
 
 
@@ -296,6 +296,9 @@ def test_mixed_batch_groups_public_offers_and_not_in_catalog_reason(
     if compose_stack.edge != EDGE_PUBLIC_URL:
         host_signed_url = signed_url.replace(EDGE_PUBLIC_URL, compose_stack.edge)
         extra_headers["Host"] = EDGE_PUBLIC_HOST
+    # Add proof-of-possession headers for identity binding verification (ADR-013)
+    pop_headers = build_pop_headers(url=signed_url)
+    extra_headers.update(pop_headers)
     content_resp = httpx.get(host_signed_url, headers=extra_headers, timeout=30.0)
     assert content_resp.status_code == httpx.codes.OK, (
         f"public signed URL fetch failed: {content_resp.status_code} {content_resp.text[:256]}"

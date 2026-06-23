@@ -28,7 +28,7 @@ func publisherManifestJSON() []byte {
 
 func newPublisherCache(clk clock.Clock) *rampwellknown.Cache {
 	return rampwellknown.NewCache(rampwellknown.CacheOptions{
-		Client:     http.DefaultClient,
+		Client:     testutil.Client(),
 		Clk:        clk,
 		ExpectRole: rampwellknown.RolePublisher,
 	})

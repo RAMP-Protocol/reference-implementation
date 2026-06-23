@@ -85,11 +85,14 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
+from typing import Any, cast
 
+import httpx
 import pytest
 
 from ..conftest import COMPOSE_FILE, StackURLs
 from ..seed import EDGE_PUBLIC_URL, SeededFixture, seed_stack
+from ..relay import relay_execute
 
 
 # ADR-008 D5 — declare stack-isolation contract.
@@ -189,6 +192,36 @@ def _rewrite_for_host(signed_url: str, edge_url: str) -> str:
     return signed_url.replace(EDGE_PUBLIC_URL, edge_url)
 
 
+def _execute_via_relay(
+    broker_url: str,
+    agent_id: str,
+    exchange_endpoint: str,
+    offer_id: str,
+    offer_signature: str,
+) -> str:
+    """Execute transaction via Broker relay and return signed URL.
+
+    RAMP-56 two-phase flow: agent signs with Exchange URL (final destination),
+    POSTs to Broker relay endpoint. Broker preserves agent sig1 and appends
+    broker sig2 (multisig). Exchange verifies both signatures and returns
+    signed URL.
+    """
+    resp = relay_execute(
+        broker_url=broker_url,
+        exchange_endpoint=exchange_endpoint,
+        agent_id=agent_id,
+        offer_id=offer_id,
+        offer_signature=offer_signature,
+    )
+    assert resp.status_code == httpx.codes.OK, (
+        f"ExecuteTransaction via relay failed: {resp.status_code}: {resp.text[:256]}"
+    )
+    tx_payload = cast(dict[str, Any], resp.json())
+    signed_url = cast(str, tx_payload.get("retrievalEndpoint"))
+    assert signed_url, f"ExecuteTransaction response missing retrievalEndpoint: {tx_payload}"
+    return signed_url
+
+
 def test_tampered_signed_url_refused_no_content_served(
     compose_stack: StackURLs,
     seeded: SeededFixture,
@@ -223,7 +256,7 @@ def test_tampered_signed_url_refused_no_content_served(
     async def run() -> None:
         client = broker_client_cls(compose_stack.broker)
 
-        # (1) Acceptance — Broker.resolve hands the agent a signed URL.
+        # (1a) Discovery — Broker.resolve returns offers without executing.
         # A unique intended_use keeps the signed body distinct so the Broker's
         # (keyID, signature) replay store does not refuse this resolve as a
         # duplicate of another test's identical {agent, uri} within the window.
@@ -243,14 +276,35 @@ def test_tampered_signed_url_refused_no_content_served(
             f"licensed={resp.licensed!r}, error={resp.error!r}, "
             f"resp={resp!r}"
         )
-        assert resp.retrieval_endpoint, (
-            f"Broker.resolve returned licensed=true but no retrieval_endpoint; "
+
+        # (1b) Extract offers from two-phase response
+        offers = resp.ext.get("ramp.broker.offers", []) if resp.ext else []
+        assert offers, (
+            f"Broker.resolve returned licensed=true but no offers; "
             f"obligation 00 failure-7 cannot be exercised: {resp!r}"
+        )
+        offer = offers[0]
+        offer_id = cast(str, offer.get("offer_id"))
+        offer_signature = cast(str, offer.get("signature"))
+        exchange_endpoint = cast(str, offer.get("exchange_endpoint"))
+        assert offer_id and offer_signature and exchange_endpoint, (
+            f"offer missing required fields: {offer!r}"
+        )
+
+        # (1c) Execute — agent signs with Exchange URL, POSTs to Broker relay.
+        # This is the "URL delivered after acceptance" — the signed URL the
+        # platform returns after transaction execution.
+        signed_url = _execute_via_relay(
+            compose_stack.broker,
+            seeded.agent_id,
+            exchange_endpoint,
+            offer_id,
+            offer_signature,
         )
 
         # (2) Tamper — flip a sig byte. The edge's parser stays happy;
         # only the cryptographic verify can refuse.
-        tampered_url, original_sig = _tamper_sig(resp.retrieval_endpoint)
+        tampered_url, original_sig = _tamper_sig(signed_url)
         host_tampered_url = _rewrite_for_host(tampered_url, compose_stack.edge)
 
         # (3, 4) Fetch the tampered URL via the shim's public surface.

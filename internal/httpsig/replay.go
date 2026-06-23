@@ -19,6 +19,11 @@ import (
 // returns seen=true; the caller rejects the request as a replay.
 type ReplayStore interface {
 	SeenOrAdd(ctx context.Context, keyID, signature string, ttl time.Duration) (seen bool, err error)
+	// Seen reports whether (keyID, signature) is already recorded, WITHOUT
+	// adding it. A multi-signature request uses this to check every signature
+	// for replay before committing any of them, so a rejected request never
+	// burns the replay key of its other (valid, first-seen) signatures.
+	Seen(ctx context.Context, keyID, signature string) (seen bool, err error)
 }
 
 // RedisReplayStore implements ReplayStore via SETNX + EX. Keys are namespaced
@@ -56,6 +61,18 @@ func (s *RedisReplayStore) SeenOrAdd(ctx context.Context, keyID, signature strin
 	return true, nil
 }
 
+// Seen reports whether the pair is recorded without adding it (read-only EXISTS).
+func (s *RedisReplayStore) Seen(ctx context.Context, keyID, signature string) (bool, error) {
+	if s == nil || s.client == nil {
+		return false, errors.New("httpsig: replay store not initialized")
+	}
+	n, err := s.client.Exists(ctx, s.prefix+replayKey(keyID, signature)).Result()
+	if err != nil {
+		return false, fmt.Errorf("httpsig: redis exists: %w", err)
+	}
+	return n > 0, nil
+}
+
 // MemoryReplayStore is a map-backed replay store for tests and Redis-less dev.
 // Not intended for production — there is no cross-process coordination.
 type MemoryReplayStore struct {
@@ -87,6 +104,14 @@ func (s *MemoryReplayStore) SeenOrAdd(_ context.Context, keyID, signature string
 	s.seen[key] = now.Add(ttl)
 	s.sweepLocked(now)
 	return false, nil
+}
+
+// Seen reports whether the pair is recorded (and unexpired) without adding it.
+func (s *MemoryReplayStore) Seen(_ context.Context, keyID, signature string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	exp, ok := s.seen[replayKey(keyID, signature)]
+	return ok && exp.After(s.nowFn()), nil
 }
 
 // sweepLocked drops expired entries so the map cannot grow unbounded across

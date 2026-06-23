@@ -87,7 +87,7 @@ type ObligationRepo interface {
 	) (Obligation, error)
 	// ListOutstanding returns PENDING obligations whose deadline has
 	// already elapsed for the given (tenant_id, agent_id). Drives the
-	// AcceptOffer backlog refusal.
+	// ExecuteTransaction reporting-overdue refusal.
 	ListOutstanding(ctx context.Context, tenantID, agentID string) ([]Obligation, error)
 }
 

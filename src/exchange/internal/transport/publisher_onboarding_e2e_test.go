@@ -110,7 +110,7 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 
 	// Step 5: fresh agent publishes ramp.json and registers.
 	const agentID = "agent.demo.test"
-	agentPub, _, err := ed25519.GenerateKey(rand.Reader)
+	agentPub, agentPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("agent keypair: %v", err)
 	}
@@ -150,9 +150,14 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 	}
 
 	// Step 8: execute first offer → CloudFront signed URL.
+	// ADR-013 D5 requires multisig (agent + broker). Register the agent's pubkey
+	// in the httpsig resolver so the signature can be verified, then create a
+	// multisig client that signs with both the agent's key and the broker's key.
+	h.resolver.Put(agentID, agentPub)
+	multisigClient := newMultisigClient(h.baseRT, h.server.URL, agentID, agentPriv, h.discoverKeyID, h.discoverPriv)
 	first := offers[0]
 	offerID, offerSig := first.GetOfferId(), first.GetSignature()
-	execResp, err := h.exchange.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
+	execResp, err := multisigClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
 		Ver: "1.0", Id: "tx-" + uuid.NewString(),
 		OfferId:        &offerID,
 		OfferSignature: &offerSig,

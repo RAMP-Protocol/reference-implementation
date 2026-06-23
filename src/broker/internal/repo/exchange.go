@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -114,9 +115,16 @@ func (r *PgxExchangeRepo) UpsertFromBootstrap(ctx context.Context, m Exchange) (
 		return Exchange{}, fmt.Errorf("marshal supported_profiles: %w", err)
 	}
 	row, err := r.q.UpsertExchange(ctx, sqlc.UpsertExchangeParams{
-		ExchangeID:        m.ID,
-		Domain:            m.Domain,
-		Endpoint:          m.Endpoint,
+		ExchangeID: m.ID,
+		Domain:     m.Domain,
+		// Canonicalize on store (MED-01): strip any trailing slash so discovery
+		// always emits a single form. The agent signs `endpoint + Procedure`
+		// against exactly the value it receives in discovery; a trailing slash
+		// would make it sign a double-slash @target-uri the broker's sig1 verify
+		// (and the Exchange route) could never match. Normalizing here — the
+		// single source of truth — keeps the SSRF check, the signature base, the
+		// forwarded URL, and the Exchange's received path byte-identical.
+		Endpoint:          strings.TrimRight(m.Endpoint, "/"),
 		TrustLevel:        sqlc.BrokerTrustLevel(m.TrustLevel),
 		SupportedProfiles: profiles,
 		Priority:          m.Priority,

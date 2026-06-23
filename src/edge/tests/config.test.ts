@@ -57,16 +57,18 @@ describe('unified manifest', () => {
 });
 
 describe('RAMP_ENFORCE_BINDING', () => {
-  it('defaults binding enforcement OFF (v1 bearer, ADR-013 D6)', () => {
+  it('defaults binding enforcement ON (ADR-013 D6.1 flip)', () => {
     const deps = buildDeps(parseEnv(baseEnv));
-    expect(deps.enforceBinding).toBe(false);
+    expect(deps.enforceBinding).toBe(true);
   });
 
-  it('enables enforcement only when explicitly set to "true"', () => {
+  it('enforces by default, opts out only when explicitly set to "false"', () => {
     const on = buildDeps(parseEnv({ ...baseEnv, RAMP_ENFORCE_BINDING: 'true' }));
     expect(on.enforceBinding).toBe(true);
     const off = buildDeps(parseEnv({ ...baseEnv, RAMP_ENFORCE_BINDING: 'false' }));
     expect(off.enforceBinding).toBe(false);
+    const unset = buildDeps(parseEnv(baseEnv));
+    expect(unset.enforceBinding).toBe(true); // defaults ON
   });
 });
 

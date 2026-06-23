@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"google.golang.org/protobuf/encoding/protojson"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
@@ -97,14 +98,21 @@ func (o *publisherOrigin) setContributors(cs ...string) {
 	o.mu.Unlock()
 }
 
-// pushAgentOrigin serves /.well-known/ramp.json for lazy-signup tests.
-// missing toggles a 404 so the registry fetch fails.
+// pushAgentOrigin serves /.well-known/ramp.json for lazy-signup tests. The
+// mutually-exclusive failure toggles drive the registry's fetch down each
+// mapLazyRegisterError branch: missing → 404 (Unauthenticated), unavailable →
+// 503 (Unavailable/retryable), malformed → schema-invalid body
+// (Unauthenticated), expired → a manifest whose only key is outside its
+// validity window (no-valid-key → Unauthenticated).
 type pushAgentOrigin struct {
-	server  *httptest.Server
-	agentID string
-	pub     ed25519.PublicKey
-	mu      sync.Mutex
-	missing bool
+	server      *httptest.Server
+	agentID     string
+	pub         ed25519.PublicKey
+	mu          sync.Mutex
+	missing     bool
+	unavailable bool
+	malformed   bool
+	expired     bool
 }
 
 func newPushAgentOrigin(t *testing.T, agentID string, pub ed25519.PublicKey) *pushAgentOrigin {
@@ -121,13 +129,25 @@ func (o *pushAgentOrigin) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	o.mu.Lock()
-	missing := o.missing
+	missing, unavailable, malformed, expired := o.missing, o.unavailable, o.malformed, o.expired
 	o.mu.Unlock()
-	if missing {
+	switch {
+	case missing:
 		http.NotFound(w, r)
 		return
+	case unavailable:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	case malformed:
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{not valid ramp json"))
+		return
 	}
-	doc, err := agentManifestFields(o.agentID, o.pub, agentKeyValidFrom(), agentKeyValidUntil())
+	from, until := agentKeyValidFrom(), agentKeyValidUntil()
+	if expired {
+		from, until = time.Now().Add(-48*time.Hour), time.Now().Add(-time.Hour)
+	}
+	doc, err := agentManifestFields(o.agentID, o.pub, from, until)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -215,9 +235,27 @@ type pushHarness struct {
 	// time via the httpsigKeys field on exchangeServerDeps.
 	discoverKeyID string
 	discoverPriv  ed25519.PrivateKey
+	// resolver is the global-httpsig static resolver. Self-acting agent
+	// tests register a fresh transport-signing pubkey here (resolver.Put) so
+	// the agent's own signature clears the gate while its agents-repo row is
+	// still absent — the precondition for exercising resolveCaller's ADR-009
+	// D2 lazy-registration path. Multisig tests likewise register agent
+	// pubkeys here dynamically.
+	resolver *httpsig.StaticResolver
 	// rsaPub is the CloudFront RSA verify key the fixture minted. Onboarding
 	// tests read it here (RAMP v1 no longer publishes it at a well-known route).
 	rsaPub *rsa.PublicKey
+}
+
+// selfActingExchangeClient returns an ExchangeService client that signs every
+// /ramp.* call with keyID/priv — the self-acting shape where the agent signs
+// for itself (keyID == requester.id == agent_id). Pairs with resolver.Put so
+// the signature clears the global gate.
+func (h *pushHarness) selfActingExchangeClient(
+	keyID string, priv ed25519.PrivateKey,
+) rampconnect.ExchangeServiceClient {
+	c := &http.Client{Transport: newSigningTransport(h.baseTransport, keyID, priv)}
+	return rampconnect.NewExchangeServiceClient(c, h.server.URL, connect.WithGRPC())
 }
 
 func newPushHarness(t *testing.T) *pushHarness {
@@ -330,6 +368,7 @@ func newPushHarness(t *testing.T) *pushHarness {
 		queries:       queries,
 		rewriteMu:     rewriteMu,
 		rewrite:       rewrite,
+		resolver:      srv.resolver,
 		unsignedCat:   rampconnect.NewCatalogServiceClient(srv.server.Client(), srv.server.URL, connect.WithGRPC()),
 		signedCat:     signedFactory,
 		exchange:      rampconnect.NewExchangeServiceClient(exchangeClient, srv.server.URL, connect.WithGRPC()),
@@ -394,6 +433,32 @@ func TestPushResources_UnknownCallerManifestMissing(t *testing.T) {
 		Entries:  []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}},
 	}))
 	assertCode(t, err, connect.CodeUnauthenticated)
+}
+
+// TestPushResources_UnknownCallerManifestUnavailable proves the catalog
+// self-signup handler classifies a TRANSIENT manifest-fetch failure (origin
+// 503) as Unavailable/retryable, not as a permanent Unauthenticated — matching
+// the service lazy-registration path (agentreg.IsCallerFault).
+func TestPushResources_UnknownCallerManifestUnavailable(t *testing.T) {
+	h := newPushHarness(t)
+	h.publisher.setContributors("caller.example")
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	origin := h.publishAgent(t, "caller.example", nil)
+	origin.mu.Lock()
+	origin.unavailable = true
+	origin.mu.Unlock()
+
+	client := h.signedCat("caller.example", priv)
+	_, err = client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
+		TenantId: h.tenantID,
+		CallerId: "caller.example",
+		Entries:  []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}},
+	}))
+	assertCode(t, err, connect.CodeUnavailable)
 }
 
 // TestPushResources_UnknownCallerAutoRegisteredAndAdmitted proves the lazy

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,35 @@ func EnvOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// EnvBool reads a boolean env var: unset → def; "0"/"false"/"no"/"off"
+// (case-insensitive) → false; any other non-empty value → true. Both services
+// gate their per-agent well-known resolution flag through this, so the parse
+// rule lives once.
+func EnvBool(key string, def bool) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "":
+		return def
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// EnvDuration parses a Go duration from key, returning def on absent/invalid/
+// negative input. A zero return lets a downstream consumer apply its own default.
+func EnvDuration(key string, def time.Duration) time.Duration {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return def
+	}
+	return d
 }
 
 // Serve runs an HTTP server on addr with the given handler, logging with name,

@@ -8,26 +8,20 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rsa"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	connect "connectrpc.com/connect"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
@@ -81,7 +75,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	fetchClient := rampwellknown.NewGuardedClientFromEnv()
 
 	queries := sqlc.New(pool)
-	agentRegistry := agentreg.New(agentreg.Config{Repo: repo.NewAgentRepo(queries), HTTP: fetchClient})
+	agentRegistry := agentreg.New(agentreg.Config{
+		Repo:   repo.NewAgentRepo(queries),
+		HTTP:   fetchClient,
+		Scheme: runhttp.EnvOr("RAMP_MANIFEST_FETCH_SCHEME", ""),
+		Port:   runhttp.EnvOr("RAMP_MANIFEST_FETCH_PORT", ""),
+	})
 	// EXCHANGE_CATALOG_URI_SCHEME defaults to https; compose overrides to http
 	// so catalog URIs route through the in-network edge worker.
 	service.SetCatalogURIScheme(runhttp.EnvOr("EXCHANGE_CATALOG_URI_SCHEME", ""))
@@ -92,12 +91,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 	exchangeSvc := buildExchange(buildSvcDeps{
-		pool:        pool,
-		queries:     queries,
-		catalog:     catalogSvc,
-		offerSigner: offerSigner,
-		keystore:    keystore,
-		billing:     selectBillingAdapter(logger),
+		pool:          pool,
+		queries:       queries,
+		catalog:       catalogSvc,
+		offerSigner:   offerSigner,
+		keystore:      keystore,
+		billing:       selectBillingAdapter(logger),
+		agentRegistry: agentRegistry,
 	})
 	mux := buildMux(muxDeps{
 		pool:          pool,
@@ -118,12 +118,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 // buildSvcDeps groups the inputs buildExchange needs so the
 // run() call site stays under the funlen cap.
 type buildSvcDeps struct {
-	pool        *pgxpool.Pool
-	queries     *sqlc.Queries
-	catalog     *service.CatalogService
-	offerSigner *signing.Ed25519Signer
-	keystore    *signing.InMemoryKeyStore
-	billing     billing.Adapter
+	pool          *pgxpool.Pool
+	queries       *sqlc.Queries
+	catalog       *service.CatalogService
+	offerSigner   *signing.Ed25519Signer
+	keystore      *signing.InMemoryKeyStore
+	billing       billing.Adapter
+	agentRegistry agentreg.Registry
 }
 
 // buildExchange wires the ExchangeService that serves the canonical
@@ -136,6 +137,7 @@ func buildExchange(d buildSvcDeps) *service.ExchangeService {
 		Catalog:      d.catalog,
 		Tenants:      repo.NewTenantRepo(d.queries),
 		Agents:       repo.NewAgentRepo(d.queries),
+		AgentReg:     d.agentRegistry,
 		Transactions: repo.NewTransactionRepo(d.queries),
 		Obligations:  repo.NewObligationRepo(d.queries),
 		Billing:      d.billing,
@@ -203,124 +205,11 @@ func buildWrapped(
 	if err != nil {
 		return nil, err
 	}
-	inner := transport.CatalogSignatureMiddleware(mux)
-	sig := httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{
-		RequestPredicate: exchangeGlobalSigRequestPredicate,
-		OnError:          transport.LogHTTPSigReject,
-	}, inner)
-	return transport.RequestIDMiddleware(logger, sig), nil
-}
-
-// exchangeGlobalSigRequestPredicate decides whether a request must clear
-// the static-resolver httpsig gate. Every non-Catalog /ramp.* request
-// MUST be signed and MUST be verified — RFC 9421 is the universal
-// transport-layer authentication. Catalog paths are excluded only
-// because CatalogSignatureMiddleware runs a different signer further
-// down the stack (per-contributor with lazy ramp.json self-signup);
-// they are still verified, just via a different mechanism. Paths
-// outside the /ramp.* namespace (healthz, /.well-known, etc.) are
-// public.
-func exchangeGlobalSigRequestPredicate(r *http.Request) bool {
-	path := r.URL.Path
-	if strings.HasPrefix(path, "/ramp.v1.CatalogService/") {
-		return false
-	}
-	return strings.HasPrefix(path, "/ramp.")
-}
-
-// buildHTTPSigDeps constructs the RFC 9421 KeyResolver + ReplayStore used by
-// the httpsig middleware. Keys are loaded from the JWKS file at
-// RAMP_KEYS_FILE (default deploy/broker/keys.json) — in the v1 demo both
-// Broker and Exchange read the same file, which carries agent pubkeys AND
-// the Broker-relay pubkey disambiguated by kid prefix. Redis, when REDIS_URL
-// is set, backs the replay store; otherwise an in-memory store is used.
-func buildHTTPSigDeps(
-	ctx context.Context, logger *slog.Logger, fetchClient rampwellknown.HTTPDoer,
-) (httpsig.KeyResolver, httpsig.ReplayStore, error) {
-	keysFile := runhttp.EnvOr("RAMP_KEYS_FILE", "deploy/broker/keys.json")
-	var redisCli *redis.Client
-	if dsn := runhttp.EnvOr("REDIS_URL", ""); dsn != "" {
-		opts, err := redis.ParseURL(dsn)
-		if err != nil {
-			return nil, nil, err
-		}
-		redisCli = redis.NewClient(opts)
-		if pingErr := redisCli.Ping(ctx).Err(); pingErr != nil {
-			_ = redisCli.Close()
-			return nil, nil, pingErr
-		}
-		logger.Info("httpsig: redis replay store ready", "addr", opts.Addr)
-	}
-	static, replay, err := httpsig.Wireup(httpsig.WireupOptions{
-		KeysFile:    keysFile,
-		Redis:       redisCli,
-		RedisPrefix: "httpsig:exchange:replay:",
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	return wellKnownAwareResolver(ctx, static, fetchClient, logger), replay, nil
-}
-
-// wellKnownAwareResolver wraps the static RAMP_KEYS_FILE resolver. When
-// EXCHANGE_BROKER_WELLKNOWN_URL is set, a revocation-aware rampwellknown.Loader
-// bound to that URL is consulted first — so a kid the Broker has revoked (or
-// whose validity window has lapsed) is rejected even if the bootstrap file
-// still lists it — with the static resolver remaining the fallback for kids the
-// well-known document does not carry or when it is momentarily unreachable.
-// Unset (the default) returns the static resolver unchanged; the demo + e2e
-// continue to resolve purely from the pre-shared file. RAMP_KEYS_FILE removal
-// is the forward step (follow-up 13.F1) once well-known resolution is primary.
-//
-// The loader's revocation poller is started on ctx (lifetime of the process):
-// without it, a kid revoked after the manifest is cached would keep verifying
-// for the full manifest TTL rather than within one poll interval.
-func wellKnownAwareResolver(
-	ctx context.Context, static httpsig.KeyResolver, fetchClient rampwellknown.HTTPDoer, logger *slog.Logger,
-) httpsig.KeyResolver {
-	url := runhttp.EnvOr("EXCHANGE_BROKER_WELLKNOWN_URL", "")
-	if url == "" {
-		return static
-	}
-	poll := envDuration("EXCHANGE_REVOCATION_POLL_INTERVAL", 0)
-	loader := rampwellknown.NewLoader(rampwellknown.LoaderOptions{
-		Fetch:        rampwellknown.FetchOptions{Client: fetchClient},
-		PollInterval: poll,
-		ManifestTTL:  envDuration("EXCHANGE_MANIFEST_TTL", 0),
-		Logger:       logger,
-	})
-	go loader.Run(ctx)
-	revocationAware := httpsig.ResolverFunc(func(ctx context.Context, keyID string) (ed25519.PublicKey, error) {
-		pub, err := loader.LookupKey(ctx, url, keyID)
-		switch {
-		case err == nil:
-			return pub, nil
-		case errors.Is(err, rampwellknown.ErrKeyRevoked), errors.Is(err, rampwellknown.ErrKeyExpired):
-			return nil, err // authoritative negative — do not fall through to the file
-		default:
-			// Unknown here, or the document is unreachable/malformed: defer to
-			// the static fallback by reporting the kid as unknown.
-			return nil, fmt.Errorf("%w: %w", httpsig.ErrUnknownKey, err)
-		}
-	})
-	logger.Info("httpsig: well-known revocation-aware resolution enabled",
-		"well_known_url", url, "poll_interval", poll)
-	return httpsig.NewCompositeResolver(revocationAware, static)
-}
-
-// envDuration parses a Go duration from name, returning def on absent/invalid/
-// negative input. Used to compress the revocation poll cadence + manifest TTL
-// in tests; a zero return lets the Loader apply its proto-mandated defaults.
-func envDuration(name string, def time.Duration) time.Duration {
-	raw := runhttp.EnvOr(name, "")
-	if raw == "" {
-		return def
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d < 0 {
-		return def
-	}
-	return d
+	// MaxSignatures bounds the relay chain depth at the Exchange terminal: the
+	// published max_intermediary_hops counts intermediaries, so the signature
+	// count ceiling is that plus the originating agent's own signature (RAMP-56).
+	maxSignatures := int(exchangeMaxIntermediaryHops()) + 1
+	return transport.WrapPublicSurface(logger, resolver, replay, maxSignatures, mux), nil
 }
 
 // muxDeps collects everything buildMux needs so run() can stay linear and

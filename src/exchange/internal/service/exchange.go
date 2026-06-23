@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +15,8 @@ import (
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampthumbprint"
+	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
@@ -56,6 +56,7 @@ type ExchangeService struct {
 	catalog      *CatalogService
 	tenants      repo.TenantRepo
 	agents       repo.AgentRepo
+	agentReg     agentreg.Registry
 	transactions repo.TransactionRepo
 	obligations  repo.ObligationRepo
 	billing      billing.Adapter
@@ -75,10 +76,16 @@ type ExchangeDeps struct {
 	// TxRunner opens transactions for multi-statement writes. Wiring passes
 	// db.PoolRunner{Pool: pool}; the service depends only on this narrow
 	// port (CLAUDE.md Rule 3 + Rule 7).
-	TxRunner     db.TxRunner
-	Catalog      *CatalogService
-	Tenants      repo.TenantRepo
-	Agents       repo.AgentRepo
+	TxRunner db.TxRunner
+	Catalog  *CatalogService
+	Tenants  repo.TenantRepo
+	Agents   repo.AgentRepo
+	// AgentReg drives ADR-009 D2 lazy registration: when resolveCaller meets
+	// a keyID with no ramp.agents row, the service pulls the caller's own
+	// /.well-known/ramp.json, verifies the key is published there, persists
+	// the row, and proceeds. nil disables lazy registration (an unknown keyID
+	// stays Unauthenticated) — used by tests that pre-seed every agent.
+	AgentReg     agentreg.Registry
 	Transactions repo.TransactionRepo
 	Obligations  repo.ObligationRepo
 	Billing      billing.Adapter
@@ -112,6 +119,7 @@ func NewExchangeService(d ExchangeDeps) *ExchangeService {
 		catalog:      d.Catalog,
 		tenants:      d.Tenants,
 		agents:       d.Agents,
+		agentReg:     d.AgentReg,
 		transactions: d.Transactions,
 		obligations:  d.Obligations,
 		billing:      d.Billing,
@@ -162,7 +170,7 @@ func (s *ExchangeService) DiscoverResources(
 		flatOffers = append(flatOffers, groupOffers...)
 	}
 	resp := &rampv1.ResourceResponse{
-		Ver:         "1.0",
+		Ver:         rampproto.Ver,
 		Id:          req.GetId(),
 		Exchange:    s.cfg.Exchange,
 		Offers:      flatOffers,
@@ -186,10 +194,6 @@ func (s *ExchangeService) ExecuteTransaction(
 	if err := s.validateTxRequest(req); err != nil {
 		return nil, err
 	}
-	caller, err := s.resolveCaller(ctx)
-	if err != nil {
-		return nil, err
-	}
 	if rec, found := s.idempotencyHit(req.GetId()); found {
 		return nil, exchange.Newf(exchange.KindIdempotent, "tx_request_id already processed: %s", rec)
 	}
@@ -197,29 +201,38 @@ func (s *ExchangeService) ExecuteTransaction(
 	if err != nil {
 		return nil, err
 	}
-	agentID, err := s.resolveAgentID(ctx, req)
-	if err != nil {
-		return nil, err
-	}
 	tenant, err := s.tenants.ByID(ctx, resolved.entry.TenantID)
 	if err != nil {
 		return nil, exchange.Wrap(exchange.KindInternal, err, "load tenant")
 	}
-	if authzErr := authorizeForAgent(caller, agentID, tenant.AllowBrokerRelay); authzErr != nil {
-		s.logOutcome(ctx, "execute_transaction", "REJECTED_AUTHZ", caller, &tenant, agentID, "", authzErr)
-		return nil, authzErr
-	}
-	// Bind the delivery URL to the proven caller key: its RFC 7638 thumbprint
-	// is embedded as the URL's agent_id param and echoed on the response
-	// (ADR-013). Computed before billing so a (near-impossible) bad-key failure
-	// reserves no funds. Note (ADR-013 D5 / 17.7): under Web Bot Auth the
-	// verified keyid equals this thumbprint, but that coupling lands with
-	// the Web Bot Auth identity work; until then the binding is to the proven key and the
-	// keyid is not hard-gated here. The edge enforces the strict 3-way identity
-	// at fetch time.
-	binding, err := agentBindingFor(caller)
+	// Resolve caller (single-sig or multisig), authorize, and compute the agent
+	// binding. resolveCallerAndBinding runs the authz gate internally and binds
+	// the delivery URL to the proven caller key (its RFC 7638 thumbprint is the
+	// URL's agent_id param, echoed on the response — ADR-013). Binding is
+	// computed before billing so a (near-impossible) bad-key failure reserves
+	// no funds.
+	//
+	// Runs BEFORE resolveAgentID: a self-acting caller whose keyID is not yet in
+	// ramp.agents is lazy-registered here (ADR-009 D2), populating the row that
+	// resolveAgentID then attributes the transaction to. Authz compares the
+	// proven caller against the wire requester.id; resolveAgentID returns that
+	// same id once validated, so passing it in directly is equivalent. (A broker
+	// relaying for an unregistered agent still fails resolveAgentID with
+	// NotFound — only the authenticated caller's own keyID lazy-registers.)
+	caller, binding, err := s.resolveCallerAndBinding(ctx, req.GetRequester().GetId(), tenant)
 	if err != nil {
 		return nil, err
+	}
+	agentID, err := s.resolveAgentID(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	// Deny agents holding an overdue reporting obligation before any funds are
+	// reserved (v1.1 enforce-reporting-overdue gate): runs after authorization
+	// so an unauthorized caller is rejected first, and before resolveBilling so
+	// a blocked agent reserves no funds.
+	if oerr := s.denyIfReportingOverdue(ctx, caller, &tenant, agentID); oerr != nil {
+		return nil, oerr
 	}
 	// idempotencyKey anchors the whole billing lifecycle for this transaction:
 	// Authorize/Record/Release share it so a retry of ExecuteTransaction reuses
@@ -328,31 +341,6 @@ type persistInput struct {
 	// thumbprint, persisted to transaction_log.agent_identity_hash (ADR-013
 	// 17.6). Same value whose base64url form rides in the URL's agent_id param.
 	agentHash []byte
-}
-
-// agentBinding carries the requesting agent's delivery-URL identity binding:
-// the RFC 7638 thumbprint of the proven caller key in both the base64url-no-pad
-// wire form (URL agent_id param + TransactionResponse.agent_identity_hash) and
-// the raw 32-byte digest persisted to transaction_log (ADR-013 D4/17.6/17.8).
-type agentBinding struct {
-	thumbprint string
-	digest     []byte
-}
-
-// agentBindingFor computes the binding from the cryptographically proven caller
-// key. The key was verified by the httpsig middleware, so it is always a valid
-// 32-byte Ed25519 key on this path; an invalid length is an internal invariant
-// violation rather than a client error.
-func agentBindingFor(caller Caller) (agentBinding, error) {
-	sum, err := rampthumbprint.ThumbprintBytes(caller.PublicKey)
-	if err != nil {
-		return agentBinding{}, exchange.Wrap(exchange.KindInternal, err, "compute agent thumbprint")
-	}
-	digest := sum[:]
-	return agentBinding{
-		thumbprint: base64.RawURLEncoding.EncodeToString(digest),
-		digest:     digest,
-	}, nil
 }
 
 func (s *ExchangeService) persistTransaction(ctx context.Context, in persistInput) (repo.TransactionRecord, error) {

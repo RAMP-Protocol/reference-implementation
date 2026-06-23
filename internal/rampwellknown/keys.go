@@ -84,6 +84,21 @@ func ActiveKeys(m *Manifest, now time.Time) []*Key {
 	return active
 }
 
+// ActiveKey returns the Ed25519 public key of the first currently-valid key in
+// document order, or ErrKeyExpired when no key's validity window covers now.
+// Unlike LookupKey (which matches a known kid), this selects an identity's
+// "current" signing key when the kid is not known ahead of time — the shape a
+// caller resolving an agent/publisher by domain anchor needs (the transport
+// keyID is the identity, not a key label). A malformed key `x` yields the
+// decode error from PublicKey.
+func ActiveKey(m *Manifest, now time.Time) (ed25519.PublicKey, error) {
+	active := ActiveKeys(m, now)
+	if len(active) == 0 {
+		return nil, ErrKeyExpired
+	}
+	return PublicKey(active[0])
+}
+
 // KeyByKid returns the key carrying kid and whether it was found. Kids are
 // unique within a single manifest's public_keys list.
 func KeyByKid(m *Manifest, kid string) (*Key, bool) {

@@ -6,7 +6,11 @@
 // transaction.
 package transport
 
-import rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+import (
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/selection"
+)
 
 // ResolveRequest is the Broker's internal resolve input, mapped from the
 // canonical rampv1.RAMPRequest by rampRequestToInput. Callers provide either a
@@ -34,6 +38,10 @@ type ResolveRequest struct {
 // error/absence-reason, budget, candidates) ride under RAMPResponse.ext with
 // ramp.broker.* keys. AbsenceReason is the ADR-008 D2 OfferAbsenceReason enum
 // name string (e.g. "OFFER_ABSENCE_REASON_TEMPORARILY_UNAVAILABLE").
+//
+// RAMP-56: Post-migration, the discovery phase (resolve endpoint) returns Offers
+// without executing; the agent picks an offer and calls the relay endpoint
+// (/broker/v1/exchange/execute) to complete the transaction.
 type ResolveResponse struct {
 	Licensed      bool
 	OfferID       string
@@ -42,6 +50,9 @@ type ResolveResponse struct {
 	Error         string
 	Candidates    []CandidateInfo
 	AbsenceReason string
+	// Offers contains the ranked candidates returned to the agent for selection.
+	// Set only on the discovery path (licensed=true, no execution yet).
+	Offers []selection.Candidate
 	// tx is the Exchange's TransactionResponse on the licensed path (nil on
 	// refusal). toRAMPResponse reads the canonical fields from it.
 	tx *rampv1.TransactionResponse

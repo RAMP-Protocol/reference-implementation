@@ -1,11 +1,12 @@
 import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
 
-// Workers-pool config for the enforcement-OFF (bearer) default posture, ADR-013
-// D6.1. Identical to vitest.config.ts EXCEPT RAMP_ENFORCE_BINDING is 'false'
-// (the production/compose default) and it runs only e2e.bearerdefault.test.ts,
-// which the default config excludes (that one runs with enforcement ON). This
-// pins the default path: a bound URL with no proof is served as a bearer
-// credential, not 403'd.
+// Workers-pool config for the enforcement-OFF (bearer) posture, ADR-013 D6.1.
+// Identical to vitest.config.ts EXCEPT RAMP_ENFORCE_BINDING is 'false' — the
+// opt-out for edges that cannot hold the bound key (e.g. CloudFront-native).
+// Enforcement is ON by default for capable edges; this config runs only
+// e2e.bearerdefault.test.ts (excluded from the default ON suite) to pin the
+// opt-out path: a bound URL with no proof is served as a bearer credential,
+// not 403'd.
 export default defineWorkersConfig({
   test: {
     include: ['tests/e2e.bearerdefault.test.ts'],
@@ -23,7 +24,7 @@ export default defineWorkersConfig({
             PROVIDER: 'pub.test',
             EXCHANGES_JSON:
               '[{"domain":"exchange.test","endpoint":"https://exchange.test","supported_profiles":["ramp-news-v1"]}]',
-            // Production/compose default — opt-in enforcement stays OFF here.
+            // ADR-013 D6.1: enforcement defaults ON; explicitly opt-out for bearer path tests
             RAMP_ENFORCE_BINDING: 'false',
           },
         },

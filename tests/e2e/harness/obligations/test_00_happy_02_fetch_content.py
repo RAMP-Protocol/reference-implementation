@@ -78,11 +78,17 @@ from ..seed import (
     EDGE_PUBLIC_URL,
     SeededFixture,
     _resolve_pg_dsn,
+    _set_allow_broker_relay,
     _upsert_agent,
     _upsert_tenant_ed25519,
     seed_stack,
 )
-from ..signing import AGENT_E2E_KEY_PATH, sign_post
+from ..relay import relay_execute
+from ..signing import (
+    AGENT_E2E_KEY_PATH,
+    build_pop_headers,
+    sign_post,
+)
 from .carriers import assert_signed_url
 
 
@@ -92,8 +98,6 @@ pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 _OBLIGATION_TEXT = (
     "The agent fetches the URL. The resource owner's content is delivered as the response body."
 )
-
-_ACCEPT_OFFER_PATH = "/ramp.v1.ExchangeService/ExecuteTransaction"
 
 # Per-test tenant keeps this module decoupled from any other module's
 # seed state when executors run in parallel against the shared compose
@@ -149,6 +153,7 @@ def spot_offer(
     """
     dsn = _resolve_pg_dsn(str(COMPOSE_FILE))
     _upsert_tenant_ed25519(dsn, tenant_id=_TENANT_ID, domain=_TENANT_DOMAIN)
+    _set_allow_broker_relay(dsn, tenant_id=_TENANT_ID)
     _upsert_agent(dsn, agent_id=_AGENT_ID)
 
     resource_uri = f"{EDGE_PUBLIC_URL}{_PUBLISHER_PATH}"
@@ -165,74 +170,57 @@ def spot_offer(
     yield resource_uri, content_id
 
 
-_DISCOVER_PATH = "/ramp.v1.ExchangeService/DiscoverResources"
-
-
-def _discover_offer(exchange_url: str, resource_uri: str) -> dict[str, Any]:
-    """Call DiscoverResources and return the single per-request Offer.
+def _discover_offer(broker_url: str, resource_uri: str) -> dict[str, Any]:
+    """Call Broker.Resolve and return the single per-request Offer with exchange_endpoint.
 
     Signs AS ``agent-e2e`` (kid == requester.id) so the same identity carries
-    into ExecuteTransaction's caller authz. ``validateTxRequest`` requires
-    BOTH ``offer_id`` and ``offer_signature``; the caller takes both off the
-    SAME discovered Offer so the Exchange's offer-signature re-verification
-    (which binds the signature to the submitted ``offer_id``) succeeds.
+    into ExecuteTransaction's caller authz. The Broker returns offers in
+    ext.ramp.broker.offers with exchange_endpoint for relay routing.
     """
     resp = sign_post(
-        f"{exchange_url}{_DISCOVER_PATH}",
+        f"{broker_url}/broker/v1/resolve",
         body={
+            "ver": "1.0",
+            "id": f"rampreq-{uuid.uuid4().hex}",
             "requester": {
                 "id": _AGENT_ID,
-                "domain": _TENANT_DOMAIN,
                 "uris": [resource_uri],
             },
         },
         key_path=AGENT_E2E_KEY_PATH,
     )
     assert resp.status_code == httpx.codes.OK, (
-        f"DiscoverResources must precede ExecuteTransaction; got "
-        f"{resp.status_code}: {resp.text[:512]}"
+        f"Broker.Resolve must precede ExecuteTransaction; got {resp.status_code}: {resp.text[:512]}"
     )
     payload = cast(dict[str, Any], resp.json())
-    offers = cast(list[dict[str, Any]], payload.get("offers") or [])
-    assert offers, f"DiscoverResources returned no offers for {resource_uri!r}"
+    ext = payload.get("ext", {})
+    offers = ext.get("ramp.broker.offers", [])
+    assert offers, f"Broker.Resolve returned no offers for {resource_uri!r}"
     return offers[0]
 
 
 def _post_execute_transaction(
-    exchange_url: str, offer_id: str, offer_signature: str
+    broker_url: str, exchange_endpoint: str, offer_id: str, offer_signature: str
 ) -> httpx.Response:
-    """Call ExecuteTransaction with an RFC 9421 signature on the request.
+    """Call ExecuteTransaction via Broker relay with RFC 9421 multisig.
 
-    Post-1rnxh: signing is universally mandatory on /ramp.v1.* paths.
-    ExecuteTransaction additionally runs caller authz (resolveCaller +
-    authorizeForAgent): the signing kid must be a registered agent in
-    ramp.agents AND equal requester.id. So this signs AS ``agent-e2e``
-    (``key_path=AGENT_E2E_KEY_PATH``; kid == requester.id == agent-e2e),
-    the stack-wide seeded identity EXCHANGE_BILLING_SEED credits. The
-    transport-only test signer (test-signer-e2e.v1) is NOT in ramp.agents
-    and would be refused at resolveCaller. No ``Authorization`` bearer and
-    no ``X-RAMP-Entitlement-Biscuit`` — SPOT offers do not exercise
-    ``verifySubscriptionCoverage``, so no entitlement biscuit is required.
+    RAMP-56 two-phase flow: agent signs with Exchange URL (final destination),
+    POSTs to Broker relay endpoint. Broker preserves agent sig1 and appends
+    broker sig2 (multisig). Exchange verifies both signatures and binds
+    delivery URL to agent's proven key.
 
-    The transaction surfaces the signed URL on the canonical
-    ``TransactionResponse.retrieval_endpoint`` field (proto-JSON
-    ``retrievalEndpoint``), which the caller asserts on.
+    ExecuteTransaction runs caller authz (resolveCaller + authorizeForAgent):
+    the signing kid must be a registered agent in ramp.agents AND equal
+    requester.id. So this signs AS ``agent-e2e`` (kid == requester.id == agent-e2e),
+    the stack-wide seeded identity EXCHANGE_BILLING_SEED credits.
     """
-    url = f"{exchange_url}{_ACCEPT_OFFER_PATH}"
-    return sign_post(
-        url,
-        body={
-            "ver": "1.0",
-            "id": f"tx-{uuid.uuid4().hex}",
-            "offerId": offer_id,
-            "offerSignature": offer_signature,
-            "requester": {
-                "id": _AGENT_ID,
-                "domain": _TENANT_DOMAIN,
-                "type": "REQUESTER_TYPE_AGENT",
-            },
-        },
-        key_path=AGENT_E2E_KEY_PATH,
+    return relay_execute(
+        broker_url=broker_url,
+        exchange_endpoint=exchange_endpoint,
+        agent_id=_AGENT_ID,
+        offer_id=offer_id,
+        offer_signature=offer_signature,
+        domain=_TENANT_DOMAIN,
     )
 
 
@@ -249,8 +237,9 @@ def test_agent_fetches_signed_url_and_receives_publisher_content(
     Assertion trace:
 
     1. Preceding scenario (happy-1) prerequisite — the agent accepts a
-       SPOT per-request offer, so the Exchange returns a signed URL.
-       Reproduced inline here (ExecuteTransaction call).
+       SPOT per-request offer via RAMP-56 two-phase flow (Broker relay
+       with multisig), so the Exchange returns a signed URL.
+       Reproduced inline here (discovery + ExecuteTransaction relay).
     2. "The agent fetches the URL" — ``httpx.get(signed_url,
        follow_redirects=True)`` with no identity, no Authorization,
        no entitlement biscuit, no RFC 9421 signature. The signed URL
@@ -264,17 +253,23 @@ def test_agent_fetches_signed_url_and_receives_publisher_content(
     assert _OBLIGATION_TEXT  # traceability anchor for the obligation matrix
     resource_uri, expected_offer_id = spot_offer
 
-    offer = _discover_offer(compose_stack.exchange, resource_uri)
-    offer_id = cast(str, offer.get("offerId"))
+    # Phase 1: Discovery - get offer with exchange_endpoint for relay routing
+    offer = _discover_offer(compose_stack.broker, resource_uri)
+    offer_id = cast(str, offer.get("offer_id"))
     offer_signature = cast(str, offer.get("signature"))
+    exchange_endpoint = cast(str, offer.get("exchange_endpoint"))
     assert offer_id == expected_offer_id, (
-        f"DiscoverResources surfaced {offer_id!r}, expected {expected_offer_id!r}"
+        f"Broker.Resolve surfaced {offer_id!r}, expected {expected_offer_id!r}"
     )
     assert offer_signature, "offer must carry a non-empty signature from the Exchange"
+    assert exchange_endpoint, "offer must carry exchange_endpoint for relay routing"
 
-    accept_resp = _post_execute_transaction(compose_stack.exchange, offer_id, offer_signature)
+    # Phase 2: Execute - agent signs with Exchange URL, POSTs to Broker relay
+    accept_resp = _post_execute_transaction(
+        compose_stack.broker, exchange_endpoint, offer_id, offer_signature
+    )
     assert accept_resp.status_code == httpx.codes.OK, (
-        f"SPOT ExecuteTransaction should succeed for per-request offer, "
+        f"SPOT ExecuteTransaction via broker relay should succeed for per-request offer, "
         f"got {accept_resp.status_code}: {accept_resp.text[:256]}"
     )
     accept_payload = accept_resp.json()
@@ -288,7 +283,11 @@ def test_agent_fetches_signed_url_and_receives_publisher_content(
     if compose_stack.edge != EDGE_PUBLIC_URL:
         host_signed_url = signed_url.replace(EDGE_PUBLIC_URL, compose_stack.edge)
 
-    content_resp = httpx.get(host_signed_url, follow_redirects=True, timeout=15.0)
+    # Add proof-of-possession headers for identity binding verification (ADR-013)
+    pop_headers = build_pop_headers(url=signed_url)
+    content_resp = httpx.get(
+        host_signed_url, headers=pop_headers, follow_redirects=True, timeout=15.0
+    )
     # Obligation requires "the resource owner's content is delivered as
     # the response body" — exact 200 status (not a 404 substitute) and
     # the publisher's canary marker present in the body. This test owns the

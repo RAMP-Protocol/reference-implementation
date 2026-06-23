@@ -20,9 +20,11 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentkeys"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig/transportconnect"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/budget"
@@ -92,11 +94,17 @@ func run(logger *slog.Logger) error {
 	prober := probe.New(guardedFetch, logger, probe.Options{
 		Scheme: runhttp.EnvOr("RAMP_PROBE_SCHEME", "https"),
 	})
+	agentResolver := buildAgentResolver(guardedFetch, logger)
 	xpool, agentKeys, err := setupRelayAndKeys(logger)
 	if err != nil {
 		return err
 	}
 	budgetSvc := budget.Select(redisCli, 0, clock.System{})
+
+	// One replay store, shared by the httpsig middleware (signed surfaces) and
+	// the relay handler (which is excluded from that middleware, SEC-01), so
+	// both enforce (keyid, signature) uniqueness against the same window.
+	replay := newBrokerReplayStore(redisCli)
 
 	mux := buildBrokerMux(brokerMuxDeps{
 		pool: pool,
@@ -110,9 +118,11 @@ func run(logger *slog.Logger) error {
 			Signer:    signer,
 			Clk:       clock.System{},
 		},
-		signer:    signer,
-		brokerID:  brokerID,
-		agentKeys: agentKeys,
+		signer:        signer,
+		brokerID:      brokerID,
+		agentKeys:     agentKeys,
+		agentResolver: agentResolver,
+		replay:        replay,
 	})
 
 	// Launch refresher goroutine — fire-and-forget.
@@ -122,7 +132,7 @@ func run(logger *slog.Logger) error {
 	// Request-id is outermost so every route (resolve, well-known, invalidation)
 	// echoes/sets X-Request-ID and carries request_id in context — the same shape
 	// the Exchange applies at its mux root.
-	wrapped := transport.RequestIDMiddleware(logger, wrapWithHTTPSig(mux, agentKeys, redisCli))
+	wrapped := transport.RequestIDMiddleware(logger, wrapWithHTTPSig(mux, agentKeys, agentResolver, replay))
 
 	addr := runhttp.EnvOr("BROKER_ADDR", ":8082")
 	runhttp.Serve("broker", addr, wrapped, logger)
@@ -203,20 +213,45 @@ type brokerMuxDeps struct {
 	signer      *signing.CoSigner
 	brokerID    string
 	agentKeys   *transport.KeyRegistry
+	// agentResolver is the per-agent well-known fallback (nil when disabled).
+	// Composed AFTER agentKeys so a bootstrap-file kid resolves without a fetch.
+	agentResolver httpsig.KeyResolver
+	replay        httpsig.ReplayStore
+}
+
+// relaySig1Resolver composes the static agent-key registry with the per-agent
+// well-known fallback (when enabled) for verifying the relayed agent's sig1.
+func (d brokerMuxDeps) relaySig1Resolver() httpsig.KeyResolver {
+	if d.agentResolver == nil {
+		return d.agentKeys
+	}
+	return httpsig.NewCompositeResolver(d.agentKeys, d.agentResolver)
 }
 
 // buildBrokerMux assembles the Broker's HTTP surface: healthz, /broker/v1/resolve,
-// and the unified /.well-known/ramp.json route. The Exchange relay handler is
-// removed in W3 (deletes ye6f-9 code); W4 will rewire callers to the canonical
-// DiscoverResources/ExecuteTransaction/ReportUsage relay.
+// /broker/v1/exchange/execute (RAMP-56 relay), and the unified /.well-known/ramp.json route.
 func buildBrokerMux(d brokerMuxDeps) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz(d.pool))
 	resolve := transport.NewResolveHandler(d.resolveDeps)
 	// Request-id correlation is applied once at the mux root in run() (see
-	// wrapWithHTTPSig call site), so every route — resolve, well-known, and
-	// invalidation — carries an X-Request-ID, matching the Exchange.
+	// wrapWithHTTPSig call site), so every route — resolve, well-known, relay,
+	// and invalidation — carries an X-Request-ID, matching the Exchange.
 	mux.Handle("POST /broker/v1/resolve", resolve)
+	// RAMP-56: Agent-originated ExecuteTransaction relay. The agent signs the
+	// request (sig1); the broker verifies sig1, confirms the target is a
+	// registered Exchange (SSRF guard), relays verbatim and appends sig2
+	// (multi-label signing); the Exchange verifies both and binds to the
+	// agent's key. relaySig1Resolver verifies sig1 — the static bootstrap file
+	// first, then the per-agent well-known fallback for a never-seen agent.
+	relay := transport.NewExchangeRelayHandler(
+		d.resolveDeps.Exchange,
+		d.relaySig1Resolver(),
+		d.resolveDeps.Exchanges,
+		d.resolveDeps.Clk,
+		d.replay,
+	)
+	mux.Handle("POST /broker/v1/exchange/execute", relay)
 	// BROKER_INVALIDATION_URL is published in the manifest so the Exchange learns
 	// where to poll revocations; BROKER_INVALIDATION_FILE is the operator's
 	// revoked-kid lever served at the route below. Both unset → no revocation
@@ -237,25 +272,59 @@ func buildBrokerMux(d brokerMuxDeps) *http.ServeMux {
 	return mux
 }
 
+// newBrokerReplayStore builds the broker's replay store: Redis-backed when a
+// client is configured (cross-process coordination), else an in-memory store
+// for Redis-less dev. The "httpsig:broker:replay:" namespace lets a shared
+// Redis host the Broker and Exchange replay stores without collision.
+func newBrokerReplayStore(redisCli *redis.Client) httpsig.ReplayStore {
+	if redisCli != nil {
+		return httpsig.NewRedisReplayStore(redisCli, "httpsig:broker:replay:")
+	}
+	return httpsig.NewMemoryReplayStore(nil)
+}
+
 // wrapWithHTTPSig builds the RFC 9421 middleware stack around mux, using the
-// in-memory ramp.json registry for resolution and (optionally) Redis for
+// in-memory ramp.json registry for resolution and the shared replay store for
 // replay protection.
 func wrapWithHTTPSig(
 	mux http.Handler,
 	reg *transport.KeyRegistry,
-	redisCli *redis.Client,
+	agentResolver httpsig.KeyResolver,
+	replay httpsig.ReplayStore,
 ) http.Handler {
-	var replay httpsig.ReplayStore
-	if redisCli != nil {
-		replay = httpsig.NewRedisReplayStore(redisCli, "httpsig:broker:replay:")
-	} else {
-		replay = httpsig.NewMemoryReplayStore(nil)
+	var resolver httpsig.KeyResolver = httpsig.NewStaticResolver(reg.Snapshot())
+	if agentResolver != nil {
+		// Static bootstrap file first (no network for known kids), then the
+		// per-agent well-known fallback for a never-seen agent's signature.
+		resolver = httpsig.NewCompositeResolver(resolver, agentResolver)
 	}
-	resolver := httpsig.NewStaticResolver(reg.Snapshot())
+	// MaxSignatures is intentionally left unset (0 = unbounded): the hop bound is
+	// an Exchange-terminal policy. Bounding it here too would double-count the
+	// relay hop the Broker is about to add (RAMP-56 change set G).
 	return httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{
 		RequestPredicate: brokerSigRequestPredicate,
 		OnError:          transport.LogHTTPSigReject,
+		OnReject:         transportconnect.WriteError,
 	}, mux)
+}
+
+// buildAgentResolver builds the per-agent well-known transport-key resolver
+// (ADR-009 D2): when an agent's kid is absent from the bootstrap keys file, it
+// resolves the key from the agent's own /.well-known/ramp.json so a
+// never-before-seen agent's sig1 verifies at the resolve gate and in the relay
+// handler. Returns nil (resolution disabled) when BROKER_AGENT_WELLKNOWN_RESOLUTION
+// is off; mirrors the Exchange-side resolver.
+func buildAgentResolver(fetch rampwellknown.HTTPDoer, logger *slog.Logger) httpsig.KeyResolver {
+	if !runhttp.EnvBool("BROKER_AGENT_WELLKNOWN_RESOLUTION", true) {
+		return nil
+	}
+	logger.Info("httpsig: per-agent well-known key resolution enabled (ADR-009 D2)")
+	return agentkeys.NewResolver(agentkeys.Config{
+		Client: fetch,
+		Scheme: runhttp.EnvOr("RAMP_MANIFEST_FETCH_SCHEME", ""),
+		Port:   runhttp.EnvOr("RAMP_MANIFEST_FETCH_PORT", ""),
+		Logger: logger,
+	})
 }
 
 // brokerSigRequestPredicate decides whether a request must clear the
@@ -271,6 +340,10 @@ func wrapWithHTTPSig(
 // Unverified paths: healthz, /.well-known/* — public by design.
 func brokerSigRequestPredicate(r *http.Request) bool {
 	path := r.URL.Path
+	// Skip signature verification for the relay endpoint - the Exchange will verify both sigs
+	if path == "/broker/v1/exchange/execute" {
+		return false
+	}
 	if strings.HasPrefix(path, "/broker/v1/") {
 		return true
 	}

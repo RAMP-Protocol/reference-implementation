@@ -39,7 +39,7 @@ func TestBrokerMux_RequestIDCoversWellKnownRoutes(t *testing.T) {
 	// Mirror run(): request-id outermost, wrapping the httpsig-wrapped mux. The
 	// well-known routes are public (brokerSigRequestPredicate), so httpsig passes
 	// them through unverified.
-	handler := transport.RequestIDMiddleware(logger, wrapWithHTTPSig(mux, transport.NewKeyRegistry(), nil))
+	handler := transport.RequestIDMiddleware(logger, wrapWithHTTPSig(mux, transport.NewKeyRegistry(), nil, nil))
 
 	for _, path := range []string{rampwellknown.Path, rampwellknown.InvalidationPath} {
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, http.NoBody)

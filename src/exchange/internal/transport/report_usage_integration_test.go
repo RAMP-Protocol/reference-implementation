@@ -41,8 +41,18 @@ func executeOfferRaw(
 	t *testing.T, h *testHarness, offer *rampv1.Offer,
 ) (*connect.Response[rampv1.TransactionResponse], error) {
 	t.Helper()
+	return executeOfferRawWithID(t, h, offer, "tx-"+t.Name())
+}
+
+// executeOfferRawWithID is executeOfferRaw with an explicit tx_request_id, for
+// tests that drive two transactions in one body — a second call sharing the
+// id would hit the idempotency short-circuit instead of reaching the handler.
+func executeOfferRawWithID(
+	t *testing.T, h *testHarness, offer *rampv1.Offer, id string,
+) (*connect.Response[rampv1.TransactionResponse], error) {
+	t.Helper()
 	return h.exchangeClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", Id: "tx-" + t.Name(),
+		Ver: "1.0", Id: id,
 		OfferId:        stringPtr(offer.GetOfferId()),
 		OfferSignature: stringPtr(offer.GetSignature()),
 		Requester:      &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},

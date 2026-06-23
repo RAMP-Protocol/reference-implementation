@@ -45,9 +45,9 @@ type Querier interface {
 	// Returns reporting obligations whose deadline has passed but which still
 	// sit in PENDING for a specific (tenant_id, agent_id). Joins to
 	// transaction_log because reporting_obligations does not carry tenant_id /
-	// agent_id columns directly. The result drives the AcceptOffer
-	// outstanding-obligations gate: a non-empty list refuses new accepts
-	// with a usage-family reason until the agent files the missing report.
+	// agent_id columns directly. The result drives the ExecuteTransaction
+	// reporting-overdue refusal: a non-empty list refuses the agent's next
+	// transaction with FailedPrecondition until it files the missing report.
 	ListOutstandingObligations(ctx context.Context, arg ListOutstandingObligationsParams) ([]RampReportingObligation, error)
 	// Records the rejection outcome without changing obligation state. The audit
 	// row is written for every rejection so disputes have a trail, but the

@@ -52,7 +52,7 @@ from ..seed import (
     _resolve_pg_dsn,
     seed_stack,
 )
-from ..signing import AGENT_E2E_KEY_PATH
+from ..signing import AGENT_E2E_KEY_PATH, build_pop_headers
 from .carriers import assert_signed_url
 
 
@@ -300,16 +300,18 @@ def test_agent_as_own_principal_lists_accepts_and_fetches_public_resource(
     # (a) rewrite the netloc to the host-published port for TCP routing
     # AND (b) carry a `Host: edge:8787` header so Workerd reconstructs
     # c.req.url with the original signed authority — see the
-    # `_host_url` module-level comment in tests/e2e/harness/test_full_stack.py.
+    # `host_url` module docstring in tests/e2e/harness/edge_routing.py.
     host_signed_url = signed_url
     extra_headers: dict[str, str] = {}
     if compose_stack.edge != EDGE_PUBLIC_URL:
         host_signed_url = signed_url.replace(EDGE_PUBLIC_URL, compose_stack.edge)
         extra_headers["Host"] = EDGE_PUBLIC_HOST
-    # Edge fetch carries no RFC 9421 signature — the signed URL itself
-    # is the cryptographic credential the edge verifies. The
-    # delegation-header guard still applies: no Authorization bearer
-    # and no entitlement biscuit should leak onto the edge fetch.
+    # ADR-013: Edge fetch requires RFC 9421 proof-of-possession signature to
+    # verify agent identity binding. The agent presents its public key
+    # (X-RAMP-Agent-Key) and signs @method + @target-uri. The delegation-header
+    # guard still applies: no Authorization bearer and no entitlement biscuit.
+    pop_headers = build_pop_headers(url=signed_url)
+    extra_headers.update(pop_headers)
     content_resp = httpx.get(host_signed_url, headers=extra_headers, timeout=30.0)
     _assert_no_delegation_credentials_on_wire(content_resp)
     assert content_resp.status_code == httpx.codes.OK, (

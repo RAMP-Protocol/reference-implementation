@@ -7,7 +7,10 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig/transportconnect"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 )
 
@@ -47,5 +50,44 @@ func RequestIDMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 // httpsig interceptor only invokes OnError with a non-nil err.
 func LogHTTPSigReject(r *http.Request, err error) {
 	reqctx.FromContext(r.Context()).WarnContext(r.Context(), "httpsig: reject",
-		"path", r.URL.Path, "err", err.Error())
+		"path", r.URL.Path, "outcome", transportconnect.RejectOutcome(err), "err", err.Error())
+}
+
+// GlobalSigRequestPredicate decides whether a request must clear the
+// static-resolver httpsig gate. Every non-Catalog /ramp.* request MUST be
+// signed and MUST be verified — RFC 9421 is the universal transport-layer
+// authentication. Catalog paths are excluded only because
+// CatalogSignatureMiddleware runs a different signer further down the stack
+// (per-contributor with lazy ramp.json self-signup); they are still verified,
+// just via a different mechanism. Paths outside the /ramp.* namespace (healthz,
+// /.well-known, etc.) are public.
+func GlobalSigRequestPredicate(r *http.Request) bool {
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/ramp.v1.CatalogService/") {
+		return false
+	}
+	return strings.HasPrefix(path, "/ramp.")
+}
+
+// WrapPublicSurface assembles the Exchange's public HTTP middleware stack —
+// RequestIDMiddleware → RFC 9421 httpsig.Middleware → CatalogSignatureMiddleware
+// → mux. Shared by cmd/server (buildWrapped) and the integration harness
+// (startExchangeServer) so both exercise identical wiring, including the
+// hop-bound MaxSignatures (ADR-013 D5 / RAMP-56). maxSignatures == 0 means
+// unbounded (per httpsig.InterceptorOptions.MaxSignatures).
+func WrapPublicSurface(
+	logger *slog.Logger,
+	resolver httpsig.KeyResolver,
+	replay httpsig.ReplayStore,
+	maxSignatures int,
+	mux http.Handler,
+) http.Handler {
+	inner := CatalogSignatureMiddleware(mux)
+	sig := httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{
+		RequestPredicate: GlobalSigRequestPredicate,
+		OnError:          LogHTTPSigReject,
+		OnReject:         transportconnect.WriteError,
+		MaxSignatures:    maxSignatures,
+	}, inner)
+	return RequestIDMiddleware(logger, sig)
 }

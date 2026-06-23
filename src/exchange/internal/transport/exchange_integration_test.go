@@ -51,6 +51,12 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}
+	// Version-skew fix: the Exchange MUST stamp Ver = "1.0" on the RAMP responses
+	// it emits. Assert the literal (not rampproto.Ver) so a regression in the
+	// constant fails here instead of echoing whatever value it currently holds.
+	if got := discovered.Msg.GetVer(); got != "1.0" {
+		t.Errorf("DiscoverResources response Ver = %q, want %q", got, "1.0")
+	}
 	offers := discovered.Msg.GetOffers()
 	if len(offers) != 1 {
 		t.Fatalf("offers len = %d", len(offers))
@@ -74,6 +80,9 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 	}))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
+	}
+	if got := execResp.Msg.GetVer(); got != "1.0" {
+		t.Errorf("ExecuteTransaction response Ver = %q, want %q", got, "1.0")
 	}
 	if execResp.Msg.GetTransactionId() == "" {
 		t.Fatal("transaction id empty")

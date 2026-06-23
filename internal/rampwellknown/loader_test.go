@@ -14,7 +14,7 @@ import (
 
 func newLoaderFor(clk clock.Clock) *rampwellknown.Loader {
 	return rampwellknown.NewLoader(rampwellknown.LoaderOptions{
-		Fetch:       rampwellknown.FetchOptions{Client: http.DefaultClient},
+		Fetch:       rampwellknown.FetchOptions{Client: testutil.Client()},
 		Clk:         clk,
 		ManifestTTL: time.Hour,
 	})
@@ -205,7 +205,7 @@ func TestLoaderRun_PollerAppliesRevocation(t *testing.T) {
 
 	clk := clock.NewDeterministic(anchor)
 	l := rampwellknown.NewLoader(rampwellknown.LoaderOptions{
-		Fetch:        rampwellknown.FetchOptions{Client: http.DefaultClient},
+		Fetch:        rampwellknown.FetchOptions{Client: testutil.Client()},
 		Clk:          clk,
 		ManifestTTL:  100 * time.Hour, // never expires during the test → isolate the poller
 		PollInterval: 10 * time.Second,

@@ -75,6 +75,11 @@ const (
 	// "stolen authority replayed without fresh attenuation" mode
 	// separately from the missing/malformed/expired/wrong-buyer modes.
 	KindEntitlementStaleAttenuation
+	// KindUnavailable signals a transient upstream dependency failure (e.g.
+	// the caller's /.well-known/ramp.json host is unreachable during ADR-009
+	// D2 lazy registration). Distinct from KindInternal so the caller learns
+	// the request is retryable rather than a server fault.
+	KindUnavailable
 )
 
 // Error is the canonical domain error. Handlers receive it from the service
@@ -116,6 +121,7 @@ var kindStrings = map[Kind]string{
 	KindSubscriptionLapsed:          "subscription_lapsed",
 	KindEntitlementNotGranted:       "entitlement_not_granted",
 	KindEntitlementStaleAttenuation: "entitlement_stale_attenuation",
+	KindUnavailable:                 "unavailable",
 }
 
 // String renders Kind for logging.
@@ -149,6 +155,8 @@ func (k Kind) ConnectCode() connect.Code {
 		return connect.CodePermissionDenied
 	case KindUnimplemented:
 		return connect.CodeUnimplemented
+	case KindUnavailable:
+		return connect.CodeUnavailable
 	case KindEntitlementMissing,
 		KindEntitlementMalformed,
 		KindEntitlementExpired,

@@ -136,6 +136,10 @@ type exchangeServerDeps struct {
 	// the URL-sign-failure hot path. The well-known RSA wiring
 	// still uses deps.keystore.
 	keystoreOverride signing.KeyStore
+	// maxSignatures bounds the inbound signature (hop) chain depth, mirroring
+	// the production ceiling (cmd/server/main.go: max_intermediary_hops + 1).
+	// 0 → unbounded — the default for tests that do not exercise the hop bound.
+	maxSignatures int
 }
 
 // startExchangeServer wires the Exchange's public HTTP surface — Connect-Go
@@ -173,6 +177,7 @@ func startExchangeServer(t *testing.T, deps exchangeServerDeps) *exchangeServerF
 		Catalog:      catalogSvc,
 		Tenants:      repo.NewTenantRepo(deps.queries),
 		Agents:       repo.NewAgentRepo(deps.queries),
+		AgentReg:     deps.registry,
 		Transactions: repo.NewTransactionRepo(deps.queries),
 		Obligations:  repo.NewObligationRepo(deps.queries),
 		Billing:      deps.bill,
@@ -180,6 +185,7 @@ func startExchangeServer(t *testing.T, deps exchangeServerDeps) *exchangeServerF
 		KeyStore:     svcKeyStore,
 		Config:       service.ExchangeConfig{Exchange: "exchange.ramp.test"},
 		Clk:          deps.clk,
+		Logger:       deps.logger,
 	})
 
 	mux := http.NewServeMux()
@@ -217,18 +223,15 @@ func startExchangeServer(t *testing.T, deps exchangeServerDeps) *exchangeServerF
 	transport.NewAgentsRegisterHandler(deps.registry, transport.AgentsRegisterOptions{}).
 		RegisterRoutes(mux)
 
-	// Production parity (cmd/server/main.go::buildWrapped): wrap with the
-	// global httpsig gate so every /ramp.* request except /ramp.v1.CatalogService/*
-	// must clear the static-resolver verification. Catalog paths run their
-	// own per-contributor signer in CatalogSignatureMiddleware further down.
+	// Production parity: drive the SAME shared constructor cmd/server's
+	// buildWrapped uses, so the integration suite exercises the real wiring —
+	// including the hop-bound MaxSignatures (deps.maxSignatures), which
+	// buildWrapped sets to max_intermediary_hops + 1.
 	resolver := httpsig.NewStaticResolver(deps.httpsigKeys)
 	replay := httpsig.NewMemoryReplayStore(time.Now)
-	inner := transport.CatalogSignatureMiddleware(mux)
-	sig := httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{
-		RequestPredicate: exchangeGlobalSigRequestPredicate,
-		OnError:          transport.LogHTTPSigReject,
-	}, inner)
-	server := httptest.NewServer(transport.RequestIDMiddleware(deps.logger, sig))
+	server := httptest.NewServer(
+		transport.WrapPublicSurface(deps.logger, resolver, replay, deps.maxSignatures, mux),
+	)
 	t.Cleanup(server.Close)
 
 	base := server.Client().Transport
@@ -244,20 +247,6 @@ func startExchangeServer(t *testing.T, deps exchangeServerDeps) *exchangeServerF
 		rsaPub:        &rsaPriv.PublicKey,
 		rsaKid:        rsaKid,
 	}
-}
-
-// exchangeGlobalSigRequestPredicate is a verbatim duplicate of the
-// production predicate at src/exchange/cmd/server/main.go:214-220. Kept
-// in the test file rather than exported from cmd/ to avoid widening the
-// production package's surface for a 5-line function. If the production
-// predicate ever changes, this copy must change with it; the duplication
-// is honest about the test mirroring main.go's wiring.
-func exchangeGlobalSigRequestPredicate(r *http.Request) bool {
-	path := r.URL.Path
-	if strings.HasPrefix(path, "/ramp.v1.CatalogService/") {
-		return false
-	}
-	return strings.HasPrefix(path, "/ramp.")
 }
 
 // signingClientTransport is an http.RoundTripper that signs outbound
@@ -342,12 +331,18 @@ type testHarness struct {
 	// with — the key the httpsig middleware verifies and the delivery-URL
 	// binding derives its RFC 7638 thumbprint from (ADR-013).
 	callerPub ed25519.PublicKey
+	// callerPriv is the Ed25519 private key for the default agent-test caller.
+	// Exposed for multisig test setup.
+	callerPriv ed25519.PrivateKey
 	// resolver lets cross-tenant + broker-relay tests register extra
 	// caller keyIDs dynamically (see addCaller below).
 	resolver *httpsig.StaticResolver
 	// baseTransport is the underlying RoundTripper Connect-Go clients
 	// chain their signing transports onto.
 	baseTransport http.RoundTripper
+	// multisigClient is set only when a multisig harness is created; signs
+	// requests with both agent and broker keys.
+	multisigClient rampconnect.ExchangeServiceClient
 }
 
 // exchangeDBFixture carries the shared test infrastructure produced by
@@ -446,6 +441,18 @@ func newTestHarnessWithClock(t *testing.T, clk *clock.DeterministicClock) *testH
 	return newTestHarnessWith(t, harnessOptions{clk: clk})
 }
 
+// newRecordingHarnessCapturingLogs is newRecordingHarness with the service
+// logger wired to a JSON handler over the returned safeBuffer, so one test can
+// assert BOTH billing-call observations (via the recordingAdapter) and
+// audit-log lines (via the buffer). Bring-up delegates to newRecordingHarnessWith
+// (Testing Doctrine #7). The buffer is safe for concurrent server/test access.
+func newRecordingHarnessCapturingLogs(t *testing.T) (*testHarness, *recordingAdapter, *safeBuffer) {
+	t.Helper()
+	buf := &safeBuffer{}
+	h, rec := newRecordingHarnessWith(t, harnessOptions{logger: slog.New(slog.NewJSONHandler(buf, nil))})
+	return h, rec, buf
+}
+
 // harnessOptions parameterises newTestHarnessWith. All fields are optional.
 type harnessOptions struct {
 	// clk controls the service clock; nil → clock.System{}.
@@ -465,6 +472,14 @@ type harnessOptions struct {
 	// InMemoryKeyStore. A failing keystore drives the URL-sign-failure hot
 	// path.
 	keystore signing.KeyStore
+	// logger overrides the service logger; nil → the io.Discard logger from
+	// setupExchangeTestDB. Pass a JSON handler over a safeBuffer to assert
+	// audit-log lines (e.g. denial outcomes).
+	logger *slog.Logger
+	// maxSignatures bounds the inbound signature (hop) chain depth at the
+	// global httpsig gate; 0 → unbounded. Set to mirror the production ceiling
+	// (max_intermediary_hops + 1) when exercising the hop bound.
+	maxSignatures int
 }
 
 // newTestHarnessWith is the shared bring-up behind every transport integration
@@ -478,6 +493,9 @@ func newTestHarnessWith(t *testing.T, opts harnessOptions) *testHarness {
 	fx := setupExchangeTestDB(t, "agent-test")
 	ctx, logger, pool, queries, keystore := fx.ctx, fx.logger, fx.pool, fx.queries, fx.keystore
 	tenantID, tenantDomain := fx.tenantID, fx.tenantDomain
+	if opts.logger != nil {
+		logger = opts.logger
+	}
 
 	offerSigner, err := signing.GenerateEd25519Signer()
 	if err != nil {
@@ -521,6 +539,7 @@ func newTestHarnessWith(t *testing.T, opts harnessOptions) *testHarness {
 		clk:              srvClk,
 		txRunner:         opts.txRunner,
 		keystoreOverride: opts.keystore,
+		maxSignatures:    opts.maxSignatures,
 	})
 	if err := srv.catalogSvc.Bootstrap(ctx); err != nil {
 		t.Fatalf("catalog bootstrap: %v", err)
@@ -545,6 +564,7 @@ func newTestHarnessWith(t *testing.T, opts harnessOptions) *testHarness {
 		tenantID:       tenantID,
 		tenantDomain:   tenantDomain,
 		callerPub:      callerPub,
+		callerPriv:     callerPriv,
 		resolver:       srv.resolver,
 		baseTransport:  srv.baseTransport,
 	}
@@ -614,94 +634,72 @@ func (h *testHarness) enableBrokerRelay(t *testing.T, tenantID string) {
 	}
 }
 
-func mustBillingAmount(t *testing.T, raw, ccy string) billing.Amount {
+// newTestHarnessWithBroker creates a test harness with multisig support:
+// registers a broker, enables broker relay for the tenant, and creates a
+// multisigClient that signs with both agent and broker keys.
+func newTestHarnessWithBroker(t *testing.T) *testHarness {
 	t.Helper()
-	a, err := billing.NewAmount(raw, ccy)
+	h := newTestHarness(t)
+	h.enableBrokerRelay(t, h.tenantID)
+	h.addBrokerAndMultisigClient(t)
+	return h
+}
+
+// newTestHarnessWithBrokerNoRelay creates a test harness with a broker but
+// WITHOUT enabling broker relay (allow_broker_relay=false). Used to test
+// rejection scenarios.
+func newTestHarnessWithBrokerNoRelay(t *testing.T) *testHarness {
+	t.Helper()
+	h := newTestHarness(t)
+	h.addBrokerAndMultisigClient(t)
+	return h
+}
+
+// addBrokerAndMultisigClient registers a broker agent and creates a multisig
+// client that signs with both agent and broker keys.
+func (h *testHarness) addBrokerAndMultisigClient(t *testing.T) {
+	t.Helper()
+	brokerPub, brokerPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("NewAmount: %v", err)
+		t.Fatalf("broker ed25519: %v", err)
 	}
-	return a
+	brokerID := "broker.example"
+	h.resolver.Put(brokerID, brokerPub)
+	if _, err := h.queries.UpsertAgent(h.ctx, sqlc.UpsertAgentParams{
+		AgentID:       brokerID,
+		PublicKey:     brokerPub,
+		RequesterType: sqlc.RampRequesterType("BROKER"),
+	}); err != nil {
+		t.Fatalf("upsert broker: %v", err)
+	}
+	h.multisigClient = newMultisigClient(h.baseTransport, h.server.URL,
+		"agent-test", h.callerPriv, brokerID, brokerPriv)
 }
 
-// stringPtr returns a pointer to s (generic proto optional-string helper).
-func stringPtr(s string) *string { return &s }
-
-// ceAs is a thin errors.As wrapper for *connect.Error to keep test ergonomics
-// compact.
-func ceAs(err error, target **connect.Error) bool {
-	var ce *connect.Error
-	if err == nil {
-		return false
-	}
-	ok := errors.As(err, &ce)
-	if ok {
-		*target = ce
-	}
-	return ok
+// newMultisigClient creates a Connect-Go client that signs with both agent and
+// broker keys (multisig). Agent signature first, broker signature appended.
+func newMultisigClient(base http.RoundTripper, serverURL, agentID string, agentPriv ed25519.PrivateKey, brokerID string, brokerPriv ed25519.PrivateKey) rampconnect.ExchangeServiceClient {
+	client := &http.Client{Transport: &multisigTransport{base, agentID, agentPriv, brokerID, brokerPriv}}
+	return rampconnect.NewExchangeServiceClient(client, serverURL, connect.WithGRPC())
 }
 
-// tenantDrain returns an authorize request that subtracts the full seed
-// balance so subsequent authorizations fail.
-func tenantDrain(t *testing.T) billing.AuthorizeRequest {
-	t.Helper()
-	return billing.AuthorizeRequest{
-		TenantID: "t", AgentID: "agent-test",
-		UnitCost: mustBillingAmount(t, "10.00", "USD"),
-		Quantity: 1, Unit: "access",
-	}
+// multisigTransport adds both agent and broker signatures to requests.
+type multisigTransport struct {
+	base       http.RoundTripper
+	agentID    string
+	agentPriv  ed25519.PrivateKey
+	brokerID   string
+	brokerPriv ed25519.PrivateKey
 }
 
-// assertConnectCode fails the test unless err is a *connect.Error whose Code
-// equals want. The error MUST be non-nil. Consolidated here so every
-// transport-layer integration test asserts Connect codes with the same shape.
-func assertConnectCode(t *testing.T, err error, want connect.Code) {
-	t.Helper()
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	var ce *connect.Error
-	if !ceAs(err, &ce) {
-		t.Fatalf("not connect.Error: %v", err)
-	}
-	if ce.Code() != want {
-		t.Fatalf("code = %v (msg %q), want %v", ce.Code(), ce.Message(), want)
-	}
-}
-
-// assertConnectError combines assertConnectCode with a substring check on
-// the error message. Used to pin the textual field-name detail produced by
-// the validator.
-func assertConnectError(t *testing.T, err error, want connect.Code, wantInMsg string) {
-	t.Helper()
-	assertConnectCode(t, err, want)
-	var ce *connect.Error
-	_ = ceAs(err, &ce)
-	if wantInMsg != "" && !strings.Contains(ce.Message(), wantInMsg) {
-		t.Errorf("message %q does not contain %q", ce.Message(), wantInMsg)
-	}
-}
-
-// assertObligationState asserts the (state, validation_outcome) pair on the
-// most-recent obligation for the given transaction. validated_at MUST be
-// populated whenever wantOutcome is non-empty (every
-// validation attempt stamps the audit timestamp).
-func assertObligationState(t *testing.T, h *testHarness, txID string, wantState, wantOutcome string) {
-	t.Helper()
-	ob, err := h.queries.GetObligationByTransaction(h.ctx, txID)
-	if err != nil {
-		t.Fatalf("GetObligationByTransaction: %v", err)
-	}
-	if string(ob.State) != wantState {
-		t.Errorf("state = %q, want %q", ob.State, wantState)
-	}
-	gotOutcome := ""
-	if ob.ValidationOutcome.Valid {
-		gotOutcome = string(ob.ValidationOutcome.RampValidationOutcome)
-	}
-	if gotOutcome != wantOutcome {
-		t.Errorf("validation_outcome = %q, want %q", gotOutcome, wantOutcome)
-	}
-	if wantOutcome != "" && !ob.ValidatedAt.Valid {
-		t.Errorf("validated_at not set; expected timestamp for outcome %q", wantOutcome)
-	}
+// RoundTrip signs with agent key, then appends broker signature.
+func (t *multisigTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	body, _ := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	now := time.Now()
+	created, expires := now.Unix(), now.Add(5*time.Minute).Unix()
+	_ = httpsig.SignRequestRAMP(req, body, t.agentID, t.agentPriv, created, expires)
+	_ = httpsig.AppendSignatureRAMP(req, body, t.brokerID, t.brokerPriv, created, expires)
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	return t.base.RoundTrip(req)
 }

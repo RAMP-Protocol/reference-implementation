@@ -2,36 +2,21 @@
 // @cloudflare/vitest-pool-workers / workerd module loader fails to collect a
 // test file named *binding* ("No test suite found"). "bearerdefault" captures
 // the same intent (the bearer-by-default posture). Do not rename to *binding*.
-import { SELF, fetchMock } from 'cloudflare:test';
+import { SELF } from 'cloudflare:test';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { thumbprint } from '../src/thumbprint.js';
-import {
-  type TestKeypair,
-  generateKeypair,
-  manifestWithKeys,
-  rawPublicKey,
-  signUrl,
-} from './helpers/ed25519.js';
-
-const PUB_ORIGIN = 'https://pub.example.com';
+import { type TestKeypair, generateKeypair, rawPublicKey, signUrl } from './helpers/ed25519.js';
+import { PUB_ORIGIN, setupE2ETest, setupRampJsonMock } from './helpers/test-setup.js';
 
 let keypair: TestKeypair;
 
 beforeAll(async () => {
-  keypair = await generateKeypair('k1');
-  fetchMock.activate();
-  fetchMock.disableNetConnect();
+  keypair = await setupE2ETest();
 });
 
 beforeEach(() => {
-  fetchMock
-    .get('https://exchange.test')
-    .intercept({ path: '/.well-known/ramp.json', method: 'GET' })
-    .reply(200, manifestWithKeys([keypair.publicJwk]), {
-      headers: { 'content-type': 'application/json' },
-    })
-    .persist();
+  setupRampJsonMock(keypair);
 });
 
 // This suite runs under vitest.binding-off.config.ts with RAMP_ENFORCE_BINDING

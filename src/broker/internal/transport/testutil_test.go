@@ -89,16 +89,23 @@ type mockExchange struct {
 	// Usage.ConsumedQuantity on the synthesised UsageReport so tests can
 	// pin that the relay actually populated the payload.
 	offerEstimatedQuantity int32
-	// lastReport captures the most-recent UsageReport seen by ReportUsage so
-	// tests can assert the full payload (e.g. Usage.ConsumedQuantity is what
-	// the broker relay populated). Without this, a finger-counter on
-	// reportCalls cannot pin the contract.
-	lastReport *rampv1.UsageReport
+	// lastQuery captures the inbound ResourceQuery so tests can assert the Broker
+	// stamps Ver = "1.0" on the message it emits upstream (version-skew fix).
+	// Without capture, a regression to "0.3" would pass CI green.
+	lastQuery *rampv1.ResourceQuery
+	// lastExecuteVer captures the ver on the inbound TransactionRequest the
+	// Exchange received. The Broker relays the agent's signed body byte-for-byte
+	// (it must not re-marshal, or it would break the agent's Content-Digest), so
+	// this is the agent's ver passed through unchanged. Tests assert it equals the
+	// canonical wire version to pin that the relay leg carries a 1.0-stamped agent
+	// message; without capture, a stale "0.3" would slip through silently.
+	lastExecuteVer string
 }
 
 func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request[rampv1.ResourceQuery]) (*connect.Response[rampv1.ResourceResponse], error) {
 	m.mu.Lock()
 	m.discoverCalls++
+	m.lastQuery = req.Msg
 	cost := m.offerUnitCost
 	scopeRestricted := m.scopeRestricted
 	m.mu.Unlock()
@@ -109,7 +116,7 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 			uri = uris[0]
 		}
 		return connect.NewResponse(&rampv1.ResourceResponse{
-			Ver: "0.3",
+			Ver: "1.0",
 			Id:  req.Msg.GetId(),
 			OfferGroups: []*rampv1.OfferGroup{{
 				Uri:           uri,
@@ -134,7 +141,7 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 		Reporting: &rampv1.ReportingObligation{Required: true},
 	}
 	return connect.NewResponse(&rampv1.ResourceResponse{
-		Ver:    "0.3",
+		Ver:    "1.0",
 		Id:     req.Msg.GetId(),
 		Offers: []*rampv1.Offer{offer},
 	}), nil
@@ -144,10 +151,11 @@ func (m *mockExchange) ExecuteTransaction(_ context.Context, req *connect.Reques
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.executeCalls++
+	m.lastExecuteVer = req.Msg.GetVer()
 	if m.denyTransaction {
 		reason := rampv1.DenialReason_DENIAL_REASON_INSUFFICIENT_BALANCE
 		return connect.NewResponse(&rampv1.TransactionResponse{
-			Ver:          "0.3",
+			Ver:          "1.0",
 			Id:           req.Msg.GetId(),
 			DenialReason: &reason,
 		}), nil
@@ -160,7 +168,7 @@ func (m *mockExchange) ExecuteTransaction(_ context.Context, req *connect.Reques
 	// mutex-guarded struct field.
 	signedURL := m.signedURL
 	return connect.NewResponse(&rampv1.TransactionResponse{
-		Ver:               "0.3",
+		Ver:               "1.0",
 		Id:                req.Msg.GetId(),
 		TransactionId:     &txID,
 		BillingId:         &billID,
@@ -172,7 +180,6 @@ func (m *mockExchange) ExecuteTransaction(_ context.Context, req *connect.Reques
 func (m *mockExchange) ReportUsage(_ context.Context, req *connect.Request[rampv1.UsageReport]) (*connect.Response[rampv1.UsageReportResponse], error) {
 	m.mu.Lock()
 	m.reportCalls++
-	m.lastReport = req.Msg
 	m.mu.Unlock()
 	return connect.NewResponse(&rampv1.UsageReportResponse{Accepted: true, ReportId: "rep-" + req.Msg.GetId()}), nil
 }
@@ -187,6 +194,18 @@ func (m *mockExchange) RequestDomainVerification(_ context.Context, _ *connect.R
 
 func (m *mockExchange) ConfirmDomainVerification(_ context.Context, _ *connect.Request[rampv1.DomainVerificationConfirmation]) (*connect.Response[rampv1.DomainVerificationResult], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, nil)
+}
+
+// assertEmittedVer fails the test unless got equals the canonical RAMP wire
+// version "1.0". Used to pin that the Broker stamps the protocol version on
+// every proto message it emits upstream (version-skew fix). The literal "1.0"
+// is asserted directly — not internal/proto.Ver — so the test pins the wire
+// contract value rather than echoing whatever the constant currently holds.
+func assertEmittedVer(t *testing.T, name, got string) {
+	t.Helper()
+	if got != "1.0" {
+		t.Errorf("emitted %s.Ver = %q, want %q", name, got, "1.0")
+	}
 }
 
 func startMockExchange(tb testing.TB, m *mockExchange) string {

@@ -1,12 +1,14 @@
 package transport
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 )
 
@@ -121,6 +123,18 @@ func (r *KeyRegistry) Lookup(kid string) (ed25519.PublicKey, bool) {
 	defer r.mu.RUnlock()
 	pub, ok := r.keys[kid]
 	return pub, ok
+}
+
+// Resolve implements httpsig.KeyResolver over the live registry. Unlike the
+// frozen snapshot the inbound middleware wraps, this view reflects keys
+// registered after boot — used by the relay handler to verify agent
+// signatures (sig1) before forwarding to the Exchange.
+func (r *KeyRegistry) Resolve(_ context.Context, keyID string) (ed25519.PublicKey, error) {
+	pub, ok := r.Lookup(keyID)
+	if !ok {
+		return nil, fmt.Errorf("%w: keyid=%q", httpsig.ErrUnknownKey, keyID)
+	}
+	return pub, nil
 }
 
 // Snapshot returns the current keys as an ed25519-pubkey map. The caller

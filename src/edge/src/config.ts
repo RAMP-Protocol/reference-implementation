@@ -42,14 +42,16 @@ const EnvSchema = z.object({
    */
   RAMP_VERIFY_KEYS: z.string().optional(),
   /**
-   * Delivery-URL identity binding enforcement (ADR-013 D1/D6). When set to
-   * "true", a signed URL carrying agent_id requires the fetcher to prove
-   * possession of the bound key. Default is OFF (bearer security: short TTL +
-   * TLS) because v1's canonical agent topology is MCP→Broker→Exchange: the
-   * Exchange binds the URL to the proven caller, which on the relay path is the
-   * broker, not the fetching agent — so proof-of-possession is unsatisfiable
-   * there until the binding identity is reworked (ADR-013 D6 keeps enforcement
-   * OPTIONAL). Enable only on deployments whose fetcher holds the bound key.
+   * Delivery-URL identity binding enforcement (ADR-013 D1/D6.1). A signed URL
+   * carrying agent_id requires the fetcher to prove possession of the bound key.
+   * Default is ON for capable edges (see buildDeps: enforce unless the value is
+   * exactly "false"). Set to "false" only on deployments whose fetcher cannot
+   * hold the bound key — e.g. CloudFront-native edges, where verification runs
+   * in the trusted key group rather than this worker. The earlier OFF default
+   * (ADR-013 D6) assumed the relay path bound the URL to the broker; D6.1 binds
+   * it to the agent's proven key (Exchange uses the agent's signature, not the
+   * broker's), which makes proof-of-possession satisfiable and ON the safe
+   * default.
    */
   RAMP_ENFORCE_BINDING: z.enum(['true', 'false']).optional(),
 });
@@ -74,7 +76,9 @@ export function buildDeps(env: EdgeEnv): AppDeps {
     manifest,
     exchangeUrl: env.EXCHANGE_URL,
     resolveKey: (kid) => cache.resolve(kid),
-    enforceBinding: env.RAMP_ENFORCE_BINDING === 'true',
+    // ADR-013 D6.1: enforcement defaults ON for capable edges (opt-out via '!= false')
+    // CloudFront-native edges set RAMP_ENFORCE_BINDING=false explicitly (technically incapable)
+    enforceBinding: env.RAMP_ENFORCE_BINDING !== 'false',
     ...(env.RSL_BODY !== undefined ? { rslBody: env.RSL_BODY } : {}),
     ...(acmeTokens !== undefined ? { acmeTokens } : {}),
     ...(env.ORIGIN_URL !== undefined ? { originUrl: env.ORIGIN_URL } : {}),

@@ -156,13 +156,19 @@ from ..seed import (
     EDGE_PUBLIC_URL,
     SeededFixture,
     _resolve_pg_dsn,
+    _set_allow_broker_relay,
     _upsert_agent,
     _upsert_catalog_contributor,
     _upsert_exchange,
     _upsert_tenant_ed25519,
     seed_stack,
 )
-from ..signing import AGENT_E2E_KEY_PATH, sign_post
+from ..relay import relay_execute
+from ..signing import (
+    AGENT_E2E_KEY_PATH,
+    build_pop_headers,
+    sign_post,
+)
 from .carriers import assert_signed_url
 
 # ADR-008 D5 — declare stack-isolation contract.
@@ -174,8 +180,6 @@ _OBLIGATION_TEXT = (
     "URI, price, currency, and timestamp."
 )
 
-_DISCOVER_PATH = "/ramp.v1.ExchangeService/DiscoverResources"
-_ACCEPT_OFFER_PATH = "/ramp.v1.ExchangeService/ExecuteTransaction"
 _REPORT_USAGE_PATH = "/ramp.v1.ExchangeService/ReportUsage"
 
 # Per-test tenant — the COUNT=1 assertion wants the ledger scoped so
@@ -362,6 +366,7 @@ def spot_offer(
         cur.execute("DELETE FROM ramp.catalog WHERE tenant_id = %s", (_TENANT_ID,))
         conn.commit()
     _upsert_tenant_ed25519(dsn, tenant_id=_TENANT_ID, domain=_TENANT_DOMAIN)
+    _set_allow_broker_relay(dsn, tenant_id=_TENANT_ID)
     _upsert_agent(dsn, agent_id=_AGENT_ID)
     _upsert_catalog_contributor(dsn, pubkey_bytes=load_public_key_bytes(CONTRIBUTOR_KEY_PATH))
     push_catalog(
@@ -394,17 +399,6 @@ def spot_offer(
         _delete_spot_offer(dsn, resource_id)
 
 
-def _post_json(url: str, body: dict[str, object]) -> httpx.Response:
-    """POST a signed JSON request to ``url``.
-
-    Post-1rnxh: signing is universally mandatory on /ramp.v1.* paths.
-    The agent signs as its own principal (kid == requester.id == agent-e2e,
-    registered in deploy/broker/keys.json + ramp.agents), which the
-    Exchange caller authz requires on ExecuteTransaction / ReportUsage.
-    """
-    return sign_post(url, body=body, key_path=AGENT_E2E_KEY_PATH)
-
-
 def _post_report_usage(exchange_url: str, transaction_id: str, billing_id: str) -> httpx.Response:
     """POST a signed ReportUsage to the Exchange for ``transaction_id``.
 
@@ -415,7 +409,7 @@ def _post_report_usage(exchange_url: str, transaction_id: str, billing_id: str) 
     offer's seeded estimated_quantity so the ±20% tolerance check passes.
     """
     body: dict[str, Any] = {
-        "ver": "0.3",
+        "ver": "1.0",
         "id": f"report-{uuid.uuid4().hex}",
         "transactionId": transaction_id,
         "billingId": billing_id,
@@ -474,54 +468,49 @@ def test_paid_usage_record_shows_uri_price_currency_and_timestamp(
     assert _OBLIGATION_TEXT  # traceability anchor for the obligation matrix
     offer_id, resource_uri = spot_offer
 
-    # Discover the offer to obtain its Exchange-minted signature —
+    # Phase 1: Discovery via Broker.resolve — get offer with exchange_endpoint
     # ExecuteTransaction validateTxRequest requires both offer_id AND
-    # offer_signature post-1rnxh + rjtks. The discover call signs the
-    # request with the test signer key (transport identity) and carries
-    # the agent on requester.id (service-layer identity).
-    discover_url = f"{compose_stack.exchange}{_DISCOVER_PATH}"
-    discover_resp = _post_json(
-        discover_url,
-        {
+    # offer_signature. Broker.resolve returns offers in ext.ramp.broker.offers
+    # with exchange_endpoint for relay routing.
+    discover_resp = sign_post(
+        f"{compose_stack.broker}/broker/v1/resolve",
+        body={
+            "ver": "1.0",
+            "id": f"rampreq-{uuid.uuid4().hex}",
             "requester": {
                 "id": _AGENT_ID,
-                "domain": _TENANT_DOMAIN,
                 "uris": [resource_uri],
             },
         },
+        key_path=AGENT_E2E_KEY_PATH,
     )
     assert discover_resp.status_code == httpx.codes.OK, (
-        f"DiscoverResources must precede ExecuteTransaction; got "
+        f"Broker.Resolve must precede ExecuteTransaction; got "
         f"{discover_resp.status_code}: {discover_resp.text[:512]}"
     )
     discover_payload = cast(dict[str, Any], discover_resp.json())
-    offers = cast(list[dict[str, Any]], discover_payload.get("offers") or [])
-    assert offers, f"DiscoverResources returned no offers for {resource_uri!r}"
+    ext = discover_payload.get("ext", {})
+    offers = ext.get("ramp.broker.offers", [])
+    assert offers, f"Broker.Resolve returned no offers for {resource_uri!r}"
     offer = offers[0]
     offer_signature = cast(str, offer.get("signature") or "")
+    exchange_endpoint = cast(str, offer.get("exchange_endpoint") or "")
     assert offer_signature, f"discovered offer carries no signature: {offer!r}"
+    assert exchange_endpoint, f"discovered offer carries no exchange_endpoint: {offer!r}"
 
-    # "After delivery" — accept the offer and fetch the signed URL.
-    accept_url = f"{compose_stack.exchange}{_ACCEPT_OFFER_PATH}"
-    # tx_request_id (TransactionRequest.id) is the idempotency key the
-    # service layer requires per validateTxRequest.
-    tx_request_id = f"tx-{uuid.uuid4().hex}"
-    accept_resp = _post_json(
-        accept_url,
-        {
-            "ver": "1.0",
-            "id": tx_request_id,
-            "offerId": offer_id,
-            "offerSignature": offer_signature,
-            "requester": {
-                "id": _AGENT_ID,
-                "domain": _TENANT_DOMAIN,
-                "type": "REQUESTER_TYPE_AGENT",
-            },
-        },
+    # Phase 2: Execute via Broker relay — agent signs with Exchange URL, POSTs to Broker
+    # RAMP-56 two-phase: agent sig1 + broker sig2 (multisig). Exchange verifies both
+    # and binds delivery URL to agent's proven key.
+    accept_resp = relay_execute(
+        broker_url=compose_stack.broker,
+        exchange_endpoint=exchange_endpoint,
+        agent_id=_AGENT_ID,
+        offer_id=offer_id,
+        offer_signature=offer_signature,
+        domain=_TENANT_DOMAIN,
     )
     assert accept_resp.status_code == httpx.codes.OK, (
-        f"ExecuteTransaction should succeed for SPOT offer {offer_id!r}, got "
+        f"ExecuteTransaction via broker relay should succeed for SPOT offer {offer_id!r}, got "
         f"{accept_resp.status_code}: {accept_resp.text[:512]}"
     )
     accept_payload = cast(dict[str, Any], accept_resp.json())
@@ -554,6 +543,11 @@ def test_paid_usage_record_shows_uri_price_currency_and_timestamp(
     if compose_stack.edge != EDGE_PUBLIC_URL:
         host_signed_url = signed_url.replace(EDGE_PUBLIC_URL, compose_stack.edge)
         extra_headers["Host"] = EDGE_PUBLIC_HOST
+
+    # Add proof-of-possession headers for identity binding verification (ADR-013)
+    pop_headers = build_pop_headers(url=signed_url)
+    extra_headers.update(pop_headers)
+
     content_resp = httpx.get(
         host_signed_url,
         headers=extra_headers,

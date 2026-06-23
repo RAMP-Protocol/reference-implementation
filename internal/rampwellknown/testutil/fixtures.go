@@ -62,6 +62,20 @@ func PublisherExchange(domain, endpoint string, rel rampv1.ProviderRelationship)
 	return &rampv1.AuthorizedExchange{Domain: domain, Endpoint: endpoint, Relationship: rel}
 }
 
+// Client returns the HTTP client the rampwellknown tests use in place of
+// http.DefaultClient. httptest.Server.Close() calls
+// http.DefaultTransport.CloseIdleConnections() as a convenience, which drops
+// every idle keep-alive connection pooled on the shared global transport. With
+// the package's parallel tests each running an Origin and deferring Close(), one
+// test's Close() can close an idle connection a concurrent test is reusing,
+// surfacing as "connection broken: http: CloseIdleConnections called". A private
+// transport with keep-alives disabled keeps no idle pool to race and never
+// touches the global transport, so no peer's Close() can disturb an in-flight
+// request.
+func Client() *http.Client {
+	return &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+}
+
 // Origin is an httptest server that serves a manifest at /.well-known/ramp.json
 // and a revocation list at /.well-known/ramp-invalidations.json. Both documents
 // are swappable mid-test; ManifestStatus overrides the manifest response code

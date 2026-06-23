@@ -13,6 +13,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig/transportconnect"
+	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/broker"
 )
@@ -22,6 +24,15 @@ type ctxKey string
 const (
 	requestIDKey ctxKey = "request_id"
 )
+
+// maxAgentBodyBytes caps the request body every agent-facing POST will buffer
+// before processing. The broker's agent endpoints carry small protobuf-JSON
+// payloads (a RAMPRequest / TransactionRequest is well under a kilobyte), so a
+// 64 KiB ceiling never truncates a legitimate request. The cap is a DoS guard:
+// without it an (intentionally pre-auth) endpoint like the ExecuteTransaction
+// relay would buffer an arbitrarily large attacker body into memory before any
+// signature check could reject it. Read with io.LimitReader at every agent POST.
+const maxAgentBodyBytes int64 = 64 * 1024
 
 // withRequestID stores id under the broker's request-id context key.
 func withRequestID(ctx context.Context, id string) context.Context {
@@ -47,7 +58,7 @@ func RequestIDMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 // non-nil err.
 func LogHTTPSigReject(r *http.Request, err error) {
 	reqctx.FromContext(r.Context()).WarnContext(r.Context(), "httpsig: reject",
-		"path", r.URL.Path, "err", err.Error())
+		"path", r.URL.Path, "outcome", transportconnect.RejectOutcome(err), "err", err.Error())
 }
 
 func requestIDFrom(ctx context.Context) string {
@@ -84,6 +95,7 @@ func writeProtoError(w http.ResponseWriter, requestID string, err error) {
 		"ramp.broker.error": fmt.Sprintf("%s: %s", be.Kind, be.Message),
 	})
 	writeProtoJSON(w, statusFromKind(be.Kind), &rampv1.RAMPResponse{
+		Ver:       rampproto.Ver,
 		RequestId: requestID,
 		Ext:       ext,
 	})

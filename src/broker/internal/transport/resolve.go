@@ -13,6 +13,7 @@ import (
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
+	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/broker"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/budget"
@@ -56,7 +57,7 @@ func NewResolveHandler(d Deps) *ResolveHandler {
 // ServeHTTP implements http.Handler for /broker/v1/resolve.
 func (h *ResolveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDFrom(r.Context())
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxAgentBodyBytes))
 	if err != nil {
 		writeProtoError(w, requestID, broker.Newf(broker.KindInvalidArgument, "read body: %v", err))
 		return
@@ -123,7 +124,15 @@ func (h *ResolveHandler) resolve(ctx context.Context, requestID string, req Reso
 	if len(offers) == 0 {
 		return noOffersResponse(ctx, flags), nil
 	}
+	// RAMP-56: Discovery phase returns ranked offers to agent; execution is
+	// a separate agent-originated flow via /broker/v1/exchange/execute.
 	ranked := selection.Rank(selection.Dedup(offers))
+
+	// Check budget for the winning offer before returning to agent. This
+	// allows the agent to know upfront if they have budget, without executing.
+	// This is a one-time pre-flight at discovery only; the broker relay
+	// (/broker/v1/exchange/execute) does NOT re-check budget — the Exchange
+	// enforces billing at execute time.
 	winner := ranked[0]
 	budgetState, allowed, err := h.checkBudget(ctx, req.LicenseID, req.BudgetMinor, winner.Offer)
 	if err != nil {
@@ -134,30 +143,12 @@ func (h *ResolveHandler) resolve(ctx context.Context, requestID string, req Reso
 		return budgetExhaustedResponse(budgetState), nil
 	}
 
-	txResp, err := h.executeTransaction(ctx, requestID, req, winner)
-	if err != nil {
-		reqctx.FromContext(ctx).ErrorContext(ctx, "execute failed", "err", err)
-		return nil, err
-	}
-	if recordErr := h.deps.Budget.Record(ctx, req.LicenseID, costMinor(txResp, winner.Offer)); recordErr != nil {
-		// Best-effort record-after-execute: the transaction is committed and the
-		// agent owns the signed URL; we log and proceed. All best-effort
-		// post-commit side-channel writes in this handler log at ERROR with the
-		// request_id — "durable work done, side-channel record failed" is
-		// alert-worthy and must stay correlatable.
-		reqctx.FromContext(ctx).ErrorContext(ctx, "budget record failed", "err", recordErr)
-	}
-	h.relayReportUsage(ctx, winner, txResp)
-	h.auditSelection(ctx, requestID, req, ranked, winner.Offer, "delivered")
+	h.auditSelection(ctx, requestID, req, ranked, nil, "offers_returned")
 
-	budgetState = h.postRecordBudget(ctx, req)
 	return &ResolveResponse{
 		Licensed:   true,
-		OfferID:    winner.Offer.GetOfferId(),
-		ExchangeID: winner.Exchange.Domain,
-		Budget:     budgetState,
+		Offers:     ranked,
 		Candidates: candidatesToInfo(ranked),
-		tx:         txResp,
 	}, nil
 }
 
@@ -309,62 +300,6 @@ func (h *ResolveHandler) checkBudget(
 	return state, true, nil
 }
 
-func (h *ResolveHandler) executeTransaction(
-	ctx context.Context, requestID string, req ResolveRequest, winner selection.Candidate,
-) (*rampv1.TransactionResponse, error) {
-	tx := &rampv1.TransactionRequest{
-		Ver:       "0.3",
-		Id:        "tx-" + uuid.NewString(),
-		OfferId:   stringPtr(winner.Offer.GetOfferId()),
-		Requester: buildRequester(ctx, req, h.deps.Clk),
-		RequestId: stringPtr(requestID),
-	}
-	if sig := winner.Offer.GetSignature(); sig != "" {
-		tx.OfferSignature = stringPtr(sig)
-	}
-	resp, err := h.deps.Exchange.ExecuteTransaction(ctx, winner.Exchange.Endpoint, tx)
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (h *ResolveHandler) relayReportUsage(
-	ctx context.Context, winner selection.Candidate, tx *rampv1.TransactionResponse,
-) {
-	if winner.Offer.GetReporting() == nil || !winner.Offer.GetReporting().GetRequired() {
-		return
-	}
-	// Use the offer's estimated_quantity as consumed quantity. The broker
-	// represents the MCP relay path where actual consumption equals the
-	// estimated amount billed. Full payload required for Exchange validation.
-	var consumed int32
-	if p := winner.Offer.GetPricing(); p != nil && p.EstimatedQuantity != nil {
-		consumed = *p.EstimatedQuantity
-	}
-	report := &rampv1.UsageReport{
-		Ver:           "0.3",
-		Id:            "ur-" + uuid.NewString(),
-		TransactionId: tx.GetTransactionId(),
-		BillingId:     tx.GetBillingId(),
-		Usage:         &rampv1.Usage{ConsumedQuantity: consumed},
-	}
-	if _, err := h.deps.Exchange.ReportUsage(ctx, winner.Exchange.Endpoint, report); err != nil {
-		reqctx.FromContext(ctx).ErrorContext(ctx, "report usage relay failed", "err", err)
-	}
-}
-
-func (h *ResolveHandler) postRecordBudget(ctx context.Context, req ResolveRequest) *BudgetState {
-	if req.LicenseID == "" || req.BudgetMinor <= 0 {
-		return nil
-	}
-	dec, err := h.deps.Budget.Check(ctx, req.LicenseID, req.BudgetMinor)
-	if err != nil {
-		return nil
-	}
-	return &BudgetState{Limit: dec.Limit, Consumed: dec.Consumed, Remaining: dec.Remaining}
-}
-
 func (h *ResolveHandler) auditSelection(
 	ctx context.Context, requestID string, req ResolveRequest,
 	ranked []selection.Candidate, winner *rampv1.Offer, outcome string,
@@ -392,7 +327,7 @@ func buildResourceQuery(
 	ctx context.Context, requestID string, req ResolveRequest, clk clock.Clock,
 ) *rampv1.ResourceQuery {
 	q := &rampv1.ResourceQuery{
-		Ver:       "0.3",
+		Ver:       rampproto.Ver,
 		Id:        "rq-" + uuid.NewString(),
 		RequestId: stringPtr(requestID),
 		Requester: buildRequester(ctx, req, clk),

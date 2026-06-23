@@ -7,6 +7,7 @@ import (
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
@@ -193,7 +194,7 @@ func (s *ExchangeService) buildTxResponse(
 		UnitCost: &unitCost,
 	}
 	return &rampv1.TransactionResponse{
-		Ver:            "1.0",
+		Ver:            rampproto.Ver,
 		Id:             req.GetId(),
 		TransactionId:  &rec.TransactionID,
 		BillingId:      &rec.BillingID,

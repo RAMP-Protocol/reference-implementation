@@ -66,6 +66,13 @@ type Config struct {
 	HTTP    HTTPDoer
 	Clock   Clock
 	Timeout time.Duration
+	// Scheme/Port shape the manifest fetch URL for bare-host agent IDs on
+	// local/compose stacks (RAMP_MANIFEST_FETCH_{SCHEME,PORT}); empty means
+	// https + default port. They MUST match what the httpsig per-agent resolver
+	// (agentkeys) uses, so transport-key verification and service-side
+	// registration fetch the same document.
+	Scheme string
+	Port   string
 }
 
 // New constructs a Registry. When nil, HTTP defaults to the SSRF-guarded env
@@ -89,6 +96,8 @@ func New(cfg Config) Registry {
 		http:    cfg.HTTP,
 		clock:   cfg.Clock,
 		timeout: cfg.Timeout,
+		scheme:  cfg.Scheme,
+		port:    cfg.Port,
 	}
 }
 
@@ -97,6 +106,8 @@ type registry struct {
 	http    HTTPDoer
 	clock   Clock
 	timeout time.Duration
+	scheme  string
+	port    string
 }
 
 func (r *registry) LookupPublicKey(ctx context.Context, agentID string) (ed25519.PublicKey, error) {
@@ -138,6 +149,8 @@ func (r *registry) RegisterFromManifest(ctx context.Context, agentID, manifestUR
 	// boundary, not the role label.
 	m, err := rampwellknown.Fetch(ctx, agentID, rampwellknown.FetchOptions{
 		Client:  r.http,
+		Scheme:  r.scheme,
+		Port:    r.port,
 		Timeout: r.timeout,
 	})
 	if err != nil {
@@ -166,12 +179,12 @@ func (r *registry) RegisterFromManifest(ctx context.Context, agentID, manifestUR
 // in document order wins — callers rotate keys by shortening the outgoing key's
 // not_after.
 func (r *registry) selectValidKey(m *rampwellknown.Manifest) (ed25519.PublicKey, error) {
-	active := rampwellknown.ActiveKeys(m, r.clock.Now())
-	if len(active) == 0 {
+	pub, err := rampwellknown.ActiveKey(m, r.clock.Now())
+	switch {
+	case errors.Is(err, rampwellknown.ErrKeyExpired):
+		// No key's validity window covers now → registrable-identity fault.
 		return nil, ErrNoValidKey
-	}
-	pub, err := rampwellknown.PublicKey(active[0])
-	if err != nil {
+	case err != nil:
 		return nil, fmt.Errorf("%w: %w", ErrMalformedManifest, err)
 	}
 	return pub, nil
@@ -222,4 +235,25 @@ func mapFetchError(err error) error {
 		return fmt.Errorf("%w: %w", ErrMalformedManifest, err)
 	}
 	return fmt.Errorf("agentreg: fetch manifest: %w", err)
+}
+
+// IsCallerFault reports whether a RegisterFromManifest error is a permanent
+// caller fault — the keyID is simply not a registrable identity (manifest
+// absent, malformed, unanchored, or publishing no currently-valid key) — rather
+// than a transient upstream failure (ErrFetch) the caller should retry. Every
+// lazy-registration call site (service.mapLazyRegisterError, the catalog
+// self-signup handler) uses it to split a 401/Unauthenticated from a
+// 503/Unavailable identically, so the classification lives once next to the
+// sentinels it switches on.
+func IsCallerFault(err error) bool {
+	switch {
+	case errors.Is(err, ErrAgentIDMismatch),
+		errors.Is(err, ErrMalformedManifest),
+		errors.Is(err, ErrNoValidKey),
+		errors.Is(err, ErrUnknown),
+		errors.Is(err, rampwellknown.ErrNoManifest):
+		return true
+	default:
+		return false
+	}
 }

@@ -49,10 +49,10 @@ func LoadRelayKey(path string) (*RelayKey, error) {
 	if doc.KID == "" {
 		return nil, errors.New("xclient: broker relay key missing kid")
 	}
-	if !strings.HasPrefix(doc.KID, "broker.") {
+	if !strings.HasPrefix(doc.KID, httpsig.BrokerKeyIDPrefix) {
 		return nil, fmt.Errorf("xclient: broker relay kid %q must have broker.<instance>.<rotation> shape", doc.KID)
 	}
-	seed, err := base64url(doc.PrivateKey)
+	seed, err := base64.RawURLEncoding.DecodeString(doc.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("xclient: decode private_key: %w", err)
 	}
@@ -97,11 +97,13 @@ func (t *signingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	if err != nil {
 		return nil, err
 	}
+
 	created := t.clk.Now().Unix()
 	expires := created + int64(t.ttl.Seconds())
-	if err := httpsig.SignRequestRAMP(req, body, t.key.KID, t.key.Private, created, expires); err != nil {
+	if err := httpsig.AppendSignatureRAMP(req, body, t.key.KID, t.key.Private, created, expires); err != nil {
 		return nil, fmt.Errorf("xclient: sign outbound: %w", err)
 	}
+
 	return t.inner.RoundTrip(req)
 }
 
@@ -120,9 +122,4 @@ func readBody(req *http.Request) ([]byte, error) {
 	req.Body = io.NopCloser(bytes.NewReader(buf))
 	req.ContentLength = int64(len(buf))
 	return buf, nil
-}
-
-func base64url(raw string) ([]byte, error) {
-	padding := strings.Repeat("=", (4-len(raw)%4)%4)
-	return base64.URLEncoding.DecodeString(raw + padding)
 }

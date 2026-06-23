@@ -1,20 +1,22 @@
-package main
+package transport_test
 
 import (
 	"net/http"
 	"testing"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/transport"
 )
 
-// TestExchangeGlobalSigRequestPredicate captures the universal-signing
-// entry policy: every /ramp.* RPC except CatalogService MUST clear the
-// RFC 9421 static-resolver gate, regardless of whether Signature-Input
-// is set on the wire (an unsigned request fails verification at the
-// middleware; the predicate's job is to mark the path as gated, not to
-// short-circuit on header presence). CatalogService is excluded because
-// CatalogSignatureMiddleware runs a per-contributor signer further down
-// — Catalog requests are still verified, just by a different mechanism.
-// Non-ramp paths (healthz, /.well-known) are public.
-func TestExchangeGlobalSigRequestPredicate(t *testing.T) {
+// TestGlobalSigRequestPredicate captures the universal-signing entry policy:
+// every /ramp.* RPC except CatalogService MUST clear the RFC 9421
+// static-resolver gate, regardless of whether Signature-Input is set on the
+// wire (an unsigned request fails verification at the middleware; the
+// predicate's job is to mark the path as gated, not to short-circuit on header
+// presence). CatalogService is excluded because CatalogSignatureMiddleware runs
+// a per-contributor signer further down — Catalog requests are still verified,
+// just by a different mechanism. Non-ramp paths (healthz, /.well-known) are
+// public.
+func TestGlobalSigRequestPredicate(t *testing.T) {
 	cases := []struct {
 		name      string
 		path      string
@@ -38,7 +40,7 @@ func TestExchangeGlobalSigRequestPredicate(t *testing.T) {
 			if tc.hasSigHdr {
 				r.Header.Set("Signature-Input", `sig=("@method");keyid="k";created=1`)
 			}
-			if got := exchangeGlobalSigRequestPredicate(r); got != tc.want {
+			if got := transport.GlobalSigRequestPredicate(r); got != tc.want {
 				t.Fatalf("predicate(%s, sig=%v) = %v, want %v", tc.path, tc.hasSigHdr, got, tc.want)
 			}
 		})

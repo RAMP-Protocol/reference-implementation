@@ -21,7 +21,7 @@ import (
 
 func newPublisherCacheTTL(clk clock.Clock, ttl time.Duration) *rampwellknown.Cache {
 	return rampwellknown.NewCache(rampwellknown.CacheOptions{
-		Client:     http.DefaultClient,
+		Client:     testutil.Client(),
 		Clk:        clk,
 		ExpectRole: rampwellknown.RolePublisher,
 		TTL:        ttl,

@@ -20,6 +20,10 @@ set -eu
 
 KEY_FILE="${SIGNING_KEY_FILE:-/keys/examplenews-subscription-key.json}"
 KID="${SIGNING_KID_OVERRIDE:-}"
+# MANIFEST_ROLE selects the manifest's role; default ROLE_PUBLISHER preserves the
+# catalog-contributor host behaviour. ROLE_AGENT serves an agent identity's
+# manifest (no catalog_contributors) for the lazy-registration e2e.
+ROLE="${MANIFEST_ROLE:-ROLE_PUBLISHER}"
 WEB_ROOT=/var/www/ramp
 
 mkdir -p "$WEB_ROOT/.well-known"
@@ -29,7 +33,7 @@ if [ ! -s "$KEY_FILE" ]; then
     exit 1
 fi
 
-python3 - "$KEY_FILE" "$WEB_ROOT/.well-known/ramp.json" "$KID" <<'PY'
+python3 - "$KEY_FILE" "$WEB_ROOT/.well-known/ramp.json" "$KID" "$ROLE" <<'PY'
 import base64
 import json
 import sys
@@ -42,16 +46,17 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
 )
 
-key_path, manifest_path, kid_override = sys.argv[1:4]
+key_path, manifest_path, kid_override, role = sys.argv[1:5]
 
 with Path(key_path).open() as fh:
     spec = json.load(fh)
 
-# The resource-owner key fixture stores the Ed25519 seed (32 bytes) base64url-
-# encoded under "private". Some legacy fixtures used "seed". Accept either.
-priv_b64 = spec.get("private") or spec.get("seed")
+# The key fixture stores the Ed25519 seed (32 bytes) base64url-encoded under
+# "private"; some fixtures use "seed", and the agent fixtures (shared with the
+# pytest signer) use "private_key". Accept any.
+priv_b64 = spec.get("private") or spec.get("seed") or spec.get("private_key")
 if not priv_b64:
-    sys.exit(f"publisher-jwks: no 'private'/'seed' in {key_path}")
+    sys.exit(f"publisher-jwks: no 'private'/'seed'/'private_key' in {key_path}")
 raw = base64.urlsafe_b64decode(priv_b64 + "=" * (-len(priv_b64) % 4))
 if len(raw) == 64:
     # Ed25519 stdlib-format key: seed (32) || pubkey (32). Use the seed.
@@ -74,7 +79,7 @@ kid = kid_override or spec.get("kid") or "publisher-key"
 
 manifest = {
     "ver": "1.0",
-    "role": "ROLE_PUBLISHER",
+    "role": role,
     "domain": spec.get("issuer", kid.split(".", 1)[0]),
     "public_keys": [
         {
@@ -88,10 +93,13 @@ manifest = {
             "not_after": valid_until,
         },
     ],
-    "catalog_contributors": [
-        {"domain": "catalog-contributor-e2e", "relationship": "harness"},
-    ],
 }
+# catalog_contributors is a publisher-only field (the self-signup Gate-1 list);
+# an agent manifest omits it.
+if role == "ROLE_PUBLISHER":
+    manifest["catalog_contributors"] = [
+        {"domain": "catalog-contributor-e2e", "relationship": "harness"},
+    ]
 
 Path(manifest_path).write_text(json.dumps(manifest, indent=2) + "\n")
 print(

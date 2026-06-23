@@ -102,9 +102,9 @@ RETURNING *;
 -- Returns reporting obligations whose deadline has passed but which still
 -- sit in PENDING for a specific (tenant_id, agent_id). Joins to
 -- transaction_log because reporting_obligations does not carry tenant_id /
--- agent_id columns directly. The result drives the AcceptOffer
--- outstanding-obligations gate: a non-empty list refuses new accepts
--- with a usage-family reason until the agent files the missing report.
+-- agent_id columns directly. The result drives the ExecuteTransaction
+-- reporting-overdue refusal: a non-empty list refuses the agent's next
+-- transaction with FailedPrecondition until it files the missing report.
 SELECT ro.obligation_id, ro.transaction_id, ro.state, ro.window_seconds,
        ro.deadline, ro.consumed_quantity, ro.received_at, ro.created_at,
        ro.required_fields, ro.estimated_quantity, ro.quantity_tolerance,

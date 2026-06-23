@@ -12,8 +12,6 @@ package httpsig
 
 import (
 	"bytes"
-	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -46,25 +44,75 @@ var ErrDigestMismatch = errors.New("httpsig: content-digest mismatch")
 // ErrSignatureVerify is returned when the ed25519 verify step fails.
 var ErrSignatureVerify = errors.New("httpsig: signature verification failed")
 
-// ErrUnknownKey is returned when the LookupKey callback cannot find the keyid.
+// ErrUnknownKey is returned when the KeyResolver cannot find the keyid. Return
+// it (wrapped or direct) to signal a miss that should trigger lazy self-signup
+// at the caller site.
 var ErrUnknownKey = errors.New("httpsig: unknown keyid")
 
-// LookupKey returns the Ed25519 public key registered for keyid. Return
-// ErrUnknownKey (wrapped or direct) to signal a miss that should trigger
-// lazy self-signup at the caller site.
-type LookupKey func(ctx context.Context, keyid string) (ed25519.PublicKey, error)
+// ErrBrokenSignatureChain is returned when a multisig request's signatures do
+// not form a valid forwarding chain: labels are non-contiguous, reordered, or a
+// sigN (N>1) does not cover exactly its predecessor via "signature";key="sigN-1"
+// (RAMP-56 forwarding chain, RFC 9421 §2.4).
+var ErrBrokenSignatureChain = errors.New("httpsig: signature chain broken (gap/reorder/missing link)")
 
-// Verified carries the parsed signature metadata on success.
-type Verified struct {
-	KeyID     string
-	Algorithm string
-	Label     string
+// ErrTooManyHops is returned when the number of signatures on a request exceeds
+// the verifier's configured MaxSignatures budget (Exchange hop bound).
+var ErrTooManyHops = errors.New("httpsig: signature count exceeds hop budget")
+
+// ComponentParam is a single RFC 9421 §2.4 parameter on a covered-component
+// identifier — e.g. the key="sig1" on `"signature";key="sig1"`.
+type ComponentParam struct {
+	Key string
+	Val string
+}
+
+// CoveredComponent is one entry in a signature's covered-component set: a
+// component name plus any RFC 9421 component parameters. Plain components
+// (@method, content-digest, ...) carry nil Params; a forwarding-chain link
+// carries a single {Key:"key", Val:"sigN-1"} param on Name "signature".
+type CoveredComponent struct {
+	Name   string
+	Params []ComponentParam
+}
+
+// plainComponents builds CoveredComponents with no parameters from names.
+func plainComponents(names ...string) []CoveredComponent {
+	out := make([]CoveredComponent, 0, len(names))
+	for _, n := range names {
+		out = append(out, CoveredComponent{Name: n})
+	}
+	return out
+}
+
+// componentParam returns the value of the named parameter on c, or "" if absent.
+func componentParam(c CoveredComponent, key string) string {
+	for _, p := range c.Params {
+		if p.Key == key {
+			return p.Val
+		}
+	}
+	return ""
+}
+
+// renderComponent serializes a covered-component identifier as it appears in the
+// Signature-Input header and the @signature-params line: `"name";k="v";...`.
+// The name is rendered verbatim (callers supply already-lowercased names) so the
+// header inner list and the signature base inner list are byte-identical.
+func renderComponent(c CoveredComponent) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	b.WriteString(c.Name)
+	b.WriteByte('"')
+	for _, p := range c.Params {
+		fmt.Fprintf(&b, ";%s=%q", p.Key, p.Val)
+	}
+	return b.String()
 }
 
 // Params captures the parameters parsed from a single Signature-Input label.
 type Params struct {
 	Label    string
-	Covered  []string
+	Covered  []CoveredComponent
 	KeyID    string
 	Alg      string
 	Created  int64
@@ -72,60 +120,56 @@ type Params struct {
 	rawInput string // verbatim value inside the inner list, used for signature base
 }
 
-// Verify parses Signature-Input + Signature + Content-Digest off req, rebuilds
-// the signature base per RFC 9421 §2.3, and verifies the ed25519 signature
-// against the public key returned by lookup.
-//
-// body must be the exact bytes that produced the request payload; caller is
-// responsible for tee-reading the HTTP body before it is consumed downstream.
-func Verify(ctx context.Context, req *http.Request, body []byte, lookup LookupKey) (*Verified, error) {
-	params, rawSig, err := parseSignatureHeaders(req.Header)
-	if err != nil {
-		return nil, err
-	}
-	if !strings.EqualFold(params.Alg, "ed25519") {
-		return nil, fmt.Errorf("%w: alg=%q", ErrUnsupportedAlgorithm, params.Alg)
-	}
-	if err := verifyContentDigest(req.Header, body, params.Covered); err != nil {
-		return nil, err
-	}
-	pub, err := lookup(ctx, params.KeyID)
-	if err != nil {
-		return nil, err
-	}
-	if len(pub) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("httpsig: stored key length %d != %d", len(pub), ed25519.PublicKeySize)
-	}
-	base, err := buildSignatureBase(req, params)
-	if err != nil {
-		return nil, err
-	}
-	if !ed25519.Verify(pub, []byte(base), rawSig) {
-		return nil, ErrSignatureVerify
-	}
-	return &Verified{KeyID: params.KeyID, Algorithm: params.Alg, Label: params.Label}, nil
-}
-
-// parseSignatureHeaders extracts a single Signature-Input / Signature pair,
-// rejecting multi-label requests (the demo supports one signer per request).
-func parseSignatureHeaders(h http.Header) (Params, []byte, error) {
+// parseAllSignatures extracts ALL signature labels from Signature-Input and
+// Signature headers. Returns a list of Params (one per label) and a map of
+// label→signature bytes. Handles 0, 1, or N signatures gracefully.
+func parseAllSignatures(h http.Header) ([]Params, map[string][]byte, error) {
 	rawInput := h.Get("Signature-Input")
 	if rawInput == "" {
-		return Params{}, nil, ErrMissingSignatureInput
+		return nil, nil, ErrMissingSignatureInput
 	}
 	rawSig := h.Get("Signature")
 	if rawSig == "" {
-		return Params{}, nil, ErrMissingSignature
+		return nil, nil, ErrMissingSignature
 	}
-	params, err := parseSignatureInput(rawInput)
-	if err != nil {
-		return Params{}, nil, err
+
+	// Parse all labels from Signature-Input (comma-separated list).
+	inputLabels := parseMultiLabelInput(rawInput)
+	if len(inputLabels) == 0 {
+		return nil, nil, fmt.Errorf("%w: no labels found", ErrMalformedSignatureInput)
 	}
-	sigBytes, err := parseSignatureField(rawSig, params.Label)
-	if err != nil {
-		return Params{}, nil, err
+
+	allParams := make([]Params, 0, len(inputLabels))
+	for _, labelInput := range inputLabels {
+		params, err := parseSignatureInput(labelInput)
+		if err != nil {
+			return nil, nil, err
+		}
+		allParams = append(allParams, params)
 	}
-	return params, sigBytes, nil
+
+	// Parse all signatures from Signature header (comma-separated list).
+	sigMap := make(map[string][]byte, len(allParams))
+	for _, params := range allParams {
+		sigBytes, err := parseSignatureField(rawSig, params.Label)
+		if err != nil {
+			return nil, nil, err
+		}
+		sigMap[params.Label] = sigBytes
+	}
+
+	return allParams, sigMap, nil
+}
+
+// ParseSignatureLabels parses the Signature-Input + Signature headers off h and
+// returns one Params per label, in header order. It is the exported entry point
+// for callers outside this package (e.g. the relay integration test) that need
+// to inspect the labels/keyids of a multi-signature request without
+// re-implementing the structured-field parser. Returns an error when either
+// header is absent or any label is malformed.
+func ParseSignatureLabels(h http.Header) ([]Params, error) {
+	params, _, err := parseAllSignatures(h)
+	return params, err
 }
 
 // parseSignatureInput parses a single-label Signature-Input structured field:
@@ -146,7 +190,7 @@ func parseSignatureInput(raw string) (Params, error) {
 	}
 	inner := rest[1:rparen]
 	params := Params{Label: label, rawInput: rest[:rparen+1] + rest[rparen+1:]}
-	fields, err := parseQuotedList(inner)
+	fields, err := parseComponentList(inner)
 	if err != nil {
 		return Params{}, err
 	}
@@ -184,87 +228,44 @@ func parseSignatureInput(raw string) (Params, error) {
 	return params, nil
 }
 
-func parseQuotedList(inner string) ([]string, error) {
-	var out []string
-	i := 0
-	for i < len(inner) {
-		for i < len(inner) && (inner[i] == ' ' || inner[i] == '\t') {
-			i++
-		}
-		if i >= len(inner) {
-			break
-		}
-		if inner[i] != '"' {
-			return nil, fmt.Errorf("%w: expected quoted identifier at %q", ErrMalformedSignatureInput, inner[i:])
-		}
-		j := i + 1
-		for j < len(inner) && inner[j] != '"' {
-			j++
-		}
-		if j >= len(inner) {
-			return nil, fmt.Errorf("%w: unterminated quoted string", ErrMalformedSignatureInput)
-		}
-		out = append(out, inner[i+1:j])
-		i = j + 1
-	}
-	return out, nil
-}
-
-// splitParams splits "keyid=\"x\";alg=\"ed25519\";created=1" on top-level
-// semicolons while preserving quoted values.
-func splitParams(s string) []string {
-	s = strings.TrimPrefix(s, ";")
-	var out []string
-	var cur strings.Builder
-	inQuote := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '"' {
-			inQuote = !inQuote
-			cur.WriteByte(c)
-			continue
-		}
-		if c == ';' && !inQuote {
-			if cur.Len() > 0 {
-				out = append(out, strings.TrimSpace(cur.String()))
-				cur.Reset()
-			}
-			continue
-		}
-		cur.WriteByte(c)
-	}
-	if cur.Len() > 0 {
-		out = append(out, strings.TrimSpace(cur.String()))
-	}
-	return out
-}
-
 // parseSignatureField pulls the binary sig bytes for label out of the
-// Signature header, which is formatted as `sig1=:base64data:`.
+// Signature header, which can be formatted as:
+//   - Single: `sig1=:base64data:`
+//   - Multi:  `sig1=:base64data:, sig2=:moredata:`
 func parseSignatureField(raw, label string) ([]byte, error) {
 	raw = strings.TrimSpace(raw)
-	prefix := label + "="
-	if !strings.HasPrefix(raw, prefix) {
-		return nil, fmt.Errorf("%w: Signature label %q not present", ErrMalformedSignatureInput, label)
+
+	// Split on commas to handle multi-label format.
+	parts := parseMultiLabelSignature(raw)
+
+	// Find the matching label.
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		prefix := label + "="
+		if !strings.HasPrefix(part, prefix) {
+			continue
+		}
+		body := strings.TrimPrefix(part, prefix)
+		if !strings.HasPrefix(body, ":") || !strings.HasSuffix(body, ":") {
+			return nil, fmt.Errorf("%w: Signature value not byte-sequence", ErrMalformedSignatureInput)
+		}
+		b64 := body[1 : len(body)-1]
+		out, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return nil, fmt.Errorf("%w: Signature base64: %w", ErrMalformedSignatureInput, err)
+		}
+		return out, nil
 	}
-	body := strings.TrimPrefix(raw, prefix)
-	if !strings.HasPrefix(body, ":") || !strings.HasSuffix(body, ":") {
-		return nil, fmt.Errorf("%w: Signature value not byte-sequence", ErrMalformedSignatureInput)
-	}
-	b64 := body[1 : len(body)-1]
-	out, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		return nil, fmt.Errorf("%w: Signature base64: %w", ErrMalformedSignatureInput, err)
-	}
-	return out, nil
+
+	return nil, fmt.Errorf("%w: Signature label %q not present", ErrMalformedSignatureInput, label)
 }
 
 // verifyContentDigest checks the Content-Digest header when the coverage set
 // includes it. RFC 9421 + RFC 9530: sha-256=:<base64>:.
-func verifyContentDigest(h http.Header, body []byte, covered []string) error {
+func verifyContentDigest(h http.Header, body []byte, covered []CoveredComponent) error {
 	needDigest := false
 	for _, c := range covered {
-		if strings.EqualFold(c, "content-digest") {
+		if strings.EqualFold(c.Name, "content-digest") {
 			needDigest = true
 			break
 		}
@@ -294,7 +295,7 @@ func buildSignatureBase(req *http.Request, params Params) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(&b, "\"%s\": %s\n", strings.ToLower(c), v)
+		fmt.Fprintf(&b, "%s: %s\n", renderComponent(c), v)
 	}
 	// The @signature-params pseudo-component is always last and contains the
 	// exact structured-field inner list + parameters, verbatim.
@@ -303,10 +304,10 @@ func buildSignatureBase(req *http.Request, params Params) (string, error) {
 	return b.String(), nil
 }
 
-func quotedList(items []string) string {
+func quotedList(items []CoveredComponent) string {
 	parts := make([]string, 0, len(items))
 	for _, it := range items {
-		parts = append(parts, `"`+it+`"`)
+		parts = append(parts, renderComponent(it))
 	}
 	return strings.Join(parts, " ")
 }
@@ -358,10 +359,11 @@ func reconstructTargetURI(req *http.Request) string {
 }
 
 // componentValue yields the canonicalized value for a covered component. The
-// demo verifier supports @method, @path, @authority, @target-uri, and any
-// literal request header name.
-func componentValue(req *http.Request, name string) (string, error) {
-	switch strings.ToLower(name) {
+// verifier supports @method, @path, @authority, @target-uri, the RFC 9421 §2.4
+// "signature";key="sigN" dictionary-member reference (the forwarding-chain
+// link), and any literal request header name.
+func componentValue(req *http.Request, c CoveredComponent) (string, error) {
+	switch strings.ToLower(c.Name) {
 	case "@method":
 		return strings.ToUpper(req.Method), nil
 	case "@path":
@@ -384,13 +386,37 @@ func componentValue(req *http.Request, name string) (string, error) {
 			return "", fmt.Errorf("httpsig: request URL unset for @target-uri")
 		}
 		return reconstructTargetURI(req), nil
+	case "signature":
+		return chainLinkValue(req, c)
 	default:
 		// Values (not Get) so we can distinguish an explicitly-set empty
 		// header (bound intentionally) from an absent one.
-		values := req.Header.Values(http.CanonicalHeaderKey(name))
+		values := req.Header.Values(http.CanonicalHeaderKey(c.Name))
 		if len(values) == 0 {
-			return "", fmt.Errorf("httpsig: header %q missing from request", name)
+			return "", fmt.Errorf("httpsig: header %q missing from request", c.Name)
 		}
 		return strings.TrimSpace(strings.Join(values, ", ")), nil
 	}
+}
+
+// chainLinkValue resolves a "signature";key="sigN" component to the canonical
+// RFC 8941 byte-sequence serialization of the referenced Signature dictionary
+// member: :base64(bytes):. It decodes the referenced member to raw bytes and
+// re-encodes canonically (base64.StdEncoding) rather than splicing the raw wire
+// substring, so signer and verifier agree byte-for-byte regardless of incidental
+// whitespace around the member on the wire (RAMP-56, Risk R1).
+func chainLinkValue(req *http.Request, c CoveredComponent) (string, error) {
+	key := componentParam(c, "key")
+	if key == "" {
+		return "", fmt.Errorf("%w: signature component missing key param", ErrMalformedSignatureInput)
+	}
+	rawSig := req.Header.Get("Signature")
+	if rawSig == "" {
+		return "", fmt.Errorf("resolve chain link %q: %w", key, ErrMissingSignature)
+	}
+	prevBytes, err := parseSignatureField(rawSig, key)
+	if err != nil {
+		return "", fmt.Errorf("resolve chain link %q: %w", key, err)
+	}
+	return ":" + base64.StdEncoding.EncodeToString(prevBytes) + ":", nil
 }

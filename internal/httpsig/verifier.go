@@ -3,6 +3,7 @@ package httpsig
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -66,12 +67,20 @@ type VerifyRequestOptions struct {
 	Clk clock.Clock
 	// MaxFutureSkew overrides the created-in-the-future tolerance.
 	MaxFutureSkew time.Duration
+	// MaxSignatures bounds the number of signatures accepted on a multisig
+	// request — the Exchange hop bound (RAMP-56). 0 means unbounded; only the
+	// Exchange-terminal middleware sets it (= max_intermediary_hops + 1). A
+	// request carrying more signatures is rejected with ErrTooManyHops before
+	// any signature is cryptographically verified.
+	MaxSignatures int
 }
 
 // VerifiedRequest carries the signature metadata on successful verification.
-// Signature is the base64 Signature header value for the sig1 label — callers
-// feed this to a ReplayStore to enforce the (keyid, signature) uniqueness
-// invariant.
+// Signature is the base64 value of THIS label's own signature bytes (not the
+// full multi-label Signature header) — callers feed this to a ReplayStore to
+// enforce the (keyid, signature) uniqueness invariant. Keying on the per-label
+// value keeps the replay key stable when a relay re-wraps the same signature
+// under a fresh co-signature.
 type VerifiedRequest struct {
 	KeyID     string
 	Algorithm string
@@ -94,75 +103,31 @@ type VerifiedRequest struct {
 // The request body is read and restored — callers may continue to read
 // req.Body after a successful call without re-buffering.
 func VerifyRequest(req *http.Request, resolver KeyResolver, opts ...VerifyRequestOptions) (*VerifiedRequest, error) {
-	options := VerifyRequestOptions{}
-	if len(opts) > 0 {
-		options = opts[0]
-	}
-	clk := options.Clk
-	if clk == nil {
-		clk = clock.System{}
-	}
-	maxSkew := options.MaxFutureSkew
-	if maxSkew == 0 {
-		maxSkew = maxFutureSkew
-	}
+	options := buildVerifyOptions(opts)
 
-	params, sigBytes, err := parseSignatureHeaders(req.Header)
+	allParams, sigMap, err := parseAllSignatures(req.Header)
 	if err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(params.Alg, "ed25519") {
-		return nil, fmt.Errorf("%w: alg=%q", ErrUnsupportedAlgorithm, params.Alg)
-	}
-	if err := enforceRequiredComponents(params.Covered); err != nil {
-		return nil, err
-	}
-	if err := enforceEntitlementCoverage(req.Header, params.Covered); err != nil {
-		return nil, err
-	}
-	if err := enforceCreatedExpires(params, clk.Now(), maxSkew); err != nil {
-		return nil, err
+	if len(allParams) == 0 {
+		return nil, ErrMissingSignatureInput
 	}
 
 	body, err := readAndRestoreBody(req)
 	if err != nil {
 		return nil, err
 	}
-	if err := verifyContentDigest(req.Header, body, params.Covered); err != nil {
-		return nil, err
-	}
 
-	pub, err := resolver.Resolve(req.Context(), params.KeyID)
-	if err != nil {
-		return nil, err
-	}
-	if len(pub) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("httpsig: stored key length %d != %d", len(pub), ed25519.PublicKeySize)
-	}
-	base, err := buildSignatureBase(req, params)
-	if err != nil {
-		return nil, err
-	}
-	if !ed25519.Verify(pub, []byte(base), sigBytes) {
-		return nil, ErrSignatureVerify
-	}
-
-	rawSig := req.Header.Get("Signature")
-	return &VerifiedRequest{
-		KeyID:     params.KeyID,
-		Algorithm: params.Alg,
-		Label:     params.Label,
-		Signature: rawSig,
-		Created:   params.Created,
-		Expires:   params.Expires,
-		PublicKey: pub,
-	}, nil
+	// Verify the first (and, for single-signer requests, only) signature. The
+	// full validation chain lives in verifySingleSignature, shared with the
+	// multisig path so both judge a signature by identical rules.
+	return verifySingleSignature(req, allParams[0], sigMap, body, resolver, options)
 }
 
-func enforceRequiredComponents(covered []string) error {
+func enforceRequiredComponents(covered []CoveredComponent) error {
 	seen := make(map[string]bool, len(covered))
 	for _, c := range covered {
-		seen[strings.ToLower(c)] = true
+		seen[strings.ToLower(c.Name)] = true
 	}
 	for _, need := range requiredCoveredComponents {
 		if !seen[need] {
@@ -177,12 +142,12 @@ func enforceRequiredComponents(covered []string) error {
 // Absent header → no constraint (RPCs without a biscuit remain legal).
 // Present header without coverage → ErrMissingRequiredComponent so an
 // attacker cannot slip a biscuit through an otherwise valid signature.
-func enforceEntitlementCoverage(h http.Header, covered []string) error {
+func enforceEntitlementCoverage(h http.Header, covered []CoveredComponent) error {
 	if h.Get("X-RAMP-Entitlement-Biscuit") == "" {
 		return nil
 	}
 	for _, c := range covered {
-		if strings.ToLower(c) == entitlementHeaderLower {
+		if strings.ToLower(c.Name) == entitlementHeaderLower {
 			return nil
 		}
 	}
@@ -204,6 +169,164 @@ func enforceCreatedExpires(p Params, now time.Time, maxSkew time.Duration) error
 		return fmt.Errorf("%w: created=%d now=%d", ErrFutureCreated, p.Created, nowUnix)
 	}
 	return nil
+}
+
+// VerifyMultisigRequest verifies ALL signatures on req. Returns list of
+// VerifiedRequest structs in label order (sig1, sig2, ...). Each signature
+// must pass verification.
+func VerifyMultisigRequest(
+	req *http.Request, resolver KeyResolver, opts ...VerifyRequestOptions,
+) ([]VerifiedRequest, error) {
+	options := buildVerifyOptions(opts)
+
+	allParams, sigMap, err := parseAllSignatures(req.Header)
+	if err != nil {
+		return nil, err
+	}
+
+	if options.MaxSignatures > 0 && len(allParams) > options.MaxSignatures {
+		return nil, fmt.Errorf("%w: got %d max %d", ErrTooManyHops, len(allParams), options.MaxSignatures)
+	}
+
+	if err := enforceSignatureChain(allParams); err != nil {
+		return nil, err
+	}
+
+	body, err := readAndRestoreBody(req)
+	if err != nil {
+		return nil, err
+	}
+
+	verified := make([]VerifiedRequest, 0, len(allParams))
+	for _, params := range allParams {
+		v, err := verifySingleSignature(req, params, sigMap, body, resolver, options)
+		if err != nil {
+			return nil, err
+		}
+		verified = append(verified, *v)
+	}
+
+	return verified, nil
+}
+
+// enforceSignatureChain checks that allParams form a valid forwarding chain
+// (RAMP-56): labels are exactly sig1..sigN contiguous in Signature-Input order,
+// sig1 carries no "signature" component, and every sigK (K>1) covers exactly one
+// "signature";key="sig(K-1)" link to its immediate predecessor.
+//
+// This is the STRUCTURAL gate only — it inspects the parsed covered sets, not the
+// signature bytes. The cryptographic binding is enforced separately by the
+// per-signature verify in the caller: each sigK's base resolves its chain link to
+// the live bytes of sig(K-1) (componentValue → chainLinkValue), so substituting
+// or tampering with a predecessor fails sigK's Ed25519 check. Signature-header
+// member order is immaterial because bytes are matched to labels by name; only
+// the Signature-Input order is constrained here.
+//
+// A single signature (the agent-direct case) trivially satisfies the chain.
+func enforceSignatureChain(allParams []Params) error {
+	for i, p := range allParams {
+		wantLabel := fmt.Sprintf("sig%d", i+1)
+		if p.Label != wantLabel {
+			return fmt.Errorf("%w: label %q at position %d, want %q", ErrBrokenSignatureChain, p.Label, i+1, wantLabel)
+		}
+		link, count := chainLink(p.Covered)
+		if i == 0 {
+			if count != 0 {
+				return fmt.Errorf("%w: sig1 must not carry a signature component", ErrBrokenSignatureChain)
+			}
+			continue
+		}
+		wantPrev := fmt.Sprintf("sig%d", i)
+		if count != 1 || link != wantPrev {
+			return fmt.Errorf("%w: %s must cover exactly \"signature\";key=%q (got %d links, key=%q)",
+				ErrBrokenSignatureChain, wantLabel, wantPrev, count, link)
+		}
+	}
+	return nil
+}
+
+// chainLink returns the key parameter of the single "signature" covered
+// component and the number of "signature" components present. A well-formed
+// chain link has count == 1; count == 0 means no link, count > 1 is malformed.
+func chainLink(covered []CoveredComponent) (key string, count int) {
+	for _, c := range covered {
+		if strings.EqualFold(c.Name, "signature") {
+			count++
+			key = componentParam(c, "key")
+		}
+	}
+	return key, count
+}
+
+func buildVerifyOptions(opts []VerifyRequestOptions) VerifyRequestOptions {
+	options := VerifyRequestOptions{}
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	if options.Clk == nil {
+		options.Clk = clock.System{}
+	}
+	if options.MaxFutureSkew == 0 {
+		options.MaxFutureSkew = maxFutureSkew
+	}
+	return options
+}
+
+func verifySingleSignature(
+	req *http.Request,
+	params Params,
+	sigMap map[string][]byte,
+	body []byte,
+	resolver KeyResolver,
+	opts VerifyRequestOptions,
+) (*VerifiedRequest, error) {
+	if !strings.EqualFold(params.Alg, "ed25519") {
+		return nil, fmt.Errorf("%w: alg=%q", ErrUnsupportedAlgorithm, params.Alg)
+	}
+
+	if err := enforceRequiredComponents(params.Covered); err != nil {
+		return nil, err
+	}
+	if err := enforceEntitlementCoverage(req.Header, params.Covered); err != nil {
+		return nil, err
+	}
+	if err := enforceCreatedExpires(params, opts.Clk.Now(), opts.MaxFutureSkew); err != nil {
+		return nil, err
+	}
+	if err := verifyContentDigest(req.Header, body, params.Covered); err != nil {
+		return nil, err
+	}
+
+	pub, err := resolver.Resolve(req.Context(), params.KeyID)
+	if err != nil {
+		return nil, err
+	}
+	if len(pub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("httpsig: stored key length %d != %d", len(pub), ed25519.PublicKeySize)
+	}
+
+	base, err := buildSignatureBase(req, params)
+	if err != nil {
+		return nil, err
+	}
+
+	sigBytes, ok := sigMap[params.Label]
+	if !ok {
+		return nil, fmt.Errorf("%w: label %q not in Signature", ErrMalformedSignatureInput, params.Label)
+	}
+	if !ed25519.Verify(pub, []byte(base), sigBytes) {
+		return nil, ErrSignatureVerify
+	}
+
+	return &VerifiedRequest{
+		KeyID:     params.KeyID,
+		Algorithm: params.Alg,
+		Label:     params.Label,
+		Signature: base64.StdEncoding.EncodeToString(sigBytes),
+		Created:   params.Created,
+		Expires:   params.Expires,
+		PublicKey: pub,
+	}, nil
 }
 
 // readAndRestoreBody drains req.Body (if any) and puts the bytes back so

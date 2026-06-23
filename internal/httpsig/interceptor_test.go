@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -146,6 +148,72 @@ func TestMiddleware_RejectsReplay(t *testing.T) {
 	}
 }
 
+// TestMiddleware_MultisigReplayDoesNotBurnOtherSignatures pins SEC-03: when a
+// multisig request is rejected because ONE of its signatures is a replay, the
+// OTHER (valid, first-seen) signatures must not be recorded — otherwise an
+// attacker could pre-burn an agent's signature by pairing it with a replayed
+// broker signature, denying the agent's legitimate request.
+func TestMiddleware_MultisigReplayDoesNotBurnOtherSignatures(t *testing.T) {
+	pub1, priv1, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen pub1: %v", err)
+	}
+	pub2, priv2, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen pub2: %v", err)
+	}
+	now := time.Unix(1700000000, 0)
+	resolver := NewStaticResolver(map[string]ed25519.PublicKey{"key1": pub1, "key2": pub2})
+	replay := NewMemoryReplayStore(func() time.Time { return now })
+
+	bodyStr := `{"q":"x"}`
+	build := func() *http.Request {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+			"http://example.test/ramp.v1.ExchangeService/DiscoverResources", bytes.NewReader([]byte(bodyStr)))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Host = req.URL.Host
+		req.Header.Set("Authorization", "Bearer jwt")
+		created := now.Unix()
+		expires := now.Add(30 * time.Second).Unix()
+		if err := SignRequestRAMP(req, []byte(bodyStr), "key1", priv1, created, expires); err != nil {
+			t.Fatalf("sign 1: %v", err)
+		}
+		if err := AppendSignatureRAMP(req, []byte(bodyStr), "key2", priv2, created, expires); err != nil {
+			t.Fatalf("sign 2: %v", err)
+		}
+		return req
+	}
+
+	// Recover the per-label replay keys (keyID, base64 signature) from a request.
+	_, sigMap, err := parseAllSignatures(build().Header)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	agentSig := base64.StdEncoding.EncodeToString(sigMap["sig1"])
+	brokerSig := base64.StdEncoding.EncodeToString(sigMap["sig2"])
+
+	// Pre-seed ONLY the broker (sig2) key, so the request replays on its second
+	// label while its first (agent) label is first-seen.
+	if _, err := replay.SeenOrAdd(context.Background(), "key2", brokerSig, 30*time.Second); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	c := middlewareConfig{
+		ttl:        30 * time.Second,
+		verifyOpts: VerifyRequestOptions{Clk: clock.NewDeterministic(now)},
+	}
+	if _, err := c.verifyMultisig(build(), resolver, replay); !errors.Is(err, ErrReplayed) {
+		t.Fatalf("verifyMultisig err = %v, want ErrReplayed", err)
+	}
+
+	// The agent's (sig1) replay key MUST remain unburned.
+	if seen, _ := replay.Seen(context.Background(), "key1", agentSig); seen {
+		t.Fatal("agent signature was burned by a rejected multisig request (SEC-03 regression)")
+	}
+}
+
 func TestMiddleware_SkipsNonRampPaths(t *testing.T) {
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -170,5 +238,78 @@ func TestMiddleware_SkipsNonRampPaths(t *testing.T) {
 	_ = resp.Body.Close()
 	if !called {
 		t.Fatalf("/healthz should have passed through without signature")
+	}
+}
+
+func TestMiddleware_MultisigStoresAllSignatures(t *testing.T) {
+	pub1, priv1, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen pub1: %v", err)
+	}
+	pub2, priv2, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen pub2: %v", err)
+	}
+	now := time.Unix(1700000000, 0)
+	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+		"key1": pub1,
+		"key2": pub2,
+	})
+	replay := NewMemoryReplayStore(func() time.Time { return now })
+
+	var seenSigs []VerifiedRequest
+	h := Middleware(resolver, replay, InterceptorOptions{
+		Clk: clock.NewDeterministic(now),
+	}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenSigs = AllSignaturesFromContext(r.Context())
+		// Verify FromContext backward compat returns first sig
+		if v := FromContext(r.Context()); v != nil && len(seenSigs) > 0 {
+			if v.KeyID != seenSigs[0].KeyID {
+				t.Errorf("FromContext keyID = %q, want %q", v.KeyID, seenSigs[0].KeyID)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	bodyStr := `{"q":"x"}`
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		srv.URL+"/ramp.v1.ExchangeService/DiscoverResources", bytes.NewReader([]byte(bodyStr)))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Host = req.URL.Host
+	req.Header.Set("Authorization", "Bearer jwt")
+
+	// Sign with first key
+	created := now.Unix()
+	expires := now.Add(30 * time.Second).Unix()
+	if err := SignRequestRAMP(req, []byte(bodyStr), "key1", priv1, created, expires); err != nil {
+		t.Fatalf("sign 1: %v", err)
+	}
+
+	// Append second signature
+	if err := AppendSignatureRAMP(req, []byte(bodyStr), "key2", priv2, created, expires); err != nil {
+		t.Fatalf("sign 2: %v", err)
+	}
+
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(seenSigs) != 2 {
+		t.Fatalf("handler saw %d sigs, want 2", len(seenSigs))
+	}
+	if seenSigs[0].KeyID != "key1" {
+		t.Errorf("sig[0].KeyID = %q, want key1", seenSigs[0].KeyID)
+	}
+	if seenSigs[1].KeyID != "key2" {
+		t.Errorf("sig[1].KeyID = %q, want key2", seenSigs[1].KeyID)
 	}
 }

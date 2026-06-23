@@ -60,11 +60,15 @@ This supersedes the current Exchange behaviour, which is wrong twice: it emits t
 
 ### D5 — The Exchange binds to the Agent, always
 
-The binding principal is **always the agent** — the key the agent holds and fetches with — never a relay. Two requirements follow:
+The binding principal is **always the agent** — the key the agent holds and fetches with — never a relay. Three requirements follow:
 
 1. **The agent signs its requests to the Broker, and the `ExecuteTransaction` that reaches the Exchange MUST carry the agent's RFC 9421 signature.** The agent never auto-delegates the execute to the Broker; it signs the execute it intends to make. A relay that re-originates `ExecuteTransaction` under its own identity (so the agent's signature is absent on the Exchange hop) is **non-conformant** — the bound URL would name the relay, which the agent cannot satisfy at fetch.
 
 2. **On a multi-hop / relayed path (`MCP → Broker → Exchange`) the request is multisig, and the Exchange verifies every signature.** The Broker is a relay: it adds its own relay signature for hop integrity and audit but **preserves the agent's**, and it carries the Exchange reply back to the agent. The Exchange verifies **all** hop signatures, then binds `agent_id` — and records `transaction_log.agent_identity_hash` — to the **agent's** verified key (the `requester` principal), attesting the relay separately (`allow_broker_relay`, ADR-006). On the direct path the agent is the sole signer and this collapses to the obvious case.
+
+   **The signatures form an ordered forwarding chain, not parallel co-signatures (RAMP-56).** The agent emits `sig1` over the RAMP base covered set (`@method`, `@target-uri`, `content-digest`, `authorization`). Each relay appends `sigN` whose covered set is the base set **plus** the RFC 9421 §2.4 dictionary-member component `"signature";key="sigN-1"`, so `sigN` cryptographically commits to its immediate predecessor. The Exchange enforces that the labels are contiguous `sig1..sigN` in header order and that each `sigN` (N>1) covers exactly its predecessor; a relay therefore cannot strip, reorder, or substitute a peer's signature without invalidating the chain. The earlier "co-sign the same body in parallel" reading — where every signature covered the identical component set and order was not bound — is **superseded**: parallel co-signing left the ordered set unprotected, which the chain closes.
+
+3. **The Exchange bounds the chain depth.** It rejects a request carrying more signatures than `WellKnownManifest.max_intermediary_hops + 1` (the published intermediary ceiling plus the originating agent's own signature — default 4 + 1 = 5) with `httpsig.ErrTooManyHops` → Connect `resource_exhausted` (HTTP 429) and a `REJECTED_HOP_BUDGET` audit outcome, before any signature is cryptographically verified. The bound is an **Exchange-terminal** policy: relays do not apply it to their own ingress (it would double-count the hop they are about to add). This discharges the future obligation the Broker `hopguard` comment anticipated.
 
 The Exchange computes `agent_id` by **recomputing** the thumbprint from the agent's proven pubkey bytes (`requester.id → agentreg.LookupPublicKey`), never by echoing a caller-claimed `keyid`. The binding is to what was cryptographically proven *for the agent*, not to whichever key happened to terminate the transport hop.
 
@@ -120,7 +124,8 @@ This **replaces** the prior "unsatisfiable on the relay path / deferred to Web B
 
 - ADR-006 — broker intermediation; the relay-trust model (`allow_broker_relay`) under which the Exchange attests the Broker as relay while binding to the agent (D5).
 - ADR-009 D5 — identity boundary; `agent_identity_hash` = RFC 7638 thumbprint; `agent_id` URL parameter.
-- RAMP-56 — follow-up: agent-signed `ExecuteTransaction` on the relay path, multisig verification of all hop signatures, and the edge enforcement default-ON flip (D5 / D6.1).
+- RAMP-56 — follow-up: agent-signed `ExecuteTransaction` on the relay path, multisig verification of all hop signatures as an ordered forwarding chain, the Exchange hop bound, and the edge enforcement default-ON flip (D5 / D6.1).
+- RFC 9421 §2.4 — HTTP Message Signatures, the `"signature";key="<label>"` dictionary-member component identifier used to chain each hop's signature to its predecessor (D5).
 - ADR-011 — three-way reconciliation; join on thumbprint equality (why the URL carries the thumbprint, not the key).
 - ADR-012 D1 — edge delivery-log fields `presented_agent_kid`, `rfc9421_signature_valid`, outcome `DELIVERY_OUTCOME_DENIED_BINDING`.
 - `proto/ramp/v1/ramp.proto` — "Retrieval-URL identity binding" narrative; `agent_identity_hash` field; `WellKnownManifest.public_keys` / `JsonWebKey` (the manifest's inline-JWK use, distinct from the fetch).

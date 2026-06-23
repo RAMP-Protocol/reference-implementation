@@ -265,10 +265,15 @@ func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 	}
 
 	// Step 7: ExecuteTransaction → signed URL + transaction_log row.
+	// ADR-013 D5 requires multisig (agent + broker). Register the agent's pubkey
+	// in the httpsig resolver so the signature can be verified, then create a
+	// multisig client that signs with both the agent's key and the broker's key.
+	h.resolver.Put(agentID, agentPub)
+	multisigClient := newMultisigClient(h.baseRT, h.server.URL, agentID, agentPriv, h.discoverKeyID, h.discoverPriv)
 	txRequestID := "tx-" + uuid.NewString()
 	offerID := first.GetOfferId()
 	offerSig := first.GetSignature()
-	execResp, err := h.exchange.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
+	execResp, err := multisigClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
 		Ver: "1.0", Id: txRequestID,
 		OfferId:        &offerID,
 		OfferSignature: &offerSig,

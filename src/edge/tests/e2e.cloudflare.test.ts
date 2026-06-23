@@ -1,4 +1,4 @@
-import { SELF, fetchMock } from 'cloudflare:test';
+import { SELF } from 'cloudflare:test';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { thumbprint } from '../src/thumbprint.js';
@@ -6,33 +6,23 @@ import { encodeBase64Url } from '../src/verify.js';
 import {
   type TestKeypair,
   generateKeypair,
-  manifestWithKeys,
   rawPublicKey,
   signGetHeaders,
   signUrl,
 } from './helpers/ed25519.js';
-
-const PUB_ORIGIN = 'https://pub.example.com';
+import { PUB_ORIGIN, setupE2ETest, setupRampJsonMock } from './helpers/test-setup.js';
 
 let keypair: TestKeypair;
 
 beforeAll(async () => {
-  keypair = await generateKeypair('k1');
-  fetchMock.activate();
-  fetchMock.disableNetConnect();
+  keypair = await setupE2ETest();
 });
 
 // The edge resolves the verify key by fetching the exchange's unified
 // /.well-known/ramp.json and reading public_keys[] — repoint the intercept to
 // it and serve the manifest shape.
 beforeEach(() => {
-  fetchMock
-    .get('https://exchange.test')
-    .intercept({ path: '/.well-known/ramp.json', method: 'GET' })
-    .reply(200, manifestWithKeys([keypair.publicJwk]), {
-      headers: { 'content-type': 'application/json' },
-    })
-    .persist();
+  setupRampJsonMock(keypair);
 });
 
 describe('GET /healthz', () => {

@@ -73,8 +73,10 @@ from typing import Any
 
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from ramp_mcp_shim.httpsig import pop_signature_base
+from ramp_mcp_shim.thumbprint import ed25519_thumbprint
 
-from .b64 import b64url_decode
+from .b64 import b64url_decode, b64url_nopad
 
 # Path to the checked-in static test signer key. Resolved relative to
 # this module so the fixture follows the harness whether the runner is
@@ -104,6 +106,14 @@ _COVERED_COMPONENTS: tuple[str, ...] = (
     "authorization",
 )
 _DEFAULT_TTL_SECONDS = 30
+
+# Caller-supplied header carrying the target Exchange endpoint for the RAMP-56
+# relay. The Go consumer names it via the ``headerExchangeEndpoint`` constant
+# (src/broker/internal/transport/exchange_relay.go); a single Python constant
+# keeps every harness producer in sync (MED-08). The string MUST match the Go
+# side byte-for-byte — it crosses the Python→Go boundary, so the two can't share
+# one literal.
+EXCHANGE_ENDPOINT_HEADER = "X-RAMP-Exchange-Endpoint"
 
 
 def _load_signer(key_path: Path | None = None) -> tuple[str, Ed25519PrivateKey]:
@@ -202,10 +212,61 @@ def sign_post(
     return httpx.post(url, content=payload, headers=headers, timeout=timeout)
 
 
+def build_pop_headers(
+    *,
+    url: str,
+    key_path: Path = AGENT_E2E_KEY_PATH,
+) -> dict[str, str]:
+    """Build proof-of-possession headers for fetching a bound signed URL (ADR-013).
+
+    When a signed URL carries an agent_id (the agent's RFC 7638 thumbprint),
+    the edge requires proof of possession: the fetcher must present its raw
+    Ed25519 public key (X-RAMP-Agent-Key) and sign the GET with RFC 9421
+    over @method + @target-uri. The edge enforces 3-way identity:
+
+        agent_id (URL param) == keyid (Signature-Input) == thumbprint(presented key)
+
+    Args:
+        url: Full signed URL to fetch (the @target-uri value)
+        key_path: Agent key file (default: agent-e2e)
+
+    Returns:
+        Headers dict with X-RAMP-Agent-Key, Signature-Input, Signature
+    """
+    kid, priv = _load_signer(key_path)
+
+    # Derive public key from private key (don't trust JSON public_key field)
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    public_key_bytes = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    # Compute RFC 7638 thumbprint (the agent_id / keyid for PoP)
+    thumbprint_val = ed25519_thumbprint(public_key_bytes)
+
+    # Create signature parameters for GET with @method + @target-uri coverage
+    created = int(time.time())
+    expires = created + _DEFAULT_TTL_SECONDS
+    covered_list = '"@method" "@target-uri"'
+    sig_params = f'({covered_list});keyid="{thumbprint_val}";alg="ed25519";created={created};expires={expires}'
+
+    # Build RFC 9421 signature base for GET via the shim helper so the harness
+    # and production sign the identical, vector-pinned base (MED-06).
+    base = pop_signature_base(url, sig_params)
+    sig = priv.sign(base.encode())
+    sig_b64 = base64.b64encode(sig).decode()
+
+    return {
+        "X-RAMP-Agent-Key": b64url_nopad(public_key_bytes),
+        "Signature-Input": f"sig1={sig_params}",
+        "Signature": f"sig1=:{sig_b64}:",
+    }
+
+
 __all__ = [
     "AGENT_E2E_KEY_PATH",
     "AGENT_NOBILLING_KEY_PATH",
     "TEST_SIGNER_KEY_PATH",
     "build_signed_headers",
+    "build_pop_headers",
     "sign_post",
 ]

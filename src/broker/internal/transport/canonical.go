@@ -4,6 +4,9 @@ import (
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/selection"
 )
 
 // rampRequestToInput maps the canonical wire RAMPRequest onto the Broker's
@@ -51,12 +54,20 @@ func rampRequestToInput(rr *rampv1.RAMPRequest) ResolveRequest {
 // it; it is an opaque passthrough. Do not recompute here.
 func toRAMPResponse(r *ResolveResponse, requestID string) *rampv1.RAMPResponse {
 	out := &rampv1.RAMPResponse{
-		Ver:       "1.0",
+		Ver:       rampproto.Ver,
 		Id:        "rampresp-" + uuid.NewString(),
 		RequestId: requestID,
 		Exchange:  r.ExchangeID,
 		Ext:       brokerExt(r),
 	}
+
+	// RAMP-56: Discovery phase returns offers in ext; execute phase returns tx.
+	// Offers are placed in ext.ramp.broker.offers since RAMPResponse doesn't
+	// have a canonical offers field (it's designed for the execute phase).
+	if len(r.Offers) > 0 {
+		return out
+	}
+
 	tx := r.tx
 	if tx == nil {
 		return out
@@ -83,6 +94,9 @@ func toRAMPResponse(r *ResolveResponse, requestID string) *rampv1.RAMPResponse {
 // field for into a google.protobuf.Struct under ramp.broker.* keys. Empty
 // optional signals are omitted. structpb numbers are float64, so minor-unit
 // int64s are widened on the way in.
+//
+// RAMP-56: Discovery phase offers are serialized here since RAMPResponse has no
+// canonical offers field (it's designed for the execute phase).
 func brokerExt(r *ResolveResponse) *structpb.Struct {
 	fields := map[string]any{"ramp.broker.licensed": r.Licensed}
 	if r.OfferID != "" {
@@ -101,17 +115,12 @@ func brokerExt(r *ResolveResponse) *structpb.Struct {
 			"remaining_minor": float64(r.Budget.Remaining),
 		}
 	}
-	if len(r.Candidates) > 0 {
-		cands := make([]any, 0, len(r.Candidates))
-		for _, c := range r.Candidates {
-			cands = append(cands, map[string]any{
-				"offer_id":    c.OfferID,
-				"exchange_id": c.ExchangeID,
-				"unit_cost":   c.UnitCost,
-				"trust_level": c.TrustLevel,
-			})
-		}
+	if cands := brokerCandidates(r.Candidates); cands != nil {
 		fields["ramp.broker.candidates"] = cands
+	}
+	// RAMP-56: Serialize discovered offers for agent selection.
+	if offers := brokerOffers(r.Offers); offers != nil {
+		fields["ramp.broker.offers"] = offers
 	}
 	s, err := structpb.NewStruct(fields)
 	if err != nil {
@@ -120,4 +129,60 @@ func brokerExt(r *ResolveResponse) *structpb.Struct {
 		return nil
 	}
 	return s
+}
+
+// brokerCandidates serializes ranked candidate summaries for the
+// ramp.broker.candidates ext key. Returns nil when there are none.
+func brokerCandidates(candidates []CandidateInfo) []any {
+	if len(candidates) == 0 {
+		return nil
+	}
+	cands := make([]any, 0, len(candidates))
+	for _, c := range candidates {
+		cands = append(cands, map[string]any{
+			"offer_id":    c.OfferID,
+			"exchange_id": c.ExchangeID,
+			"unit_cost":   c.UnitCost,
+			"trust_level": c.TrustLevel,
+		})
+	}
+	return cands
+}
+
+// brokerOffers serializes discovered offers (RAMP-56 discovery phase) for the
+// ramp.broker.offers ext key. Returns nil when there are none.
+func brokerOffers(candidates []selection.Candidate) []any {
+	if len(candidates) == 0 {
+		return nil
+	}
+	offers := make([]any, 0, len(candidates))
+	for _, candidate := range candidates {
+		offers = append(offers, brokerOffer(candidate))
+	}
+	return offers
+}
+
+// brokerOffer serializes a single discovered offer into the map shape carried
+// under ramp.broker.offers.
+func brokerOffer(candidate selection.Candidate) map[string]any {
+	offer := candidate.Offer
+	offerMap := map[string]any{
+		"offer_id":          offer.GetOfferId(),
+		"exchange_domain":   candidate.Exchange.Domain,
+		"exchange_endpoint": candidate.Exchange.Endpoint,
+	}
+	if sig := offer.GetSignature(); sig != "" {
+		offerMap["signature"] = sig
+	}
+	if p := offer.GetPricing(); p != nil {
+		pricing := map[string]any{"rate": p.GetRate()}
+		if p.EstimatedQuantity != nil {
+			pricing["estimated_quantity"] = *p.EstimatedQuantity
+		}
+		if p.UnitCost != nil {
+			pricing["unit_cost"] = *p.UnitCost
+		}
+		offerMap["pricing"] = pricing
+	}
+	return offerMap
 }

@@ -203,7 +203,7 @@ def test_report_for_unclaimed_tx_is_refused_by_exchange(
     unknown_tx_id = f"tx-never-accepted-{uuid.uuid4().hex}"
     url = f"{compose_stack.exchange}{_REPORT_USAGE_PATH}"
     body: dict[str, Any] = {
-        "ver": "0.3",
+        "ver": "1.0",
         "id": f"report-{uuid.uuid4().hex}",
         "transactionId": unknown_tx_id,
         "billingId": "",

@@ -388,6 +388,83 @@ func TestRegistry_NilHTTPClientDefaultsToGuardedClient(t *testing.T) {
 	}
 }
 
+// newRawOrigin serves a fixed status + body at the well-known path, for failure
+// fixtures the JWKS-shaped fixtureOrigin cannot express (malformed body, 5xx).
+func newRawOrigin(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/ramp.json" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestRegistry_NoValidKey(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	reg, q, rw := setupRegistry(t, &fixedClock{now: now})
+	ctx := t.Context()
+
+	// Every published key's validity window lies entirely in the past.
+	pub := mustEd25519(t)
+	const agentID = "agent.fixture.test"
+	origin := newFixtureOrigin(t, agentID, []fixtureKey{{
+		kid: "k1", pub: pub,
+		validFrom:  now.Add(-48 * time.Hour),
+		validUntil: now.Add(-time.Hour),
+	}})
+	rw.set(agentID, origin.server.URL)
+
+	err := reg.RegisterFromManifest(ctx, agentID, agentID)
+	if !errors.Is(err, agentreg.ErrNoValidKey) {
+		t.Fatalf("want ErrNoValidKey for an all-expired manifest, got %v", err)
+	}
+	if _, err := q.GetAgent(ctx, agentID); err == nil {
+		t.Fatal("no agent row should persist when no key is currently valid")
+	}
+}
+
+func TestRegistry_MalformedManifest(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	reg, q, rw := setupRegistry(t, &fixedClock{now: now})
+	ctx := t.Context()
+
+	const agentID = "agent.fixture.test"
+	rw.set(agentID, newRawOrigin(t, http.StatusOK, "{not valid ramp json").URL)
+
+	err := reg.RegisterFromManifest(ctx, agentID, agentID)
+	if !errors.Is(err, agentreg.ErrMalformedManifest) {
+		t.Fatalf("want ErrMalformedManifest for a schema-invalid body, got %v", err)
+	}
+	if _, err := q.GetAgent(ctx, agentID); err == nil {
+		t.Fatal("no agent row should persist for a malformed manifest")
+	}
+}
+
+func TestRegistry_TransientFetchFailure(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	reg, q, rw := setupRegistry(t, &fixedClock{now: now})
+	ctx := t.Context()
+
+	const agentID = "agent.fixture.test"
+	rw.set(agentID, newRawOrigin(t, http.StatusServiceUnavailable, "upstream down").URL)
+
+	// A 503 is a transient transport failure: it surfaces verbatim (ErrFetch) so
+	// the lazy-registration mapper classifies it Unavailable/retryable, not as a
+	// permanent caller fault (mapLazyRegisterError).
+	err := reg.RegisterFromManifest(ctx, agentID, agentID)
+	if !errors.Is(err, rampwellknown.ErrFetch) {
+		t.Fatalf("want rampwellknown.ErrFetch for a 503, got %v", err)
+	}
+	if _, err := q.GetAgent(ctx, agentID); err == nil {
+		t.Fatal("no agent row should persist on a transient fetch failure")
+	}
+}
+
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

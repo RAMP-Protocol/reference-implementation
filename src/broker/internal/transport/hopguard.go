@@ -23,8 +23,10 @@ const brokerIntermediaryHops int32 = 1
 // Vacuous at the current single-hop depth (1 ≤ any max_hops ≥ 1); wired
 // declaratively so a future multi-hop relay inherits the bound. The Exchange's
 // own chain-depth tolerance is published as
-// WellKnownManifest.max_intermediary_hops (set by the Exchange producer) and
-// enforced Exchange-side once a chain is long enough to matter.
+// WellKnownManifest.max_intermediary_hops (set by the Exchange producer) and is
+// now enforced Exchange-side via httpsig.VerifyRequestOptions.MaxSignatures
+// (= max_intermediary_hops + 1, wired in the Exchange middleware), which rejects
+// an over-long signature chain with httpsig.ErrTooManyHops (RAMP-56).
 func enforceHopBudget(maxHops *int32) error {
 	if maxHops != nil && brokerIntermediaryHops > *maxHops {
 		return broker.Newf(broker.KindInvalidArgument,

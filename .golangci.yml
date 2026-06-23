@@ -141,6 +141,13 @@ linters:
           - gosec
           - lll
           - gocritic
+      # gosec G705 (XSS via taint analysis) does not apply to the Broker's
+      # writeProtoJSON: the payload is server-built canonical proto-JSON written
+      # with Content-Type application/json, never user-reflected HTML.
+      - path: 'src/broker/internal/transport/middleware.go'
+        text: 'G705'
+        linters:
+          - gosec
 
 formatters:
   enable:

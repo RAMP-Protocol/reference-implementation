@@ -79,6 +79,32 @@ services:
       retries: 20
       start_period: 5s
 
+  # ───── Agent well-known host (lazy-registration e2e) ─────
+  # Serves the fresh agent's ROLE_AGENT /.well-known/ramp.json on the
+  # `lazy-agent-e2e` network alias (== the agent's keyID/domain). The agent is
+  # deliberately ABSENT from RAMP_KEYS_FILE and ramp.agents, so the Exchange's
+  # and Broker's per-agent well-known resolvers (ADR-009 D2) are the only way its
+  # transport signature verifies — and a transaction lazily registers it.
+  agent-jwks:
+    build:
+      context: deploy/publisher-jwks
+      dockerfile: Dockerfile
+    environment:
+      SIGNING_KEY_FILE: "/keys/agent_lazy_e2e_key.json"
+      MANIFEST_ROLE: "ROLE_AGENT"
+    volumes:
+      - ./tests/e2e/harness/fixtures:/keys:ro
+    networks:
+      default:
+        aliases:
+          - lazy-agent-e2e
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
   # One-shot: generate ephemeral signing keys into a shared volume at stack-up so
   # nothing is committed to git. Mints (a) the AWS_CLOUDFRONT_RSA tenant RSA pair —
   # the Exchange reads the private half (RAMP_RSA_PRIVATE_PEM_FILE), the aws-edge
@@ -118,7 +144,7 @@ services:
       # "free" elsewhere (always-approve); the e2e harness needs a real
       # deny path so the credit-less-buyer obligation surfaces.
       RAMP_BILLING_ADAPTER: "inmemory"
-      EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"}}'
+      EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"},"lazy-agent-e2e":{"value":"100.00","currency":"USD"}}'
       # Local-dev overrides for the manifest-fetch resolver (HTTPS is the
       # default; compose network is HTTP-only).
       RAMP_MANIFEST_FETCH_SCHEME: "http"
@@ -184,6 +210,9 @@ services:
       BROKER_ID: "broker-e2e"
       BROKER_DOMAIN: "broker.e2e.local"
       RAMP_PROBE_SCHEME: "http"
+      # Per-agent well-known resolver fetches an unknown agent's manifest; the
+      # compose network is HTTP-only (mirrors the Exchange's setting).
+      RAMP_MANIFEST_FETCH_SCHEME: "http"
       # The SSRF guard on the publisher-probe fetch blocks private/loopback hosts
       # by default; the compose publisher (and host.docker.internal probe target)
       # are internal http hosts, so permit it here. MUST stay unset in production.
@@ -410,6 +439,8 @@ services:
         condition: service_healthy
       mcp:
         condition: service_started
+      agent-jwks:
+        condition: service_healthy
       postgres:
         condition: service_healthy
 

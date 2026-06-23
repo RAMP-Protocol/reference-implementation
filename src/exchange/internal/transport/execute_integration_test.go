@@ -161,6 +161,66 @@ func TestExecuteTransaction_BindsAgentIdentity(t *testing.T) {
 	}
 }
 
+// TestExecuteTransaction_MultisigBindsToAgent verifies that multisig requests
+// (agent + broker) bind the delivery URL to the AGENT's key, not the broker's.
+func TestExecuteTransaction_MultisigBindsToAgent(t *testing.T) {
+	h := newTestHarnessWithBroker(t)
+	ctx := h.ctx
+	seedCatalog(t, h)
+	offers := discoverFirst(t, h)
+	offer := offers[0]
+
+	resp, err := h.multisigClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
+		Ver:            "1.0",
+		Id:             "tx-multisig",
+		OfferId:        stringPtr(offer.GetOfferId()),
+		OfferSignature: stringPtr(offer.GetSignature()),
+		Requester:      &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+	}))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	msg := resp.Msg
+
+	// Verify binding is to agent key, not broker key
+	wantAgentHash, err := rampthumbprint.Thumbprint(h.callerPub)
+	if err != nil {
+		t.Fatalf("agent thumbprint: %v", err)
+	}
+	if got := msg.GetAgentIdentityHash(); got != wantAgentHash {
+		t.Errorf("agent_identity_hash = %q, want agent thumbprint %q (not broker)", got, wantAgentHash)
+	}
+
+	signedURL := extractSignedURL(t, msg)
+	parsed, err := url.Parse(signedURL)
+	if err != nil {
+		t.Fatalf("parse retrieval_endpoint: %v", err)
+	}
+	if got := parsed.Query().Get("agent_id"); got != wantAgentHash {
+		t.Errorf("URL agent_id = %q, want agent thumbprint %q (not broker)", got, wantAgentHash)
+	}
+}
+
+// TestExecuteTransaction_MultisigRejectsBrokerWithoutAllowRelay verifies that
+// multisig requests with broker signature are rejected when tenant has
+// allow_broker_relay=false.
+func TestExecuteTransaction_MultisigRejectsBrokerWithoutAllowRelay(t *testing.T) {
+	h := newTestHarnessWithBrokerNoRelay(t)
+	ctx := h.ctx
+	seedCatalog(t, h)
+	offers := discoverFirst(t, h)
+	offer := offers[0]
+
+	_, err := h.multisigClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
+		Ver:            "1.0",
+		Id:             "tx-multisig-denied",
+		OfferId:        stringPtr(offer.GetOfferId()),
+		OfferSignature: stringPtr(offer.GetSignature()),
+		Requester:      &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+	}))
+	assertConnectCode(t, err, connect.CodePermissionDenied)
+}
+
 // ---- helpers --------------------------------------------------------------
 
 func seedCatalog(t *testing.T, h *testHarness) {

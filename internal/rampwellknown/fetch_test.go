@@ -20,7 +20,7 @@ func TestFetch_HappyPathAssertsRole(t *testing.T) {
 	defer origin.Close()
 
 	m, err := rampwellknown.Fetch(context.Background(), origin.URL, rampwellknown.FetchOptions{
-		Client:     http.DefaultClient,
+		Client:     testutil.Client(),
 		ExpectRole: rampwellknown.RoleAgent,
 	})
 	if err != nil {
@@ -87,7 +87,7 @@ func TestFetch_Errors(t *testing.T) {
 			defer origin.Close()
 			tc.arrange(origin)
 			_, err := rampwellknown.Fetch(context.Background(), origin.URL, rampwellknown.FetchOptions{
-				Client:     http.DefaultClient,
+				Client:     testutil.Client(),
 				ExpectRole: tc.expect,
 			})
 			if !errors.Is(err, tc.wantErr) {

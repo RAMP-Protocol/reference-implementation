@@ -38,6 +38,29 @@ func TestMemoryReplayStore_DifferentKeyIDIndependent(t *testing.T) {
 	}
 }
 
+func TestMemoryReplayStore_Seen(t *testing.T) {
+	var now time.Time
+	s := NewMemoryReplayStore(func() time.Time { return now })
+	now = time.Unix(1700000000, 0)
+
+	// Seen is read-only: it must NOT record the pair.
+	if seen, _ := s.Seen(context.Background(), "a", "sig"); seen {
+		t.Fatalf("Seen on a fresh pair returned true")
+	}
+	if seen, _ := s.SeenOrAdd(context.Background(), "a", "sig", time.Minute); seen {
+		t.Fatalf("SeenOrAdd after Seen returned true — Seen must not have added the pair")
+	}
+	// Now it is recorded; Seen reports true without mutating expiry.
+	if seen, _ := s.Seen(context.Background(), "a", "sig"); !seen {
+		t.Fatalf("Seen on a recorded pair returned false")
+	}
+	// Expired entries read as fresh.
+	now = now.Add(2 * time.Minute)
+	if seen, _ := s.Seen(context.Background(), "a", "sig"); seen {
+		t.Fatalf("Seen on an expired pair returned true")
+	}
+}
+
 func TestMemoryReplayStore_ExpiredEntryIsFresh(t *testing.T) {
 	var now time.Time
 	s := NewMemoryReplayStore(func() time.Time { return now })

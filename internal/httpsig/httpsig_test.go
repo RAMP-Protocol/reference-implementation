@@ -2,168 +2,154 @@ package httpsig
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io"
 	"net/http"
-	"strings"
 	"testing"
+	"time"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
-func newSignedRequest(t *testing.T, body []byte, keyID string, priv ed25519.PrivateKey) *http.Request {
-	t.Helper()
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
-		"https://exchange.example/ramp.v1.CatalogService/PushResources", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	req.Host = "exchange.example"
-	if err := SignRequest(req, body, keyID, priv, 1700000000); err != nil {
-		t.Fatalf("sign: %v", err)
-	}
-	return req
-}
+// The three tests below exercise digest/header negatives that the canonical
+// VerifyRequest suite (verifier_test.go) does not otherwise cover. They were
+// ported from the deleted legacy httpsig.Verify tests (MED-03) onto the
+// canonical verifier using the shared newRAMPSignedRequest fixture + a fixed
+// clock; the remaining legacy negatives (valid, wrong-key, unknown-key,
+// missing-input, bad-alg) are already covered there and were dropped.
 
-// makeFixedLookup returns a LookupKey that admits only callerTestKeyID.
-const callerTestKeyID = "caller.test"
-
-func makeFixedLookup(pub ed25519.PublicKey) LookupKey {
-	return func(_ context.Context, k string) (ed25519.PublicKey, error) {
-		if k != callerTestKeyID {
-			return nil, ErrUnknownKey
-		}
-		return pub, nil
-	}
-}
-
-func TestVerify_ValidSignature(t *testing.T) {
+func TestVerifyRequest_TamperedBodyRejected(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	body := []byte(`{"hello":"world"}`)
-	req := newSignedRequest(t, body, "caller.test", priv)
+	now := time.Unix(1700000000, 0)
+	req := newRAMPSignedRequest(t, []byte(`{"hello":"world"}`), priv, now)
+	// Swap the body after signing: Content-Digest still commits to the original,
+	// so the digest check (which runs before the ed25519 verify) must reject.
+	req.Body = io.NopCloser(bytes.NewReader([]byte(`{"hello":"mars"}`)))
 
-	v, err := Verify(context.Background(), req, body, makeFixedLookup(pub))
-	if err != nil {
-		t.Fatalf("verify: %v", err)
-	}
-	if v.KeyID != "caller.test" {
-		t.Fatalf("keyid = %q, want caller.test", v.KeyID)
-	}
-}
-
-func TestVerify_TamperedBodyRejected(t *testing.T) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("gen: %v", err)
-	}
-	body := []byte(`{"hello":"world"}`)
-	req := newSignedRequest(t, body, "caller.test", priv)
-
-	tampered := []byte(`{"hello":"mars"}`)
-	_, err = Verify(context.Background(), req, tampered, makeFixedLookup(pub))
+	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("want ErrDigestMismatch, got %v", err)
 	}
 }
 
-func TestVerify_WrongKeyIDRejected(t *testing.T) {
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("gen: %v", err)
-	}
-	wrongPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("gen: %v", err)
-	}
-	body := []byte(`{"hello":"world"}`)
-	req := newSignedRequest(t, body, "caller.test", priv)
-
-	// Lookup returns the wrong pubkey — signature verification must fail.
-	_, err = Verify(context.Background(), req, body, makeFixedLookup(wrongPub))
-	if !errors.Is(err, ErrSignatureVerify) {
-		t.Fatalf("want ErrSignatureVerify, got %v", err)
-	}
-}
-
-func TestVerify_UnknownKeyIDReturnsLookupErr(t *testing.T) {
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("gen: %v", err)
-	}
-	body := []byte(`{"hello":"world"}`)
-	req := newSignedRequest(t, body, "unknown.test", priv)
-
-	sentinel := errors.New("not registered")
-	_, err = Verify(context.Background(), req, body, func(_ context.Context, k string) (ed25519.PublicKey, error) {
-		return nil, sentinel
-	})
-	if !errors.Is(err, sentinel) {
-		t.Fatalf("want sentinel lookup err, got %v", err)
-	}
-}
-
-func TestVerify_MissingContentDigestRejected(t *testing.T) {
+func TestVerifyRequest_MissingContentDigestRejected(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	body := []byte(`{"hello":"world"}`)
-	req := newSignedRequest(t, body, "caller.test", priv)
+	now := time.Unix(1700000000, 0)
+	req := newRAMPSignedRequest(t, []byte(`{"hello":"world"}`), priv, now)
 	req.Header.Del("Content-Digest")
 
-	_, err = Verify(context.Background(), req, body, makeFixedLookup(pub))
+	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrMissingContentDigest) {
 		t.Fatalf("want ErrMissingContentDigest, got %v", err)
 	}
 }
 
-func TestVerify_MissingSignatureInputRejected(t *testing.T) {
+func TestVerifyRequest_MissingSignatureRejected(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	body := []byte(`{"hello":"world"}`)
-	req := newSignedRequest(t, body, "caller.test", priv)
-	req.Header.Del("Signature-Input")
+	now := time.Unix(1700000000, 0)
+	req := newRAMPSignedRequest(t, []byte(`{"hello":"world"}`), priv, now)
+	req.Header.Del("Signature") // keep Signature-Input so the miss is on Signature
 
-	_, err = Verify(context.Background(), req, body, makeFixedLookup(pub))
-	if !errors.Is(err, ErrMissingSignatureInput) {
-		t.Fatalf("want ErrMissingSignatureInput, got %v", err)
-	}
-}
-
-func TestVerify_MissingSignatureRejected(t *testing.T) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("gen: %v", err)
-	}
-	body := []byte(`{"hello":"world"}`)
-	req := newSignedRequest(t, body, "caller.test", priv)
-	req.Header.Del("Signature")
-
-	_, err = Verify(context.Background(), req, body, makeFixedLookup(pub))
+	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrMissingSignature) {
 		t.Fatalf("want ErrMissingSignature, got %v", err)
 	}
 }
 
-func TestVerify_UnsupportedAlgRejected(t *testing.T) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("gen: %v", err)
+// TestParseAllSignatures_ZeroSignatures verifies handling of empty headers.
+func TestParseAllSignatures_ZeroSignatures(t *testing.T) {
+	h := http.Header{}
+	allParams, sigMap, err := parseAllSignatures(h)
+	if !errors.Is(err, ErrMissingSignatureInput) {
+		t.Fatalf("want ErrMissingSignatureInput, got %v", err)
 	}
-	body := []byte(`{"hello":"world"}`)
-	req := newSignedRequest(t, body, "caller.test", priv)
-	// Swap alg in Signature-Input to rsa — forces unsupported-alg rejection
-	// even though the raw signature was produced with ed25519.
-	input := req.Header.Get("Signature-Input")
-	req.Header.Set("Signature-Input", strings.Replace(input, `alg="ed25519"`, `alg="rsa-pss-sha256"`, 1))
+	if len(allParams) != 0 {
+		t.Fatalf("want 0 params, got %d", len(allParams))
+	}
+	if len(sigMap) != 0 {
+		t.Fatalf("want empty sigMap, got %d entries", len(sigMap))
+	}
+}
 
-	_, err = Verify(context.Background(), req, body, makeFixedLookup(pub))
-	if !errors.Is(err, ErrUnsupportedAlgorithm) {
-		t.Fatalf("want ErrUnsupportedAlgorithm, got %v", err)
+// TestParseAllSignatures_OneSignature verifies single-label parsing.
+func TestParseAllSignatures_OneSignature(t *testing.T) {
+	h := http.Header{}
+	h.Set("Signature-Input", `sig1=("@method" "@path");keyid="caller.test";alg="ed25519";created=1700000000`)
+	h.Set("Signature", `sig1=:YWJjZGVm:`)
+
+	allParams, sigMap, err := parseAllSignatures(h)
+	if err != nil {
+		t.Fatalf("parseAllSignatures: %v", err)
+	}
+	if len(allParams) != 1 {
+		t.Fatalf("want 1 params, got %d", len(allParams))
+	}
+	if allParams[0].Label != "sig1" {
+		t.Fatalf("want label sig1, got %q", allParams[0].Label)
+	}
+	if allParams[0].KeyID != "caller.test" {
+		t.Fatalf("want keyid caller.test, got %q", allParams[0].KeyID)
+	}
+	if len(sigMap) != 1 {
+		t.Fatalf("want 1 sig, got %d", len(sigMap))
+	}
+	if _, ok := sigMap["sig1"]; !ok {
+		t.Fatalf("sig1 not in sigMap")
+	}
+}
+
+// TestParseAllSignatures_TwoSignatures verifies multi-label parsing.
+func TestParseAllSignatures_TwoSignatures(t *testing.T) {
+	h := http.Header{}
+	h.Set("Signature-Input", `sig1=("@method" "@path");keyid="caller.test";alg="ed25519";created=1700000000, sig2=("@method");keyid="proxy.test";alg="ed25519";created=1700000001`)
+	h.Set("Signature", `sig1=:YWJjZGVm:, sig2=:ZGVmZ2hp:`)
+
+	allParams, sigMap, err := parseAllSignatures(h)
+	if err != nil {
+		t.Fatalf("parseAllSignatures: %v", err)
+	}
+	if len(allParams) != 2 {
+		t.Fatalf("want 2 params, got %d", len(allParams))
+	}
+	if allParams[0].Label != "sig1" {
+		t.Fatalf("want label sig1, got %q", allParams[0].Label)
+	}
+	if allParams[1].Label != "sig2" {
+		t.Fatalf("want label sig2, got %q", allParams[1].Label)
+	}
+	if len(sigMap) != 2 {
+		t.Fatalf("want 2 sigs, got %d", len(sigMap))
+	}
+	if _, ok := sigMap["sig1"]; !ok {
+		t.Fatalf("sig1 not in sigMap")
+	}
+	if _, ok := sigMap["sig2"]; !ok {
+		t.Fatalf("sig2 not in sigMap")
+	}
+}
+
+// TestParseAllSignatures_MalformedMultiLabel verifies error handling.
+func TestParseAllSignatures_MalformedMultiLabel(t *testing.T) {
+	h := http.Header{}
+	h.Set("Signature-Input", `sig1=("@method");keyid="caller.test";alg="ed25519", malformed`)
+	h.Set("Signature", `sig1=:YWJjZGVm:`)
+
+	_, _, err := parseAllSignatures(h)
+	if !errors.Is(err, ErrMalformedSignatureInput) {
+		t.Fatalf("want ErrMalformedSignatureInput, got %v", err)
 	}
 }

@@ -208,6 +208,9 @@ func extString(out *rampv1.RAMPResponse, key string) string {
 	return out.GetExt().GetFields()[key].GetStringValue()
 }
 
+// TestResolve_LicensedFlow verifies the RAMP-56 two-phase discovery flow:
+// broker discovers and returns ranked offers; execution is a separate
+// agent-originated flow via /broker/v1/exchange/execute.
 func TestResolve_LicensedFlow(t *testing.T) {
 	ctx := context.Background()
 	fx := newFixture(t, ctx, fixtureOpts{providerDomain: "acme.example"})
@@ -225,44 +228,60 @@ func TestResolve_LicensedFlow(t *testing.T) {
 	if !extBool(out, "ramp.broker.licensed") {
 		t.Fatal("expected ramp.broker.licensed=true")
 	}
-	if out.GetRetrievalEndpoint() == "" {
-		t.Error("expected retrieval_endpoint")
+
+	// RAMP-56: Discovery phase returns offers, NOT execution results
+	if out.GetRetrievalEndpoint() != "" {
+		t.Error("discovery phase should NOT return retrieval_endpoint (execute phase only)")
 	}
-	if out.GetTransactionId() == "" {
-		t.Error("expected transaction_id")
+	if out.GetTransactionId() != "" {
+		t.Error("discovery phase should NOT return transaction_id (execute phase only)")
 	}
-	if !strings.HasPrefix(extString(out, "ramp.broker.offer_id"), "offer-") {
-		t.Errorf("offer_id = %q", extString(out, "ramp.broker.offer_id"))
+
+	// Verify offers are returned in ext.ramp.broker.offers
+	offersField := out.GetExt().GetFields()["ramp.broker.offers"]
+	if offersField == nil {
+		t.Fatal("expected ramp.broker.offers in ext")
 	}
-	budget := out.GetExt().GetFields()["ramp.broker.budget"].GetStructValue()
-	if budget == nil || budget.GetFields()["consumed_minor"].GetNumberValue() <= 0 {
-		t.Errorf("budget state = %v", budget)
+	offers := offersField.GetListValue().GetValues()
+	if len(offers) == 0 {
+		t.Fatal("expected at least one offer")
 	}
+
+	// Verify offer structure
+	offer := offers[0].GetStructValue().GetFields()
+	offerID := offer["offer_id"].GetStringValue()
+	if !strings.HasPrefix(offerID, "offer-") {
+		t.Errorf("offer_id = %q", offerID)
+	}
+	if offer["exchange_endpoint"].GetStringValue() == "" {
+		t.Error("offer missing exchange_endpoint")
+	}
+	if offer["signature"].GetStringValue() == "" {
+		t.Error("offer missing signature")
+	}
+
+	// Discovery phase: only DiscoverResources is called
 	if fx.exchange.discoverCalls != 1 {
 		t.Errorf("discover calls = %d, want 1", fx.exchange.discoverCalls)
 	}
-	if fx.exchange.executeCalls != 1 {
-		t.Errorf("execute calls = %d, want 1", fx.exchange.executeCalls)
+	if fx.exchange.executeCalls != 0 {
+		t.Errorf("execute calls = %d, want 0 (agent calls execute via relay)", fx.exchange.executeCalls)
 	}
-	if fx.exchange.reportCalls != 1 {
-		t.Errorf("report calls = %d, want 1", fx.exchange.reportCalls)
+	if fx.exchange.reportCalls != 0 {
+		t.Errorf("report calls = %d, want 0 (happens after execute)", fx.exchange.reportCalls)
 	}
-	// Pin the contract of the relay payload itself, not just that a call
-	// happened. The relay synthesises a UsageReport that
-	// echoes the offer's EstimatedQuantity as Usage.ConsumedQuantity; a
-	// future regression that drops the field surfaces here, not in CI green.
-	if fx.exchange.lastReport == nil {
-		t.Fatal("relay did not capture a UsageReport")
-	}
-	if got := fx.exchange.lastReport.GetUsage().GetConsumedQuantity(); got != 42 {
-		t.Errorf("relay Usage.ConsumedQuantity = %d, want 42", got)
-	}
-	if fx.exchange.lastReport.GetTransactionId() == "" {
-		t.Error("relay UsageReport missing transaction_id")
-	}
-	if fx.exchange.lastReport.GetBillingId() == "" {
-		t.Error("relay UsageReport missing billing_id")
-	}
+	// Version-skew fix: in the two-phase discovery flow the Broker authors exactly
+	// two RAMP messages — the upstream ResourceQuery (asserted on what the mock
+	// Exchange received) and the downstream RAMPResponse (asserted on the decoded
+	// body). Both must stamp the canonical wire version. The literal "1.0" is
+	// asserted directly (not rampproto.Ver) so a regression in the constant fails
+	// here instead of passing CI green. TransactionRequest and UsageReport are no
+	// longer Broker-authored — the agent signs them and the Broker relays them raw,
+	// so their ver is the agent's contract, not the Broker's. The relay test pins
+	// that passthrough by asserting the ver the Exchange receives is unchanged (see
+	// TestExchangeRelay_MultisigBindsToAgent in exchange_relay_integration_test.go).
+	assertEmittedVer(t, "ResourceQuery", fx.exchange.lastQuery.GetVer())
+	assertEmittedVer(t, "RAMPResponse", out.GetVer())
 }
 
 // TestResolve_NoRampJSON_RefusesNotInCatalog locks in the v1 contract:
@@ -280,6 +299,7 @@ func TestResolve_NoRampJSON_RefusesNotInCatalog(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
 	out := decodeRAMPResponse(t, resp)
+	assertEmittedVer(t, "RAMPResponse", out.GetVer())
 	if extBool(out, "ramp.broker.licensed") {
 		t.Error("expected licensed=false for unmanifested domain")
 	}
@@ -309,6 +329,7 @@ func TestResolve_BudgetExhausted(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
 	out := decodeRAMPResponse(t, resp)
+	assertEmittedVer(t, "RAMPResponse", out.GetVer())
 	if extBool(out, "ramp.broker.licensed") {
 		t.Error("expected licensed=false after budget exhaustion")
 	}
@@ -336,6 +357,7 @@ func TestResolve_ScopeInsufficientRefusal(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
 	out := decodeRAMPResponse(t, resp)
+	assertEmittedVer(t, "RAMPResponse", out.GetVer())
 	if extBool(out, "ramp.broker.licensed") {
 		t.Error("expected licensed=false on SCOPE_INSUFFICIENT upstream")
 	}
@@ -363,6 +385,8 @@ func TestResolve_NoVerifiedCaller_Unauthenticated(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 401, body = %s", resp.StatusCode, body)
 	}
+	out := decodeRAMPResponse(t, resp)
+	assertEmittedVer(t, "RAMPResponse", out.GetVer())
 	if fx.exchange.discoverCalls != 0 || fx.exchange.executeCalls != 0 {
 		t.Errorf("upstream calls leaked: discover=%d execute=%d",
 			fx.exchange.discoverCalls, fx.exchange.executeCalls)
@@ -383,6 +407,8 @@ func TestResolve_CallerImpersonation_PermissionDenied(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 403, body = %s", resp.StatusCode, body)
 	}
+	out := decodeRAMPResponse(t, resp)
+	assertEmittedVer(t, "RAMPResponse", out.GetVer())
 	if fx.exchange.discoverCalls != 0 || fx.exchange.executeCalls != 0 {
 		t.Errorf("upstream calls leaked: discover=%d execute=%d",
 			fx.exchange.discoverCalls, fx.exchange.executeCalls)
@@ -410,6 +436,8 @@ func TestResolve_MaxHopsBelowBrokerHopBudget_Rejected(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 400, body = %s", resp.StatusCode, body)
 	}
+	out := decodeRAMPResponse(t, resp)
+	assertEmittedVer(t, "RAMPResponse", out.GetVer())
 	if fx.exchange.discoverCalls != 0 || fx.exchange.executeCalls != 0 {
 		t.Errorf("max_hops rejection must not reach upstream: discover=%d execute=%d",
 			fx.exchange.discoverCalls, fx.exchange.executeCalls)
