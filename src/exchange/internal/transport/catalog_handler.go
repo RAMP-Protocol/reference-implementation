@@ -11,8 +11,11 @@ import (
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/keypolicy"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
@@ -21,7 +24,7 @@ import (
 // maxCatalogBodyBytes bounds the PushResources body the signature middleware
 // buffers before any verification. The endpoint is pre-auth (the RFC 9421
 // signature is checked in the handler, not at a gate), so an unbounded read
-// would let an unauthenticated caller exhaust memory (parallels HIGH-01 on the
+// would let an unauthenticated caller exhaust memory (parallels the same cap on the
 // broker relay). 1 MiB is generous for a bulk catalog push while still bounding
 // the DoS surface.
 const maxCatalogBodyBytes int64 = 1 << 20
@@ -90,65 +93,182 @@ func (h *CatalogHandler) PushResources(
 	ctx context.Context,
 	req *connect.Request[rampv1.PushResourcesRequest],
 ) (*connect.Response[rampv1.PushResourcesResponse], error) {
+	// Every return goes through catalogFaultError, not bare ToConnect: the Kind→Code
+	// table is only half the answer. The other half is the ErrorDetail envelope —
+	// the domain a client filters on and the field name a refusal names — and a
+	// path that skips it silently discards both.
+	if err := canonicalizeCallerID(ctx, req.Msg); err != nil {
+		return nil, catalogFaultError(err)
+	}
 	if err := h.verifyCallerSignature(ctx, req.Msg.GetCallerId()); err != nil {
-		return nil, err
+		return nil, catalogFaultError(err)
 	}
 	out, err := h.svc.PushResources(ctx, req.Msg)
 	if err != nil {
-		return nil, exchange.ToConnect(err)
+		return nil, catalogFaultError(err)
 	}
 	return connect.NewResponse(out), nil
+}
+
+// canonicalizeCallerID rewrites msg.CallerId to the canonical directory host, in
+// place, so the two gates this request passes read one value rather than two
+// spellings of it.
+//
+// Gate 1 (verifyCallerSignature) resolves the caller's key through agentreg,
+// which canonicalizes internally. Gate 2 (the per-entry contributor check)
+// compares caller_id against the publisher manifest's contributor domains
+// VERBATIM. Left raw, the two disagreed: a publisher posting
+// "https://pub.example" authenticated successfully as pub.example and was then
+// refused with caller_not_in_catalog_contributors — a rejection naming a
+// condition it demonstrably satisfies. Rewriting at the edge is the same shape
+// agents/register and the Broker's resolve input already use, and agentreg's own
+// storageKey doc names this caller_id as one of the inputs that normalization
+// exists for.
+//
+// Only the CALLER side is folded HERE. The manifest side is folded too, but by
+// the comparison itself — AuthorizesContributor takes the identity rule as a
+// parameter and applies it to both. Folding one side only made the check
+// asymmetric and refused every publisher that had spelled its own contributor
+// entry with a scheme, in mixed case, with a trailing dot, or with :443.
+//
+// Folding does not widen who counts as a contributor, which is what this comment
+// used to claim: distinct hosts keep distinct identities, so it removes
+// differences of spelling and nothing else.
+//
+// An empty caller_id passes through untouched. It is a missing identity rather
+// than an unregistrable one, and both gates already have their own answers for
+// it — Gate 1 refuses self-signup without a caller_id, Gate 2 refuses the push.
+func canonicalizeCallerID(ctx context.Context, msg *rampv1.PushResourcesRequest) error {
+	raw := msg.GetCallerId()
+	if raw == "" {
+		return nil
+	}
+	callerID, err := agentid.FromDirectory(raw)
+	if err != nil {
+		// InvalidArgument, matching the sibling refusals on the Broker's agent_id
+		// and on /agents/register: the caller sent a field that is not a host. That
+		// is a malformed argument, not a failure to authenticate — and answering it
+		// as the latter told a caller to go looking at its keys.
+		//
+		// The message is curated and the cause is logged rather than returned. The
+		// wrapped chain names the parser and the rule that rejected the value, which
+		// helps an operator and tells an unauthenticated stranger about our
+		// internals; /agents/register already draws that line the same way.
+		reqctx.FromContext(ctx).WarnContext(ctx, "catalog caller_id is not a host",
+			"caller_id", raw, "err", err)
+		return exchange.Newf(exchange.KindInvalidRequest,
+			"caller_id does not name a host").WithField("caller_id")
+	}
+	msg.CallerId = callerID
+	return nil
 }
 
 // verifyCallerSignature enforces Gate 1. The middleware must have populated
 // the context with raw body + headers; verification is retried once after a
 // manifest-driven self-signup attempt when keyid is unknown.
+//
+// Errors are constructed through the domain Kind vocabulary (exchange.Newf /
+// exchange.Wrap) and PushResources funnels them through exchange.ToConnect, so
+// the signature gate shares the single Kind→connect.Code mapping table with
+// every other handler path instead of hand-picking connect codes inline
+// (one canonical Kind→code mapping, never per-site). The emitted codes are UNCHANGED by this
+// refactor: a sig-verify / self-signup failure is KindUnauthenticated (→
+// CodeUnauthenticated) and the missing-middleware wiring fault is KindInternal
+// (→ CodeInternal), exactly as the prior inline connect.NewError calls produced.
 func (h *CatalogHandler) verifyCallerSignature(ctx context.Context, callerID string) error {
 	sigCtx, ok := ctx.Value(httpContextKey{}).(*catalogSignatureCtx)
 	if !ok || sigCtx == nil {
-		return connect.NewError(connect.CodeInternal, errors.New("catalog: signature middleware missing"))
+		return exchange.Newf(exchange.KindInternal, "catalog: signature middleware missing")
 	}
 	// VerifyRequest (not the legacy Verify) so the catalog push is held to the
 	// same RFC 9421 policy as every other signed surface: required covered
-	// components (@method, @target-uri, content-digest, authorization) AND the
-	// created/expires freshness window. The catalog signer already covers that
-	// set and stamps created/expires, so this is a tightening, not a break.
-	resolver := httpsig.ResolverFunc(func(ctx context.Context, keyID string) (ed25519.PublicKey, error) {
-		return h.registry.LookupPublicKey(ctx, keyID)
+	// components (@method, @target-uri, content-digest, authorization,
+	// signature-agent) AND the created/expires freshness window. The catalog
+	// signer already covers that set and stamps created/expires, so this is a
+	// tightening, not a break.
+	//
+	// After the WBA split the signature keyid is a thumbprint, so the caller's
+	// key is NOT resolvable by keyid in the agents table. It is resolved by the
+	// contributor's caller_id (its domain / Signature-Agent directory), which is
+	// what the agents table (and the Gate-1 self-signup TOFU-pin) is keyed on:
+	// the closure ignores the thumbprint keyid and returns the key pinned for
+	// callerID, so VerifyRequestResolved checks the signature against the published key.
+	resolver := keypolicy.ResolverFunc(func(ctx context.Context, _ string) (ed25519.PublicKey, error) {
+		return h.registry.LookupPublicKey(ctx, callerID)
 	})
-	// Connect already drained request.Body to decode the message, so re-supply
-	// the captured bytes before each verification (VerifyRequest reads the body
-	// off the request to recompute Content-Digest).
+	// helpers.VerifyRequestResolved is pure: body is supplied explicitly so
+	// request.Body (already drained by Connect) need not be re-seated.
 	verify := func() error {
-		sigCtx.request.Body = io.NopCloser(bytes.NewReader(sigCtx.body))
-		_, err := httpsig.VerifyRequest(sigCtx.request, resolver)
+		_, err := helpers.VerifyRequestResolved(ctx, sigCtx.request, sigCtx.body, resolver, helpers.VerifyOptions{})
 		return err
 	}
 	if err := verify(); err != nil {
-		if !errors.Is(err, agentreg.ErrUnknown) {
-			return connect.NewError(connect.CodeUnauthenticated, err)
-		}
-		if callerID == "" {
-			return connect.NewError(connect.CodeUnauthenticated, err)
-		}
-		if regErr := h.registry.RegisterFromManifest(ctx, callerID, callerID); regErr != nil {
-			return connectRegisterError(regErr)
-		}
-		if err := verify(); err != nil {
-			return connect.NewError(connect.CodeUnauthenticated, err)
-		}
+		return h.selfSignupOnVerifyFailure(ctx, callerID, err, verify)
 	}
 	return nil
 }
 
-// connectRegisterError maps a RegisterFromManifest failure to a Connect error,
-// splitting a permanent caller fault (Unauthenticated) from a transient upstream
-// fetch failure (Unavailable/retryable). agentreg.IsCallerFault is the single
-// source of that classification, shared with service.mapLazyRegisterError.
-func connectRegisterError(err error) error {
-	code := connect.CodeUnavailable
-	if agentreg.IsCallerFault(err) {
-		code = connect.CodeUnauthenticated
+// selfSignupOnVerifyFailure handles a failed caller-signature verification. Two
+// cases resolve the same way — re-learn the caller's currently-published key and
+// re-verify — differing only in fetch-error handling:
+//
+//   - First contact (agentreg.ErrUnknown: no pinned key) → firstContactSelfSignup
+//     registers the key from the publisher's WBA directory. A fetch failure is
+//     surfaced (caller fault → Unauthenticated, transient → Unavailable) because
+//     the fetch is required to establish identity at all.
+//   - Known caller whose signature no longer matches the pinned key (key
+//     rotation) → a bounded/debounced RefreshDirectoryKey re-pins, then re-verify.
+//     A refresh failure is NOT surfaced: it is logged and we re-verify against the
+//     best key available, denying on mismatch, so an unreachable directory can't
+//     upgrade an impersonation attempt into a retryable Unavailable.
+//
+// The retry-on-unknown shape is intentionally app-level, not an SDK hook: it
+// occurs only on this path, and CatalogService mounts raw (bypassing the SDK
+// connectserver verify seam) for per-contributor verification, so a
+// verify-with-self-signup hook would redesign the catalog path for one caller.
+//
+// Failures are expressed in the domain Kind vocabulary so PushResources'
+// exchange.ToConnect owns the single Kind→connect.Code mapping (Architecture
+// Rule 9).
+func (h *CatalogHandler) selfSignupOnVerifyFailure(
+	ctx context.Context, callerID string, verifyErr error, verify func() error,
+) error {
+	if callerID == "" {
+		return exchange.Wrap(exchange.KindUnauthenticated, verifyErr, "catalog: unknown caller, no caller_id for self-signup")
 	}
-	return connect.NewError(code, err)
+	if errors.Is(verifyErr, agentreg.ErrUnknown) {
+		return h.firstContactSelfSignup(ctx, callerID, verify)
+	}
+	if err := h.registry.RefreshDirectoryKey(ctx, callerID); err != nil {
+		reqctx.FromContext(ctx).WarnContext(ctx,
+			"catalog: caller key re-pin failed", "caller_id", callerID, "err", err)
+	}
+	if err := verify(); err != nil {
+		return exchange.Wrap(exchange.KindUnauthenticated, err, "catalog: caller signature invalid")
+	}
+	return nil
+}
+
+// firstContactSelfSignup registers a caller with no pinned key from its WBA
+// directory (trust-on-first-fetch) and re-verifies. agentreg.IsCallerFault is
+// the single source of the caller-fault vs transient split, shared with
+// service.mapLazyRegisterError.
+func (h *CatalogHandler) firstContactSelfSignup(
+	ctx context.Context, callerID string, verify func() error,
+) error {
+	if regErr := h.registry.RegisterFromDirectory(ctx, callerID, callerID); regErr != nil {
+		if agentreg.IsCallerFault(regErr) {
+			return exchange.Wrap(exchange.KindUnauthenticated, regErr, "catalog: caller self-signup failed")
+		}
+		return exchange.Wrap(exchange.KindUnavailable, regErr, "catalog: caller self-signup unavailable")
+	}
+	// Provable evidence that the key was learned via the well-known fetch (not a
+	// DB pre-seed) — the e2e catalog-trust test asserts this line, and it only
+	// fires on a cache miss, so its presence proves first-contact self-signup.
+	reqctx.FromContext(ctx).InfoContext(ctx,
+		"catalog: caller self-signup from well-known manifest", "caller_id", callerID)
+	if err := verify(); err != nil {
+		return exchange.Wrap(exchange.KindUnauthenticated, err, "catalog: caller signature invalid after self-signup")
+	}
+	return nil
 }

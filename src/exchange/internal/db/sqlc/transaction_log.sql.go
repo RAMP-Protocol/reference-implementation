@@ -13,16 +13,17 @@ import (
 
 const createTransaction = `-- name: CreateTransaction :one
 INSERT INTO ramp.transaction_log (
-    transaction_id, tx_request_id, tenant_id, agent_id, resource_id,
+    transaction_id, idempotency_key, tenant_id, agent_id, resource_id,
     offer_id, agent_identity_hash, signed_url_hash, expiry,
-    billing_id, unit_cost, currency, consumed_unit, denial_reason
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-RETURNING transaction_id, tx_request_id, tenant_id, agent_id, resource_id, offer_id, agent_identity_hash, signed_url_hash, expiry, billing_id, unit_cost, currency, consumed_unit, denial_reason, created_at
+    billing_id, unit_cost, currency, consumed_unit, denial_reason,
+    result_payload
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+RETURNING transaction_id, idempotency_key, tenant_id, agent_id, resource_id, offer_id, agent_identity_hash, signed_url_hash, expiry, billing_id, unit_cost, currency, consumed_unit, denial_reason, created_at, result_payload
 `
 
 type CreateTransactionParams struct {
 	TransactionID     string               `json:"transaction_id"`
-	TxRequestID       string               `json:"tx_request_id"`
+	IdempotencyKey    string               `json:"idempotency_key"`
 	TenantID          string               `json:"tenant_id"`
 	AgentID           string               `json:"agent_id"`
 	ResourceID        string               `json:"resource_id"`
@@ -35,6 +36,7 @@ type CreateTransactionParams struct {
 	Currency          string               `json:"currency"`
 	ConsumedUnit      pgtype.Text          `json:"consumed_unit"`
 	DenialReason      NullRampDenialReason `json:"denial_reason"`
+	ResultPayload     []byte               `json:"result_payload"`
 }
 
 // Writes the full transaction row. The handler MUST await this commit before
@@ -42,7 +44,7 @@ type CreateTransactionParams struct {
 func (q *Queries) CreateTransaction(ctx context.Context, arg CreateTransactionParams) (RampTransactionLog, error) {
 	row := q.db.QueryRow(ctx, createTransaction,
 		arg.TransactionID,
-		arg.TxRequestID,
+		arg.IdempotencyKey,
 		arg.TenantID,
 		arg.AgentID,
 		arg.ResourceID,
@@ -55,11 +57,12 @@ func (q *Queries) CreateTransaction(ctx context.Context, arg CreateTransactionPa
 		arg.Currency,
 		arg.ConsumedUnit,
 		arg.DenialReason,
+		arg.ResultPayload,
 	)
 	var i RampTransactionLog
 	err := row.Scan(
 		&i.TransactionID,
-		&i.TxRequestID,
+		&i.IdempotencyKey,
 		&i.TenantID,
 		&i.AgentID,
 		&i.ResourceID,
@@ -73,21 +76,26 @@ func (q *Queries) CreateTransaction(ctx context.Context, arg CreateTransactionPa
 		&i.ConsumedUnit,
 		&i.DenialReason,
 		&i.CreatedAt,
+		&i.ResultPayload,
 	)
 	return i, err
 }
 
-const getTransactionByRequestID = `-- name: GetTransactionByRequestID :one
-SELECT transaction_id, tx_request_id, tenant_id, agent_id, resource_id, offer_id, agent_identity_hash, signed_url_hash, expiry, billing_id, unit_cost, currency, consumed_unit, denial_reason, created_at FROM ramp.transaction_log WHERE tx_request_id = $1
+const getTransactionByID = `-- name: GetTransactionByID :one
+SELECT transaction_id, idempotency_key, tenant_id, agent_id, resource_id, offer_id, agent_identity_hash, signed_url_hash, expiry, billing_id, unit_cost, currency, consumed_unit, denial_reason, created_at, result_payload FROM ramp.transaction_log WHERE transaction_id = $1
 `
 
-// Idempotency lookup: return a prior transaction for the same tx_request_id.
-func (q *Queries) GetTransactionByRequestID(ctx context.Context, txRequestID string) (RampTransactionLog, error) {
-	row := q.db.QueryRow(ctx, getTransactionByRequestID, txRequestID)
+// Read a transaction by its public transaction_id (the value the resolve /
+// ExecuteTransaction response returns). Unique-key audit read: like
+// GetTransactionByIdempotencyKey it is keyed on a globally-unique id and is not
+// tenant-filtered; the returned row carries tenant_id so callers scope/assert
+// the tenant binding themselves.
+func (q *Queries) GetTransactionByID(ctx context.Context, transactionID string) (RampTransactionLog, error) {
+	row := q.db.QueryRow(ctx, getTransactionByID, transactionID)
 	var i RampTransactionLog
 	err := row.Scan(
 		&i.TransactionID,
-		&i.TxRequestID,
+		&i.IdempotencyKey,
 		&i.TenantID,
 		&i.AgentID,
 		&i.ResourceID,
@@ -101,6 +109,36 @@ func (q *Queries) GetTransactionByRequestID(ctx context.Context, txRequestID str
 		&i.ConsumedUnit,
 		&i.DenialReason,
 		&i.CreatedAt,
+		&i.ResultPayload,
+	)
+	return i, err
+}
+
+const getTransactionByIdempotencyKey = `-- name: GetTransactionByIdempotencyKey :one
+SELECT transaction_id, idempotency_key, tenant_id, agent_id, resource_id, offer_id, agent_identity_hash, signed_url_hash, expiry, billing_id, unit_cost, currency, consumed_unit, denial_reason, created_at, result_payload FROM ramp.transaction_log WHERE idempotency_key = $1
+`
+
+// Idempotency lookup: return a prior transaction for the same idempotency_key.
+func (q *Queries) GetTransactionByIdempotencyKey(ctx context.Context, idempotencyKey string) (RampTransactionLog, error) {
+	row := q.db.QueryRow(ctx, getTransactionByIdempotencyKey, idempotencyKey)
+	var i RampTransactionLog
+	err := row.Scan(
+		&i.TransactionID,
+		&i.IdempotencyKey,
+		&i.TenantID,
+		&i.AgentID,
+		&i.ResourceID,
+		&i.OfferID,
+		&i.AgentIdentityHash,
+		&i.SignedUrlHash,
+		&i.Expiry,
+		&i.BillingID,
+		&i.UnitCost,
+		&i.Currency,
+		&i.ConsumedUnit,
+		&i.DenialReason,
+		&i.CreatedAt,
+		&i.ResultPayload,
 	)
 	return i, err
 }

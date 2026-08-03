@@ -16,6 +16,7 @@
     "**/*_pb.ts",
     "**/*connect.go",
     "**/internal/db/sqlc/**",
+    "**/internal/sor/db/sqlc/**",
     "**/.venv/**",
     "**/__pycache__/**",
     "**/cmd/server/main.go"

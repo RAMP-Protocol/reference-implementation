@@ -112,7 +112,7 @@ cmd_publish() {
     echo "published ed25519 + rsa private keys to Secrets Manager (ramp-demo/*) via profile '${AWS_PROFILE}'."
     echo "roll the ECS services so tasks pick up the new secrets:"
     echo "  make aws-roll-services   # or:"
-    echo "  aws --profile ${AWS_PROFILE} ecs update-service --cluster ramp-demo --service ramp-demo-{exchange,broker,mcp} --force-new-deployment"
+    echo "  aws --profile ${AWS_PROFILE} ecs update-service --cluster ramp-demo --service ramp-demo-{exchange,broker,identity} --force-new-deployment"
 }
 
 main() {

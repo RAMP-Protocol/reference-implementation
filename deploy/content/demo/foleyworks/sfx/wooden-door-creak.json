@@ -1,0 +1,13 @@
+{
+  "name": "Wooden Door Creak",
+  "slug": "wooden-door-creak",
+  "category": "foley/doors",
+  "duration_seconds": 4.3,
+  "sample_rate_hz": 96000,
+  "bit_depth": 24,
+  "channels": 1,
+  "loopable": false,
+  "format": "WAV",
+  "tags": ["door", "creak", "wood", "hinge", "foley"],
+  "description": "Slow creak of an old wooden door swinging on a dry hinge, ending in a soft latch click. Close-mic mono capture with minimal room tone. Original foley recording metadata for demo purposes."
+}

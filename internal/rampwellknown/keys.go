@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"time"
+
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 )
 
 // EncodeEd25519X encodes a raw Ed25519 public key as a JWK `x` parameter:
@@ -32,30 +34,41 @@ func DecodeEd25519X(x string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(raw), nil
 }
 
+// DecodeJWKEd25519 is the single guard+decode for a JWK Set entry across every
+// JWKS ingestion path (the httpsig bootstrap resolver, the Broker key registry):
+// it rejects a non-OKP/Ed25519 key type and decodes the `x` parameter. A wrong
+// kty/crv or an undecodable x is ErrSchemaInvalid, so a loader filtering a mixed
+// JWK set skips a bad entry uniformly on error rather than re-deriving the
+// decode+guard (and drifting on its failure policy) at each call site.
+func DecodeJWKEd25519(kty, crv, x string) (ed25519.PublicKey, error) {
+	if kty != "OKP" || crv != "Ed25519" {
+		return nil, fmt.Errorf("%w: kty=%q crv=%q, want OKP/Ed25519", ErrSchemaInvalid, kty, crv)
+	}
+	return DecodeEd25519X(x)
+}
+
 // NewKey builds a published JWK for an Ed25519 public key valid over the
 // half-open window [notBefore, notAfter). Producers use this so every role
 // emits an identical JWK shape (RFC 8037: kty=OKP, crv=Ed25519, use=sig,
-// alg=EdDSA, x=base64url(pub)).
-func NewKey(kid string, pub ed25519.PublicKey, notBefore, notAfter time.Time) *Key {
-	return &Key{
-		Kid:       kid,
-		Kty:       "OKP",
-		Crv:       "Ed25519",
-		Use:       "sig",
-		Alg:       "EdDSA",
-		X:         EncodeEd25519X(pub),
-		NotBefore: notBefore.UTC().Format(time.RFC3339),
-		NotAfter:  notAfter.UTC().Format(time.RFC3339),
-	}
+// alg=EdDSA, x=base64url(pub)). Keys carry no kid: they are identified by their
+// RFC 7638 thumbprint (see Thumbprint), which is the RFC 9421 keyid.
+func NewKey(pub ed25519.PublicKey, notBefore, notAfter time.Time) *Key {
+	// Delegate to KeyFromEncodedX so the RFC 8037 JWK header quartet
+	// (kty/crv/use/alg) is stamped in exactly one place.
+	return KeyFromEncodedX(
+		EncodeEd25519X(pub),
+		notBefore.UTC().Format(time.RFC3339),
+		notAfter.UTC().Format(time.RFC3339),
+	)
 }
 
 // KeyFromEncodedX builds a published JWK from an already-base64url x parameter
 // (RFC 8037 raw 32-byte public key) and pre-formatted RFC 3339 validity bounds.
 // Use it when the key bytes are already encoded — e.g. folding a registry JWKS
-// into a manifest; reach for NewKey instead when the key is a raw ed25519.PublicKey.
-func KeyFromEncodedX(kid, x, notBefore, notAfter string) *Key {
+// into a WBA directory; reach for NewKey instead when the key is a raw
+// ed25519.PublicKey.
+func KeyFromEncodedX(x, notBefore, notAfter string) *Key {
 	return &Key{
-		Kid:       kid,
 		Kty:       "OKP",
 		Crv:       "Ed25519",
 		Use:       "sig",
@@ -66,17 +79,17 @@ func KeyFromEncodedX(kid, x, notBefore, notAfter string) *Key {
 	}
 }
 
-// ActiveKeys returns the manifest keys whose validity window covers now,
+// ActiveKeys returns the WBA directory's keys whose validity window covers now,
 // preserving document order. The window is half-open: a key is active when
 // not_before <= now < not_after (lower bound inclusive, upper bound strict),
 // matching the proto contract and avoiding a double-active instant at rotation.
 // Keys with unparseable timestamps are skipped, not fatal.
-func ActiveKeys(m *Manifest, now time.Time) []*Key {
-	if m == nil {
+func ActiveKeys(f *WBAFile, now time.Time) []*Key {
+	if f == nil {
 		return nil
 	}
-	active := make([]*Key, 0, len(m.GetPublicKeys()))
-	for _, k := range m.GetPublicKeys() {
+	active := make([]*Key, 0, len(f.GetKeys()))
+	for _, k := range f.GetKeys() {
 		if keyActiveAt(k, now) {
 			active = append(active, k)
 		}
@@ -84,33 +97,41 @@ func ActiveKeys(m *Manifest, now time.Time) []*Key {
 	return active
 }
 
-// ActiveKey returns the Ed25519 public key of the first currently-valid key in
-// document order, or ErrKeyExpired when no key's validity window covers now.
-// Unlike LookupKey (which matches a known kid), this selects an identity's
-// "current" signing key when the kid is not known ahead of time — the shape a
-// caller resolving an agent/publisher by domain anchor needs (the transport
-// keyID is the identity, not a key label). A malformed key `x` yields the
-// decode error from PublicKey.
-func ActiveKey(m *Manifest, now time.Time) (ed25519.PublicKey, error) {
-	active := ActiveKeys(m, now)
-	if len(active) == 0 {
-		return nil, ErrKeyExpired
-	}
-	return PublicKey(active[0])
-}
+// Window-active offer/agent key selection (the by-domain-anchor "current key"
+// selector) now lives in the SDK: resolvers.ActiveEd25519Key /
+// ActiveEd25519KeyWithExpiry. Callers use those directly; the in-repo copies were
+// retired once the SDK shipped the same selection with its own parity corpus.
 
-// KeyByKid returns the key carrying kid and whether it was found. Kids are
-// unique within a single manifest's public_keys list.
-func KeyByKid(m *Manifest, kid string) (*Key, bool) {
-	if m == nil || kid == "" {
+// KeyByThumbprint returns the key in f whose RFC 7638 thumbprint equals
+// thumbprint (the RFC 9421 keyid) and whether it was found. Each key's
+// thumbprint is computed locally from its decoded public key via the SDK thumbprint helper;
+// keys with an undecodable `x` are skipped. This is the resolution primitive
+// that replaces kid matching after the WBA split.
+func KeyByThumbprint(f *WBAFile, thumbprint string) (*Key, bool) {
+	if f == nil || thumbprint == "" {
 		return nil, false
 	}
-	for _, k := range m.GetPublicKeys() {
-		if k.GetKid() == kid {
+	for _, k := range f.GetKeys() {
+		tp, err := Thumbprint(k)
+		if err != nil {
+			continue
+		}
+		if tp == thumbprint {
 			return k, true
 		}
 	}
 	return nil, false
+}
+
+// Thumbprint returns the RFC 7638 JWK thumbprint (base64url-no-pad, the RFC 9421
+// keyid) of k, computed from its decoded Ed25519 public key. A malformed `x`
+// yields the decode error from PublicKey.
+func Thumbprint(k *Key) (string, error) {
+	pub, err := PublicKey(k)
+	if err != nil {
+		return "", err
+	}
+	return helpers.Thumbprint(pub)
 }
 
 // PublicKey decodes a JWK's x parameter into an ed25519.PublicKey. The wire
@@ -119,11 +140,7 @@ func PublicKey(k *Key) (ed25519.PublicKey, error) {
 	if k == nil {
 		return nil, fmt.Errorf("%w: nil key", ErrSchemaInvalid)
 	}
-	pub, err := DecodeEd25519X(k.GetX())
-	if err != nil {
-		return nil, fmt.Errorf("%w (kid %q)", err, k.GetKid())
-	}
-	return pub, nil
+	return DecodeEd25519X(k.GetX())
 }
 
 // keyActiveAt reports whether k's [not_before, not_after) window covers now.

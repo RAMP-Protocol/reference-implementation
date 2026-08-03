@@ -26,9 +26,8 @@ func newTestSignedRequest(t *testing.T, url, body, authz string, priv ed25519.Pr
 	}
 	req.Host = req.URL.Host
 	req.Header.Set("Authorization", authz)
-	created := now.Unix()
 	expires := now.Add(30 * time.Second).Unix()
-	if err := SignRequestRAMP(req, []byte(body), testKeyID, priv, created, expires); err != nil {
+	if err := SignRequestRAMP(req, []byte(body), testKeyID, priv, expires); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 	return req
@@ -39,7 +38,7 @@ func TestMiddleware_AcceptsSigned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
@@ -81,7 +80,7 @@ func TestMiddleware_RejectsUnsignedWith401(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
@@ -112,7 +111,7 @@ func TestMiddleware_RejectsReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
@@ -148,7 +147,7 @@ func TestMiddleware_RejectsReplay(t *testing.T) {
 	}
 }
 
-// TestMiddleware_MultisigReplayDoesNotBurnOtherSignatures pins SEC-03: when a
+// TestMiddleware_MultisigReplayDoesNotBurnOtherSignatures pins the multisig replay contract: when a
 // multisig request is rejected because ONE of its signatures is a replay, the
 // OTHER (valid, first-seen) signatures must not be recorded — otherwise an
 // attacker could pre-burn an agent's signature by pairing it with a replayed
@@ -162,7 +161,7 @@ func TestMiddleware_MultisigReplayDoesNotBurnOtherSignatures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen pub2: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{"key1": pub1, "key2": pub2})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
@@ -175,19 +174,25 @@ func TestMiddleware_MultisigReplayDoesNotBurnOtherSignatures(t *testing.T) {
 		}
 		req.Host = req.URL.Host
 		req.Header.Set("Authorization", "Bearer jwt")
-		created := now.Unix()
 		expires := now.Add(30 * time.Second).Unix()
-		if err := SignRequestRAMP(req, []byte(bodyStr), "key1", priv1, created, expires); err != nil {
+		if err := SignRequestRAMP(req, []byte(bodyStr), "key1", priv1, expires); err != nil {
 			t.Fatalf("sign 1: %v", err)
 		}
-		if err := AppendSignatureRAMP(req, []byte(bodyStr), "key2", priv2, created, expires); err != nil {
+		if err := AppendSignatureRAMP(req, []byte(bodyStr), "key2", priv2, expires); err != nil {
 			t.Fatalf("sign 2: %v", err)
 		}
 		return req
 	}
 
-	// Recover the per-label replay keys (keyID, base64 signature) from a request.
-	_, sigMap, err := parseAllSignatures(build().Header)
+	// Build and sign the multisig request ONCE; clone it for the verify leg so the
+	// seeded sig2 and the verified sig2 are identical by construction. yaronf
+	// stamps created = time.Now() per sign call, so re-signing via a second build()
+	// would desync the bytes across a wall-clock second boundary and silently miss
+	// the replay (regression-guard flake).
+	req := build()
+
+	// Recover the per-label replay keys (keyID, base64 signature) from the request.
+	_, sigMap, err := parseAllSignatures(req.Header)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -204,13 +209,15 @@ func TestMiddleware_MultisigReplayDoesNotBurnOtherSignatures(t *testing.T) {
 		ttl:        30 * time.Second,
 		verifyOpts: VerifyRequestOptions{Clk: clock.NewDeterministic(now)},
 	}
-	if _, err := c.verifyMultisig(build(), resolver, replay); !errors.Is(err, ErrReplayed) {
+	verifyReq := req.Clone(req.Context())
+	verifyReq.Body = io.NopCloser(bytes.NewReader([]byte(bodyStr)))
+	if _, err := c.verifyMultisig(verifyReq, resolver, replay); !errors.Is(err, ErrReplayed) {
 		t.Fatalf("verifyMultisig err = %v, want ErrReplayed", err)
 	}
 
 	// The agent's (sig1) replay key MUST remain unburned.
 	if seen, _ := replay.Seen(context.Background(), "key1", agentSig); seen {
-		t.Fatal("agent signature was burned by a rejected multisig request (SEC-03 regression)")
+		t.Fatal("agent signature was burned by a rejected multisig request")
 	}
 }
 
@@ -219,7 +226,7 @@ func TestMiddleware_SkipsNonRampPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
@@ -250,7 +257,7 @@ func TestMiddleware_MultisigStoresAllSignatures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen pub2: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
 		"key1": pub1,
 		"key2": pub2,
@@ -283,14 +290,13 @@ func TestMiddleware_MultisigStoresAllSignatures(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer jwt")
 
 	// Sign with first key
-	created := now.Unix()
 	expires := now.Add(30 * time.Second).Unix()
-	if err := SignRequestRAMP(req, []byte(bodyStr), "key1", priv1, created, expires); err != nil {
+	if err := SignRequestRAMP(req, []byte(bodyStr), "key1", priv1, expires); err != nil {
 		t.Fatalf("sign 1: %v", err)
 	}
 
 	// Append second signature
-	if err := AppendSignatureRAMP(req, []byte(bodyStr), "key2", priv2, created, expires); err != nil {
+	if err := AppendSignatureRAMP(req, []byte(bodyStr), "key2", priv2, expires); err != nil {
 		t.Fatalf("sign 2: %v", err)
 	}
 

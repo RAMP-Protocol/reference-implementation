@@ -19,24 +19,37 @@ import (
 // executeTransactionFor and the hot-path-failure tests.
 func pushDiscoverOffer(t *testing.T, h *testHarness, estimatedQty int32) *rampv1.Offer {
 	t.Helper()
+	// Pricing (including estimated_quantity, which drives the obligation
+	// tolerance window) is term-derived now.
+	return pushDiscoverTermOffer(t, h, "/articles/hello", seedPricedTermEst(estimatedQty))
+}
+
+// pushDiscoverTermOffer pushes a single-entry catalog at path carrying term
+// through the public PushResources surface, discovers path, and returns the
+// first offer. The shared Agent→Exchange ingest+discovery round-trip: the priced
+// (pushDiscoverOffer) and free-resource suites both reuse it, so a PER_UNIT term
+// and a FREE term exercise the identical public path with no raw-sqlc arrange
+// (Testing Doctrine §9).
+func pushDiscoverTermOffer(t *testing.T, h *testHarness, path string, term *rampv1.LicenseTerm) *rampv1.Offer {
+	t.Helper()
 	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
 		TenantId: h.tenantID,
 		CallerId: "agent-test",
 		Entries: []*rampv1.ResourceEntry{{
-			Domain:            h.tenantDomain,
-			Path:              "/articles/hello",
-			EstimatedQuantity: &estimatedQty,
+			Domain: h.tenantDomain,
+			Path:   path,
+			Terms:  []*rampv1.LicenseTerm{term},
 		}},
 	}))
 	if err != nil {
-		t.Fatalf("push: %v", err)
+		t.Fatalf("push %s: %v", path, err)
 	}
-	return discoverFirst(t, h)[0]
+	return discoverPath(t, h, path)[0]
 }
 
 // executeOfferRaw runs ExecuteTransaction for the given offer and returns the
 // raw response/error WITHOUT fataling, so failure-path tests can assert on the
-// error. The tx_request_id is derived from t.Name() to stay unique across tests.
+// error. The idempotency_key is derived from t.Name() to stay unique across tests.
 func executeOfferRaw(
 	t *testing.T, h *testHarness, offer *rampv1.Offer,
 ) (*connect.Response[rampv1.TransactionResponse], error) {
@@ -44,19 +57,16 @@ func executeOfferRaw(
 	return executeOfferRawWithID(t, h, offer, "tx-"+t.Name())
 }
 
-// executeOfferRawWithID is executeOfferRaw with an explicit tx_request_id, for
+// executeOfferRawWithID is executeOfferRaw with an explicit idempotency_key, for
 // tests that drive two transactions in one body — a second call sharing the
 // id would hit the idempotency short-circuit instead of reaching the handler.
+// Items-only contract (C4 collapse): the offer is presented as a single items[]
+// entry with a body AgentAcceptance, via the shared executeSingleItem helper.
 func executeOfferRawWithID(
 	t *testing.T, h *testHarness, offer *rampv1.Offer, id string,
 ) (*connect.Response[rampv1.TransactionResponse], error) {
 	t.Helper()
-	return h.exchangeClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", Id: id,
-		OfferId:        stringPtr(offer.GetOfferId()),
-		OfferSignature: stringPtr(offer.GetSignature()),
-		Requester:      &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
-	}))
+	return executeSingleItem(t, h, id, offer)
 }
 
 // executeTransactionFor pushes a catalog entry, discovers an offer, executes
@@ -64,7 +74,7 @@ func executeOfferRawWithID(
 // controls the offer's EstimatedQuantity (drives the obligation's
 // estimated_quantity column, used by the tolerance check). The pre-rename
 // `executeAndReport` was a misnomer — this helper only executes, it never
-// reports (review §D).
+// reports.
 func executeTransactionFor(t *testing.T, h *testHarness, estimatedQty int32) (txID, billingID string) {
 	t.Helper()
 	offer := pushDiscoverOffer(t, h, estimatedQty)
@@ -72,14 +82,15 @@ func executeTransactionFor(t *testing.T, h *testHarness, estimatedQty int32) (tx
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	return execResp.Msg.GetTransactionId(), execResp.Msg.GetBillingId()
+	item := singleResultItem(t, execResp)
+	return item.GetTransactionId(), item.GetBillingId()
 }
 
 // seedTenantPolicy seeds a tenants.reporting_policy JSONB row via the
 // generated sqlc Querier (no raw SQL).
 func seedTenantPolicy(t *testing.T, h *testHarness, policyJSON string) {
 	t.Helper()
-	if err := h.queries.SetTenantReportingPolicy(h.ctx, sqlc.SetTenantReportingPolicyParams{
+	if _, err := h.queries.SetTenantReportingPolicy(h.ctx, sqlc.SetTenantReportingPolicyParams{
 		TenantID:        h.tenantID,
 		ReportingPolicy: []byte(policyJSON),
 	}); err != nil {
@@ -96,7 +107,7 @@ func TestReportUsage_HappyPath(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	resp, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-1",
+		Ver: "1.0", IdempotencyKey: "r-1",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -104,9 +115,8 @@ func TestReportUsage_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("report: %v", err)
 	}
-	if !resp.Msg.GetAccepted() {
-		t.Errorf("response Accepted=false, want true")
-	}
+	// Acceptance is no longer an in-body flag (ADR-019 §2): a successful report
+	// returns no transport error and carries the issued report_id.
 	if resp.Msg.GetReportId() == "" {
 		t.Errorf("response ReportId empty")
 	}
@@ -123,12 +133,13 @@ func TestReportUsage_RequiredFields_FromTenantPolicy(t *testing.T) {
 	txID, _ := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-req",
+		Ver: "1.0", IdempotencyKey: "r-req",
 		TransactionId: txID,
 		BillingId:     "", // required but missing
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
 	}))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "billing_id")
+	assertReportRejectionField(t, err, "billing_id")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_FIELDS")
 }
 
@@ -143,12 +154,13 @@ func TestReportUsage_WindowExpired(t *testing.T) {
 	det.Advance(25 * time.Hour)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-window",
+		Ver: "1.0", IdempotencyKey: "r-window",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 0},
 	}))
 	assertConnectError(t, err, connect.CodeFailedPrecondition, "window")
+	assertReportRejectionField(t, err, "window")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_WINDOW")
 }
 
@@ -158,12 +170,13 @@ func TestReportUsage_ToleranceViolation(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-tol",
+		Ver: "1.0", IdempotencyKey: "r-tol",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 200},
 	}))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "outside")
+	assertReportRejectionField(t, err, "consumed_quantity")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_TOLERANCE")
 }
 
@@ -173,7 +186,7 @@ func TestReportUsage_ToleranceAtBoundary_Plus20(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-bound-plus",
+		Ver: "1.0", IdempotencyKey: "r-bound-plus",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 120},
@@ -185,13 +198,13 @@ func TestReportUsage_ToleranceAtBoundary_Plus20(t *testing.T) {
 }
 
 // TestReportUsage_ToleranceAtBoundary_Minus20 mirrors the +20% boundary test
-// in the negative direction (review finding L9).
+// in the negative direction.
 func TestReportUsage_ToleranceAtBoundary_Minus20(t *testing.T) {
 	h := newTestHarness(t)
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-bound-minus",
+		Ver: "1.0", IdempotencyKey: "r-bound-minus",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 80},
@@ -208,12 +221,13 @@ func TestReportUsage_BillingIDMismatch(t *testing.T) {
 	txID, _ := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-billing",
+		Ver: "1.0", IdempotencyKey: "r-billing",
 		TransactionId: txID,
 		BillingId:     "wrong-billing-id",
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
 	}))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "billing_id")
+	assertReportRejectionField(t, err, "billing_id")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_BILLING_ID")
 }
 
@@ -221,7 +235,7 @@ func TestReportUsage_BillingIDMismatch(t *testing.T) {
 func TestReportUsage_UnknownTransaction(t *testing.T) {
 	h := newTestHarness(t)
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-unknown",
+		Ver: "1.0", IdempotencyKey: "r-unknown",
 		TransactionId: "nonexistent-tx",
 		BillingId:     "b",
 		Usage:         &rampv1.Usage{ConsumedQuantity: 1},
@@ -237,12 +251,13 @@ func TestReportUsage_ZeroEstimate_NonZeroConsumed_Rejected(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 0)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-ze",
+		Ver: "1.0", IdempotencyKey: "r-ze",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 1},
 	}))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "zero-estimate")
+	assertReportRejectionField(t, err, "consumed_quantity")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_TOLERANCE")
 }
 
@@ -253,7 +268,7 @@ func TestReportUsage_ZeroEstimate_ZeroConsumed_Accepted(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 0)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-zz",
+		Ver: "1.0", IdempotencyKey: "r-zz",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 0},
@@ -265,18 +280,19 @@ func TestReportUsage_ZeroEstimate_ZeroConsumed_Accepted(t *testing.T) {
 }
 
 // TestReportUsage_NegativeConsumed_Rejected pins that the validator rejects
-// negative consumed quantities (review finding L12).
+// negative consumed quantities.
 func TestReportUsage_NegativeConsumed_Rejected(t *testing.T) {
 	h := newTestHarness(t)
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-neg",
+		Ver: "1.0", IdempotencyKey: "r-neg",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: -1},
 	}))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "negative")
+	assertReportRejectionField(t, err, "consumed_quantity")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_TOLERANCE")
 }
 
@@ -289,13 +305,14 @@ func TestReportUsage_TimestampInFuture_Rejected(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-ts-future",
+		Ver: "1.0", IdempotencyKey: "r-ts-future",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
 		Timestamp:     timestamppb.New(det.Now().Add(10 * time.Minute)),
 	}))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "future")
+	assertReportRejectionField(t, err, "timestamp")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_TIMESTAMP")
 }
 
@@ -306,13 +323,14 @@ func TestReportUsage_TimestampBeforeTransaction_Rejected(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-ts-past",
+		Ver: "1.0", IdempotencyKey: "r-ts-past",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
 		Timestamp:     timestamppb.New(time.Now().Add(-2 * time.Hour)),
 	}))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "precedes")
+	assertReportRejectionField(t, err, "timestamp")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_TIMESTAMP")
 }
 
@@ -322,7 +340,7 @@ func TestReportUsage_TimestampUnset_Accepted(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-ts-unset",
+		Ver: "1.0", IdempotencyKey: "r-ts-unset",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -341,13 +359,14 @@ func TestReportUsage_ExchangeMismatch_Rejected(t *testing.T) {
 
 	wrong := "evil.example"
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-mp-bad",
+		Ver: "1.0", IdempotencyKey: "r-mp-bad",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
 		Exchange:      &wrong,
 	}))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "exchange")
+	assertReportRejectionField(t, err, "exchange")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_EXCHANGE")
 }
 
@@ -358,7 +377,7 @@ func TestReportUsage_ExchangeUnset_Accepted(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-mp-unset",
+		Ver: "1.0", IdempotencyKey: "r-mp-unset",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -378,7 +397,7 @@ func TestReportUsage_DuplicateIdempotent(t *testing.T) {
 
 	build := func() *connect.Request[rampv1.UsageReport] {
 		return connect.NewRequest(&rampv1.UsageReport{
-			Ver: "1.0", Id: "r-dup",
+			Ver: "1.0", IdempotencyKey: "r-dup",
 			TransactionId: txID,
 			BillingId:     billingID,
 			Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -397,9 +416,6 @@ func TestReportUsage_DuplicateIdempotent(t *testing.T) {
 		t.Fatalf("idempotent calls returned different report_ids: %q vs %q",
 			first.Msg.GetReportId(), second.Msg.GetReportId())
 	}
-	if !second.Msg.GetAccepted() {
-		t.Errorf("second response Accepted=false, want true (idempotent replay)")
-	}
 }
 
 // TestReportUsage_AlreadyReported verifies that a second call with a NEW
@@ -410,7 +426,7 @@ func TestReportUsage_AlreadyReported(t *testing.T) {
 	txID, billingID := executeTransactionFor(t, h, 100)
 
 	if _, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-first",
+		Ver: "1.0", IdempotencyKey: "r-first",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -418,7 +434,7 @@ func TestReportUsage_AlreadyReported(t *testing.T) {
 		t.Fatalf("first: %v", err)
 	}
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-second-different-id",
+		Ver: "1.0", IdempotencyKey: "r-second-different-id",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -437,7 +453,7 @@ func TestReportUsage_RejectedThenCorrected(t *testing.T) {
 
 	// First call — outside tolerance.
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-bad",
+		Ver: "1.0", IdempotencyKey: "r-bad",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 200},
@@ -447,7 +463,7 @@ func TestReportUsage_RejectedThenCorrected(t *testing.T) {
 
 	// Second call — corrected.
 	if _, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-good",
+		Ver: "1.0", IdempotencyKey: "r-good",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -455,4 +471,117 @@ func TestReportUsage_RejectedThenCorrected(t *testing.T) {
 		t.Fatalf("corrected call: %v", err)
 	}
 	assertObligationState(t, h, txID, "RECEIVED", "VALIDATED")
+}
+
+// TestReportUsage_FreeTx_EmptyBillingID_Accepted pins the free-path report
+// contract: a zero-cost transaction persists billing_id NULL (ADR-009 D2/D5),
+// so a conformant report carries no billing_id and validates (empty == empty).
+// consumed_quantity is 0 because the FREE term seeds estimated_quantity 0.
+func TestReportUsage_FreeTx_EmptyBillingID_Accepted(t *testing.T) {
+	h := newTestHarness(t)
+	offer := pushDiscoverTermOffer(t, h, "/articles/free-report", seedFreeTerm())
+	execResp, err := executeOfferRaw(t, h, offer)
+	if err != nil {
+		t.Fatalf("execute free offer: %v", err)
+	}
+	txID := singleResultItem(t, execResp).GetTransactionId()
+
+	resp, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
+		Ver: "1.0", IdempotencyKey: "r-free-empty",
+		TransactionId: txID,
+		BillingId:     "",
+		Usage:         &rampv1.Usage{ConsumedQuantity: 0},
+	}))
+	if err != nil {
+		t.Fatalf("free report with empty billing_id: %v", err)
+	}
+	if resp.Msg.GetReportId() == "" {
+		t.Error("response ReportId empty")
+	}
+	assertObligationState(t, h, txID, "RECEIVED", "VALIDATED")
+}
+
+// TestReportUsage_FreeTx_NonEmptyBillingID_Rejected pins the threat-model T25
+// gate on the free path: the transaction stored no billing_id, so a report
+// naming a non-empty handle is a reservation absent from this Exchange's
+// transaction log — a forged handle rejected with InvalidArgument, and the
+// obligation stays PENDING (no side effect).
+func TestReportUsage_FreeTx_NonEmptyBillingID_Rejected(t *testing.T) {
+	h := newTestHarness(t)
+	offer := pushDiscoverTermOffer(t, h, "/articles/free-report-forged", seedFreeTerm())
+	execResp, err := executeOfferRaw(t, h, offer)
+	if err != nil {
+		t.Fatalf("execute free offer: %v", err)
+	}
+	txID := singleResultItem(t, execResp).GetTransactionId()
+
+	_, err = h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
+		Ver: "1.0", IdempotencyKey: "r-free-forged",
+		TransactionId: txID,
+		BillingId:     "forged-handle",
+		Usage:         &rampv1.Usage{ConsumedQuantity: 0},
+	}))
+	assertConnectError(t, err, connect.CodeInvalidArgument, "billing_id")
+	assertReportRejectionField(t, err, "billing_id")
+	assertObligationState(t, h, txID, "PENDING", "REJECTED_BILLING_ID")
+}
+
+// TestReportUsage_FreeTx_BillingIDRequired_EmptyAccepted pins the interaction
+// between a tenant policy that lists billing_id in required_fields and the free
+// path. A price-zero transaction stores no billing_id (ADR-009 D5), so the
+// obligation drops billing_id from its required set at build time and a
+// conformant empty-billing_id report validates. Without the free-path strip this
+// report is un-fileable: the empty billing_id is rejected at the required-fields
+// gate, and any non-empty value is rejected as a forged handle.
+func TestReportUsage_FreeTx_BillingIDRequired_EmptyAccepted(t *testing.T) {
+	h := newTestHarness(t)
+	// Seed BEFORE execute: the obligation captures required_fields at execute time.
+	seedTenantPolicy(t, h, `{"required_fields":["billing_id"]}`)
+	offer := pushDiscoverTermOffer(t, h, "/articles/free-billing-required", seedFreeTerm())
+	execResp, err := executeOfferRaw(t, h, offer)
+	if err != nil {
+		t.Fatalf("execute free offer: %v", err)
+	}
+	txID := singleResultItem(t, execResp).GetTransactionId()
+
+	resp, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
+		Ver: "1.0", IdempotencyKey: "r-free-req-empty",
+		TransactionId: txID,
+		BillingId:     "",
+		Usage:         &rampv1.Usage{ConsumedQuantity: 0},
+	}))
+	if err != nil {
+		t.Fatalf("free report with empty billing_id under billing_id-required policy: %v", err)
+	}
+	if resp.Msg.GetReportId() == "" {
+		t.Error("response ReportId empty")
+	}
+	assertObligationState(t, h, txID, "RECEIVED", "VALIDATED")
+}
+
+// TestReportUsage_FreeTx_BillingIDRequired_ForgedRejected is the negative path:
+// even when the tenant requires billing_id, a free-path report naming a non-empty
+// handle is still rejected as forged (threat model T25). The free-path strip
+// removes the unsatisfiable required-fields gate without weakening the billing_id
+// existence check, so the rejection is REJECTED_BILLING_ID (not REJECTED_FIELDS)
+// and the obligation stays PENDING.
+func TestReportUsage_FreeTx_BillingIDRequired_ForgedRejected(t *testing.T) {
+	h := newTestHarness(t)
+	seedTenantPolicy(t, h, `{"required_fields":["billing_id"]}`)
+	offer := pushDiscoverTermOffer(t, h, "/articles/free-billing-required-forged", seedFreeTerm())
+	execResp, err := executeOfferRaw(t, h, offer)
+	if err != nil {
+		t.Fatalf("execute free offer: %v", err)
+	}
+	txID := singleResultItem(t, execResp).GetTransactionId()
+
+	_, err = h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
+		Ver: "1.0", IdempotencyKey: "r-free-req-forged",
+		TransactionId: txID,
+		BillingId:     "forged-handle",
+		Usage:         &rampv1.Usage{ConsumedQuantity: 0},
+	}))
+	assertConnectError(t, err, connect.CodeInvalidArgument, "billing_id")
+	assertReportRejectionField(t, err, "billing_id")
+	assertObligationState(t, h, txID, "PENDING", "REJECTED_BILLING_ID")
 }

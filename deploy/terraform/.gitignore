@@ -1,0 +1,8 @@
+# Terraform working directories and any state, anywhere under this package —
+# defense in depth on top of the per-stack .gitignore files. Lock files
+# (.terraform.lock.hcl) in stacks/ ARE committed on purpose.
+**/.terraform/
+**/terraform.tfstate
+**/terraform.tfstate.*
+**/crash.log
+modules/**/.terraform.lock.hcl

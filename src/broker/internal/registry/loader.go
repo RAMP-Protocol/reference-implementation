@@ -14,7 +14,8 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
 )
 
-// BootstrapEntry models one exchange definition from bootstrap.yaml.
+// BootstrapEntry models one exchange definition from the operator's registry
+// file, the path to which arrives in BROKER_REGISTRY_FILE.
 type BootstrapEntry struct {
 	ID                string   `yaml:"id"`
 	Domain            string   `yaml:"domain"`

@@ -9,23 +9,25 @@ SELECT * FROM ramp.catalog WHERE resource_id = $1;
 
 -- name: UpsertCatalogEntry :one
 INSERT INTO ramp.catalog (
-    resource_id, tenant_id, uri, uri_prefix, pricing, licensing_rules,
-    delivery_method
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
+    resource_id, tenant_id, uri, uri_prefix, pricing, terms,
+    delivery_method, metadata, resource_owner_id
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (resource_id) DO UPDATE
    SET tenant_id = EXCLUDED.tenant_id,
        uri = EXCLUDED.uri,
        uri_prefix = EXCLUDED.uri_prefix,
        pricing = EXCLUDED.pricing,
-       licensing_rules = EXCLUDED.licensing_rules,
+       terms = EXCLUDED.terms,
        delivery_method = EXCLUDED.delivery_method,
+       metadata = EXCLUDED.metadata,
+       resource_owner_id = EXCLUDED.resource_owner_id,
        updated_at = NOW()
 RETURNING *;
 
 -- name: InsertCatalogEntry :one
 INSERT INTO ramp.catalog (
-    resource_id, tenant_id, uri, uri_prefix, pricing, licensing_rules,
-    delivery_method
+    resource_id, tenant_id, uri, uri_prefix, pricing, terms,
+    delivery_method, metadata, resource_owner_id
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING *;

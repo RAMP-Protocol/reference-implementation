@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,7 +23,11 @@ func (noopRegistry) LookupPublicKey(_ context.Context, _ string) (ed25519.Public
 	return nil, errors.New("unused in admin-removed regression test")
 }
 
-func (noopRegistry) RegisterFromManifest(_ context.Context, _, _ string) error {
+func (noopRegistry) RegisterFromDirectory(_ context.Context, _, _ string) error {
+	return errors.New("unused in admin-removed regression test")
+}
+
+func (noopRegistry) RefreshDirectoryKey(_ context.Context, _ string) error {
 	return errors.New("unused in admin-removed regression test")
 }
 
@@ -38,9 +43,12 @@ func (noopRegistry) RegisterFromManifest(_ context.Context, _, _ string) error {
 // `ramp.v1.CatalogService/PushResources` RPC — that is the only way
 // catalog data enters the live trie, in tests and in production alike.
 //
-// This file's sole remaining job: assert the routes stay 404, so the
-// surface cannot reappear by accident. Adding any handler under /admin/*
-// to buildMux will cause one of these assertions to fail.
+// This file's sole remaining job: assert the admin routes stay 404, so the
+// surface cannot reappear by accident. This includes BOTH the legacy
+// /admin/* REST shortcuts AND the Connect procedure paths for the
+// ramp.admin.v1.AdminService (SetTenantFeeRate, SetReportingPolicy).
+// Adding any admin handler to buildMux will cause one of these assertions
+// to fail.
 // ─────────────────────────────────────────────────────────────────────────
 //
 // TestAdminRoutesReturn404 is the cheap, DB-free compile-time guard. The
@@ -56,29 +64,54 @@ func TestAdminRoutesReturn404(t *testing.T) {
 	if err != nil {
 		t.Fatalf("offer signer: %v", err)
 	}
-	mux := buildMux(muxDeps{
+	mux, err := buildMux(muxDeps{
 		pool:          nil, // healthzHandler tolerates nil
 		exchange:      nil, // Connect-Go handlers register against nil; never invoked here
 		catalog:       nil,
 		agentRegistry: noopRegistry{},
 		offerSigner:   offerSigner,
 	})
+	if err != nil {
+		t.Fatalf("build mux: %v", err)
+	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	cases := []struct{ method, path string }{
-		{http.MethodPost, "/admin/seed"},
-		{http.MethodPost, "/admin/catalog/reload"},
-		{http.MethodGet, "/admin/catalog"},
-		{http.MethodGet, "/admin/keys/rsa-public.pem"},
+	cases := []struct {
+		method string
+		path   string
+		body   io.Reader // nil uses empty body
+	}{
+		{http.MethodPost, "/admin/seed", nil},
+		{http.MethodPost, "/admin/catalog/reload", nil},
+		{http.MethodGet, "/admin/catalog", nil},
+		{http.MethodGet, "/admin/keys/rsa-public.pem", nil},
+		// Connect procedure paths for the admin surface — must not appear on
+		// the public mux. These are unsigned, unauthenticated setters that
+		// change money and policy; only the separate internal listener (with
+		// IP-allowlist) should serve them.
+		{http.MethodPost, "/ramp.admin.v1.AdminService/SetTenantFeeRate", strings.NewReader(`{"ver":"1.0","rate":{"tenant_id":"t_test","fee_rate_bps":100}}`)},
+		{http.MethodPost, "/ramp.admin.v1.AdminService/SetReportingPolicy", strings.NewReader(`{"ver":"1.0","policy":{"tenant_id":"t_test"}}`)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			var body io.Reader
+			if tc.body != nil {
+				body = tc.body
+			} else {
+				body = strings.NewReader("")
+			}
 			req, err := http.NewRequestWithContext(
-				context.Background(), tc.method, srv.URL+tc.path, strings.NewReader(""),
+				context.Background(), tc.method, srv.URL+tc.path, body,
 			)
 			if err != nil {
 				t.Fatalf("build request: %v", err)
+			}
+			// Connect procedure paths need JSON content-type for the server to
+			// even attempt route matching; the assertion is 404 (route absent),
+			// not 400/415 (route exists but content wrong).
+			if tc.method == http.MethodPost && tc.body != nil {
+				req.Header.Set("Content-Type", "application/json")
 			}
 			resp, err := srv.Client().Do(req)
 			if err != nil {
@@ -96,11 +129,14 @@ func TestAdminRoutesReturn404(t *testing.T) {
 // buildMux didn't silently drop a route that the rest of the surface still
 // needs.
 func TestHealthzStillRegistered(t *testing.T) {
-	mux := buildMux(muxDeps{
+	mux, err := buildMux(muxDeps{
 		pool:          nil,
 		agentRegistry: noopRegistry{},
 		offerSigner:   mustSigner(t),
 	})
+	if err != nil {
+		t.Fatalf("build mux: %v", err)
+	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 

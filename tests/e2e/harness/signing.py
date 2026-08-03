@@ -2,7 +2,7 @@
 
 Why this exists
 ---------------
-Post-commit ``9c3a93b`` (1rnxh), the Exchange's RFC 9421 ``httpsig``
+Post-commit 9c3a93b, the Exchange's RFC 9421 httpsig
 middleware verifies every ``/ramp.v1.ExchangeService/*`` and
 ``/ramp.v1.BrokerService/*`` request unconditionally. The previous
 "sign only when ``Signature-Input`` is present" predicate let plain
@@ -64,25 +64,33 @@ headers before sending.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from ramp_mcp_shim.httpsig import pop_signature_base
-from ramp_mcp_shim.thumbprint import ed25519_thumbprint
+from ramp_sdk.pop import sign_agent_binding
 
-from .b64 import b64url_decode, b64url_nopad
+from .httpsig_signer import load_keypair, sign_request
 
 # Path to the checked-in static test signer key. Resolved relative to
 # this module so the fixture follows the harness whether the runner is
 # the repo checkout, the in-network compose `runner` service, or a CI
 # image that COPYs the harness tree intact.
 TEST_SIGNER_KEY_PATH = Path(__file__).resolve().parent / "fixtures" / "test_signer_key.json"
+
+# Re-export agent key fixtures that now live in seed.py, for harness modules and
+# tests that historically import them from `.signing` (v1.1 merge reconciliation;
+# seed has no dependency back on signing, so this is cycle-safe). The demo terms
+# are denominated in EUR/USD; the in-memory billing adapter authorizes a term
+# only on a currency match, so EUR terms are bought with the EUR buyer
+# and USD terms with the USD buyer (== agent-e2e).
+from .seed import (  # noqa: E402,F401
+    EUR_AGENT_KEY_PATH,
+    USD_AGENT_ID,
+    USD_AGENT_KEY_PATH,
+)
 
 # Agent identities the obligation/full-stack tests act AS. Their kid equals the
 # agent_id and is registered in ramp.agents by seed.py, so the Exchange's
@@ -95,42 +103,16 @@ AGENT_NOBILLING_KEY_PATH = (
     Path(__file__).resolve().parent / "fixtures" / "agent_nobilling_e2e_key.json"
 )
 
-# Components covered by the signature. Order and quoting must match the
-# Exchange's verifier (``internal/httpsig/verifier.go``) and the
-# matching ``catalog_push._sign_request`` helper; the duplication is
-# deliberate to keep this module self-contained.
-_COVERED_COMPONENTS: tuple[str, ...] = (
-    "@method",
-    "@target-uri",
-    "content-digest",
-    "authorization",
-)
+# Proof-of-possession signature TTL (seconds) for bound signed-URL GETs (ADR-013).
 _DEFAULT_TTL_SECONDS = 30
 
-# Caller-supplied header carrying the target Exchange endpoint for the RAMP-56
+# Caller-supplied header carrying the target Exchange endpoint for the known-URL
 # relay. The Go consumer names it via the ``headerExchangeEndpoint`` constant
 # (src/broker/internal/transport/exchange_relay.go); a single Python constant
-# keeps every harness producer in sync (MED-08). The string MUST match the Go
+# keeps every harness producer in sync. The string MUST match the Go
 # side byte-for-byte — it crosses the Python→Go boundary, so the two can't share
 # one literal.
 EXCHANGE_ENDPOINT_HEADER = "X-RAMP-Exchange-Endpoint"
-
-
-def _load_signer(key_path: Path | None = None) -> tuple[str, Ed25519PrivateKey]:
-    """Return ``(kid, Ed25519PrivateKey)`` for a signing identity.
-
-    ``key_path`` defaults to the generic test signer (``TEST_SIGNER_KEY_PATH``);
-    pass ``AGENT_E2E_KEY_PATH`` / ``AGENT_NOBILLING_KEY_PATH`` to sign AS a
-    registered agent (kid == agent_id), which the Exchange's caller authz
-    requires for ExecuteTransaction / ReportUsage.
-
-    The key file format mirrors ``deploy/mcp/agent-key.json``: a JSON
-    object with ``kid`` + ``private_key`` (b64url, no padding) + a
-    redundant ``public_key`` field.
-    """
-    doc = json.loads((key_path or TEST_SIGNER_KEY_PATH).read_text())
-    seed = b64url_decode(doc["private_key"])
-    return doc["kid"], Ed25519PrivateKey.from_private_bytes(seed)
 
 
 def build_signed_headers(
@@ -149,30 +131,13 @@ def build_signed_headers(
     (e.g. the obligation-05 "unknown signer" scenarios) build their own
     headers via ``httpsig_signer``.
     """
-    kid, priv = _load_signer(key_path)
-    digest_header = "sha-256=:" + base64.b64encode(hashlib.sha256(body).digest()).decode() + ":"
-    created = int(time.time())
-    expires = created + _DEFAULT_TTL_SECONDS
-    covered_list = " ".join(f'"{c}"' for c in _COVERED_COMPONENTS)
-    sig_params = f'({covered_list});keyid="{kid}";alg="ed25519";created={created};expires={expires}'
-    authorization = ""
-    base_lines = [
-        f'"@method": {method.upper()}',
-        f'"@target-uri": {target_uri}',
-        f'"content-digest": {digest_header}',
-        f'"authorization": {authorization}',
-        f'"@signature-params": {sig_params}',
-    ]
-    base = "\n".join(base_lines)
-    sig = priv.sign(base.encode())
-    sig_b64 = base64.b64encode(sig).decode()
-    return {
-        "Content-Digest": digest_header,
-        "Authorization": authorization,
-        "Signature-Input": f"sig1={sig_params}",
-        "Signature": f"sig1=:{sig_b64}:",
-        "Content-Type": content_type,
-    }
+    # sign_request is the single WBA signer: keyid = RFC 7638 thumbprint and the
+    # covered Signature-Agent defaults to kid (in the demo/tests an agent's kid ==
+    # its directory == caller identity). Content-Type is not part of the signing
+    # base, so it is added to the returned headers here.
+    kid, priv = load_keypair(key_path or TEST_SIGNER_KEY_PATH)
+    signed = sign_request(method=method, target_uri=target_uri, body=body, kid=kid, priv=priv)
+    return {**signed.headers, "Content-Type": content_type}
 
 
 def sign_post(
@@ -205,7 +170,13 @@ def sign_post(
     headers = build_signed_headers(method="POST", target_uri=url, body=payload, key_path=key_path)
     if extra_headers:
         for key, value in extra_headers.items():
-            if key in {"Content-Digest", "Authorization", "Signature-Input", "Signature"}:
+            if key in {
+                "Content-Digest",
+                "Authorization",
+                "Signature-Agent",
+                "Signature-Input",
+                "Signature",
+            }:
                 msg = f"sign_post: caller may not override signed header {key!r}"
                 raise ValueError(msg)
             headers[key] = value
@@ -233,39 +204,30 @@ def build_pop_headers(
     Returns:
         Headers dict with X-RAMP-Agent-Key, Signature-Input, Signature
     """
-    kid, priv = _load_signer(key_path)
+    _kid, priv = load_keypair(key_path)
 
-    # Derive public key from private key (don't trust JSON public_key field)
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-
-    public_key_bytes = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-
-    # Compute RFC 7638 thumbprint (the agent_id / keyid for PoP)
-    thumbprint_val = ed25519_thumbprint(public_key_bytes)
-
-    # Create signature parameters for GET with @method + @target-uri coverage
+    # The SDK's PoP SIGN face owns the covered set, keyid derivation, and the
+    # vector-pinned signature base; the harness supplies only the key and clock.
     created = int(time.time())
-    expires = created + _DEFAULT_TTL_SECONDS
-    covered_list = '"@method" "@target-uri"'
-    sig_params = f'({covered_list});keyid="{thumbprint_val}";alg="ed25519";created={created};expires={expires}'
-
-    # Build RFC 9421 signature base for GET via the shim helper so the harness
-    # and production sign the identical, vector-pinned base (MED-06).
-    base = pop_signature_base(url, sig_params)
-    sig = priv.sign(base.encode())
-    sig_b64 = base64.b64encode(sig).decode()
-
+    presented_key, signature_input, signature = sign_agent_binding(
+        url=url,
+        signer_seed=priv.private_bytes_raw(),
+        created=created,
+        expires=created + _DEFAULT_TTL_SECONDS,
+    )
     return {
-        "X-RAMP-Agent-Key": b64url_nopad(public_key_bytes),
-        "Signature-Input": f"sig1={sig_params}",
-        "Signature": f"sig1=:{sig_b64}:",
+        "X-RAMP-Agent-Key": presented_key,
+        "Signature-Input": signature_input,
+        "Signature": signature,
     }
 
 
 __all__ = [
     "AGENT_E2E_KEY_PATH",
     "AGENT_NOBILLING_KEY_PATH",
+    "EUR_AGENT_KEY_PATH",
     "TEST_SIGNER_KEY_PATH",
+    "USD_AGENT_KEY_PATH",
     "build_signed_headers",
     "build_pop_headers",
     "sign_post",

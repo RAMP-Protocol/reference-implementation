@@ -4,9 +4,10 @@
   "domain": "publisher",
   "exchanges": [
     {
-      "domain": "exchange.e2e.local",
+      "domain": "exchange:8081",
       "endpoint": "http://exchange:8081",
-      "relationship": "PROVIDER_RELATIONSHIP_DIRECT"
+      "relationship": "PROVIDER_RELATIONSHIP_DIRECT",
+      "ext": { "resource_owner_id": "demo-resource-owner" }
     }
   ],
   "catalog_contributors": [

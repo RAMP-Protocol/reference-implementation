@@ -1,0 +1,95 @@
+#cloud-config
+# Rendered by Terraform (modules/compose-stack) and delivered gzipped as EC2
+# user data. Everything the stack needs lands under /opt/ramp; no SSH
+# provisioners, no baked images.
+#
+# Key material is split into per-service directories so each container is
+# given ONLY its own keys: a compromise of one service must not hand over
+# another service's signing identity. keys.json (the shared PUBLIC-key
+# registry) is written into both consumers' directories; only private keys
+# are single-home.
+#
+# Files land 0600 root, then a runcmd below re-owns them root:65532 and
+# opens files 0640 / directories 0750 before compose starts: the services
+# run as distroless nonroot (uid/gid 65532) and mount their key directory
+# read-only, so they need group read across the UID boundary — but no other
+# local user gets to read the keys. (Done in runcmd because write_files
+# cannot chown to a gid that has no /etc/group entry yet.)
+
+package_update: true
+
+write_files:
+  # Root-only: the rendered compose file embeds secrets (the Vault token,
+  # session/signing keys, DB passwords), and only root's docker compose
+  # invocation reads it.
+  - path: /opt/ramp/docker-compose.yml
+    permissions: "0600"
+    content: |
+      ${indent(6, compose_yaml)}
+  - path: /opt/ramp/Caddyfile
+    permissions: "0644"
+    content: |
+      ${indent(6, caddyfile)}
+  - path: /opt/ramp/init-sql/10-create-exchange-dbs.sql
+    permissions: "0644"
+    content: |
+      ${indent(6, init_sql)}
+  # Zitadel's FirstInstance provisioning. Carries the console admin password,
+  # so it is root-only — like the compose file, and unlike the Caddyfile
+  # above, nothing in a container reads it as a non-root user (Zitadel runs
+  # as root here).
+  - path: /opt/ramp/zitadel/init-steps.yaml
+    permissions: "0600"
+    content: |
+      ${indent(6, zitadel_init_steps)}
+  - path: /opt/ramp/keys/exchange/keys.json
+    permissions: "0600"
+    content: |
+      ${indent(6, keys_json)}
+  - path: /opt/ramp/keys/exchange/ed25519-private.pem
+    permissions: "0600"
+    content: |
+      ${indent(6, ed25519_private_pem)}
+%{ if rsa_private_pem != null }
+  - path: /opt/ramp/keys/exchange/rsa-private.pem
+    permissions: "0600"
+    content: |
+      ${indent(6, rsa_private_pem)}
+%{ endif }
+  - path: /opt/ramp/keys/broker/keys.json
+    permissions: "0600"
+    content: |
+      ${indent(6, keys_json)}
+  - path: /opt/ramp/keys/broker/broker-relay-key.json
+    permissions: "0600"
+    content: |
+      ${indent(6, broker_relay_key_json)}
+  - path: /opt/ramp/keys/broker/broker-identity-key.pem
+    permissions: "0600"
+    content: |
+      ${indent(6, broker_identity_key_pem)}
+%{ if registry_server != null }
+  # Base64-delivered so the secret is never interpolated into a shell
+  # command line — any byte in the token is safe. Root-only, removed after
+  # the one docker login below.
+  - path: /opt/ramp/.registry-password
+    permissions: "0600"
+    encoding: b64
+    content: ${base64encode(registry_password)}
+%{ endif }
+
+runcmd:
+  # Docker Engine + Compose plugin via the official convenience script.
+  - curl -fsSL https://get.docker.com | sh
+%{ if registry_server != null }
+  - docker login ${registry_server} -u '${registry_username}' --password-stdin < /opt/ramp/.registry-password
+  - rm -f /opt/ramp/.registry-password
+%{ endif }
+  # Keys arrive 0600 root (see header). Group 65532 = the distroless nonroot
+  # gid the services run as; group-read on files plus group-traverse on the
+  # per-service directories lets the read-only bind mounts work while every
+  # other local user stays locked out.
+  - chown -R root:65532 /opt/ramp/keys
+  - find /opt/ramp/keys -type d -exec chmod 0750 {} +
+  - find /opt/ramp/keys -type f -exec chmod 0640 {} +
+  - docker compose -f /opt/ramp/docker-compose.yml up -d

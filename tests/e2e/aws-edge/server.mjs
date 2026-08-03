@@ -21,10 +21,16 @@ import { createHash, createPublicKey, createVerify } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 
-// Shared with the Hono edge worker (src/edge/src/publisher-manifest.mjs, copied
+// Shared with the Hono edge worker (src/edge/src/well-known.mjs, copied
 // into the image at build time) so this shim cannot drift from the canonical
-// publisher-manifest shape. Guarded by tests/e2e/harness/test_manifest_parity.py.
-import { buildPublisherManifest, WELL_KNOWN_PATH } from './publisher-manifest.mjs';
+// discovery-document shapes. Guarded by tests/e2e/harness/test_manifest_parity.py.
+import {
+  WBA_DIRECTORY_CONTENT_TYPE,
+  WBA_PATH,
+  WELL_KNOWN_PATH,
+  buildPublisherManifest,
+  buildPublisherWba,
+} from './well-known.mjs';
 
 const PORT = Number.parseInt(process.env.PORT ?? '8788', 10);
 const ORIGIN_URL = required('ORIGIN_URL');
@@ -35,6 +41,11 @@ const EXCHANGES = JSON.parse(required('EXCHANGES_JSON'));
 const CATALOG_CONTRIBUTORS = process.env.CATALOG_CONTRIBUTORS_JSON
   ? JSON.parse(process.env.CATALOG_CONTRIBUTORS_JSON)
   : [];
+// This publisher's signing key(s), served in the WBA directory's keys[] (no kid)
+// so the Exchange learns them via the well-known fetch (no DB pre-seed). Optional.
+const WBA_KEYS = process.env.WBA_KEYS_JSON ? JSON.parse(process.env.WBA_KEYS_JSON) : undefined;
+// Optional directory-level revocation_url advertised in the WBA directory.
+const WBA_REVOCATION_URL = process.env.WBA_REVOCATION_URL || undefined;
 // CloudFront RSA verify key provisioned out-of-band (trusted key group model);
 // the cdn-keys.json route is retired (D4). MUST be the public half of the
 // Exchange's RSA key. Read from RAMP_CF_PUBLIC_PEM, or the file at
@@ -152,9 +163,22 @@ async function handle(req, res) {
   if (url.pathname === WELL_KNOWN_PATH) {
     // Built from the shared canonical builder so this shim cannot drift. Pass
     // undefined (not an empty array) for no contributors so the field is omitted,
-    // matching buildPublisherManifest's contract.
+    // matching buildPublisherManifest's contract. Identity keys are NOT in the
+    // overlay after the WBA split — they are served at WBA_PATH below.
     const contributors = CATALOG_CONTRIBUTORS.length > 0 ? CATALOG_CONTRIBUTORS : undefined;
     reply(res, 200, buildPublisherManifest(PROVIDER, EXCHANGES, contributors));
+    return;
+  }
+  if (url.pathname === WBA_PATH) {
+    // The publisher's self key as a JWK Set (no kid), so the Exchange learns it
+    // via the well-known fetch. Absent when no self key is provisioned → 404.
+    if (!WBA_KEYS) {
+      reply(res, 404, { error: 'not found' });
+      return;
+    }
+    reply(res, 200, buildPublisherWba(WBA_KEYS, WBA_REVOCATION_URL), {
+      'content-type': WBA_DIRECTORY_CONTENT_TYPE,
+    });
     return;
   }
   if (req.method !== 'GET') {

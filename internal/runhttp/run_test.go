@@ -37,6 +37,29 @@ func TestEnvBool(t *testing.T) {
 	}
 }
 
+// EnvOptIn guards deliberately-unsafe behaviour, so it is a strict allowlist:
+// only "true" and "1" enable it. The cases that matter are the ones EnvBool
+// would wrongly treat as true — a typo must leave the guard in place.
+func TestEnvOptIn(t *testing.T) {
+	const key = "RAMP_TEST_OPTIN"
+
+	if EnvOptIn(key) {
+		t.Error("unset must be false")
+	}
+	for _, v := range []string{"true", "TRUE", "True", "1"} {
+		t.Setenv(key, v)
+		if !EnvOptIn(key) {
+			t.Errorf("%q should opt in", v)
+		}
+	}
+	for _, v := range []string{"", "0", "false", "no", "off", "yes", "on", "flase", "disabled", "true "} {
+		t.Setenv(key, v)
+		if EnvOptIn(key) {
+			t.Errorf("%q must NOT opt in", v)
+		}
+	}
+}
+
 func TestEnvDuration(t *testing.T) {
 	const key = "RAMP_TEST_DUR"
 	if got := EnvDuration(key, 5*time.Second); got != 5*time.Second {

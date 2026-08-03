@@ -34,13 +34,13 @@ The Exchange recognises four primary roles. The fifth — *Broker* — is not a 
 |---|---|---|---|
 | AC-1 | Discover available content | ✓ `ramp.v1.ExchangeService/DiscoverResources` | — |
 | AC-2 | Accept an offer and receive a signed URL | ✓ `ExecuteTransaction` → Authorize → URL mint (Ed25519 or RSA CloudFront per tenant) | ADR-009 |
-| AC-3 | Fetch content from the Edge using the URL | ✓ Edge serves; URL signature verified (`src/edge/src/verify.ts`) | ADR-012 |
+| AC-3 | Fetch content from the Edge using the URL | ✓ Edge serves; URL signature verified via `@ramp-protocol/sdk-l1/verify` | ADR-012 |
 | AC-4 | Report usage of the content | ✓ `ReportUsage` (pure audit endpoint, post-MR-2; no money movement) | ADR-009 |
 | AC-5 | Dispute a transaction | ✗ `DisputeTransaction` not implemented | ADR-011 |
 | AC-6 | View own balance, quota, transaction history | ✗ no admin / self-service surface (billing adapter exposes `GetBalance` but it is not wired to any RPC) | ADR-010 (admin UI / self-service plane) |
 | AC-7 | Top up balance / fund the account | ✗ entirely out-of-protocol today (manual DB / billing-provider action) | ADR-010 |
 | AC-8 | Maintain own identity (`ramp.json`, key rotation) | partial — self-signup via `ramp.json` is implemented (`agent_self_signup_e2e_test.go`); key rotation is TBD | ADR-009 |
-| AC-9 | Receive a refund (passive) | ✗ no Refund adapter method yet (incoming via MR !2 follow-up) | ADR-011 (output side) |
+| AC-9 | Receive a refund (passive) | ✗ no Refund adapter method yet (incoming via the refund follow-up) | ADR-011 (output side) |
 
 ---
 
@@ -78,7 +78,7 @@ The Exchange recognises four primary roles. The fifth — *Broker* — is not a 
 
 | # | Use case | Today | Pulls on |
 |---|---|---|---|
-| EDC-1 | Verify signed URL on incoming fetch | ✓ Ed25519 verification implemented (`src/edge/src/verify.ts`); RSA CloudFront signed URLs verified natively by CloudFront | — |
+| EDC-1 | Verify signed URL on incoming fetch | ✓ Ed25519 verification implemented via `@ramp-protocol/sdk-l1/verify`; RSA CloudFront signed URLs verified natively by CloudFront | — |
 | EDC-2 | Serve content when URL valid | ✓ basic origin-proxy serve path (`src/edge/src/app.ts`) | — |
 | EDC-3 | Sign and log delivery record (the third witness) | ✗ this is the gap — Edge currently neither signs nor records deliveries | ADR-012 |
 | EDC-4 | Publish delivery logs to a queryable store | ✗ not designed | ADR-012 |
@@ -93,4 +93,3 @@ The Exchange recognises four primary roles. The fifth — *Broker* — is not a 
 - **ADR-010 (forthcoming)** — admin / self-service surface (balance, history, payouts). Pulls on AC-6, AC-7, PC-3, PC-4, PC-5, EC-3, EC-4.
 - **ADR-011 (forthcoming)** — dispute & refund flow. Pulls on AC-5, AC-9, PC-6, EC-5, EC-6.
 - **ADR-012 (forthcoming)** — Edge delivery record (the third signed witness). Pulls on AC-3, PC-8, EC-5, EDC-3, EDC-4, EDC-5.
-- **CLAUDE.md** — repository conventions and testing doctrine.

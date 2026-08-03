@@ -1,7 +1,6 @@
 """Obligation 05 — happy 02: an expired or future-dated signature is refused.
 
-Verbatim scenario (``docs/obligations/05-system-refuses-when-authority-is-bad.md``,
-third happy-path bullet):
+Verbatim scenario (third happy-path bullet):
 
 > The agent presents a signature whose ``created`` parameter is too
 > far in the future, or whose ``expires`` parameter is in the past.
@@ -123,7 +122,7 @@ def test_expired_signature_is_refused_with_specific_reason(
     2. ``says the signature is expired`` — the refusal reason names
        the expired signature (token from the EXPIRED bucket).
     """
-    body_obj = {"requester": {"uris": ["http://edge:8787/premium/any.html"]}}
+    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/any.html"]}
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)
@@ -187,7 +186,7 @@ def test_future_created_signature_is_refused_with_specific_reason(
        the EXPIRED ∪ FUTURE-CREATED buckets, since both halves share
        a timestamp-window vocabulary).
     """
-    body_obj = {"requester": {"uris": ["http://edge:8787/premium/any.html"]}}
+    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/any.html"]}
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)

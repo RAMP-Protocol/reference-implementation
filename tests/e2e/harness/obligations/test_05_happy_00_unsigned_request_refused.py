@@ -1,7 +1,6 @@
 """Obligation 05 — happy 00: an unsigned request is refused.
 
-Verbatim scenario (``docs/obligations/05-system-refuses-when-authority-is-bad.md``,
-first happy-path bullet — for obligation 05 the "happy path" IS the
+Verbatim scenario (first happy-path bullet — for obligation 05 the "happy path" IS the
 refusal, because refusal is the product):
 
 > The agent presents a /ramp.v1.* request with no Signature or
@@ -140,7 +139,7 @@ def test_unsigned_canonical_rpc_is_refused_with_signature_specific_reason(
        token, so a buyer operator can tell this apart from a missing-
        scope refusal or a missing-resource refusal.
     """
-    body = {"requester": {"uris": ["http://edge:8787/premium/any.html"]}}
+    body = {"requester": {}, "uris": ["http://edge:8787/premium/any.html"]}
     url = f"{compose_stack.exchange}{_DISCOVER_PATH}"
     # No Signature-Input, no Signature, no Content-Digest, no
     # Authorization. This is the "unsigned request" input.

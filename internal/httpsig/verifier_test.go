@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -16,21 +17,12 @@ import (
 
 const testKeyID = "agent-demo.v1"
 
+// newRAMPSignedRequest signs body under testKeyID with the standard now+30s
+// expiry. It delegates to newRAMPSignedRequestExpiring (chain_test.go), the single
+// definition of "a RAMP-signed request", so the request shape lives in one place.
 func newRAMPSignedRequest(t *testing.T, body []byte, priv ed25519.PrivateKey, now time.Time) *http.Request {
 	t.Helper()
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
-		"https://exchange.example/ramp.v1.ExchangeService/DiscoverResources", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	req.Host = "exchange.example"
-	req.Header.Set("Authorization", "Bearer test-jwt")
-	created := now.Unix()
-	expires := now.Add(30 * time.Second).Unix()
-	if err := SignRequestRAMP(req, body, testKeyID, priv, created, expires); err != nil {
-		t.Fatalf("sign: %v", err)
-	}
-	return req
+	return newRAMPSignedRequestExpiring(t, body, priv, now.Add(30*time.Second).Unix())
 }
 
 func TestVerifyRequest_Valid(t *testing.T) {
@@ -38,7 +30,7 @@ func TestVerifyRequest_Valid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"query":"foo"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 
@@ -86,7 +78,7 @@ func TestVerifyRequest_BadSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"hello":"world"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 
@@ -94,6 +86,12 @@ func TestVerifyRequest_BadSignature(t *testing.T) {
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrSignatureVerify) {
 		t.Fatalf("want ErrSignatureVerify, got %v", err)
+	}
+	// The sentinel must WRAP the underlying cause, not collapse to it bare
+	// — a future regression to `return ErrSignatureVerify` would drop the
+	// yaronf cause and fail this guard. Assert augmentation, not exact wording.
+	if err.Error() == ErrSignatureVerify.Error() {
+		t.Fatalf("cause discarded: error is the bare sentinel %q", err)
 	}
 }
 
@@ -109,13 +107,22 @@ func TestVerifyRequest_MissingCoverageComponent(t *testing.T) {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Host = "exchange.example"
-	// Use the legacy short-coverage signer — it omits @target-uri and
-	// authorization, which RAMP policy requires.
-	if err := SignRequest(req, body, testKeyID, priv, 1700000000); err != nil {
+	now := signNow()
+	// Sign with a deliberately short coverage set — it omits @target-uri and
+	// authorization, which RAMP policy requires — to drive the required-component
+	// check, which runs before the time window.
+	shortCoverage := Params{
+		Label:   "sig1",
+		Covered: plainComponents("@method", "@path", "@authority", "content-digest"),
+		KeyID:   testKeyID,
+		Alg:     "ed25519",
+	}
+	setContentDigest(req, body)
+	if err := signWithParams(req, shortCoverage, priv, sigWriteSet); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
-	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(time.Unix(1700000000, 0))})
+	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrMissingRequiredComponent) {
 		t.Fatalf("want ErrMissingRequiredComponent, got %v", err)
 	}
@@ -126,7 +133,7 @@ func TestVerifyRequest_Expired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"hello":"world"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 
@@ -143,8 +150,9 @@ func TestVerifyRequest_FutureCreatedRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	// Sign with a 'created' that is > 300s ahead of the verifier clock.
-	signerNow := time.Unix(1700000000, 0)
+	// The signer stamps created = now() (yaronf). Put the verifier clock 10
+	// minutes BEHIND now so created is > 300s in the verifier's future.
+	signerNow := signNow()
 	body := []byte(`{"hello":"world"}`)
 	req := newRAMPSignedRequest(t, body, priv, signerNow)
 
@@ -156,12 +164,54 @@ func TestVerifyRequest_FutureCreatedRejected(t *testing.T) {
 	}
 }
 
+func TestVerifyRequest_MissingCreatedRejected(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	now := signNow()
+	body := []byte(`{"q":"x"}`)
+	req := newRAMPSignedRequest(t, body, priv, now)
+	// Strip created= from Signature-Input so the parsed Params.Created is 0.
+	// enforceCreatedExpires rejects with ErrMissingCreated before the Ed25519
+	// check, so the signature the mutation invalidated is never reached. Pattern
+	// strip (not value) because yaronf stamps created = real now() at sign time.
+	inp := req.Header.Get("Signature-Input")
+	req.Header.Set("Signature-Input", regexp.MustCompile(`;created=\d+`).ReplaceAllString(inp, ""))
+
+	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
+	if !errors.Is(err, ErrMissingCreated) {
+		t.Fatalf("want ErrMissingCreated, got %v", err)
+	}
+}
+
+func TestVerifyRequest_MissingExpiresRejected(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	now := signNow()
+	body := []byte(`{"q":"x"}`)
+	req := newRAMPSignedRequest(t, body, priv, now)
+	// Strip expires= so the parsed Params.Expires is 0 → ErrMissingExpires, which
+	// also fires before the Ed25519 check.
+	inp := req.Header.Get("Signature-Input")
+	req.Header.Set("Signature-Input", regexp.MustCompile(`;expires=\d+`).ReplaceAllString(inp, ""))
+
+	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
+	if !errors.Is(err, ErrMissingExpires) {
+		t.Fatalf("want ErrMissingExpires, got %v", err)
+	}
+}
+
 func TestVerifyRequest_TamperedAuthorizationRejected(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"hello":"world"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 	req.Header.Set("Authorization", "Bearer tampered")
@@ -198,7 +248,7 @@ func TestVerifyRequest_EntitlementHeaderCovered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"q":"x"}`)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		"https://exchange.example/ramp.v1.ExchangeService/DiscoverResources", bytes.NewReader(body))
@@ -208,7 +258,7 @@ func TestVerifyRequest_EntitlementHeaderCovered(t *testing.T) {
 	req.Host = "exchange.example"
 	req.Header.Set("Authorization", "Bearer test-jwt")
 	req.Header.Set("X-RAMP-Entitlement-Biscuit", "AAAA")
-	if err := SignRequestRAMP(req, body, testKeyID, priv, now.Unix(), now.Add(30*time.Second).Unix()); err != nil {
+	if err := SignRequestRAMP(req, body, testKeyID, priv, now.Add(30*time.Second).Unix()); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 	// Signer MUST have added the header to coverage.
@@ -227,7 +277,7 @@ func TestVerifyRequest_EntitlementHeaderPresentButUncovered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"q":"x"}`)
 	// Sign WITHOUT the biscuit header set.
 	req := newRAMPSignedRequest(t, body, priv, now)
@@ -247,14 +297,14 @@ func TestVerifyRequest_TamperedEntitlementHeaderRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"q":"x"}`)
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		"https://exchange.example/ramp.v1.ExchangeService/DiscoverResources", bytes.NewReader(body))
 	req.Host = "exchange.example"
 	req.Header.Set("Authorization", "Bearer test-jwt")
 	req.Header.Set("X-RAMP-Entitlement-Biscuit", "ORIGINAL")
-	if err := SignRequestRAMP(req, body, testKeyID, priv, now.Unix(), now.Add(30*time.Second).Unix()); err != nil {
+	if err := SignRequestRAMP(req, body, testKeyID, priv, now.Add(30*time.Second).Unix()); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 	// Swap the biscuit after signing.
@@ -272,7 +322,7 @@ func TestVerifyRequest_UnknownKeyid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"q":"x"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 
@@ -288,7 +338,7 @@ func TestVerifyRequest_BadAlgRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 	// Re-write alg in Signature-Input to a rejected algorithm.

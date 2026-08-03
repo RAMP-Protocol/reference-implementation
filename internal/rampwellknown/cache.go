@@ -22,8 +22,10 @@ const (
 
 // CacheOptions configures a Cache.
 type CacheOptions struct {
-	// Client performs origin GETs; nil means the SSRF-guarded env client
-	// (NewGuardedClientFromEnv) so a caller that omits it is safe by default.
+	// Client performs origin GETs. It is REQUIRED: the SSRF-guarded client is
+	// SDK-owned, constructed once from resolvers.NewGuardedClientFromEnv at the
+	// caller's composition root and injected here. A nil Client fails loud with
+	// ErrNoClient at fetch time — this package keeps no in-package guarded default.
 	Client HTTPDoer
 	// Scheme/Port shape the fetch URL for bare hosts (local/compose stacks).
 	Scheme string
@@ -45,10 +47,10 @@ type CacheOptions struct {
 // TTL for absent (404) domains. It is the shared publisher-manifest cache for
 // the Exchange contributor-authz check and the Broker routing probe.
 //
-// The positive (host→manifest) core lives in the shared manifestStore; Cache
+// The positive (host→manifest) core lives in the shared docStore; Cache
 // adds the negative (404) map and Cache-Control handling on top.
 type Cache struct {
-	store       *manifestStore
+	store       *docStore[*Manifest]
 	client      HTTPDoer
 	scheme      string
 	port        string
@@ -64,9 +66,6 @@ type Cache struct {
 
 // NewCache constructs a Cache with defaults applied.
 func NewCache(opts CacheOptions) *Cache {
-	if opts.Client == nil {
-		opts.Client = NewGuardedClientFromEnv()
-	}
 	if opts.Scheme == "" {
 		opts.Scheme = "https"
 	}
@@ -83,7 +82,7 @@ func NewCache(opts CacheOptions) *Cache {
 		opts.Clk = clock.System{}
 	}
 	return &Cache{
-		store:       newManifestStore(opts.Clk),
+		store:       newDocStore[*Manifest](opts.Clk),
 		client:      opts.Client,
 		scheme:      opts.Scheme,
 		port:        opts.Port,
@@ -135,6 +134,9 @@ func (c *Cache) single(ctx context.Context, host string) (*Manifest, error) {
 // load performs the origin GET, schema-validates + decodes the body, and stores
 // the result (negative on 404, positive otherwise with the header-derived TTL).
 func (c *Cache) load(ctx context.Context, host string) (*Manifest, error) {
+	if c.client == nil {
+		return nil, ErrNoClient
+	}
 	rawURL, err := ManifestURL(host, c.scheme, c.port)
 	if err != nil {
 		return nil, err

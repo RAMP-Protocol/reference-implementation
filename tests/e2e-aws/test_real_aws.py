@@ -18,9 +18,20 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
+
+# The e2e-aws suite lives outside the harness package; mirror demo_proof.py and
+# put tests/e2e on sys.path so the canonical response carriers import resolves.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "e2e"))
+
+from harness.resolve_carriers import (  # noqa: E402
+    licensed_of,
+    retrieval_endpoint_of,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RAMP_E2E_AWS") != "1",
@@ -61,8 +72,9 @@ def test_resolve_returns_cloudfront_signed_url(
     )
     assert resp.status_code == httpx.codes.OK, resp.text
     payload = resp.json()
-    assert payload.get("licensed") is True, payload
-    signed = payload["signed_url"]
+    assert licensed_of(payload) is True, payload
+    signed = retrieval_endpoint_of(payload)
+    assert signed is not None, payload
     for name in ("Expires", "Signature", "Key-Pair-Id"):
         assert name in signed, f"{name} missing in {signed}"
 
@@ -76,7 +88,8 @@ def test_signed_url_delivers_content_via_cloudfront(
         json={"agent_id": agent_id, "uri": resource_uri},
         timeout=30.0,
     )
-    signed = resp.json()["signed_url"]
+    signed = retrieval_endpoint_of(resp.json())
+    assert signed is not None, resp.text
     content_resp = httpx.get(signed, timeout=30.0)
     assert content_resp.status_code == httpx.codes.OK, content_resp.text
     assert len(content_resp.content) > 0
@@ -91,7 +104,8 @@ def test_tampered_signature_is_rejected_by_cloudfront(
         json={"agent_id": agent_id, "uri": resource_uri},
         timeout=30.0,
     )
-    signed = resp.json()["signed_url"]
+    signed = retrieval_endpoint_of(resp.json())
+    assert signed is not None, resp.text
     match = re.search(r"Signature=([^&]+)", signed)
     assert match, signed
     sig = match.group(1)

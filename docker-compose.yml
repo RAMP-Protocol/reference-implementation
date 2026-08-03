@@ -24,17 +24,180 @@ services:
     restart: unless-stopped
     ports:
       - "${RAMP_REDIS_PORT:-56379}:6379"
-    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
-    volumes:
-      - redisdata:/data
+    command: ["redis-server", "--save", "", "--loglevel", "warning"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
+  # Local-dev TigerBeetle for running the Exchange binary against a real ledger.
+  # (Integration tests do NOT use this service — they spin up their own container
+  # via internal/testutil.StartSharedTigerBeetle.) A single-replica cluster: the
+  # data file is formatted on first boot only (the volume persists it across
+  # restarts), then started. Point the Exchange at it with
+  # EXCHANGE_BILLING_TB_ADDRESS=127.0.0.1:${RAMP_TB_PORT:-53000}.
+  #
+  # --development relaxes Direct IO (Docker/overlay/macOS volumes) and shrinks
+  # caches. security_opt/cap_add are mandatory: Docker >= 25 blocks io_uring
+  # without seccomp=unconfined (error: PermissionDenied), and TigerBeetle locks
+  # memory (macOS error: SystemResources without IPC_LOCK).
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.17.8
+    restart: unless-stopped
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        [ -f /data/0_0.tigerbeetle ] || /tigerbeetle format --cluster=0 --replica=0 --replica-count=1 --development /data/0_0.tigerbeetle
+        exec /tigerbeetle start --addresses=0.0.0.0:3000 --cache-grid=256MiB --development /data/0_0.tigerbeetle
+    security_opt:
+      - "seccomp=unconfined"
+    cap_add:
+      - "IPC_LOCK"
+    # The image is busybox-based (it already runs `sh -c` above), so `nc` is
+    # available for a TCP probe. This proves the replica is accepting connections,
+    # which is what callers wait for — not that the cluster answers correctly; only
+    # a real request does that. Formatting runs before `start`, so the port opening
+    # is the honest readiness edge.
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "3000"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "${RAMP_TB_PORT:-53000}:3000"
+    volumes:
+      - tbdata:/data
+
+  # Local-dev Vault for running the Identity Service against a real key store.
+  # (Integration tests do NOT use this service — they spin up their own container
+  # via internal/testutil.StartSharedVault.) Dev mode is in-memory and starts
+  # UNSEALED with a fixed root token: perfect for a laptop, unacceptable anywhere
+  # else, which is why nothing outside this file knows that token. The keys the
+  # service mints here vanish when the container stops, exactly as dev keys should.
+  vault:
+    image: hashicorp/vault:1.20
+    restart: unless-stopped
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${RAMP_VAULT_DEV_TOKEN:-dev-root-token}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    # IPC_LOCK lets Vault lock its memory so secrets are never swapped to disk.
+    cap_add:
+      - "IPC_LOCK"
+    # Bound to the loopback interface, not 0.0.0.0: this Vault boots unsealed with a
+    # root token that is a published default in this file, and it is the one service
+    # here holding agents' private keys. On a shared network an unbound port hands
+    # every one of them to anyone who can reach the host.
+    ports:
+      - "127.0.0.1:${RAMP_VAULT_PORT:-58200}:8200"
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Zitadel: the upstream OIDC provider for developer sign-up. Integration tests
+  # do not use these; the `zitadel` test tier starts its own pair via
+  # internal/testutil.StartSharedZitadel. Bring them up with `make zitadel-up`,
+  # which runs scripts/zitadel-bootstrap.sh to provision the org, the OIDC app and
+  # — when GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are exported — Google
+  # federation. Sign-in then runs through the Identity service's own flow.
+  #
+  # The `zitadel` profile keeps all three out of the default set, so a bare
+  # `docker compose up` skips their ~30-45s boot. Corollary: a bare
+  # `docker compose down` does not stop them either — use `make zitadel-down`.
+  zitadel-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    profiles: ["zitadel"]
+    environment:
+      POSTGRES_USER: zitadel
+      POSTGRES_PASSWORD: zitadel
+      POSTGRES_DB: zitadel
+    # Not published: only Zitadel talks to it, over the compose network.
+    volumes:
+      - zitadeldata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zitadel -d zitadel"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # v3.4.9 is PINNED: v4.x has an open migration-03 boot crash, and v3's Login V1
+  # fixes the external-IdP callback path Google must be told about (see runbook).
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:v3.4.9
+    restart: unless-stopped
+    profiles: ["zitadel"]
+    command:
+      - start-from-init
+      - --masterkey
+      - ${RAMP_ZITADEL_MASTERKEY:-MasterkeyNeedsToHave32Characters}
+      - --tlsMode
+      - disabled
+      - --steps
+      - /etc/zitadel/init-steps.yaml
+    environment:
+      # ExternalDomain + ExternalPort are baked into the issuer, JWKS, and endpoint
+      # URLs AT INIT, not derived from the request Host. So the published port is
+      # fixed, never ephemeral, and changing it after first boot needs a
+      # `make zitadel-down` (which drops the volumes) first.
+      ZITADEL_EXTERNALDOMAIN: ${RAMP_ZITADEL_DOMAIN:-localhost}
+      ZITADEL_EXTERNALPORT: ${RAMP_ZITADEL_PORT:-58080}
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_PORT: "8080"
+      ZITADEL_TLS_ENABLED: "false"
+      ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
+      ZITADEL_DATABASE_POSTGRES_PORT: "5432"
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+    # root, so FirstInstance can write the admin PAT into the shared volume.
+    user: "0"
+    ports:
+      - "127.0.0.1:${RAMP_ZITADEL_PORT:-58080}:8080"
+    volumes:
+      - ./deploy/zitadel/init-steps.yaml:/etc/zitadel/init-steps.yaml:ro
+      - zitadel-bootstrap:/bootstrap
+    depends_on:
+      zitadel-db:
+        condition: service_healthy
+
+  # One-shot provisioning; see scripts/zitadel-bootstrap.sh. It dials zitadel:8080
+  # over the compose network while ExternalDomain is `localhost`, so it overrides
+  # the Host header — Zitadel routes instances by it.
+  zitadel-init:
+    image: curlimages/curl:8.11.1
+    profiles: ["zitadel"]
+    entrypoint: ["sh", "/bootstrap.sh"]
+    # root, to match the zitadel service: FirstInstance creates /bootstrap owned by
+    # root, and this image's default uid 100 cannot write the client id/secret there.
+    user: "0"
+    environment:
+      ZITADEL_BASE_URL: http://zitadel:8080
+      ZITADEL_INSTANCE_HOST: ${RAMP_ZITADEL_DOMAIN:-localhost}
+      ZITADEL_ISSUER: http://${RAMP_ZITADEL_DOMAIN:-localhost}:${RAMP_ZITADEL_PORT:-58080}
+      IDENTITY_AUTH_ISSUER: ${IDENTITY_AUTH_ISSUER:-http://localhost:8083}
+      EXTRA_REDIRECT_URIS: ${EXTRA_REDIRECT_URIS:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+    volumes:
+      - ./scripts/zitadel-bootstrap.sh:/bootstrap.sh:ro
+      - zitadel-bootstrap:/bootstrap
+    depends_on:
+      - zitadel
+
 # Named volumes are scoped by docker compose project name (`-p <project>`),
 # so two concurrent projects get independent data dirs automatically.
 volumes:
   pgdata:
-  redisdata:
+  tbdata:
+  zitadeldata:
+  # Carries the admin PAT from FirstInstance to the bootstrap, and the resulting
+  # client id/secret back out to `make zitadel-creds`.
+  zitadel-bootstrap:

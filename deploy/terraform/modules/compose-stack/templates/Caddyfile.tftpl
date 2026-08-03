@@ -1,0 +1,73 @@
+# Rendered by Terraform (modules/compose-stack). Caddy terminates TLS for
+# every public hostname with automatic Let's Encrypt certificates.
+{
+	email ${acme_email}
+%{ if acme_staging }
+	# Let's Encrypt STAGING CA: certificates are untrusted, but apply/destroy
+	# cycles cannot hit production rate limits. Flip acme_staging off for the
+	# real environment.
+	acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+%{ endif ~}
+	# Agent directories live on subdomains that do not exist until a developer
+	# signs up, so their certificates cannot be provisioned ahead of time.
+	# on-demand issuance mints one per subdomain on its first request.
+	#
+	# `ask` is mandatory — without it any name presented in SNI would trigger
+	# an issuance attempt. Pointing it at the identity service's health check
+	# answers 200 for every name asked, which is permissive on its own; what
+	# actually bounds issuance is the site address below, which routes only
+	# names matching *.${identity_hostname}. Anything else never reaches this
+	# policy. Tightening `ask` to an endpoint that confirms the agent exists
+	# is the production shape.
+	on_demand_tls {
+		ask http://identity:8083/healthz
+	}
+}
+
+${exchange_hostname} {
+	reverse_proxy exchange:8081
+}
+
+${broker_hostname} {
+	reverse_proxy broker:8082
+}
+
+# The Identity Service's own surface: the MCP endpoint, the OAuth sign-up
+# flow, and /healthz.
+${identity_hostname} {
+	reverse_proxy identity:8083
+}
+
+# Agent Web Bot Auth directories, one subdomain per provisioned agent. The
+# service dispatches on the Host header and 404s anything that is not a single
+# label under ${identity_hostname}, so this block must not rewrite the host —
+# Caddy passes it through unchanged by default, which is why no header
+# directive appears here.
+*.${identity_hostname} {
+	tls {
+		on_demand
+	}
+	reverse_proxy identity:8083
+}
+
+# Upstream OIDC provider. Public because the developer sign-up flow redirects
+# a browser here, and because the issuer string must resolve identically for
+# that browser and for the Identity Service validating the tokens.
+${zitadel_hostname} {
+	# h2c: the Zitadel console talks gRPC-Web to the backend, which needs
+	# HTTP/2 on a connection Caddy is not terminating TLS on. Plain HTTP/1.1
+	# proxying serves the login pages but breaks the console.
+	reverse_proxy zitadel:8080 {
+		transport http {
+			versions h2c 2
+		}
+	}
+}
+%{ if origin_hostname != null }
+# Demo publisher origin (staging only): the edge worker fetches verified
+# content from here. Publicly reachable by design in staging; a production
+# publisher restricts its origin.
+${origin_hostname} {
+	reverse_proxy publisher:80
+}
+%{ endif ~}

@@ -1,8 +1,8 @@
--- Offer negotiation + explicit reporting obligations (ofxz).
+-- Offer negotiation + explicit reporting obligations.
 --
 -- The existing catalog + reporting_obligations model supports discover-and-
 -- execute where every resource has an implicit per-request offer plus a
--- matching subscription-priced offer. The ofxz flow adds explicit, tenant-
+-- matching subscription-priced offer. The offer-negotiation flow adds explicit, tenant-
 -- scoped offer rows so the Exchange can enumerate SPOT / SUBSCRIPTION / FREE
 -- offers independently of the catalog pricing blob.
 --
@@ -22,9 +22,9 @@ CREATE TYPE ramp.transaction_lifecycle AS ENUM (
 );
 
 ALTER TABLE ramp.transaction_log
-    ADD COLUMN lifecycle ramp.transaction_lifecycle NOT NULL DEFAULT 'ACCEPTED'; -- LISTED→ACCEPTED→DELIVERED→REPORTED progression for ofxz negotiation rows
+    ADD COLUMN lifecycle ramp.transaction_lifecycle NOT NULL DEFAULT 'ACCEPTED'; -- LISTED→ACCEPTED→DELIVERED→REPORTED progression for offer-negotiation rows
 
--- Relax resource_id FK so ofxz AcceptOffer can write transaction_log rows
+-- Relax resource_id FK so the legacy AcceptOffer path can write transaction_log rows
 -- referencing ramp.offers rather than ramp.catalog. Legacy catalog-driven
 -- rows keep referential integrity via service-layer assertions; the FK is
 -- replaced by an index to preserve lookup performance.
@@ -39,7 +39,7 @@ CREATE TYPE ramp.offer_type AS ENUM (
 );
 
 -- ---------------------------------------------------------------------------
--- Offers — explicit offer rows for the ofxz negotiation flow.
+-- Offers — explicit offer rows for the offer-negotiation flow.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE ramp.offers (

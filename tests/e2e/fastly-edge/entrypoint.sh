@@ -7,7 +7,7 @@
 
 set -eu
 
-REQUIRED="EXCHANGE_URL EXCHANGE_MANIFEST_URL ORIGIN_URL PROVIDER EXCHANGES_JSON"
+REQUIRED="EXCHANGE_URL EXCHANGE_WBA_URL ORIGIN_URL PROVIDER EXCHANGES_JSON"
 for name in $REQUIRED; do
   eval "v=\${$name:-}"
   if [ -z "$v" ]; then
@@ -39,11 +39,14 @@ service_id = ""
       ORIGIN_URL = "${ORIGIN_URL}"
       PROVIDER = "${PROVIDER}"
       EXCHANGES_JSON = $(printf '%s' "$EXCHANGES_JSON" | node -e 'process.stdout.write(JSON.stringify(require("fs").readFileSync(0,"utf8")))')
-      EXCHANGE_MANIFEST_URL = "${EXCHANGE_MANIFEST_URL:-}"
+      EXCHANGE_WBA_URL = "${EXCHANGE_WBA_URL:-}"
+      RAMP_ENFORCE_BINDING = "${RAMP_ENFORCE_BINDING:-}"
       RSL_BODY = "${RSL_BODY:-}"
       CATALOG_CONTRIBUTORS_JSON = $(printf '%s' "${CATALOG_CONTRIBUTORS_JSON:-}" | node -e 'process.stdout.write(JSON.stringify(require("fs").readFileSync(0,"utf8")))')
+      WBA_KEYS_JSON = $(printf '%s' "${WBA_KEYS_JSON:-}" | node -e 'process.stdout.write(JSON.stringify(require("fs").readFileSync(0,"utf8")))')
+      WBA_REVOCATION_URL = "${WBA_REVOCATION_URL:-}"
 
 [setup]
 EOF
 
-exec fastly compute serve --skip-build --addr=0.0.0.0:7676
+exec fastly compute serve --skip-build --addr="${FASTLY_SERVE_ADDR:-0.0.0.0:7676}"

@@ -1,0 +1,15 @@
+-- Rendered by Terraform (modules/compose-stack). Runs ONCE at Postgres
+-- cluster init (mounted under /docker-entrypoint-initdb.d), before the
+-- socket opens for application connections.
+--
+-- The Exchange and Broker share the default `ramp` database (separate
+-- schemas). Two more are always created by the module: `identity` for the
+-- Identity Service, and `sor` for the Exchange's System of Record, which runs
+-- on a second pool and migrates itself at boot but never creates its own
+-- database. Further databases appear here when a multi-exchange topology sets
+-- extra_databases — each additional exchange instance owns a separate catalog
+-- database so the global DiscoverResources read cannot leak one publisher's
+-- catalog onto another exchange.
+%{ for db in extra_databases }
+CREATE DATABASE ${db};
+%{ endfor }

@@ -13,9 +13,8 @@ import (
 
 func TestFetch_HappyPathAssertsRole(t *testing.T) {
 	t.Parallel()
-	_, key := testutil.NewSigningKey("k", anchor.Add(-time.Hour), anchor.Add(time.Hour))
 	origin := testutil.NewOrigin(testutil.MarshalManifest(
-		testutil.Manifest(rampwellknown.RoleAgent, "agent.example", key),
+		testutil.Manifest(rampwellknown.RoleAgent, "agent.example"),
 	))
 	defer origin.Close()
 
@@ -31,30 +30,53 @@ func TestFetch_HappyPathAssertsRole(t *testing.T) {
 	}
 }
 
-// TestFetch_ZeroClientUsesGuardedDefault pins that omitting Client falls back to
-// the SSRF-guarded env client (not http.DefaultClient): with
-// RAMP_FETCH_INSECURE_ALLOW_PRIVATE unset it rejects the http:// loopback test
-// origin, so a caller that forgets to wire a client cannot reach an internal
-// target.
-func TestFetch_ZeroClientUsesGuardedDefault(t *testing.T) {
+func TestFetchWBA_HappyPath(t *testing.T) {
 	t.Parallel()
-	_, key := testutil.NewSigningKey("k", anchor.Add(-time.Hour), anchor.Add(time.Hour))
+	priv, key := testutil.NewSigningKey("k", anchor.Add(-time.Hour), anchor.Add(time.Hour))
+	origin := testutil.NewOrigin(nil)
+	defer origin.Close()
+	origin.SetWBA(testutil.MarshalWBA(testutil.WBAFile(key)))
+
+	f, err := rampwellknown.FetchWBA(context.Background(), origin.URL, rampwellknown.FetchOptions{
+		Client: testutil.Client(),
+	})
+	if err != nil {
+		t.Fatalf("FetchWBA: %v", err)
+	}
+	if len(f.GetKeys()) != 1 {
+		t.Fatalf("want 1 key, got %d", len(f.GetKeys()))
+	}
+	pub, err := rampwellknown.PublicKey(f.GetKeys()[0])
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	if !pub.Equal(priv.Public()) {
+		t.Fatal("fetched key mismatch")
+	}
+}
+
+// TestFetch_ZeroClientFailsLoud pins that omitting Client is a fail-loud
+// ErrNoClient, NOT a silent fall-open. The SSRF-guarded client is SDK-owned;
+// this package keeps no in-package guarded default, so a caller that forgets to
+// inject a client gets a clear error rather than either a fail-open
+// http.DefaultClient or a re-wrapped SDK factory.
+func TestFetch_ZeroClientFailsLoud(t *testing.T) {
+	t.Parallel()
 	origin := testutil.NewOrigin(testutil.MarshalManifest(
-		testutil.Manifest(rampwellknown.RoleAgent, "agent.example", key),
+		testutil.Manifest(rampwellknown.RoleAgent, "agent.example"),
 	))
 	defer origin.Close()
 
 	_, err := rampwellknown.Fetch(context.Background(), origin.URL, rampwellknown.FetchOptions{})
-	if !errors.Is(err, rampwellknown.ErrBlockedTarget) {
-		t.Fatalf("want ErrBlockedTarget from the guarded default, got %v", err)
+	if !errors.Is(err, rampwellknown.ErrNoClient) {
+		t.Fatalf("want ErrNoClient when Client is omitted, got %v", err)
 	}
 }
 
 func TestFetch_Errors(t *testing.T) {
 	t.Parallel()
-	_, key := testutil.NewSigningKey("k", anchor.Add(-time.Hour), anchor.Add(time.Hour))
 	brokerManifest := testutil.MarshalManifest(
-		testutil.Manifest(rampwellknown.RoleBroker, "broker.example", key),
+		testutil.Manifest(rampwellknown.RoleBroker, "broker.example"),
 	)
 
 	tests := []struct {

@@ -1,0 +1,131 @@
+//go:build integration
+
+package transport_test
+
+import (
+	"net/http"
+	"testing"
+
+	connect "connectrpc.com/connect"
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
+)
+
+// GetAccountStatus reuses the Register test harness wholesale
+// (newRegisterHarness / newAgent / newBrokerCaller): both RPCs share the same
+// signed-request path, the same self-signup, and the same account surfaces, so
+// the status tests observe exactly the account state Register produced through
+// the same public router.
+
+// TestExchangeGetAccountStatus_RegisteredActive drives Register then
+// GetAccountStatus through the real Connect-Go router: a registered agent under
+// a tenant whose activate_new_agents_by_default defaults TRUE reports its stored
+// billing_ref and active=true. The status read observes the account Register
+// created — no raw SQL (Testing Doctrine §9).
+func TestExchangeGetAccountStatus_RegisteredActive(t *testing.T) {
+	h := newRegisterHarness(t)
+	a := h.newAgent(t, "status-agent.example")
+
+	reg, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{
+		Ver:              "1.0",
+		RegistrationData: mustRegistrationStruct(t, map[string]any{"legal_entity": "Acme AI Ltd"}),
+	}))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	ref := reg.Msg.GetBillingRef()
+
+	resp, err := a.client.GetAccountStatus(h.ctx, connect.NewRequest(&rampv1.GetAccountStatusRequest{Ver: "1.0"}))
+	if err != nil {
+		t.Fatalf("GetAccountStatus: %v", err)
+	}
+	if got := resp.Msg.GetBillingRef(); got != ref {
+		t.Fatalf("billing_ref = %q, want %q (the ref Register stored)", got, ref)
+	}
+	if !resp.Msg.GetActive() {
+		t.Fatal("active = false, want true (tenant activate_new_agents_by_default defaults TRUE)")
+	}
+}
+
+// TestExchangeGetAccountStatus_RegisteredInactive proves an account that exists
+// but is switched off reports active=false, NOT NotFound. The SoR in-memory
+// adapter exposes no public deactivate surface (only OnRegister / IsActive), so
+// the account is made inactive at the source by flipping the tenant activation
+// default OFF before Register — the same arrange surface
+// TestExchangeRegister_TenantActivationDefaultOff uses. This still exercises the
+// load-bearing distinction (a present billing_ref + active=false must not
+// collapse to NotFound) without inventing a deactivate path the production code
+// does not have.
+func TestExchangeGetAccountStatus_RegisteredInactive(t *testing.T) {
+	h := newRegisterHarness(t)
+	// Flip the single default tenant's activation policy off so the agent starts
+	// inactive. Tenant configuration has no production write path (set out of
+	// band), so the sqlc fixture mutator is the sanctioned arrange surface.
+	if err := h.queries.SetTenantActivateNewAgentsByDefault(h.ctx, sqlc.SetTenantActivateNewAgentsByDefaultParams{
+		TenantID: h.tenantID, ActivateNewAgentsByDefault: false,
+	}); err != nil {
+		t.Fatalf("flip activation default off: %v", err)
+	}
+
+	a := h.newAgent(t, "inactive-agent.example")
+	reg, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	ref := reg.Msg.GetBillingRef()
+
+	resp, err := a.client.GetAccountStatus(h.ctx, connect.NewRequest(&rampv1.GetAccountStatusRequest{Ver: "1.0"}))
+	if err != nil {
+		t.Fatalf("GetAccountStatus on an inactive account: %v (want success with active=false, not an error)", err)
+	}
+	if got := resp.Msg.GetBillingRef(); got != ref {
+		t.Fatalf("billing_ref = %q, want %q (account exists)", got, ref)
+	}
+	if resp.Msg.GetActive() {
+		t.Fatal("active = true, want false (registered under activation default OFF)")
+	}
+}
+
+// TestExchangeGetAccountStatus_NeverRegistered proves an identity that has a
+// signed presence but no account is NotFound (not an empty success). The agent
+// self-signs up on its first signed call (lazy registration), so its
+// ramp.agents row exists with an empty billing_ref — exactly the "known
+// identity, no account" state — and GetAccountStatus maps it to CodeNotFound.
+func TestExchangeGetAccountStatus_NeverRegistered(t *testing.T) {
+	h := newRegisterHarness(t)
+	a := h.newAgent(t, "unregistered-agent.example")
+
+	_, err := a.client.GetAccountStatus(h.ctx, connect.NewRequest(&rampv1.GetAccountStatusRequest{Ver: "1.0"}))
+	if got := connect.CodeOf(err); got != connect.CodeNotFound {
+		t.Fatalf("code = %v, want NotFound (err=%v)", got, err)
+	}
+}
+
+// TestExchangeGetAccountStatus_Negatives drives the auth/permission failure
+// modes through the same public surface (Testing Doctrine §10), mirroring
+// Register's negatives: an unsigned request is rejected by the httpsig gate
+// before the handler runs, and a broker caller carries no agent identity of its
+// own so it has no account to read.
+func TestExchangeGetAccountStatus_Negatives(t *testing.T) {
+	t.Run("unsigned request is Unauthenticated", func(t *testing.T) {
+		h := newRegisterHarness(t)
+		unsigned := rampconnect.NewExchangeServiceClient(
+			&http.Client{Transport: h.baseTransport}, h.server, connect.WithGRPC(),
+		)
+		_, err := unsigned.GetAccountStatus(h.ctx, connect.NewRequest(&rampv1.GetAccountStatusRequest{Ver: "1.0"}))
+		if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
+			t.Fatalf("code = %v, want Unauthenticated (err=%v)", got, err)
+		}
+	})
+
+	t.Run("broker caller is PermissionDenied", func(t *testing.T) {
+		h := newRegisterHarness(t)
+		client := h.newBrokerCaller(t, "broker-status.example")
+		_, err := client.GetAccountStatus(h.ctx, connect.NewRequest(&rampv1.GetAccountStatusRequest{Ver: "1.0"}))
+		if got := connect.CodeOf(err); got != connect.CodePermissionDenied {
+			t.Fatalf("code = %v, want PermissionDenied (err=%v)", got, err)
+		}
+	})
+}

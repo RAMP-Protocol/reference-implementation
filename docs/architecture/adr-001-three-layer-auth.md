@@ -3,12 +3,9 @@
 **Status:** Refined by ADR-004 (2026-04-23). The three-layer framing is correct as an observation of enterprise deployment shape; ADR-004 refines the framing to pin which layer is authoritative for authorization (inner: biscuit) and which layers are deployment shims (outer: JWT + RFC 9421). See `docs/architecture/adr-004-protocol-layers.md`.
 **Originally accepted:** 2026-04-21.
 **Supersedes:** — (new record; supersedes the unpublished "unwrap-to-biscuit at MCP shim" proposal discussed and rejected on 2026-04-21)
-**Related paused-methodology artifacts:** ADR-039 (requester-identity-model), ADR-040 (biscuit-delegation-tokens), ADR-057 (dual-authorization-architecture) — all tracked in the `piarch` repo.
-**Related design docs:** `docs/design/request-lifecycle.md` §1, `docs/design/idp-migration.md`
 **See also:**
 - `docs/architecture/adr-002-entitlement-biscuit-model.md` — single resource-owner-signed entitlement biscuit + mandatory per-request buyer attenuation; expands Layer 3 below.
 - `docs/architecture/adr-003-key-rotation-revocation.md` — rotation and revocation mechanics for all four key hierarchies referenced in this ADR.
-- `docs/protocol/ramp-protocol.md` — canonical implementer-facing narrative for the key-discovery, renewal, and revocation surfaces (URL convention, hosting options, per-JWK `use` field, worked examples).
 
 ---
 
@@ -39,7 +36,7 @@ The three cryptographic layers serve three disjoint purposes and MUST NOT be com
 
 - **What it proves:** the HTTP request itself is authentic, body-intact, and not replayed within the signature window.
 - **Verifier input:** the `Signature-Input` / `Signature` headers; `keyid` resolves to the calling agent's or MCP-shim's registered Ed25519 pubkey.
-- **Used for:** request-level integrity; non-repudiation for compliance audit; interoperability with enterprise signature-auditing tools (this is the mswf correctness win that justifies the layer existing at all).
+- **Used for:** request-level integrity; non-repudiation for compliance audit; interoperability with enterprise signature-auditing tools (the correctness win that justifies the layer existing at all).
 - **NOT used for:** identity-to-authz translation. A valid RFC 9421 signature proves "this request came from an agent with key X"; it does not prove "agent with key X is authorized to fetch Y".
 
 ### Layer 2 — JWT (OIDC access token)
@@ -87,7 +84,7 @@ The three cryptographic layers serve three disjoint purposes and MUST NOT be com
 ### Negative / costs accepted
 
 - **Three independent verifications per request.** Broker verifies all three; Exchange re-verifies all three (does not trust Broker's assertions). This is an intentional CPU cost for trust-boundary hygiene.
-- **Multiple key hierarchies.** Four distinct hierarchies (agent Ed25519, IdP RS256, entitlement-biscuit Ed25519 per resource owner, buyer delegation Ed25519). Runbook complexity is real but all key sets are discoverable via `/.well-known/*` endpoints (or, for buyer delegation keys, the opaque `buyer_keys_url` recorded in the authority block) with documented rotation procedures (see `docs/design/request-lifecycle.md` §2 and ADR-003).
+- **Multiple key hierarchies.** Four distinct hierarchies (agent Ed25519, IdP RS256, entitlement-biscuit Ed25519 per resource owner, buyer delegation Ed25519). Runbook complexity is real but all key sets are discoverable via `/.well-known/*` endpoints (or, for buyer delegation keys, the opaque `buyer_keys_url` recorded in the authority block) with documented rotation procedures (see ADR-003).
 - **A lint gate is required and load-bearing.** Without enforcement, a reviewer can drift Exchange service code into reading `jwt.sub` because "it's easier". The enforcement (see below) is not optional; it is the mechanism that makes this ADR durable.
 
 ---
@@ -162,12 +159,11 @@ Waivers must include the `adr-001-allow-jwt:` prefix and a one-line justificatio
 
 ## Notes
 
-- The single entitlement biscuit and its mandatory per-request attenuation semantics are the subject of ADR-002 (tracked as beads `e23e` / ye6f-15). That ADR expands on Layer 3 here; this ADR treats the biscuit layer as a single conceptual box.
-- `docs/design/request-lifecycle.md` is authoritative for the runtime flow; this ADR is authoritative for the reasoning. If the design doc and the ADR disagree, the ADR wins and the design doc is wrong — file a task.
+- The single entitlement biscuit and its mandatory per-request attenuation semantics are the subject of ADR-002. That ADR expands on Layer 3 here; this ADR treats the biscuit layer as a single conceptual box.
 
 ---
 
-## Amendment (2026-04-21, ye6f-11)
+## Amendment (2026-04-21)
 
 Two refinements to Layer 1, tightening both sides of the trust boundary so there is no trust-exempt internal hop and only one key-discovery shape:
 

@@ -3,202 +3,113 @@ package httpsig
 import (
 	"context"
 	"crypto/ed25519"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
-// KeyResolver looks up the Ed25519 public key registered for keyid. The
-// adapter is the boundary between the RFC 9421 verifier and whatever key
-// directory the caller wires (static map, Broker /.well-known, tenant DB).
-// Implementations are expected to return ErrUnknownKey (or a wrapping error)
-// when the keyid is not registered.
+// KeyResolver looks up the Ed25519 public key registered for keyid (after the
+// WBA split, an RFC 7638 thumbprint). The adapter is the boundary between the
+// RFC 9421 verifier and whatever key directory the caller wires (static map,
+// Broker WBA directory, per-agent discovery). Implementations are expected to
+// return ErrUnknownKey (or a wrapping error) when the keyid is not registered.
+// A discovery resolver reads the signed directory origin via
+// SignatureAgentFromContext to know which WBA directory to fetch.
 type KeyResolver interface {
 	Resolve(ctx context.Context, keyID string) (ed25519.PublicKey, error)
 }
 
+type signatureAgentCtxKey struct{}
+
+// WithSignatureAgent returns ctx carrying the (signed) Signature-Agent directory
+// origin. The verifier sets it before invoking a KeyResolver so a discovery
+// resolver knows which WBA directory to fetch and match the keyid against.
+func WithSignatureAgent(ctx context.Context, dir string) context.Context {
+	return context.WithValue(ctx, signatureAgentCtxKey{}, dir)
+}
+
+// SignatureAgentFromContext returns the Signature-Agent directory origin set by
+// the verifier, or "" when absent.
+func SignatureAgentFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(signatureAgentCtxKey{}).(string)
+	return v
+}
+
 // StaticResolver serves pubkeys from an in-memory map. Tests and the demo
-// hardcoded-agent path use this directly.
+// hardcoded-agent path use this directly. A key MAY carry a half-open validity
+// window (not_before/not_after); a key outside its window resolves to
+// ErrKeyExpired, so a statically-loaded key is held to the same validity gate as
+// a directory-published one (closing the gap where a static bootstrap key
+// bypassed not_before/not_after). A key with no window is unbounded.
 type StaticResolver struct {
 	mu   sync.RWMutex
-	keys map[string]ed25519.PublicKey
+	keys map[string]staticKey
+	now  func() time.Time
 }
 
-// NewStaticResolver returns a StaticResolver seeded with keys.
-func NewStaticResolver(keys map[string]ed25519.PublicKey) *StaticResolver {
-	copied := make(map[string]ed25519.PublicKey, len(keys))
-	for k, v := range keys {
-		copied[k] = v
+// staticKey is a pubkey plus an optional half-open validity window. A zero
+// notBefore/notAfter is unbounded on that side.
+type staticKey struct {
+	pub       ed25519.PublicKey
+	notBefore time.Time
+	notAfter  time.Time
+}
+
+func (k staticKey) activeAt(t time.Time) bool {
+	if !k.notBefore.IsZero() && t.Before(k.notBefore) {
+		return false
 	}
-	return &StaticResolver{keys: copied}
+	if !k.notAfter.IsZero() && !t.Before(k.notAfter) {
+		return false
+	}
+	return true
 }
 
-// Resolve implements KeyResolver.
+// NewStaticResolver returns a StaticResolver seeded with keys, each unbounded
+// (always valid). The validity clock defaults to time.Now; SetClock overrides it.
+func NewStaticResolver(keys map[string]ed25519.PublicKey) *StaticResolver {
+	copied := make(map[string]staticKey, len(keys))
+	for k, v := range keys {
+		copied[k] = staticKey{pub: v}
+	}
+	return &StaticResolver{keys: copied, now: clock.System{}.Now}
+}
+
+// SetClock overrides the validity clock (deterministic time in tests).
+func (s *StaticResolver) SetClock(now func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now = now
+}
+
+// Resolve implements KeyResolver. A known key outside its validity window
+// resolves to ErrKeyExpired (authoritative — the composite must not fall through).
 func (s *StaticResolver) Resolve(_ context.Context, keyID string) (ed25519.PublicKey, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	pub, ok := s.keys[keyID]
+	k, ok := s.keys[keyID]
 	if !ok {
 		return nil, fmt.Errorf("%w: keyid=%q", ErrUnknownKey, keyID)
 	}
-	return pub, nil
+	if !k.activeAt(s.now()) {
+		return nil, fmt.Errorf("%w: keyid=%q", ErrKeyExpired, keyID)
+	}
+	return k.pub, nil
 }
 
-// Put registers a keyid → pubkey mapping. Intended for test seeding and
-// dynamic registration paths (Broker agent-register endpoint).
+// Put registers a keyid → pubkey mapping with no validity window (always valid).
+// Intended for test seeding and dynamic registration paths (Broker
+// agent-register endpoint).
 func (s *StaticResolver) Put(keyID string, pub ed25519.PublicKey) {
+	s.PutTimed(keyID, pub, time.Time{}, time.Time{})
+}
+
+// PutTimed registers a keyid → pubkey mapping bounded by a half-open validity
+// window [notBefore, notAfter). A zero bound is unbounded on that side.
+func (s *StaticResolver) PutTimed(keyID string, pub ed25519.PublicKey, notBefore, notAfter time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.keys[keyID] = pub
-}
-
-// WellKnownResolver fetches a JWKS-shaped document from a URL and caches
-// resolved keys with a TTL. The wire format is a subset of RFC 7517:
-//
-//	{"keys":[
-//	  {"kid":"agent1.v1","kty":"OKP","crv":"Ed25519","x":"<base64url>","use":"sig","alg":"EdDSA"}
-//	]}
-type WellKnownResolver struct {
-	url         string
-	http        *http.Client
-	ttl         time.Duration
-	clk         clock.Clock
-	mu          sync.RWMutex
-	cache       map[string]ed25519.PublicKey
-	cacheExp    time.Time
-	allowlist   func(keyID string) bool
-	fetchSingle sync.Mutex
-}
-
-// WellKnownOptions tunes the resolver. Zero values are safe defaults.
-type WellKnownOptions struct {
-	// HTTP overrides the client used to fetch the JWKS. nil means http.DefaultClient.
-	HTTP *http.Client
-	// TTL is how long to cache a successful fetch. Defaults to 5 minutes.
-	TTL time.Duration
-	// Clk is the clock source consulted for cache freshness. Defaults to
-	// clock.System{} per ADR-008 D1.
-	Clk clock.Clock
-	// Allow returns true when keyID is allowed to sign against this verifier.
-	// nil means allow-all (demo default — explicit TODO).
-	Allow func(keyID string) bool
-}
-
-// NewWellKnownResolver returns a resolver that lazily fetches the JWKS at url.
-func NewWellKnownResolver(url string, opts WellKnownOptions) *WellKnownResolver {
-	client := opts.HTTP
-	if client == nil {
-		client = http.DefaultClient
-	}
-	ttl := opts.TTL
-	if ttl <= 0 {
-		ttl = 5 * time.Minute
-	}
-	clk := opts.Clk
-	if clk == nil {
-		clk = clock.System{}
-	}
-	// TODO(ramp-agent-registry): allowlist should be per-tenant, sourced from
-	// the Broker agent registry. For the v1 demo a nil allowlist means accept
-	// any registered keyid; replaced when multi-tenant registration lands.
-	return &WellKnownResolver{
-		url:       url,
-		http:      client,
-		ttl:       ttl,
-		clk:       clk,
-		cache:     map[string]ed25519.PublicKey{},
-		allowlist: opts.Allow,
-	}
-}
-
-// Resolve implements KeyResolver. Cache hit short-circuits; cache miss or TTL
-// expiry triggers a single JWKS refresh (races are coalesced by fetchSingle).
-func (r *WellKnownResolver) Resolve(ctx context.Context, keyID string) (ed25519.PublicKey, error) {
-	if r.allowlist != nil && !r.allowlist(keyID) {
-		return nil, fmt.Errorf("%w: keyid %q not on allowlist", ErrUnknownKey, keyID)
-	}
-	if pub, ok := r.cachedKey(keyID); ok {
-		return pub, nil
-	}
-	if err := r.refresh(ctx); err != nil {
-		return nil, err
-	}
-	if pub, ok := r.cachedKey(keyID); ok {
-		return pub, nil
-	}
-	return nil, fmt.Errorf("%w: keyid=%q", ErrUnknownKey, keyID)
-}
-
-func (r *WellKnownResolver) cachedKey(keyID string) (ed25519.PublicKey, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.clk.Now().After(r.cacheExp) {
-		return nil, false
-	}
-	pub, ok := r.cache[keyID]
-	return pub, ok
-}
-
-func (r *WellKnownResolver) refresh(ctx context.Context) error {
-	r.fetchSingle.Lock()
-	defer r.fetchSingle.Unlock()
-	// Double-check: another goroutine may have refreshed while we waited.
-	r.mu.RLock()
-	fresh := r.clk.Now().Before(r.cacheExp)
-	r.mu.RUnlock()
-	if fresh {
-		return nil
-	}
-	// r.url is operator-supplied configuration (broker /.well-known JWKS endpoint),
-	// not request-derived input — gosec G107/G704 SSRF taint is a false positive.
-	// #nosec G107 G704 -- trusted operator config
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.url, nil)
-	if err != nil {
-		return fmt.Errorf("httpsig: well-known request: %w", err)
-	}
-	// #nosec G107 G704 -- trusted operator config
-	resp, err := r.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("httpsig: well-known fetch: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("httpsig: well-known status %d", resp.StatusCode)
-	}
-	var doc struct {
-		Keys []struct {
-			Kid string `json:"kid"`
-			Kty string `json:"kty"`
-			Crv string `json:"crv"`
-			X   string `json:"x"`
-		} `json:"keys"`
-	}
-	if decErr := json.NewDecoder(resp.Body).Decode(&doc); decErr != nil {
-		return fmt.Errorf("httpsig: well-known decode: %w", decErr)
-	}
-	fresh2 := make(map[string]ed25519.PublicKey, len(doc.Keys))
-	for _, k := range doc.Keys {
-		if !strings.EqualFold(k.Kty, "OKP") || !strings.EqualFold(k.Crv, "Ed25519") {
-			continue
-		}
-		raw, decErr := base64.RawURLEncoding.DecodeString(k.X)
-		if decErr != nil {
-			continue
-		}
-		if len(raw) != ed25519.PublicKeySize {
-			continue
-		}
-		fresh2[k.Kid] = ed25519.PublicKey(raw)
-	}
-	r.mu.Lock()
-	r.cache = fresh2
-	r.cacheExp = r.clk.Now().Add(r.ttl)
-	r.mu.Unlock()
-	return nil
+	s.keys[keyID] = staticKey{pub: pub, notBefore: notBefore, notAfter: notAfter}
 }

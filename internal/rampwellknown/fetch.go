@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 )
 
@@ -22,8 +21,11 @@ type HTTPDoer interface {
 
 // FetchOptions tunes a manifest fetch. Zero values get safe defaults.
 type FetchOptions struct {
-	// Client performs the GET; nil means the SSRF-guarded env client
-	// (NewGuardedClientFromEnv) so a caller that omits it is safe by default.
+	// Client performs the GET. It is REQUIRED: the SSRF guard is SDK-owned, so a
+	// caller constructs the client once from the SDK factory
+	// (resolvers.NewGuardedClientFromEnv) at its composition root and injects it
+	// here. A nil Client is a fail-loud ErrNoClient — this package never wraps or
+	// re-exports the SDK guarded-client factory as an in-package default.
 	Client HTTPDoer
 	// Scheme overrides the URL scheme for bare hosts; default "https".
 	Scheme string
@@ -36,16 +38,11 @@ type FetchOptions struct {
 	ExpectRole Role
 }
 
-// defaultGuardedClient is the SSRF-guarded fallback used when a caller omits
-// Client. Built once (OnceValue) so repeated zero-Client fetches reuse one
-// transport rather than constructing a client per call.
-var defaultGuardedClient = sync.OnceValue(func() HTTPDoer { return NewGuardedClientFromEnv() })
-
-func (o FetchOptions) client() HTTPDoer {
-	if o.Client != nil {
-		return o.Client
+func (o FetchOptions) client() (HTTPDoer, error) {
+	if o.Client == nil {
+		return nil, ErrNoClient
 	}
-	return defaultGuardedClient()
+	return o.Client, nil
 }
 
 func (o FetchOptions) timeout() time.Duration {
@@ -64,7 +61,11 @@ func Fetch(ctx context.Context, host string, opts FetchOptions) (*Manifest, erro
 	if err != nil {
 		return nil, err
 	}
-	raw, err := getDoc(ctx, opts.client(), u, opts.timeout())
+	client, err := opts.client()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := getDoc(ctx, client, u, opts.timeout())
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +84,37 @@ func ParseManifest(raw []byte, expect Role) (*Manifest, error) {
 		return nil, fmt.Errorf("%w: want %s got %s", ErrRoleMismatch, expect, m.GetRole())
 	}
 	return &m, nil
+}
+
+// FetchWBA GETs host's /.well-known/http-message-signatures-directory, schema-
+// validates it, and decodes it via protojson into a WBAFile. A 404 yields
+// ErrNoManifest; a transient/non-2xx failure yields ErrFetch; a malformed body
+// yields ErrSchemaInvalid. FetchOptions.ExpectRole is not consulted — the WBA
+// directory carries no role.
+func FetchWBA(ctx context.Context, host string, opts FetchOptions) (*WBAFile, error) {
+	u, err := WBAURL(host, opts.Scheme, opts.Port)
+	if err != nil {
+		return nil, err
+	}
+	client, err := opts.client()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := getDoc(ctx, client, u, opts.timeout())
+	if err != nil {
+		return nil, err
+	}
+	return ParseWBA(raw)
+}
+
+// ParseWBA schema-validates raw and decodes it via protojson into a WBAFile.
+// Exported so producers and tests can round-trip bytes without an HTTP call.
+func ParseWBA(raw []byte) (*WBAFile, error) {
+	var f WBAFile
+	if err := decodeValidated(raw, &f, ValidateWBA); err != nil {
+		return nil, err
+	}
+	return &f, nil
 }
 
 // getDoc performs the GET and returns the (size-bounded) body. 404 →
@@ -110,7 +142,12 @@ func httpGet(
 ) (int, http.Header, []byte, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// rawURL is built from operator-supplied host config, not request input.
+	// rawURL's host can be REQUEST-DERIVED on the discovery path: after the WBA
+	// split it is built from the caller-supplied Signature-Agent directory. SSRF
+	// is therefore mitigated by the SDK-guarded HTTP client the discovery callers
+	// inject (constructed once from resolvers.NewGuardedClientFromEnv at the
+	// composition root); callers on request-influenced hosts MUST pass a guarded
+	// client, never a fail-open http.DefaultClient.
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil) //nolint:noctx // ctx carried via reqCtx
 	if err != nil {
 		return 0, nil, nil, fmt.Errorf("%w: build request: %w", ErrFetch, err)

@@ -101,8 +101,8 @@ func WithTx(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) erro
 // TxRunner is the narrow port services depend on to open a transaction.
 // Decouples service code from *pgxpool.Pool so the pool stays in wiring
 // (cmd/server) and tests can substitute alternatives without booting a real
-// pool. Satisfies CLAUDE.md Rule 7 (explicit transactional boundaries) +
-// Rule 3 (interface segregation at ports).
+// pool. Gives explicit transactional boundaries and interface
+// segregation at the port.
 type TxRunner interface {
 	WithTx(ctx context.Context, fn func(pgx.Tx) error) error
 }

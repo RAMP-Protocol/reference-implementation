@@ -1,0 +1,6 @@
+-- NOTE: PostgreSQL has no ALTER TYPE ... DROP VALUE; the
+-- RESTRICTION_NOT_SATISFIED label added to ramp.denial_reason by the up
+-- migration cannot be removed without rebuilding the type and rewriting every
+-- dependent column. The value is additive and harmless (no rows reference it
+-- unless an enforcing path chooses to), so this down migration deliberately
+-- leaves it in place on rollback — mirroring the 000008 BROKER-enum decision.

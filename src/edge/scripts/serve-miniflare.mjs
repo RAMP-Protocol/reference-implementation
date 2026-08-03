@@ -24,14 +24,14 @@ const mf = new Miniflare({
   scriptPath: process.env.WORKER_SCRIPT ?? 'dist/worker.mjs',
   host: '0.0.0.0',
   port,
-  compatibilityDate: '2024-12-30',
+  compatibilityDate: '2026-07-01',
   compatibilityFlags: ['nodejs_compat'],
   bindings: {
     EXCHANGE_URL: requireEnv('EXCHANGE_URL'),
-    // EXCHANGE_MANIFEST_URL points at the Exchange's /.well-known/ramp.json;
-    // the worker resolves signed-URL verify keys from its public_keys[]. The
-    // old JWKS_URL binding is gone (jwks.json was collapsed into ramp.json).
-    EXCHANGE_MANIFEST_URL: requireEnv('EXCHANGE_MANIFEST_URL'),
+    // EXCHANGE_WBA_URL points at the Exchange's Web Bot Auth directory
+    // (/.well-known/http-message-signatures-directory); the worker resolves
+    // signed-URL verify keys from its keys[] by RFC 7638 thumbprint.
+    EXCHANGE_WBA_URL: requireEnv('EXCHANGE_WBA_URL'),
     ORIGIN_URL: requireEnv('ORIGIN_URL'),
     PROVIDER: requireEnv('PROVIDER'),
     EXCHANGES_JSON: requireEnv('EXCHANGES_JSON'),
@@ -41,8 +41,15 @@ const mf = new Miniflare({
     // when the deploy lists authorized third-party catalog pushers.
     CATALOG_CONTRIBUTORS_JSON: process.env.CATALOG_CONTRIBUTORS_JSON ?? '',
     // Optional D5 pre-provisioned verify keys (inline JWK array). Passed only
-    // when set so the worker falls back to fetching ramp.json otherwise.
+    // when set so the worker falls back to fetching the WBA directory otherwise.
     ...(process.env.RAMP_VERIFY_KEYS ? { RAMP_VERIFY_KEYS: process.env.RAMP_VERIFY_KEYS } : {}),
+    // Optional self-publish signing key(s) served in the WBA directory's keys[]
+    // (no kid) so the Exchange learns a catalog-writer's key via the well-known
+    // fetch (Gate-1 self-signup) instead of a DB pre-seed. Passed only when set.
+    ...(process.env.WBA_KEYS_JSON ? { WBA_KEYS_JSON: process.env.WBA_KEYS_JSON } : {}),
+    ...(process.env.WBA_REVOCATION_URL
+      ? { WBA_REVOCATION_URL: process.env.WBA_REVOCATION_URL }
+      : {}),
   },
 });
 

@@ -8,14 +8,13 @@ import (
 	"io"
 	"net/http"
 	"testing"
-	"time"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
 // The three tests below exercise digest/header negatives that the canonical
 // VerifyRequest suite (verifier_test.go) does not otherwise cover. They were
-// ported from the deleted legacy httpsig.Verify tests (MED-03) onto the
+// ported from the deleted legacy httpsig.Verify tests onto the
 // canonical verifier using the shared newRAMPSignedRequest fixture + a fixed
 // clock; the remaining legacy negatives (valid, wrong-key, unknown-key,
 // missing-input, bad-alg) are already covered there and were dropped.
@@ -25,7 +24,7 @@ func TestVerifyRequest_TamperedBodyRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	req := newRAMPSignedRequest(t, []byte(`{"hello":"world"}`), priv, now)
 	// Swap the body after signing: Content-Digest still commits to the original,
 	// so the digest check (which runs before the ed25519 verify) must reject.
@@ -43,7 +42,7 @@ func TestVerifyRequest_MissingContentDigestRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	req := newRAMPSignedRequest(t, []byte(`{"hello":"world"}`), priv, now)
 	req.Header.Del("Content-Digest")
 
@@ -59,7 +58,7 @@ func TestVerifyRequest_MissingSignatureRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	req := newRAMPSignedRequest(t, []byte(`{"hello":"world"}`), priv, now)
 	req.Header.Del("Signature") // keep Signature-Input so the miss is on Signature
 
@@ -151,5 +150,35 @@ func TestParseAllSignatures_MalformedMultiLabel(t *testing.T) {
 	_, _, err := parseAllSignatures(h)
 	if !errors.Is(err, ErrMalformedSignatureInput) {
 		t.Fatalf("want ErrMalformedSignatureInput, got %v", err)
+	}
+}
+
+// TestParseAllSignatures_WrongParamTypes pins that every signature parameter is
+// rejected when it carries the wrong structured-field type, rather than being
+// silently dropped. A silently-dropped tag is the dangerous one: a WBA verifier
+// filtering on tag="web-bot-auth" would see a signature with no tag at all and,
+// depending on its policy, either reject a valid agent or accept an untagged one.
+func TestParseAllSignatures_WrongParamTypes(t *testing.T) {
+	base := `sig1=("@method");keyid="caller.test";alg="ed25519"`
+	cases := map[string]string{
+		"tag as integer":    base + `;tag=7`,
+		"nonce as integer":  base + `;nonce=7`,
+		"created as string": base + `;created="soon"`,
+		"expires as string": base + `;expires="later"`,
+		"alg as integer":    `sig1=("@method");keyid="caller.test";alg=7`,
+		"keyid as integer":  `sig1=("@method");keyid=7;alg="ed25519"`,
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := http.Header{}
+			h.Set("Signature-Input", input)
+			h.Set("Signature", `sig1=:YWJjZGVm:`)
+
+			_, _, err := parseAllSignatures(h)
+
+			if !errors.Is(err, ErrMalformedSignatureInput) {
+				t.Fatalf("want ErrMalformedSignatureInput, got %v", err)
+			}
+		})
 	}
 }

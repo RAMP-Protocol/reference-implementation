@@ -12,7 +12,7 @@ import (
 )
 
 const getTenantByDomain = `-- name: GetTenantByDomain :one
-SELECT tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay FROM ramp.tenants WHERE domain = $1
+SELECT tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay, fee_rate_bps, fee_rate_notes, activate_new_agents_by_default FROM ramp.tenants WHERE domain = $1
 `
 
 func (q *Queries) GetTenantByDomain(ctx context.Context, domain string) (RampTenant, error) {
@@ -29,12 +29,15 @@ func (q *Queries) GetTenantByDomain(ctx context.Context, domain string) (RampTen
 		&i.RsaKeyRef,
 		&i.CloudfrontKeyPairID,
 		&i.AllowBrokerRelay,
+		&i.FeeRateBps,
+		&i.FeeRateNotes,
+		&i.ActivateNewAgentsByDefault,
 	)
 	return i, err
 }
 
 const getTenantByID = `-- name: GetTenantByID :one
-SELECT tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay FROM ramp.tenants WHERE tenant_id = $1
+SELECT tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay, fee_rate_bps, fee_rate_notes, activate_new_agents_by_default FROM ramp.tenants WHERE tenant_id = $1
 `
 
 func (q *Queries) GetTenantByID(ctx context.Context, tenantID string) (RampTenant, error) {
@@ -51,6 +54,9 @@ func (q *Queries) GetTenantByID(ctx context.Context, tenantID string) (RampTenan
 		&i.RsaKeyRef,
 		&i.CloudfrontKeyPairID,
 		&i.AllowBrokerRelay,
+		&i.FeeRateBps,
+		&i.FeeRateNotes,
+		&i.ActivateNewAgentsByDefault,
 	)
 	return i, err
 }
@@ -60,7 +66,7 @@ INSERT INTO ramp.tenants (
     tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy,
     signing_scheme, rsa_key_ref, cloudfront_key_pair_id
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay
+RETURNING tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay, fee_rate_bps, fee_rate_notes, activate_new_agents_by_default
 `
 
 type InsertTenantParams struct {
@@ -97,8 +103,31 @@ func (q *Queries) InsertTenant(ctx context.Context, arg InsertTenantParams) (Ram
 		&i.RsaKeyRef,
 		&i.CloudfrontKeyPairID,
 		&i.AllowBrokerRelay,
+		&i.FeeRateBps,
+		&i.FeeRateNotes,
+		&i.ActivateNewAgentsByDefault,
 	)
 	return i, err
+}
+
+const setTenantActivateNewAgentsByDefault = `-- name: SetTenantActivateNewAgentsByDefault :exec
+UPDATE ramp.tenants
+   SET activate_new_agents_by_default = $2
+ WHERE tenant_id = $1
+`
+
+type SetTenantActivateNewAgentsByDefaultParams struct {
+	TenantID                   string `json:"tenant_id"`
+	ActivateNewAgentsByDefault bool   `json:"activate_new_agents_by_default"`
+}
+
+// Flips the per-tenant policy for whether a newly registered agent starts
+// active in the billing system-of-record. Admin / fixture path; the column
+// defaults to TRUE on insert, so this is only needed to opt a tenant out.
+// Mirrors SetTenantAllowBrokerRelay.
+func (q *Queries) SetTenantActivateNewAgentsByDefault(ctx context.Context, arg SetTenantActivateNewAgentsByDefaultParams) error {
+	_, err := q.db.Exec(ctx, setTenantActivateNewAgentsByDefault, arg.TenantID, arg.ActivateNewAgentsByDefault)
+	return err
 }
 
 const setTenantAllowBrokerRelay = `-- name: SetTenantAllowBrokerRelay :exec
@@ -120,7 +149,33 @@ func (q *Queries) SetTenantAllowBrokerRelay(ctx context.Context, arg SetTenantAl
 	return err
 }
 
-const setTenantReportingPolicy = `-- name: SetTenantReportingPolicy :exec
+const setTenantFeeRateBps = `-- name: SetTenantFeeRateBps :execrows
+UPDATE ramp.tenants
+   SET fee_rate_bps = $2,
+       fee_rate_notes = $3
+ WHERE tenant_id = $1
+`
+
+type SetTenantFeeRateBpsParams struct {
+	TenantID     string      `json:"tenant_id"`
+	FeeRateBps   int32       `json:"fee_rate_bps"`
+	FeeRateNotes pgtype.Text `json:"fee_rate_notes"`
+}
+
+// Replaces the tenant-level default commission rate (basis points) and the
+// operator note in one write. The admin SetTenantFeeRate RPC write path (also a
+// fixture mutator). Full replace: fee_rate_notes is set to $3, which is NULL
+// when the operator omits it. Returns rows-affected so a call for a missing
+// tenant is a detectable no-op rather than a silent success.
+func (q *Queries) SetTenantFeeRateBps(ctx context.Context, arg SetTenantFeeRateBpsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setTenantFeeRateBps, arg.TenantID, arg.FeeRateBps, arg.FeeRateNotes)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setTenantReportingPolicy = `-- name: SetTenantReportingPolicy :execrows
 UPDATE ramp.tenants
    SET reporting_policy = $2
  WHERE tenant_id = $1
@@ -131,11 +186,15 @@ type SetTenantReportingPolicyParams struct {
 	ReportingPolicy []byte `json:"reporting_policy"`
 }
 
-// Replaces the reporting_policy JSONB for a tenant. Admin / fixture path
-// for tests that need to seed required_fields, quantity_tolerance, or
-// window_seconds defaults without bypassing the repo layer (review
-// finding 7 — no raw pool.Exec in tests).
-func (q *Queries) SetTenantReportingPolicy(ctx context.Context, arg SetTenantReportingPolicyParams) error {
-	_, err := q.db.Exec(ctx, setTenantReportingPolicy, arg.TenantID, arg.ReportingPolicy)
-	return err
+// Replaces the reporting_policy JSONB for a tenant. The admin SetReportingPolicy
+// RPC write path (also used by fixtures to seed required_fields,
+// quantity_tolerance, or window_seconds without bypassing the repo layer).
+// Returns rows-affected so the caller can tell a real update from a no-op on a
+// missing tenant.
+func (q *Queries) SetTenantReportingPolicy(ctx context.Context, arg SetTenantReportingPolicyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setTenantReportingPolicy, arg.TenantID, arg.ReportingPolicy)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

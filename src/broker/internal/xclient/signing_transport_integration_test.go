@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/xclient"
 )
 
@@ -44,19 +44,39 @@ func writeRelayKeyFile(tb testing.TB, dir, kid string, priv ed25519.PrivateKey, 
 	return path
 }
 
-// exchangeStub wraps a handler with the same RFC 9421 middleware the real
-// Exchange uses. Static resolver seeded with the expected broker-relay pubkey.
+// exchangeStub wraps a handler with an inline RFC 9421 verify gate that mirrors
+// the Exchange's signature check. Static resolver seeded with the expected
+// broker-relay pubkey; any request whose first signature does not verify against
+// that key is rejected 401.
 func exchangeStub(tb testing.TB, kid string, pub ed25519.PublicKey) *httptest.Server {
 	tb.Helper()
-	resolver := httpsig.NewStaticResolver(map[string]ed25519.PublicKey{kid: pub})
-	replay := httpsig.NewMemoryReplayStore(nil)
-	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{kid: pub})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, err := helpers.VerifyRequestResolved(r.Context(), r, body, resolver, helpers.VerifyOptions{}); err != nil {
+			http.Error(w, "httpsig: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
-	handler := httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{}, inner)
 	srv := httptest.NewServer(handler)
 	tb.Cleanup(srv.Close)
 	return srv
+}
+
+// mustSigningTransport builds the relay signing RoundTripper for key, failing
+// the test on construction error so the http.Client literal stays a one-liner.
+func mustSigningTransport(t *testing.T, key *xclient.RelayKey) http.RoundTripper {
+	t.Helper()
+	rt, err := xclient.NewSigningTransport(http.DefaultTransport, key, "broker.test.local", 30*time.Second, nil)
+	if err != nil {
+		t.Fatalf("new signing transport: %v", err)
+	}
+	return rt
 }
 
 // TestIntegration_BrokerRelaySignedRoundTrip drives the full happy path:
@@ -76,14 +96,20 @@ func TestIntegration_BrokerRelaySignedRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadRelayKey: %v", err)
 	}
-	if key.KID != kid {
-		t.Fatalf("kid = %q, want %q", key.KID, kid)
+	// After the WBA split the relay's keyid is the RFC 7638 thumbprint of its
+	// public key, derived from the file (the file's kid is ignored).
+	wantKeyid, err := helpers.Thumbprint(pub)
+	if err != nil {
+		t.Fatalf("thumbprint: %v", err)
+	}
+	if key.KeyID != wantKeyid {
+		t.Fatalf("keyid = %q, want %q", key.KeyID, wantKeyid)
 	}
 
-	srv := exchangeStub(t, kid, pub)
+	srv := exchangeStub(t, key.KeyID, pub)
 	client := &http.Client{
 		Timeout:   5 * time.Second,
-		Transport: xclient.NewSigningTransport(http.DefaultTransport, key, 30*time.Second, nil),
+		Transport: mustSigningTransport(t, key),
 	}
 	body := []byte(`{"q":"x"}`)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
@@ -103,16 +129,15 @@ func TestIntegration_BrokerRelaySignedRoundTrip(t *testing.T) {
 }
 
 // TestIntegration_BrokerRelayRejectedAfterKeySwap covers the adversarial case:
-// the transport signs with a rotated priv key not yet published to the
-// Exchange's resolver.  The same kid still resolves to the old pub, so the
-// ed25519 verify step must fail and the Exchange must return 401.
+// the transport signs with an attacker key the Exchange never published. After
+// the WBA split the keyid IS the key's thumbprint, so a swapped key presents a
+// thumbprint the resolver does not know — the Exchange returns 401.
 func TestIntegration_BrokerRelayRejectedAfterKeySwap(t *testing.T) {
-	const kid = "broker.broker-test.v1"
 	originalPub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen original: %v", err)
 	}
-	// Attacker key — shares kid with original but Exchange never saw the pub.
+	// Attacker key — the Exchange never saw this pub.
 	attackerPub, attackerPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen attacker: %v", err)
@@ -120,17 +145,21 @@ func TestIntegration_BrokerRelayRejectedAfterKeySwap(t *testing.T) {
 	_ = attackerPub
 
 	keyDir := t.TempDir()
-	path := writeRelayKeyFile(t, keyDir, kid, attackerPriv, attackerPriv.Public().(ed25519.PublicKey))
+	path := writeRelayKeyFile(t, keyDir, "ignored-kid", attackerPriv, attackerPriv.Public().(ed25519.PublicKey))
 	key, err := xclient.LoadRelayKey(path)
 	if err != nil {
 		t.Fatalf("LoadRelayKey: %v", err)
 	}
 
-	// Exchange only knows the ORIGINAL pubkey under this kid.
-	srv := exchangeStub(t, kid, originalPub)
+	// Exchange only knows the ORIGINAL pubkey (by its thumbprint).
+	originalTP, err := helpers.Thumbprint(originalPub)
+	if err != nil {
+		t.Fatalf("thumbprint: %v", err)
+	}
+	srv := exchangeStub(t, originalTP, originalPub)
 	client := &http.Client{
 		Timeout:   5 * time.Second,
-		Transport: xclient.NewSigningTransport(http.DefaultTransport, key, 30*time.Second, nil),
+		Transport: mustSigningTransport(t, key),
 	}
 	body := []byte(`{"q":"x"}`)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
@@ -148,18 +177,27 @@ func TestIntegration_BrokerRelayRejectedAfterKeySwap(t *testing.T) {
 	}
 }
 
-// TestIntegration_BrokerRelayRejectsMalformedKid guards the kid prefix
-// contract: relay kids must start with "broker." so audit logs and
-// verifier heuristics can disambiguate relay hops from agent callers in
-// the unified /.well-known/ramp.json JWKS.
-func TestIntegration_BrokerRelayRejectsMalformedKid(t *testing.T) {
+// TestIntegration_BrokerRelayDerivesKeyidFromKey guards the post-WBA-split
+// contract: the relay's RFC 9421 keyid is derived as the RFC 7638 thumbprint of
+// its public key, independent of any (now-ignored) kid in the file. The former
+// "broker." kid-prefix requirement is gone — role is the DB requester_type
+// discriminator, not a kid namespace.
+func TestIntegration_BrokerRelayDerivesKeyidFromKey(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
 	keyDir := t.TempDir()
-	path := writeRelayKeyFile(t, keyDir, "agent-demo.v1", priv, pub)
-	if _, err := xclient.LoadRelayKey(path); err == nil {
-		t.Fatalf("LoadRelayKey accepted non-broker kid; want prefix rejection")
+	path := writeRelayKeyFile(t, keyDir, "any-legacy-kid", priv, pub)
+	key, err := xclient.LoadRelayKey(path)
+	if err != nil {
+		t.Fatalf("LoadRelayKey rejected a keyless-kid file: %v", err)
+	}
+	want, err := helpers.Thumbprint(pub)
+	if err != nil {
+		t.Fatalf("thumbprint: %v", err)
+	}
+	if key.KeyID != want {
+		t.Fatalf("keyid = %q, want thumbprint %q", key.KeyID, want)
 	}
 }

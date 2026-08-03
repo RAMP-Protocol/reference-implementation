@@ -1,10 +1,13 @@
-.PHONY: deps fmt lint typecheck test test-fast dev deploy
+.PHONY: deps fmt fmt-check lint typecheck test test-fast dev deploy
 
 deps:
 	npm install
 
 fmt:
 	npm run fmt
+
+fmt-check:
+	npm run fmt:check
 
 lint:
 	npm run lint

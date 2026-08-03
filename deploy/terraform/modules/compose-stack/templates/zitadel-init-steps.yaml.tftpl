@@ -1,0 +1,39 @@
+# Rendered by Terraform (modules/compose-stack). Zitadel's FirstInstance
+# provisioning, consumed by `start-from-init --steps`. It creates the instance,
+# the `ramp` org, a human admin for console access, and the `ramp-bootstrap`
+# machine user whose personal access token the identity bootstrap script
+# authenticates with.
+#
+# This is a staging-specific rendering of deploy/zitadel/init-steps.yaml. That
+# file is a tracked laptop-stack fixture whose passwords are published in the
+# repository; this one takes its admin password from Terraform because the
+# instance it provisions is reachable from the internet.
+#
+# The PAT lands in /bootstrap, a named volume the bootstrap script mounts.
+# Zitadel writes it once, at first init: wiping the zitadeldata volume without
+# also wiping zitadelbootstrap leaves a stale PAT that authenticates against
+# nothing.
+FirstInstance:
+  InstanceName: "ramp-staging"
+  MachineKeyPath: /bootstrap/zadmin.key
+  PatPath: /bootstrap/zadmin.pat
+  Org:
+    Name: "ramp"
+    Human:
+      UserName: "zadmin"
+      FirstName: "Z"
+      LastName: "Admin"
+      Email:
+        Address: "zadmin@ramp.staging"
+        Verified: true
+      Password: "${zitadel_admin_password}"
+      PasswordChangeRequired: false
+    Machine:
+      Machine:
+        Username: "ramp-bootstrap"
+        Name: "RAMP bootstrap service account"
+      MachineKey:
+        ExpirationDate: "2099-01-01T00:00:00Z"
+        Type: 1
+      Pat:
+        ExpirationDate: "2099-01-01T00:00:00Z"

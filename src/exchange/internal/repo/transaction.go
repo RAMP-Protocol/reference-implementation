@@ -15,7 +15,7 @@ import (
 // TransactionRecord is the domain view of a transaction_log row.
 type TransactionRecord struct {
 	TransactionID     string
-	TxRequestID       string
+	IdempotencyKey    string
 	TenantID          string
 	AgentID           string
 	ResourceID        string
@@ -29,6 +29,11 @@ type TransactionRecord struct {
 	ConsumedUnit      string
 	DenialReason      string
 	CreatedAt         time.Time
+	// ResultPayload is the serialized rampv1.TransactionResultItem built for the
+	// ExecuteTransaction response, persisted on the row so a replayed
+	// idempotency_key returns the original result verbatim. Nil for legacy
+	// (pre-migration) rows, which fall back to the AlreadyExists replay refusal.
+	ResultPayload []byte
 }
 
 // PersistTxIntent carries the fields needed to mint a transaction-log row
@@ -37,9 +42,9 @@ type TransactionRecord struct {
 // each repo owns the column-shape for its table.
 type PersistTxIntent struct {
 	// Identifiers
-	TransactionID string
-	TxRequestID   string
-	ObligationID  string
+	TransactionID  string
+	IdempotencyKey string
+	ObligationID   string
 
 	// Tenant / caller binding
 	TenantID string
@@ -53,6 +58,10 @@ type PersistTxIntent struct {
 	AgentIdentityHash []byte
 	SignedURLHash     []byte
 	Expiry            time.Time
+
+	// ResultPayload is the serialized rampv1.TransactionResultItem for this item,
+	// persisted on the transaction_log row so a replay returns it verbatim.
+	ResultPayload []byte
 
 	// Billing / pricing
 	BillingID       string
@@ -75,7 +84,12 @@ type TransactionRepo interface {
 	// Equivalent to building a TransactionRecord inline and calling Create,
 	// but keeps the column-shape mapping inside the repo.
 	CreateForOffer(ctx context.Context, tx pgx.Tx, intent PersistTxIntent) (TransactionRecord, error)
-	ByRequestID(ctx context.Context, txRequestID string) (TransactionRecord, error)
+	ByIdempotencyKey(ctx context.Context, idempotencyKey string) (TransactionRecord, error)
+	// ByID returns the transaction with the given public transaction_id (the
+	// value the resolve / ExecuteTransaction response returns). It is the
+	// production read path for observing a persisted transaction by its id —
+	// the surface tests assert through instead of a raw transaction_log SELECT.
+	ByID(ctx context.Context, transactionID string) (TransactionRecord, error)
 }
 
 // ErrTransactionNotFound signals an idempotency probe miss.
@@ -96,7 +110,7 @@ func (r *transactionRepo) Create(ctx context.Context, tx pgx.Tx, rec Transaction
 	}
 	row, err := qtx.CreateTransaction(ctx, sqlc.CreateTransactionParams{
 		TransactionID:     rec.TransactionID,
-		TxRequestID:       rec.TxRequestID,
+		IdempotencyKey:    rec.IdempotencyKey,
 		TenantID:          rec.TenantID,
 		AgentID:           rec.AgentID,
 		ResourceID:        rec.ResourceID,
@@ -109,11 +123,12 @@ func (r *transactionRepo) Create(ctx context.Context, tx pgx.Tx, rec Transaction
 		Currency:          rec.Currency,
 		ConsumedUnit:      pgText(rec.ConsumedUnit),
 		DenialReason:      nullDenial(rec.DenialReason),
+		ResultPayload:     rec.ResultPayload,
 	})
 	if err != nil {
 		return TransactionRecord{}, fmt.Errorf("create transaction: %w", err)
 	}
-	return transactionFromRow(row), nil
+	return transactionFromRow(row)
 }
 
 // CreateForOffer projects a PersistTxIntent onto a TransactionRecord and
@@ -124,7 +139,7 @@ func (r *transactionRepo) CreateForOffer(
 ) (TransactionRecord, error) {
 	return r.Create(ctx, tx, TransactionRecord{
 		TransactionID:     intent.TransactionID,
-		TxRequestID:       intent.TxRequestID,
+		IdempotencyKey:    intent.IdempotencyKey,
 		TenantID:          intent.TenantID,
 		AgentID:           intent.AgentID,
 		ResourceID:        intent.ResourceID,
@@ -135,24 +150,36 @@ func (r *transactionRepo) CreateForOffer(
 		BillingID:         intent.BillingID,
 		UnitCostDecimal:   intent.UnitCostDecimal,
 		Currency:          intent.Currency,
+		ResultPayload:     intent.ResultPayload,
 	})
 }
 
-func (r *transactionRepo) ByRequestID(ctx context.Context, txRequestID string) (TransactionRecord, error) {
-	row, err := r.q.GetTransactionByRequestID(ctx, txRequestID)
+func (r *transactionRepo) ByIdempotencyKey(ctx context.Context, idempotencyKey string) (TransactionRecord, error) {
+	row, err := r.q.GetTransactionByIdempotencyKey(ctx, idempotencyKey)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return TransactionRecord{}, ErrTransactionNotFound
 		}
-		return TransactionRecord{}, fmt.Errorf("get transaction by request id: %w", err)
+		return TransactionRecord{}, fmt.Errorf("get transaction by idempotency key: %w", err)
 	}
-	return transactionFromRow(row), nil
+	return transactionFromRow(row)
 }
 
-func transactionFromRow(row sqlc.RampTransactionLog) TransactionRecord {
+func (r *transactionRepo) ByID(ctx context.Context, transactionID string) (TransactionRecord, error) {
+	row, err := r.q.GetTransactionByID(ctx, transactionID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return TransactionRecord{}, ErrTransactionNotFound
+		}
+		return TransactionRecord{}, fmt.Errorf("get transaction by id: %w", err)
+	}
+	return transactionFromRow(row)
+}
+
+func transactionFromRow(row sqlc.RampTransactionLog) (TransactionRecord, error) {
 	rec := TransactionRecord{
 		TransactionID:     row.TransactionID,
-		TxRequestID:       row.TxRequestID,
+		IdempotencyKey:    row.IdempotencyKey,
 		TenantID:          row.TenantID,
 		AgentID:           row.AgentID,
 		ResourceID:        row.ResourceID,
@@ -162,20 +189,25 @@ func transactionFromRow(row sqlc.RampTransactionLog) TransactionRecord {
 		BillingID:         textOrEmpty(row.BillingID),
 		Currency:          row.Currency,
 		ConsumedUnit:      textOrEmpty(row.ConsumedUnit),
+		ResultPayload:     row.ResultPayload,
 	}
 	if row.Expiry.Valid {
 		rec.Expiry = row.Expiry.Time
 	}
-	if dec, err := decimalFromNumeric(row.UnitCost); err == nil {
-		rec.UnitCostDecimal = dec
+	// Propagate the NUMERIC decode error rather than swallowing it: a money field
+	// must never be silently zeroed by a decode failure.
+	dec, err := decimalFromNumeric(row.UnitCost)
+	if err != nil {
+		return TransactionRecord{}, fmt.Errorf("decode unit_cost for transaction %q: %w", row.TransactionID, err)
 	}
+	rec.UnitCostDecimal = dec
 	if row.DenialReason.Valid {
 		rec.DenialReason = string(row.DenialReason.RampDenialReason)
 	}
 	if row.CreatedAt.Valid {
 		rec.CreatedAt = row.CreatedAt.Time
 	}
-	return rec
+	return rec, nil
 }
 
 func numericFromDecimal(raw string) (pgtype.Numeric, error) {

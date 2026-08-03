@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce per-language file-length caps from CLAUDE.md (Code Hygiene section).
+"""Enforce the per-language file-length caps this repository sets.
 
 Exits non-zero if any non-generated file exceeds its cap. No warnings — every
 violation is an error.
@@ -29,6 +29,14 @@ TEST_GLOBS = [
     "**/tests/**/*.py",
     "**/tests/**/*.ts",
     "**/__tests__/**/*.ts",
+    # Top-level tests/ tree: paths relative to the repo root start with "tests/",
+    # so the "**/tests/**" globs above — which require a leading path segment
+    # before "tests/" under fnmatch — do not match a harness helper like
+    # tests/e2e/harness/seed.py. Anchor the top-level tree explicitly so every
+    # file under it takes the 800-line test cap, not the src cap.
+    "tests/**/*.py",
+    "tests/**/*.ts",
+    "tests/**/*.go",
 ]
 
 # Generated / vendored / virtualenv paths that are exempt.
@@ -43,6 +51,7 @@ EXCLUDE_GLOBS = [
     "**/.wrangler/**",
     "**/.gocache/**",
     "**/internal/db/sqlc/**",
+    "**/internal/sor/db/sqlc/**",  # generated sqlc output for the SoR's own DB
     "**/*.pb.go",
     "**/*connect.go",
     "**/*_pb.ts",
@@ -52,10 +61,11 @@ EXCLUDE_GLOBS = [
 ]
 
 # Only walk these directories (demo production code).
-# scripts/ is excluded — legacy piarch derivation tooling lives there.
+# scripts/ is excluded — it holds standalone tooling, not demo production code.
 INCLUDE_ROOTS = [
     "src",
     "internal",
+    "tests",
 ]
 
 
@@ -110,7 +120,7 @@ def main() -> int:
             violations.append((path, lines, cap))
 
     if violations:
-        print("FAIL: file-length cap exceeded (see CLAUDE.md § Code Hygiene):", file=sys.stderr)
+        print("FAIL: file-length cap exceeded:", file=sys.stderr)
         for path, lines, cap in violations:
             rel = path.relative_to(REPO_ROOT)
             label = "test" if is_test_file(path) else "src"

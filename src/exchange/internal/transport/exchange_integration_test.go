@@ -9,6 +9,8 @@ import (
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
 
 // TestSmoke walks the full scrappy-demo happy path.
@@ -16,19 +18,30 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 	h := newTestHarness(t)
 	ctx := h.ctx
 
-	// 1. PushResources via CatalogService. EstimatedQuantity is set so the
-	// reporting-side tolerance check has something to compare against — the
-	// new zero-estimate-rejects-non-zero-consumed rule means
-	// EstimatedQuantity must be non-zero whenever the smoke path reports
-	// a non-zero ConsumedQuantity.
+	// 1. PushResources via CatalogService. Pricing (and its estimated_quantity)
+	// is carried on a LicenseTerm now: the term is the sole source of
+	// the offer price, and its Pricing.estimated_quantity feeds the reporting-side
+	// tolerance check — the zero-estimate-rejects-non-zero-consumed rule means the
+	// estimate must be non-zero whenever the smoke path reports a non-zero
+	// ConsumedQuantity.
 	smokeEstimated := int32(50)
+	smokeUnit := "accesses"
 	pushResp, err := h.catalogClient.PushResources(ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
 		TenantId: h.tenantID,
 		CallerId: "agent-test",
 		Entries: []*rampv1.ResourceEntry{{
-			Domain:            h.tenantDomain,
-			Path:              "/articles/hello",
-			EstimatedQuantity: &smokeEstimated,
+			Domain: h.tenantDomain,
+			Path:   "/articles/hello",
+			Terms: []*rampv1.LicenseTerm{{
+				Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
+				Pricing: &rampv1.Pricing{
+					Model:             rampv1.PricingModel_PRICING_MODEL_PER_UNIT,
+					Rate:              "0.05",
+					Currency:          "USD",
+					Unit:              &smokeUnit,
+					EstimatedQuantity: &smokeEstimated,
+				},
+			}},
 		}},
 	}))
 	if err != nil {
@@ -40,12 +53,12 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 
 	// 2. DiscoverResources.
 	discovered, err := h.exchangeClient.DiscoverResources(ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver: "1.0", Id: "q-1",
+		Ver:  "1.0",
+		Uris: []string{"https://" + h.tenantDomain + "/articles/hello"},
 		Requester: &rampv1.Requester{
 			Id:     "agent-test",
 			Domain: "agent.example",
 			Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-			Uris:   []string{"https://" + h.tenantDomain + "/articles/hello"},
 		},
 	}))
 	if err != nil {
@@ -66,59 +79,59 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 		t.Fatalf("offer signature not populated: %+v", offer)
 	}
 
-	// 3. ExecuteTransaction. Signed URL lands on the canonical retrieval_endpoint.
-	offerID := offer.GetOfferId()
-	offerSig := offer.GetSignature()
-	execResp, err := h.exchangeClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", Id: "tx-1",
-		OfferId:        stringPtr(offerID),
-		OfferSignature: stringPtr(offerSig),
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example",
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	// 3. ExecuteTransaction (items-only contract after the C4 collapse). The
+	// signed URL lands on the single result item's retrieval_endpoint, and the
+	// per-item transaction_id / billing_id feed ReportUsage.
+	execResp, err := executeSingleItem(t, h, "tx-1", offer)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
+	// Version-skew coverage (orthogonal, adopted from v1.1): the items-only
+	// TransactionResponse still stamps the top-level Ver, so this assertion holds
+	// against the collapsed contract.
 	if got := execResp.Msg.GetVer(); got != "1.0" {
 		t.Errorf("ExecuteTransaction response Ver = %q, want %q", got, "1.0")
 	}
-	if execResp.Msg.GetTransactionId() == "" {
+	// Items-only contract (C4 collapse): the transaction_id lives on the single
+	// result item, not at the top level.
+	item := singleResultItem(t, execResp)
+	if item.GetTransactionId() == "" {
 		t.Fatal("transaction id empty")
 	}
-	signedURL := extractSignedURL(t, execResp.Msg)
+	signedURL := itemSignedURL(t, execResp)
 	if _, err := url.Parse(signedURL); err != nil {
 		t.Fatalf("signed url parse: %v", err)
 	}
 
-	assertTransactionLogged(t, ctx, h, "tx-1")
+	// The items[] path persists under the DERIVED key idempotency_key:offer_id.
+	assertTransactionLogged(t, ctx, h, "tx-1"+":"+offer.GetOfferId())
 
 	// 4. ReportUsage marks obligation RECEIVED.
 	if _, err := h.exchangeClient.ReportUsage(ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-1",
-		TransactionId: execResp.Msg.GetTransactionId(),
-		BillingId:     execResp.Msg.GetBillingId(),
+		Ver: "1.0", IdempotencyKey: "r-1",
+		TransactionId: item.GetTransactionId(),
+		BillingId:     item.GetBillingId(),
 		Usage:         &rampv1.Usage{ConsumedQuantity: 42, Function: []string{"ai_input"}},
 	})); err != nil {
 		t.Fatalf("report: %v", err)
 	}
 
-	assertObligationState(t, h, execResp.Msg.GetTransactionId(), "RECEIVED", "VALIDATED")
+	assertObligationState(t, h, item.GetTransactionId(), "RECEIVED", "VALIDATED")
 }
 
 // assertTransactionLogged verifies the transaction_log row exists by
 // idempotency key.
-func assertTransactionLogged(t *testing.T, ctx context.Context, h *testHarness, txRequestID string) {
+func assertTransactionLogged(t *testing.T, ctx context.Context, h *testHarness, idempotencyKey string) {
 	t.Helper()
-	row, err := h.queries.GetTransactionByRequestID(ctx, txRequestID)
+	// Production repository surface, not the raw sqlc Querier (Testing Doctrine pt9).
+	rec, err := repo.NewTransactionRepo(h.queries).ByIdempotencyKey(ctx, idempotencyKey)
 	if err != nil {
-		t.Fatalf("GetTransactionByRequestID: %v", err)
+		t.Fatalf("TransactionRepo.ByIdempotencyKey: %v", err)
 	}
-	if row.TxRequestID != txRequestID {
-		t.Fatalf("tx_request_id = %q", row.TxRequestID)
+	if rec.IdempotencyKey != idempotencyKey {
+		t.Fatalf("idempotency_key = %q", rec.IdempotencyKey)
 	}
-	if len(row.SignedUrlHash) != 32 {
-		t.Fatalf("signed_url_hash len = %d", len(row.SignedUrlHash))
+	if len(rec.SignedURLHash) != 32 {
+		t.Fatalf("signed_url_hash len = %d", len(rec.SignedURLHash))
 	}
 }

@@ -7,27 +7,22 @@ package sqlc
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const recordSelection = `-- name: RecordSelection :one
 INSERT INTO broker.selection_log (
-    log_id, request_id, agent_id, query, candidate_offers,
-    winner_offer_id, winner_exchange, rationale
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING log_id, request_id, agent_id, query, candidate_offers, winner_offer_id, winner_exchange, rationale, created_at
+    log_id, request_id, agent_id, query, candidate_offers, rationale
+) VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING log_id, request_id, agent_id, query, candidate_offers, rationale, created_at
 `
 
 type RecordSelectionParams struct {
-	LogID           string      `json:"log_id"`
-	RequestID       string      `json:"request_id"`
-	AgentID         string      `json:"agent_id"`
-	Query           string      `json:"query"`
-	CandidateOffers []byte      `json:"candidate_offers"`
-	WinnerOfferID   pgtype.Text `json:"winner_offer_id"`
-	WinnerExchange  pgtype.Text `json:"winner_exchange"`
-	Rationale       []byte      `json:"rationale"`
+	LogID           string `json:"log_id"`
+	RequestID       string `json:"request_id"`
+	AgentID         string `json:"agent_id"`
+	Query           string `json:"query"`
+	CandidateOffers []byte `json:"candidate_offers"`
+	Rationale       []byte `json:"rationale"`
 }
 
 func (q *Queries) RecordSelection(ctx context.Context, arg RecordSelectionParams) (BrokerSelectionLog, error) {
@@ -37,8 +32,6 @@ func (q *Queries) RecordSelection(ctx context.Context, arg RecordSelectionParams
 		arg.AgentID,
 		arg.Query,
 		arg.CandidateOffers,
-		arg.WinnerOfferID,
-		arg.WinnerExchange,
 		arg.Rationale,
 	)
 	var i BrokerSelectionLog
@@ -48,10 +41,42 @@ func (q *Queries) RecordSelection(ctx context.Context, arg RecordSelectionParams
 		&i.AgentID,
 		&i.Query,
 		&i.CandidateOffers,
-		&i.WinnerOfferID,
-		&i.WinnerExchange,
 		&i.Rationale,
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const selectionsByRequestID = `-- name: SelectionsByRequestID :many
+SELECT log_id, request_id, agent_id, query, candidate_offers, rationale, created_at FROM broker.selection_log
+WHERE request_id = $1
+ORDER BY created_at DESC
+`
+
+func (q *Queries) SelectionsByRequestID(ctx context.Context, requestID string) ([]BrokerSelectionLog, error) {
+	rows, err := q.db.Query(ctx, selectionsByRequestID, requestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BrokerSelectionLog{}
+	for rows.Next() {
+		var i BrokerSelectionLog
+		if err := rows.Scan(
+			&i.LogID,
+			&i.RequestID,
+			&i.AgentID,
+			&i.Query,
+			&i.CandidateOffers,
+			&i.Rationale,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

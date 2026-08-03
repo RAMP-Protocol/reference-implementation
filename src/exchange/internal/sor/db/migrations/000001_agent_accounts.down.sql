@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS sor.agent_accounts;
+DROP SCHEMA IF EXISTS sor;

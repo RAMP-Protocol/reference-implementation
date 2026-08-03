@@ -1,7 +1,6 @@
 """Obligation 05 — failure 05: platform accepts a bad signature (DEFECT guard).
 
-Verbatim scenario (``docs/obligations/05-system-refuses-when-authority-is-bad.md``,
-first failure-mode bullet):
+Verbatim scenario (first failure-mode bullet):
 
 > The platform accepts a bad signature. This is a defect and must be
 > caught before release.
@@ -82,7 +81,7 @@ class _BadSignatureVariant:
 def _build_variants(*, exchange_url: str) -> list[_BadSignatureVariant]:
     """Assemble the five bad-signature variants."""
     variants: list[_BadSignatureVariant] = []
-    body_obj = {"requester": {"uris": ["http://edge:8787/premium/regression-guard.html"]}}
+    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/regression-guard.html"]}
     body = json.dumps(body_obj, separators=(",", ":")).encode()
     url = f"{exchange_url}{_DISCOVER_PATH}"
 
@@ -135,7 +134,7 @@ def _build_variants(*, exchange_url: str) -> list[_BadSignatureVariant]:
         )
 
         # (d) Tampered body — sign body A, send body B.
-        body_b_obj = {"requester": {"uris": ["http://edge:8787/premium/different.html"]}}
+        body_b_obj = {"requester": {}, "uris": ["http://edge:8787/premium/different.html"]}
         body_b = json.dumps(body_b_obj, separators=(",", ":")).encode()
         signed_a = sign_request(method="POST", target_uri=url, body=body, kid=kid, priv=priv)
         variants.append(
@@ -152,7 +151,7 @@ def _build_variants(*, exchange_url: str) -> list[_BadSignatureVariant]:
         # signed request; the test driver issues a priming first call
         # before the under-test second call so the second call is the
         # replay the platform must refuse.
-        replay_body_obj = {"requester": {"uris": ["http://edge:8787/premium/replay-defect.html"]}}
+        replay_body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/replay-defect.html"]}
         replay_body = json.dumps(replay_body_obj, separators=(",", ":")).encode()
         replay_signed = sign_request(
             method="POST", target_uri=url, body=replay_body, kid=kid, priv=priv

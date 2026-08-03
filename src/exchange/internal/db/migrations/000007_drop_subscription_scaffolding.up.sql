@@ -1,4 +1,4 @@
--- Drop biscuit/subscription scaffolding from Exchange (EPIC e2k7h, T7).
+-- Drop biscuit/subscription scaffolding from Exchange (slice T7).
 --
 -- v1 obligations 00/03/04/05 do not exercise the subscription path or the
 -- biscuit-derived principal-identity facts. Per the EPIC, "nothing and I

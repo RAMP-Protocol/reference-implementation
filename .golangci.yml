@@ -1,7 +1,15 @@
 version: "2"
 
 run:
-  timeout: 5m
+  # Sized for a CACHE-COLD run, not a warm one. The runners have no shared cache
+  # server, so a job landing on a slot that has not built this project before
+  # starts with an empty build cache, and the module cache is never cached at
+  # all (a torn archive corrupted CI once). Such a run re-downloads every module
+  # and compiles the whole dependency graph before a single linter executes: one
+  # measured at 5m48s and tripped the previous 5m limit, having already printed
+  # "0 issues". A warm run is well under a minute, so this ceiling costs nothing
+  # when the cache is there and stops a cold slot failing a clean branch.
+  timeout: 15m
   tests: true
 
 severity:
@@ -78,16 +86,54 @@ linters:
               skipComments: false
     depguard:
       rules:
+        # Canonical signing payloads (RFC 8785 JCS over proto-JSON) are
+        # SDK-internal; app code signs/verifies through the SDK faces. The
+        # structural guard test (internal/guards) carries the same ban as
+        # belt-and-suspenders.
+        no-hand-rolled-canonicalization:
+          deny:
+            - pkg: "github.com/gowebpki/jcs"
+              desc: "JCS canonicalization is SDK-internal; sign/verify through the sdk/go faces"
+        # Services must not depend on each other, and shared code outside the
+        # two service trees must not reach into either. depguard applies a
+        # rule with a negation-only files list to every file EXCEPT the
+        # negated globs — so this rule covers only the code OUTSIDE both
+        # services; the per-tree rules below carry the ban INSIDE each
+        # service. NOTE: today every service package sits under a Go
+        # `internal/` segment, so the compiler already refuses these imports
+        # (probe files fail typecheck before depguard runs); the rules here
+        # are declarative intent that bites the day a non-internal package
+        # appears under either service tree.
         no-circular-internal:
           deny:
-            # Services must not depend on each other.
             - pkg: "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange"
-              desc: "broker must not import exchange internals; use protocol via Connect-Go"
+              desc: "shared code must not import exchange internals; use protocol via Connect-Go"
             - pkg: "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker"
-              desc: "exchange must not import broker internals; use protocol via Connect-Go"
+              desc: "shared code must not import broker internals; use protocol via Connect-Go"
           files:
             - "!**/src/broker/**"
             - "!**/src/exchange/**"
+        broker-no-exchange-internals:
+          deny:
+            - pkg: "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange"
+              desc: "broker must not import exchange internals; use protocol via Connect-Go"
+          files:
+            - "**/src/broker/**"
+        exchange-no-broker-internals:
+          deny:
+            - pkg: "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker"
+              desc: "exchange must not import broker internals; use protocol via Connect-Go"
+          files:
+            - "**/src/exchange/**"
+        # The relay service layer sits below the transport adapter; the
+        # dependency points transport→relay only (symmetric to the clean
+        # internal/resolve package).
+        broker-relay-no-transport:
+          deny:
+            - pkg: "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport"
+              desc: "internal/relay must not import transport; ports are locally-owned structural interfaces"
+          files:
+            - "**/src/broker/internal/relay/**"
     # ADR-008 D1 — wall-clock primitives are forbidden inside the policy
     # trees. Production code consults the injected clock.Clock; only the
     # canonical leaf in internal/clock and the production roots that
@@ -133,8 +179,9 @@ linters:
           - funlen
           - lll
           - maintidx
-      # Generated code is exempt across the board.
-      - path: 'internal/db/sqlc/'
+      # Generated code is exempt across the board (sqlc output trees: the
+      # Exchange/Broker main DBs and the SoR's own DB).
+      - path: 'internal/(db|sor/db)/sqlc/'
         linters:
           - revive
           - unused
@@ -146,6 +193,25 @@ linters:
       # with Content-Type application/json, never user-reflected HTML.
       - path: 'src/broker/internal/transport/middleware.go'
         text: 'G705'
+        linters:
+          - gosec
+      # gosec G124: the developer sign-up flow cookies ARE HttpOnly and
+      # SameSite=Lax; only the Secure attribute is config-driven
+      # (oauthserver.Config.SecureCookies) so a local http compose/test stack
+      # works. oauthserver.New refuses an https issuer unless SecureCookies is
+      # true, so production cookies are always Secure — gosec cannot follow that
+      # cross-function guard and flags the non-literal Secure value.
+      - path: 'src/identity/internal/oauthserver/cookies.go'
+        text: 'G124'
+        linters:
+          - gosec
+      # gosec G710 (open redirect via taint analysis): every redirect target is
+      # the client's registered redirect_uri, validated by allowedRedirect (exact
+      # match against the stored allowlist) at /authorize before being sealed into
+      # the flow cookie; every redirectWith caller passes an already-validated URI.
+      # Taint analysis cannot follow that validation through the sealed cookie.
+      - path: 'src/identity/internal/oauthserver/redirect.go'
+        text: 'G710'
         linters:
           - gosec
 

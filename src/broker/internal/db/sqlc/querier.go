@@ -11,6 +11,7 @@ import (
 type Querier interface {
 	ListActiveExchanges(ctx context.Context) ([]BrokerExchange, error)
 	RecordSelection(ctx context.Context, arg RecordSelectionParams) (BrokerSelectionLog, error)
+	SelectionsByRequestID(ctx context.Context, requestID string) ([]BrokerSelectionLog, error)
 	UpsertExchange(ctx context.Context, arg UpsertExchangeParams) (BrokerExchange, error)
 }
 

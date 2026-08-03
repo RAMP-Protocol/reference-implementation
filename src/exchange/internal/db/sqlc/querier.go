@@ -9,6 +9,19 @@ import (
 )
 
 type Querier interface {
+	// Appends one admin control-plane change to the append-only audit log. Written
+	// inside the setter's transaction, after the rows-affected check, so an
+	// unknown-tenant no-op leaves no row.
+	AppendAuditLog(ctx context.Context, arg AppendAuditLogParams) error
+	// Returns the audit trail for a tenant, most recent first. Read path for admin
+	// change reconstruction and the integration tests' side-effect assertions.
+	AuditLogByTenant(ctx context.Context, tenantID string) ([]RampAuditLog, error)
+	// Writes the append-once evidence row for a successfully executed transaction
+	// item: the full signed offer + both-party signatures + both verifying public
+	// keys + the delivered URL. Written inside the same transaction as the
+	// transaction_log + obligation rows, after the transaction_log row exists (the
+	// transaction_id FK). The row is never updated or deleted (append-once triggers).
+	CreateEvidence(ctx context.Context, arg CreateEvidenceParams) error
 	CreateObligation(ctx context.Context, arg CreateObligationParams) (RampReportingObligation, error)
 	// Writes the full transaction row. The handler MUST await this commit before
 	// returning the signed URL to the caller (write-before-sign invariant).
@@ -20,6 +33,19 @@ type Querier interface {
 	FindObligationBySourceReportID(ctx context.Context, arg FindObligationBySourceReportIDParams) (RampReportingObligation, error)
 	GetAgent(ctx context.Context, agentID string) (RampAgent, error)
 	GetCatalogEntry(ctx context.Context, resourceID string) (RampCatalog, error)
+	// Reads one tenant's evidence row. This is the DEFAULT read: transaction_id is
+	// globally unique, but the tenant predicate keeps Architecture Rule 4 structural
+	// rather than a checked-by-convention property of every future call site. The
+	// payload here — the full offer, both signatures, both keys and a delivered
+	// signed URL — is materially more sensitive than transaction_log's.
+	GetEvidenceByTenantAndTransactionID(ctx context.Context, arg GetEvidenceByTenantAndTransactionIDParams) (RampTransactionEvidence, error)
+	// admin:cross_tenant — DELIBERATELY not tenant-filtered, for the operator-facing
+	// admin plane (which has no per-tenant scope, ADR-022) and the cross-tenant
+	// reconciliation sweep (ADR-011 D2, whose eligibility scan carries the same
+	// marker). Every call site must carry the marker too. Tenant-scoped callers use
+	// GetEvidenceByTenantAndTransactionID; the returned row carries tenant_id so a
+	// caller here can still assert the binding.
+	GetEvidenceByTransactionIDCrossTenant(ctx context.Context, transactionID string) (RampTransactionEvidence, error)
 	GetObligationByTransaction(ctx context.Context, transactionID string) (RampReportingObligation, error)
 	// Loads the most-recent obligation for a transaction together with the
 	// transaction + tenant fields required for protocol validation AND for the
@@ -34,10 +60,19 @@ type Querier interface {
 	// row. The transaction_log + tenants rows are read-only
 	// on this path and need no lock.
 	GetObligationWithTransactionForUpdate(ctx context.Context, transactionID string) (GetObligationWithTransactionForUpdateRow, error)
+	// Returns the per-(tenant, resource_owner) commission override in basis points,
+	// or no row when none is configured (the caller falls back to the tenant default).
+	GetResourceOwnerFeeOverride(ctx context.Context, arg GetResourceOwnerFeeOverrideParams) (int32, error)
 	GetTenantByDomain(ctx context.Context, domain string) (RampTenant, error)
 	GetTenantByID(ctx context.Context, tenantID string) (RampTenant, error)
-	// Idempotency lookup: return a prior transaction for the same tx_request_id.
-	GetTransactionByRequestID(ctx context.Context, txRequestID string) (RampTransactionLog, error)
+	// Read a transaction by its public transaction_id (the value the resolve /
+	// ExecuteTransaction response returns). Unique-key audit read: like
+	// GetTransactionByIdempotencyKey it is keyed on a globally-unique id and is not
+	// tenant-filtered; the returned row carries tenant_id so callers scope/assert
+	// the tenant binding themselves.
+	GetTransactionByID(ctx context.Context, transactionID string) (RampTransactionLog, error)
+	// Idempotency lookup: return a prior transaction for the same idempotency_key.
+	GetTransactionByIdempotencyKey(ctx context.Context, idempotencyKey string) (RampTransactionLog, error)
 	InsertCatalogEntry(ctx context.Context, arg InsertCatalogEntryParams) (RampCatalog, error)
 	InsertTenant(ctx context.Context, arg InsertTenantParams) (RampTenant, error)
 	ListAllCatalog(ctx context.Context) ([]RampCatalog, error)
@@ -61,17 +96,38 @@ type Querier interface {
 	// The partial unique index on (transaction_id, source_report_id) prevents
 	// two concurrent "same-id" writes from both succeeding.
 	MarkValidationValidated(ctx context.Context, arg MarkValidationValidatedParams) (RampReportingObligation, error)
+	// Stores the billing account id for an agent, first write wins. The
+	// billing_ref IS NULL guard makes a repeat call a no-op (zero rows →
+	// pgx.ErrNoRows), so a stored ref is never overwritten (ADR-021 D4). The
+	// column is deliberately absent from UpsertAgent's update list: a key
+	// rotation re-upsert must leave billing_ref intact (ADR-021 D3).
+	SetAgentBillingRef(ctx context.Context, arg SetAgentBillingRefParams) (RampAgent, error)
+	// Flips the per-tenant policy for whether a newly registered agent starts
+	// active in the billing system-of-record. Admin / fixture path; the column
+	// defaults to TRUE on insert, so this is only needed to opt a tenant out.
+	// Mirrors SetTenantAllowBrokerRelay.
+	SetTenantActivateNewAgentsByDefault(ctx context.Context, arg SetTenantActivateNewAgentsByDefaultParams) error
 	// Flips the broker-relay opt-in for a tenant. Admin / fixture path; the
 	// column defaults to FALSE on insert so this is only needed when a tenant
 	// explicitly opts into broker-on-behalf reporting.
 	SetTenantAllowBrokerRelay(ctx context.Context, arg SetTenantAllowBrokerRelayParams) error
-	// Replaces the reporting_policy JSONB for a tenant. Admin / fixture path
-	// for tests that need to seed required_fields, quantity_tolerance, or
-	// window_seconds defaults without bypassing the repo layer (review
-	// finding 7 — no raw pool.Exec in tests).
-	SetTenantReportingPolicy(ctx context.Context, arg SetTenantReportingPolicyParams) error
+	// Replaces the tenant-level default commission rate (basis points) and the
+	// operator note in one write. The admin SetTenantFeeRate RPC write path (also a
+	// fixture mutator). Full replace: fee_rate_notes is set to $3, which is NULL
+	// when the operator omits it. Returns rows-affected so a call for a missing
+	// tenant is a detectable no-op rather than a silent success.
+	SetTenantFeeRateBps(ctx context.Context, arg SetTenantFeeRateBpsParams) (int64, error)
+	// Replaces the reporting_policy JSONB for a tenant. The admin SetReportingPolicy
+	// RPC write path (also used by fixtures to seed required_fields,
+	// quantity_tolerance, or window_seconds without bypassing the repo layer).
+	// Returns rows-affected so the caller can tell a real update from a no-op on a
+	// missing tenant.
+	SetTenantReportingPolicy(ctx context.Context, arg SetTenantReportingPolicyParams) (int64, error)
 	UpsertAgent(ctx context.Context, arg UpsertAgentParams) (RampAgent, error)
 	UpsertCatalogEntry(ctx context.Context, arg UpsertCatalogEntryParams) (RampCatalog, error)
+	// Sets the override commission for one resource owner under one tenant. Admin /
+	// fixture path; the CHECK (0 <= fee_rate_bps < 10000) rejects an out-of-range rate.
+	UpsertResourceOwnerFeeOverride(ctx context.Context, arg UpsertResourceOwnerFeeOverrideParams) error
 }
 
 var _ Querier = (*Queries)(nil)

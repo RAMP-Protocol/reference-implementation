@@ -5,13 +5,15 @@ import "context"
 // JWTClaims captures the subset of JWT-derived principal facts the
 // Exchange service layer consumes for authz and audit:
 //
-//   - Sub — the JWT subject (principal identifier). Used as one input
-//     to the agent-identity hash (see docs/design/request-lifecycle.md
-//     §2a and sha256(sub||tenant_id) in src/exchange/internal/service).
-//   - Org — the JWT org/tenant claim. Gate D cross-checks this against
-//     the authority-block subscriber_org fact.
+//   - Sub — the JWT subject (principal identifier), carried into audit
+//     records. It is NOT the agent-identity hash: that value is the
+//     accepting agent's RFC 7638 JWK thumbprint — itself a SHA-256 over
+//     the canonical JWK — taken from the presented key rather than from
+//     any JWT claim, and used verbatim without a further hash.
+//   - Org — the JWT org/tenant claim, cross-checked against the tenant
+//     the request is being executed for.
 //
-// JWT validation lives in a future interceptor (tracked as ye6f-5); the
+// JWT validation lives in a future interceptor (deferred); the
 // claims ride in ctx so the service layer stays transport-agnostic and
 // tests can populate the struct directly without signing a real JWT.
 type JWTClaims struct {

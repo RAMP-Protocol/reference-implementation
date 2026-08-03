@@ -25,6 +25,11 @@ import (
 // struggling to seed state, the fix is to sign a real PushResources RPC,
 // not to weaken the authorization model. This file is a tripwire, not
 // a design affordance.
+//
+// The tripwire covers BOTH the legacy /admin/* REST shortcuts AND the
+// Connect procedure paths for ramp.admin.v1.AdminService (SetTenantFeeRate,
+// SetReportingPolicy). These unsigned, unauthenticated setters change
+// money and policy; they must NOT appear on the public mux.
 // ─────────────────────────────────────────────────────────────────────────
 //
 // TestAdminRoutesReturn404 boots the full production HTTP surface via
@@ -65,6 +70,22 @@ func TestAdminRoutesReturn404(t *testing.T) {
 			method: http.MethodGet,
 			path:   "/admin/keys/rsa-public.pem",
 			body:   nil,
+		},
+		// Connect procedure paths for the admin surface — must not appear on
+		// the public mux. These are unsigned, unauthenticated setters that
+		// change money and policy; only the separate internal listener (with
+		// IP-allowlist) should serve them.
+		{
+			name:   "POST /ramp.admin.v1.AdminService/SetTenantFeeRate",
+			method: http.MethodPost,
+			path:   "/ramp.admin.v1.AdminService/SetTenantFeeRate",
+			body:   strings.NewReader(`{"ver":"1.0","rate":{"tenant_id":"t_test","fee_rate_bps":100}}`),
+		},
+		{
+			name:   "POST /ramp.admin.v1.AdminService/SetReportingPolicy",
+			method: http.MethodPost,
+			path:   "/ramp.admin.v1.AdminService/SetReportingPolicy",
+			body:   strings.NewReader(`{"ver":"1.0","policy":{"tenant_id":"t_test"}}`),
 		},
 	}
 	for _, tc := range cases {

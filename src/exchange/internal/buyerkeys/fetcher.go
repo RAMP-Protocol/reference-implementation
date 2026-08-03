@@ -13,23 +13,24 @@
 // successful fetch for a given URL receive ErrUnavailable when the current
 // fetch fails; callers that saw at least one successful fetch continue to
 // be served from the cached entry (the revocation-list fetcher implements
-// the same fail-closed-on-stale rule; see docs/design/key-revocation.md).
+// the same fail-closed-on-stale rule).
 package buyerkeys
 
 import (
 	"context"
 	"crypto/ed25519"
-	"encoding/base64"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/keypolicy"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 )
 
 // Sentinel errors returned by Fetcher. Callers map these to
@@ -42,9 +43,13 @@ var (
 	// ErrMalformed — the URL returned a document that could not be
 	// parsed as a JWKS with ed25519 keys.
 	ErrMalformed = errors.New("buyerkeys: JWKS malformed")
-	// ErrInsecureScheme — a non-HTTPS URL was supplied in production.
-	// Tests may opt into http:// via AllowInsecure.
-	ErrInsecureScheme = errors.New("buyerkeys: URL must be https")
+	// ErrNoClient — the Fetcher was constructed with no injected HTTP client.
+	// This is a permanent composition-root misconfiguration, never a retryable
+	// upstream outage, so it surfaces UNWRAPPED (never chained into the transient
+	// ErrUnavailable) and no network dial is attempted. Mirrors
+	// rampwellknown.ErrNoClient; the SSRF-guarded client is built once at the
+	// composition root and injected, matching agentreg/probe/rampwellknown.
+	ErrNoClient = errors.New("buyerkeys: HTTP client is required")
 )
 
 // DefaultCacheTTL matches the protocol-level 5-minute cache hint.
@@ -56,9 +61,8 @@ type Config struct {
 	HTTP *http.Client
 	// Clk drives cache-entry freshness comparisons. Defaults to clock.System{}
 	// per ADR-008 D1.
-	Clk           clock.Clock
-	TTL           time.Duration
-	AllowInsecure bool
+	Clk clock.Clock
+	TTL time.Duration
 }
 
 // Fetcher resolves buyer_keys_url → set of ed25519 public keys. Safe for
@@ -67,7 +71,6 @@ type Fetcher struct {
 	http  *http.Client
 	clk   clock.Clock
 	ttl   time.Duration
-	allow bool
 	mu    sync.Mutex
 	cache map[string]cacheEntry
 }
@@ -78,13 +81,17 @@ type cacheEntry struct {
 	rawKIDs   map[string]ed25519.PublicKey // kid → key for look-by-kid
 }
 
-// New constructs a Fetcher honoring cfg. HTTP defaults to a 5s-timeout
-// client; Clk defaults to clock.System{}; TTL defaults to DefaultCacheTTL.
+// New constructs a Fetcher honoring cfg. The SSRF-guarded HTTP client is a
+// REQUIRED injected dependency (cfg.HTTP): the buyer_keys_url is a
+// contract-named, protocol-opaque HTTPS URL that MUST be fetched through the
+// SDK's private-IP-blocking client, and the app is a pure consumer that owns no
+// scheme policy — so the guarded client is built ONCE at the composition root
+// (resolvers.NewGuardedClientFromEnv) and passed in, never fabricated here.
+// This matches every sibling fetcher (agentreg, probe, rampwellknown). A nil
+// cfg.HTTP is not silently patched: the Fetcher stores it and resolve returns
+// the permanent ErrNoClient without dialing. Clk defaults to clock.System{};
+// TTL defaults to DefaultCacheTTL.
 func New(cfg Config) *Fetcher {
-	client := cfg.HTTP
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
-	}
 	clk := cfg.Clk
 	if clk == nil {
 		clk = clock.System{}
@@ -94,10 +101,9 @@ func New(cfg Config) *Fetcher {
 		ttl = DefaultCacheTTL
 	}
 	return &Fetcher{
-		http:  client,
+		http:  cfg.HTTP,
 		clk:   clk,
 		ttl:   ttl,
-		allow: cfg.AllowInsecure,
 		cache: make(map[string]cacheEntry),
 	}
 }
@@ -115,7 +121,11 @@ func (f *Fetcher) Contains(ctx context.Context, url string, pub ed25519.PublicKe
 		return false, err
 	}
 	for _, k := range entry.keys {
-		if len(k) == len(pub) && equalEd25519(k, pub) {
+		// Constant-time compare (subtle) over the raw public keys: returns 1 only
+		// when the byte slices are equal AND the same length, so the explicit
+		// length guard is subsumed. Public keys are not secret, but this removes a
+		// hand-rolled early-return byte loop in favor of the vetted primitive.
+		if subtle.ConstantTimeCompare(k, pub) == 1 {
 			return true, nil
 		}
 	}
@@ -138,8 +148,13 @@ func (f *Fetcher) LookupKID(ctx context.Context, url, kid string) (ed25519.Publi
 // has elapsed. Stale entries are served when refresh fails (fail-closed on
 // stale, per ADR-003 §4/§5b).
 func (f *Fetcher) resolve(ctx context.Context, url string) (cacheEntry, error) {
-	if err := validateScheme(url, f.allow); err != nil {
-		return cacheEntry{}, err
+	// Fail loud on a missing client BEFORE the cache serve and the ErrUnavailable
+	// wrap below: a nil client is a permanent composition-root misconfiguration,
+	// not a transient outage, and no cache entry could ever have been populated
+	// without it. Returning ErrNoClient here (never chained into ErrUnavailable)
+	// keeps a hard config error from masquerading as a retryable one.
+	if f.http == nil {
+		return cacheEntry{}, ErrNoClient
 	}
 	f.mu.Lock()
 	existing, hit := f.cache[url]
@@ -160,18 +175,6 @@ func (f *Fetcher) resolve(ctx context.Context, url string) (cacheEntry, error) {
 	f.cache[url] = entry
 	f.mu.Unlock()
 	return entry, nil
-}
-
-// validateScheme rejects non-HTTPS URLs in production mode.
-func validateScheme(url string, allowInsecure bool) error {
-	switch {
-	case strings.HasPrefix(url, "https://"):
-		return nil
-	case allowInsecure && strings.HasPrefix(url, "http://"):
-		return nil
-	default:
-		return fmt.Errorf("%w: %s", ErrInsecureScheme, url)
-	}
 }
 
 // fetch GETs the JWKS document and parses the ed25519 `OKP` keys out of it.
@@ -206,10 +209,18 @@ func (f *Fetcher) fetch(ctx context.Context, url string) (cacheEntry, error) {
 // keys (use="revoke") are tracked separately by the revocationlist
 // package and intentionally excluded here.
 func parseJWKS(body []byte) (cacheEntry, error) {
+	// The standard-JWK decode (OKP/Ed25519 guard, base64url `x`, RFC 8037 32-byte
+	// length check) is delegated to keypolicy.LoadJWKSBytes — THE shared
+	// fail-closed JWKS loader (the Broker key registry loads through it too). A
+	// malformed entry is SKIPPED there rather than failing the whole document, so
+	// one typo in a buyer's key set cannot wedge the fetch. buyerkeys keeps its own
+	// struct ONLY for the members the shared loader does not surface: `kid`
+	// (look-by-kid) and `use` (the "verify"/unset signing-key filter; revocation
+	// keys use="revoke" are excluded here and tracked by the revocationlist
+	// package). Both views read the SAME bytes; entries are correlated by their
+	// canonical base64url `x`.
 	var raw struct {
 		Keys []struct {
-			Kty string `json:"kty"`
-			Crv string `json:"crv"`
 			X   string `json:"x"`
 			Kid string `json:"kid"`
 			Use string `json:"use"`
@@ -218,38 +229,26 @@ func parseJWKS(body []byte) (cacheEntry, error) {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return cacheEntry{}, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
-	entry := cacheEntry{rawKIDs: make(map[string]ed25519.PublicKey)}
+	type kidUse struct {
+		kid string
+		use string
+	}
+	meta := make(map[string]kidUse, len(raw.Keys))
 	for _, k := range raw.Keys {
-		if k.Kty != "OKP" || k.Crv != "Ed25519" {
-			continue
+		meta[k.X] = kidUse{kid: k.Kid, use: k.Use}
+	}
+	entry := cacheEntry{rawKIDs: make(map[string]ed25519.PublicKey)}
+	if err := keypolicy.LoadJWKSBytes(body, func(tk keypolicy.TimedKey) {
+		m := meta[rampwellknown.EncodeEd25519X(tk.Public)]
+		if m.use != "" && m.use != "verify" {
+			return
 		}
-		if k.Use != "" && k.Use != "verify" {
-			continue
+		entry.keys = append(entry.keys, tk.Public)
+		if m.kid != "" {
+			entry.rawKIDs[m.kid] = tk.Public
 		}
-		pub, err := base64.RawURLEncoding.DecodeString(k.X)
-		if err != nil {
-			return cacheEntry{}, fmt.Errorf("%w: key x=%q: %w", ErrMalformed, k.X, err)
-		}
-		if len(pub) != ed25519.PublicKeySize {
-			return cacheEntry{}, fmt.Errorf("%w: key x length=%d", ErrMalformed, len(pub))
-		}
-		edpub := ed25519.PublicKey(pub)
-		entry.keys = append(entry.keys, edpub)
-		if k.Kid != "" {
-			entry.rawKIDs[k.Kid] = edpub
-		}
+	}); err != nil {
+		return cacheEntry{}, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
 	return entry, nil
-}
-
-func equalEd25519(a, b ed25519.PublicKey) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

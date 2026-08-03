@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -29,9 +30,11 @@ func TestAppendSignatureRAMP_EmptyHeaders(t *testing.T) {
 	req.Host = "broker.example"
 	req.Header.Set("Authorization", "Bearer token123")
 
-	created := int64(1700000000)
-	expires := int64(1700000100)
-	err = AppendSignatureRAMP(req, body, "agent.test", priv, created, expires)
+	// yaronf stamps created = now(); sign at real now and verify under a
+	// deterministic clock anchored at the same instant.
+	now := signNow()
+	expires := now.Add(100 * time.Second).Unix()
+	err = AppendSignatureRAMP(req, body, "agent.test", priv, expires)
 	if err != nil {
 		t.Fatalf("AppendSignatureRAMP: %v", err)
 	}
@@ -47,9 +50,9 @@ func TestAppendSignatureRAMP_EmptyHeaders(t *testing.T) {
 		t.Fatalf("want Signature starting with sig1=, got %q", sig)
 	}
 
-	// Verify the signature validates under the canonical verifier (MED-03).
+	// Verify the signature validates under the canonical verifier.
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{"agent.test": pub})
-	v, err := VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(time.Unix(created, 0))})
+	v, err := VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if err != nil {
 		t.Fatalf("VerifyRequest: %v", err)
 	}
@@ -61,11 +64,56 @@ func TestAppendSignatureRAMP_EmptyHeaders(t *testing.T) {
 	}
 }
 
+// TestAppendSignatureRAMP_MalformedSignatureInputRejected verifies the relay
+// append path fails fast when an existing Signature-Input header is present but
+// unparseable: rather than treating the garbage as "no signatures" and
+// co-signing a fresh sig1 over a malformed envelope, AppendSignatureRAMP returns
+// an ErrMalformedSignatureInput-wrapped error and does not append a signature.
+func TestAppendSignatureRAMP_MalformedSignatureInputRejected(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	body := []byte(`{"hello":"world"}`)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		"https://broker.example/ramp.v1.BrokerService/Resolve", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Host = "broker.example"
+	req.Header.Set("Authorization", "Bearer token123")
+
+	// A Signature-Input that is present but not a valid structured-field
+	// dictionary, with a matching Signature header so the envelope is genuinely
+	// "signed but malformed" rather than absent.
+	const malformedInput = "sig1=(((garbage"
+	const existingSig = "sig1=:AAAA:"
+	req.Header.Set("Signature-Input", malformedInput)
+	req.Header.Set("Signature", existingSig)
+
+	now := signNow()
+	err = AppendSignatureRAMP(req, body, "broker.test", priv, now.Add(30*time.Second).Unix())
+	if !errors.Is(err, ErrMalformedSignatureInput) {
+		t.Fatalf("want ErrMalformedSignatureInput, got %v", err)
+	}
+
+	// No co-signing side effect: the existing Signature/Signature-Input headers
+	// are untouched — no fresh sigN was appended over the malformed envelope.
+	if got := req.Header.Get("Signature-Input"); got != malformedInput {
+		t.Fatalf("Signature-Input mutated: want %q, got %q", malformedInput, got)
+	}
+	if got := req.Header.Get("Signature"); got != existingSig {
+		t.Fatalf("Signature mutated: want %q, got %q", existingSig, got)
+	}
+}
+
 // verifySignatureAtIndex is a helper that verifies a signature at a specific
-// index in the params list.
+// index in the params list. It drives the production yaronf-backed verify
+// (verifyEd25519) so the test exercises the real canonicalization rather than a
+// hand-rolled base. body is restored inside verifyEd25519 for the next label.
 func verifySignatureAtIndex(
 	t *testing.T, req *http.Request,
-	allParams []Params, sigMap map[string][]byte,
+	allParams []Params, body []byte,
 	idx int, wantLabel, wantKeyID string, pub ed25519.PublicKey,
 ) {
 	t.Helper()
@@ -79,12 +127,8 @@ func verifySignatureAtIndex(
 	if params.KeyID != wantKeyID {
 		t.Fatalf("params[%d]: want keyid %s, got %s", idx, wantKeyID, params.KeyID)
 	}
-	base, err := buildSignatureBase(req, params)
-	if err != nil {
-		t.Fatalf("buildSignatureBase %s: %v", wantLabel, err)
-	}
-	if !ed25519.Verify(pub, []byte(base), sigMap[params.Label]) {
-		t.Fatalf("%s verification failed", wantLabel)
+	if err := verifyEd25519(req, params.Label, pub, body); err != nil {
+		t.Fatalf("%s verification failed: %v", wantLabel, err)
 	}
 }
 
@@ -110,15 +154,14 @@ func TestAppendSignatureRAMP_ExistingSig1(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer agent-token")
 
 	// Agent signs first (creates sig1).
-	created := int64(1700000000)
 	expires := int64(1700000100)
-	err = SignRequestRAMP(req, body, "agent.test", agentPriv, created, expires)
+	err = SignRequestRAMP(req, body, "agent.test", agentPriv, expires)
 	if err != nil {
 		t.Fatalf("SignRequestRAMP (agent): %v", err)
 	}
 
 	// Broker appends signature (should create sig2).
-	err = AppendSignatureRAMP(req, body, "broker.test", brokerPriv, created+1, expires+1)
+	err = AppendSignatureRAMP(req, body, "broker.test", brokerPriv, expires+1)
 	if err != nil {
 		t.Fatalf("AppendSignatureRAMP (broker): %v", err)
 	}
@@ -133,7 +176,7 @@ func TestAppendSignatureRAMP_ExistingSig1(t *testing.T) {
 	}
 
 	// Parse and verify both signatures.
-	allParams, sigMap, err := parseAllSignatures(req.Header)
+	allParams, _, err := parseAllSignatures(req.Header)
 	if err != nil {
 		t.Fatalf("parseAllSignatures: %v", err)
 	}
@@ -141,8 +184,8 @@ func TestAppendSignatureRAMP_ExistingSig1(t *testing.T) {
 		t.Fatalf("want 2 signatures, got %d", len(allParams))
 	}
 
-	verifySignatureAtIndex(t, req, allParams, sigMap, 0, "sig1", "agent.test", agentPub)
-	verifySignatureAtIndex(t, req, allParams, sigMap, 1, "sig2", "broker.test", brokerPub)
+	verifySignatureAtIndex(t, req, allParams, body, 0, "sig1", "agent.test", agentPub)
+	verifySignatureAtIndex(t, req, allParams, body, 1, "sig2", "broker.test", brokerPub)
 }
 
 // TestAppendSignatureRAMP_TwiceAppends verifies calling AppendSignatureRAMP
@@ -170,29 +213,28 @@ func TestAppendSignatureRAMP_TwiceAppends(t *testing.T) {
 	req.Host = "exchange.example"
 	req.Header.Set("Authorization", "")
 
-	created := int64(1700000000)
 	expires := int64(1700000100)
 
 	// First signature.
-	err = SignRequestRAMP(req, body, "signer1.test", priv1, created, expires)
+	err = SignRequestRAMP(req, body, "signer1.test", priv1, expires)
 	if err != nil {
 		t.Fatalf("SignRequestRAMP: %v", err)
 	}
 
 	// Append second signature.
-	err = AppendSignatureRAMP(req, body, "signer2.test", priv2, created+1, expires+1)
+	err = AppendSignatureRAMP(req, body, "signer2.test", priv2, expires+1)
 	if err != nil {
 		t.Fatalf("AppendSignatureRAMP (second): %v", err)
 	}
 
 	// Append third signature.
-	err = AppendSignatureRAMP(req, body, "signer3.test", priv3, created+2, expires+2)
+	err = AppendSignatureRAMP(req, body, "signer3.test", priv3, expires+2)
 	if err != nil {
 		t.Fatalf("AppendSignatureRAMP (third): %v", err)
 	}
 
 	// Verify all three signatures exist.
-	allParams, sigMap, err := parseAllSignatures(req.Header)
+	allParams, _, err := parseAllSignatures(req.Header)
 	if err != nil {
 		t.Fatalf("parseAllSignatures: %v", err)
 	}
@@ -204,20 +246,8 @@ func TestAppendSignatureRAMP_TwiceAppends(t *testing.T) {
 	wantKeyIDs := []string{"signer1.test", "signer2.test", "signer3.test"}
 	wantPubs := []ed25519.PublicKey{pub1, pub2, pub3}
 
-	for i, params := range allParams {
-		if params.Label != wantLabels[i] {
-			t.Fatalf("signature %d: want label %s, got %s", i, wantLabels[i], params.Label)
-		}
-		if params.KeyID != wantKeyIDs[i] {
-			t.Fatalf("signature %d: want keyid %s, got %s", i, wantKeyIDs[i], params.KeyID)
-		}
-		base, err := buildSignatureBase(req, params)
-		if err != nil {
-			t.Fatalf("buildSignatureBase sig%d: %v", i+1, err)
-		}
-		if !ed25519.Verify(wantPubs[i], []byte(base), sigMap[params.Label]) {
-			t.Fatalf("sig%d verification failed", i+1)
-		}
+	for i := range allParams {
+		verifySignatureAtIndex(t, req, allParams, body, i, wantLabels[i], wantKeyIDs[i], wantPubs[i])
 	}
 }
 
@@ -242,11 +272,11 @@ func TestAppendSignatureRAMP_PreservesExistingHeaders(t *testing.T) {
 	req.Host = "broker.example"
 	req.Header.Set("Authorization", "Bearer original-token")
 
-	created := int64(1700000000)
-	expires := int64(1700000100)
+	now := signNow()
+	expires := now.Add(100 * time.Second).Unix()
 
 	// First signature.
-	err = SignRequestRAMP(req, body, "first.test", priv1, created, expires)
+	err = SignRequestRAMP(req, body, "first.test", priv1, expires)
 	if err != nil {
 		t.Fatalf("SignRequestRAMP: %v", err)
 	}
@@ -255,7 +285,7 @@ func TestAppendSignatureRAMP_PreservesExistingHeaders(t *testing.T) {
 	originalAuth := req.Header.Get("Authorization")
 
 	// Append second signature.
-	err = AppendSignatureRAMP(req, body, "second.test", priv2, created+1, expires+1)
+	err = AppendSignatureRAMP(req, body, "second.test", priv2, expires+1)
 	if err != nil {
 		t.Fatalf("AppendSignatureRAMP: %v", err)
 	}
@@ -270,10 +300,10 @@ func TestAppendSignatureRAMP_PreservesExistingHeaders(t *testing.T) {
 			originalAuth, req.Header.Get("Authorization"))
 	}
 
-	// Verify sig1 still validates under the canonical verifier (MED-03).
+	// Verify sig1 still validates under the canonical verifier.
 	// VerifyRequest checks the first label, so the resolver needs only sig1's key.
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{"first.test": pub1})
-	v, err := VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(time.Unix(created, 0))})
+	v, err := VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if err != nil {
 		t.Fatalf("VerifyRequest sig1 after append: %v", err)
 	}

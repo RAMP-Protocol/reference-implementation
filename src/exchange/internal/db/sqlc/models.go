@@ -67,19 +67,23 @@ func (e RampDeliveryMethod) Valid() bool {
 type RampDenialReason string
 
 const (
-	RampDenialReasonINVALIDLICENSE      RampDenialReason = "INVALID_LICENSE"
-	RampDenialReasonEXPIREDLICENSE      RampDenialReason = "EXPIRED_LICENSE"
-	RampDenialReasonINSUFFICIENTBALANCE RampDenialReason = "INSUFFICIENT_BALANCE"
-	RampDenialReasonRATELIMITED         RampDenialReason = "RATE_LIMITED"
-	RampDenialReasonCONTENTUNAVAILABLE  RampDenialReason = "CONTENT_UNAVAILABLE"
-	RampDenialReasonFUNCTIONPROHIBITED  RampDenialReason = "FUNCTION_PROHIBITED"
-	RampDenialReasonGEORESTRICTED       RampDenialReason = "GEO_RESTRICTED"
-	RampDenialReasonREPORTINGOVERDUE    RampDenialReason = "REPORTING_OVERDUE"
-	RampDenialReasonOFFEREXPIRED        RampDenialReason = "OFFER_EXPIRED"
-	RampDenialReasonSIGNATUREINVALID    RampDenialReason = "SIGNATURE_INVALID"
-	RampDenialReasonQUOTAEXCEEDED       RampDenialReason = "QUOTA_EXCEEDED"
-	RampDenialReasonDELEGATIONEXPIRED   RampDenialReason = "DELEGATION_EXPIRED"
-	RampDenialReasonSCOPEINSUFFICIENT   RampDenialReason = "SCOPE_INSUFFICIENT"
+	RampDenialReasonBILLINGREFINACTIVE      RampDenialReason = "BILLING_REF_INACTIVE"
+	RampDenialReasonINSUFFICIENTBALANCE     RampDenialReason = "INSUFFICIENT_BALANCE"
+	RampDenialReasonRATELIMITED             RampDenialReason = "RATE_LIMITED"
+	RampDenialReasonCONTENTUNAVAILABLE      RampDenialReason = "CONTENT_UNAVAILABLE"
+	RampDenialReasonRESTRICTIONNOTSATISFIED RampDenialReason = "RESTRICTION_NOT_SATISFIED"
+	RampDenialReasonREPORTINGOVERDUE        RampDenialReason = "REPORTING_OVERDUE"
+	RampDenialReasonOFFEREXPIRED            RampDenialReason = "OFFER_EXPIRED"
+	RampDenialReasonSIGNATUREINVALID        RampDenialReason = "SIGNATURE_INVALID"
+	RampDenialReasonQUOTAEXCEEDED           RampDenialReason = "QUOTA_EXCEEDED"
+	RampDenialReasonDELEGATIONINVALID       RampDenialReason = "DELEGATION_INVALID"
+	RampDenialReasonSCOPEINSUFFICIENT       RampDenialReason = "SCOPE_INSUFFICIENT"
+	RampDenialReasonENTITLEMENTMISSING      RampDenialReason = "ENTITLEMENT_MISSING"
+	RampDenialReasonENTITLEMENTMALFORMED    RampDenialReason = "ENTITLEMENT_MALFORMED"
+	RampDenialReasonENTITLEMENTEXPIRED      RampDenialReason = "ENTITLEMENT_EXPIRED"
+	RampDenialReasonENTITLEMENTWRONGBUYER   RampDenialReason = "ENTITLEMENT_WRONG_BUYER"
+	RampDenialReasonSUBSCRIPTIONLAPSED      RampDenialReason = "SUBSCRIPTION_LAPSED"
+	RampDenialReasonENTITLEMENTNOTGRANTED   RampDenialReason = "ENTITLEMENT_NOT_GRANTED"
 )
 
 func (e *RampDenialReason) Scan(src interface{}) error {
@@ -119,19 +123,23 @@ func (ns NullRampDenialReason) Value() (driver.Value, error) {
 
 func (e RampDenialReason) Valid() bool {
 	switch e {
-	case RampDenialReasonINVALIDLICENSE,
-		RampDenialReasonEXPIREDLICENSE,
+	case RampDenialReasonBILLINGREFINACTIVE,
 		RampDenialReasonINSUFFICIENTBALANCE,
 		RampDenialReasonRATELIMITED,
 		RampDenialReasonCONTENTUNAVAILABLE,
-		RampDenialReasonFUNCTIONPROHIBITED,
-		RampDenialReasonGEORESTRICTED,
+		RampDenialReasonRESTRICTIONNOTSATISFIED,
 		RampDenialReasonREPORTINGOVERDUE,
 		RampDenialReasonOFFEREXPIRED,
 		RampDenialReasonSIGNATUREINVALID,
 		RampDenialReasonQUOTAEXCEEDED,
-		RampDenialReasonDELEGATIONEXPIRED,
-		RampDenialReasonSCOPEINSUFFICIENT:
+		RampDenialReasonDELEGATIONINVALID,
+		RampDenialReasonSCOPEINSUFFICIENT,
+		RampDenialReasonENTITLEMENTMISSING,
+		RampDenialReasonENTITLEMENTMALFORMED,
+		RampDenialReasonENTITLEMENTEXPIRED,
+		RampDenialReasonENTITLEMENTWRONGBUYER,
+		RampDenialReasonSUBSCRIPTIONLAPSED,
+		RampDenialReasonENTITLEMENTNOTGRANTED:
 		return true
 	}
 	return false
@@ -368,21 +376,35 @@ func (e RampValidationOutcome) Valid() bool {
 type RampAgent struct {
 	AgentID       string             `json:"agent_id"`
 	PublicKey     []byte             `json:"public_key"`
-	ManifestUrl   pgtype.Text        `json:"manifest_url"`
+	DiscoveryUrl  pgtype.Text        `json:"discovery_url"`
 	RequesterType RampRequesterType  `json:"requester_type"`
 	RegisteredAt  pgtype.Timestamptz `json:"registered_at"`
+	BillingRef    pgtype.Text        `json:"billing_ref"`
+}
+
+type RampAuditLog struct {
+	LogID      string             `json:"log_id"`
+	Actor      pgtype.Text        `json:"actor"`
+	SourceAddr string             `json:"source_addr"`
+	Action     string             `json:"action"`
+	Detail     []byte             `json:"detail"`
+	TenantID   string             `json:"tenant_id"`
+	RequestID  pgtype.Text        `json:"request_id"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
 type RampCatalog struct {
-	ResourceID     string             `json:"resource_id"`
-	TenantID       string             `json:"tenant_id"`
-	Uri            string             `json:"uri"`
-	UriPrefix      string             `json:"uri_prefix"`
-	Pricing        []byte             `json:"pricing"`
-	LicensingRules []byte             `json:"licensing_rules"`
-	DeliveryMethod RampDeliveryMethod `json:"delivery_method"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	ResourceID      string             `json:"resource_id"`
+	TenantID        string             `json:"tenant_id"`
+	Uri             string             `json:"uri"`
+	UriPrefix       string             `json:"uri_prefix"`
+	Pricing         []byte             `json:"pricing"`
+	DeliveryMethod  RampDeliveryMethod `json:"delivery_method"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	Terms           []byte             `json:"terms"`
+	Metadata        []byte             `json:"metadata"`
+	ResourceOwnerID string             `json:"resource_owner_id"`
 }
 
 type RampReportingObligation struct {
@@ -404,21 +426,55 @@ type RampReportingObligation struct {
 }
 
 type RampTenant struct {
-	TenantID            string             `json:"tenant_id"`
-	Domain              string             `json:"domain"`
-	HmacSecretRef       string             `json:"hmac_secret_ref"`
-	Ed25519KeyRef       string             `json:"ed25519_key_ref"`
-	ReportingPolicy     []byte             `json:"reporting_policy"`
-	CreatedAt           pgtype.Timestamptz `json:"created_at"`
-	SigningScheme       RampSigningScheme  `json:"signing_scheme"`
-	RsaKeyRef           pgtype.Text        `json:"rsa_key_ref"`
-	CloudfrontKeyPairID pgtype.Text        `json:"cloudfront_key_pair_id"`
-	AllowBrokerRelay    bool               `json:"allow_broker_relay"`
+	TenantID                   string             `json:"tenant_id"`
+	Domain                     string             `json:"domain"`
+	HmacSecretRef              string             `json:"hmac_secret_ref"`
+	Ed25519KeyRef              string             `json:"ed25519_key_ref"`
+	ReportingPolicy            []byte             `json:"reporting_policy"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	SigningScheme              RampSigningScheme  `json:"signing_scheme"`
+	RsaKeyRef                  pgtype.Text        `json:"rsa_key_ref"`
+	CloudfrontKeyPairID        pgtype.Text        `json:"cloudfront_key_pair_id"`
+	AllowBrokerRelay           bool               `json:"allow_broker_relay"`
+	FeeRateBps                 int32              `json:"fee_rate_bps"`
+	FeeRateNotes               pgtype.Text        `json:"fee_rate_notes"`
+	ActivateNewAgentsByDefault bool               `json:"activate_new_agents_by_default"`
+}
+
+type RampTenantResourceOwnerFee struct {
+	TenantID        string             `json:"tenant_id"`
+	ResourceOwnerID string             `json:"resource_owner_id"`
+	FeeRateBps      int32              `json:"fee_rate_bps"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RampTransactionEvidence struct {
+	TransactionID                     string             `json:"transaction_id"`
+	TenantID                          string             `json:"tenant_id"`
+	OfferID                           string             `json:"offer_id"`
+	OfferJson                         []byte             `json:"offer_json"`
+	OfferCanonicalBytes               []byte             `json:"offer_canonical_bytes"`
+	OfferSignature                    string             `json:"offer_signature"`
+	OfferSignatureAlgorithm           string             `json:"offer_signature_algorithm"`
+	ExchangeSigningPublicKey          []byte             `json:"exchange_signing_public_key"`
+	AgentAcceptanceSignature          string             `json:"agent_acceptance_signature"`
+	AgentAcceptanceCanonicalBytes     []byte             `json:"agent_acceptance_canonical_bytes"`
+	AgentAcceptanceSignatureAlgorithm string             `json:"agent_acceptance_signature_algorithm"`
+	RequesterID                       string             `json:"requester_id"`
+	RequesterDomain                   string             `json:"requester_domain"`
+	RequestIdempotencyKey             string             `json:"request_idempotency_key"`
+	AgentPublicKey                    []byte             `json:"agent_public_key"`
+	AgentDiscoveryUrl                 string             `json:"agent_discovery_url"`
+	SignedUrlFull                     string             `json:"signed_url_full"`
+	RequestID                         pgtype.Text        `json:"request_id"`
+	RequestIDMinted                   pgtype.Bool        `json:"request_id_minted"`
+	CreatedAt                         pgtype.Timestamptz `json:"created_at"`
 }
 
 type RampTransactionLog struct {
 	TransactionID     string               `json:"transaction_id"`
-	TxRequestID       string               `json:"tx_request_id"`
+	IdempotencyKey    string               `json:"idempotency_key"`
 	TenantID          string               `json:"tenant_id"`
 	AgentID           string               `json:"agent_id"`
 	ResourceID        string               `json:"resource_id"`
@@ -432,4 +488,5 @@ type RampTransactionLog struct {
 	ConsumedUnit      pgtype.Text          `json:"consumed_unit"`
 	DenialReason      NullRampDenialReason `json:"denial_reason"`
 	CreatedAt         pgtype.Timestamptz   `json:"created_at"`
+	ResultPayload     []byte               `json:"result_payload"`
 }

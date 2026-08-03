@@ -85,8 +85,6 @@ type BrokerSelectionLog struct {
 	AgentID         string             `json:"agent_id"`
 	Query           string             `json:"query"`
 	CandidateOffers []byte             `json:"candidate_offers"`
-	WinnerOfferID   pgtype.Text        `json:"winner_offer_id"`
-	WinnerExchange  pgtype.Text        `json:"winner_exchange"`
 	Rationale       []byte             `json:"rationale"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }

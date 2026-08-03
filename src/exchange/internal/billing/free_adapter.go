@@ -12,11 +12,21 @@ import (
 // approved; Record is a no-op. The Exchange's transaction log is the single
 // source of truth for what was issued and to whom — this adapter exists
 // solely to satisfy the Adapter interface contract so the hot path is
-// identical across paid and free tiers (see design-demo-bootstrap.md §5.1).
+// identical across paid and free tiers.
 type FreeAdapter struct{}
 
 // NewFreeAdapter returns a zero-state FreeAdapter.
 func NewFreeAdapter() FreeAdapter { return FreeAdapter{} }
+
+// EnsureAgentAccount is a no-op success: the free tier keeps no ledger, so
+// there is no account to create. The empty-ref guard still applies so the
+// interface contract is uniform across tiers.
+func (FreeAdapter) EnsureAgentAccount(_ context.Context, billingRef string) error {
+	if billingRef == "" {
+		return errEmptyBillingRef
+	}
+	return nil
+}
 
 // Authorize always approves and returns a fresh ULID BillingID.
 func (FreeAdapter) Authorize(_ context.Context, _ AuthorizeRequest) (AuthorizeResult, error) {

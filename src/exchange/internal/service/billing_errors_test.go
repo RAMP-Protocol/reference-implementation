@@ -28,7 +28,9 @@ func TestBillingErrorKind(t *testing.T) {
 		{"before_record", billing.ErrRefundBeforeRecord, exchange.KindFailedPrecondition, connect.CodeFailedPrecondition},
 		{"exceeds_record", billing.ErrRefundExceedsRecord, exchange.KindFailedPrecondition, connect.CodeFailedPrecondition},
 		{"invalid_amount", billing.ErrInvalidAmount, exchange.KindInvalidRequest, connect.CodeInvalidArgument},
+		{"not_representable", billing.ErrAmountNotRepresentable, exchange.KindInvalidRequest, connect.CodeInvalidArgument},
 		{"insufficient", billing.ErrInsufficientBalance, exchange.KindBillingDenied, connect.CodePermissionDenied},
+		{"backend_unavailable", billing.ErrBackendUnavailable, exchange.KindUnavailable, connect.CodeUnavailable},
 		{"wrapped_sentinel", fmt.Errorf("refund: %w", billing.ErrRefundUnsupported), exchange.KindUnimplemented, connect.CodeUnimplemented},
 		{"non_sentinel", errors.New("boom"), exchange.KindInternal, connect.CodeInternal},
 	}

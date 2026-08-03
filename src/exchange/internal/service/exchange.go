@@ -2,34 +2,47 @@ package service
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
-	"fmt"
-	"log/slog"
-	"sync"
 	"time"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/sor"
 )
 
 // ExchangeConfig bundles wiring knobs for the service.
 type ExchangeConfig struct {
-	Exchange       string        // canonical exchange domain (echoed in ResourceResponse)
-	OfferTTL       time.Duration // default 5m
-	URLTTL         time.Duration // default 5m
-	ReportWindow   time.Duration // default 24h
-	IdempotencyLRU int           // default 1024
+	Exchange     string        // canonical exchange domain (echoed in ResourceResponse)
+	OfferTTL     time.Duration // default 5m
+	URLTTL       time.Duration // default 5m
+	ReportWindow time.Duration // default 24h
+	// SupportedProfiles is the Exchange's advertised extension-profile set (the
+	// same list published in WellKnownManifest.supported_profiles). It gates which
+	// profiles DiscoverResources will project and is the set tx-reconstruction
+	// retries for signature parity (ADR-014).
+	SupportedProfiles []string
+	// DefaultTenantDomain names the single tenant a Register call reads its
+	// activate_new_agents_by_default policy from (ADR-021 §5 decision 1). The
+	// RegisterRequest carries no tenant field and billing_ref is per-Exchange, so
+	// v1 resolves one default tenant by domain at construction time rather than
+	// from the request. Populated in cmd/server from EXCHANGE_DEFAULT_TENANT
+	// (falling back to EXCHANGE_DOMAIN); handling per-publisher activation defaults
+	// is deferred past v1.
+	DefaultTenantDomain string
 }
 
 func (c ExchangeConfig) withDefaults() ExchangeConfig {
@@ -42,9 +55,6 @@ func (c ExchangeConfig) withDefaults() ExchangeConfig {
 	if c.ReportWindow == 0 {
 		c.ReportWindow = 24 * time.Hour
 	}
-	if c.IdempotencyLRU == 0 {
-		c.IdempotencyLRU = 1024
-	}
 	return c
 }
 
@@ -54,31 +64,34 @@ func (c ExchangeConfig) withDefaults() ExchangeConfig {
 type ExchangeService struct {
 	tx           db.TxRunner
 	catalog      *CatalogService
-	tenants      repo.TenantRepo
+	tenants      repo.TenantReadRepo
 	agents       repo.AgentRepo
 	agentReg     agentreg.Registry
 	transactions repo.TransactionRepo
 	obligations  repo.ObligationRepo
+	evidence     repo.EvidenceRepo
+	feeOverrides repo.FeeOverrideRepo
 	billing      billing.Adapter
 	offerSigner  *signing.Ed25519Signer
 	keyStore     signing.KeyStore
 	clk          clock.Clock
 	cfg          ExchangeConfig
-	logger       *slog.Logger
-
-	idemMu  sync.Mutex
-	idemHit map[string]string // tx_request_id -> transaction_id (LRU-bounded)
-	idemSeq []string
+	// sor is the System of Record the Register flow creates and reads agent
+	// accounts through (ADR-021), and the paid charge path reads the account's
+	// active flag from before reserving money (checkAccountActive). billingRefGen
+	// mints the candidate billing_ref the Exchange passes to the SoR (ADR-021 D2).
+	sor           sor.Adapter
+	billingRefGen BillingRefGen
 }
 
 // ExchangeDeps bundles the wiring dependencies.
 type ExchangeDeps struct {
 	// TxRunner opens transactions for multi-statement writes. Wiring passes
 	// db.PoolRunner{Pool: pool}; the service depends only on this narrow
-	// port (CLAUDE.md Rule 3 + Rule 7).
+	// port, and multi-statement writes run inside one transaction.
 	TxRunner db.TxRunner
 	Catalog  *CatalogService
-	Tenants  repo.TenantRepo
+	Tenants  repo.TenantReadRepo
 	Agents   repo.AgentRepo
 	// AgentReg drives ADR-009 D2 lazy registration: when resolveCaller meets
 	// a keyID with no ramp.agents row, the service pulls the caller's own
@@ -88,19 +101,41 @@ type ExchangeDeps struct {
 	AgentReg     agentreg.Registry
 	Transactions repo.TransactionRepo
 	Obligations  repo.ObligationRepo
+	// Evidence persists the append-once transaction_evidence row (full signed
+	// offer + both-party signatures + both verifying keys) inside the same
+	// ExecuteTransaction commit as the transaction_log + obligation writes.
+	// Required: every successful ExecuteTransaction writes one; a nil value would
+	// panic the hot path.
+	Evidence repo.EvidenceRepo
+	// FeeOverrides resolves the per-(tenant, resource_owner) commission override
+	// at Authorize. Required: every ExecuteTransaction resolves the effective fee
+	// rate so it can be frozen on the hold; a nil value would panic the hot path.
+	FeeOverrides repo.FeeOverrideRepo
 	Billing      billing.Adapter
 	OfferSigner  *signing.Ed25519Signer
 	KeyStore     signing.KeyStore
+	// SoR is the account System of Record the Register flow and the paid charge
+	// path's active-flag gate depend on (ADR-021 D2/D4). The boot path
+	// (cmd/server) threads the selected adapter here — in production wrapped in
+	// the 30-second read-through cache, which is what keeps the per-transaction
+	// active check off the SoR itself.
+	SoR sor.Adapter
+	// BillingRefGen mints the candidate billing_ref (ADR-021 D2). nil defaults to
+	// uuid.NewString in NewExchangeService; tests inject a deterministic
+	// generator.
+	BillingRefGen BillingRefGen
 	// Clk is the time source consulted by the offer-expiry, signed-URL
 	// expiry and reporting-grace deadlines. nil defaults to clock.System{};
 	// integration tests pass a DeterministicClock so the gates are driven
 	// without sleeping. See ADR-008 D1.
 	Clk clock.Clock
-	// Logger is the structured-logging sink. Every ExecuteTransaction /
-	// ReportUsage outcome (success or rejection) emits one log line via
-	// this logger with request_id + caller_keyid + outcome attributes
-	// (CLAUDE.md Rule 8). nil → slog.Default().
-	Logger *slog.Logger
+	// Every ExecuteTransaction / ReportUsage outcome (success or rejection)
+	// emits one log line through the REQUEST-SCOPED logger that
+	// RequestIDMiddleware binds onto the context (reqctx.IntoContext), so the
+	// line carries request_id + caller_keyid + outcome attributes. The
+	// service therefore takes no construction-time
+	// logger; logOutcome retrieves the logger via reqctx.FromContext(ctx),
+	// which falls back to slog.Default() when no middleware ran.
 	Config ExchangeConfig
 }
 
@@ -110,25 +145,27 @@ func NewExchangeService(d ExchangeDeps) *ExchangeService {
 	if clk == nil {
 		clk = clock.System{}
 	}
-	logger := d.Logger
-	if logger == nil {
-		logger = slog.Default()
+	gen := d.BillingRefGen
+	if gen == nil {
+		gen = uuid.NewString
 	}
 	return &ExchangeService{
-		tx:           d.TxRunner,
-		catalog:      d.Catalog,
-		tenants:      d.Tenants,
-		agents:       d.Agents,
-		agentReg:     d.AgentReg,
-		transactions: d.Transactions,
-		obligations:  d.Obligations,
-		billing:      d.Billing,
-		offerSigner:  d.OfferSigner,
-		keyStore:     d.KeyStore,
-		clk:          clk,
-		cfg:          d.Config.withDefaults(),
-		logger:       logger,
-		idemHit:      map[string]string{},
+		tx:            d.TxRunner,
+		catalog:       d.Catalog,
+		tenants:       d.Tenants,
+		agents:        d.Agents,
+		agentReg:      d.AgentReg,
+		transactions:  d.Transactions,
+		obligations:   d.Obligations,
+		evidence:      d.Evidence,
+		feeOverrides:  d.FeeOverrides,
+		billing:       d.Billing,
+		offerSigner:   d.OfferSigner,
+		keyStore:      d.KeyStore,
+		clk:           clk,
+		cfg:           d.Config.withDefaults(),
+		sor:           d.SoR,
+		billingRefGen: gen,
 	}
 }
 
@@ -137,8 +174,9 @@ func NewExchangeService(d ExchangeDeps) *ExchangeService {
 //   - catalog hit  → per-request offer in the OfferGroup
 //   - catalog miss → empty group, OFFER_ABSENCE_REASON_NOT_IN_CATALOG
 //
-// The canonical v1 path is batch-shaped: ResourceQuery.requester.uris is
-// always a list, and the response carries one OfferGroup per requested URI.
+// The canonical v1 path is batch-shaped: ResourceQuery.uris is always a list
+// (the requester is identity-only), and the response carries one OfferGroup
+// per requested URI.
 // The flat `offers` field mirrors the assembled per-request offers as a
 // convenience aggregate; per ramp.proto §ResourceResponse, callers are
 // expected to read OfferGroup.
@@ -153,16 +191,19 @@ func (s *ExchangeService) DiscoverResources(
 	if req.GetRequester().GetId() == "" {
 		return nil, exchange.Newf(exchange.KindInvalidRequest, "requester.id required")
 	}
-	uris := req.GetRequester().GetUris()
+	uris := req.GetUris()
 	if len(uris) == 0 {
 		return nil, exchange.Newf(exchange.KindInvalidRequest, "at least one uri required")
 	}
 	snap := s.catalog.Snapshot()
+	// Only project profiles the Exchange advertises (single source of truth =
+	// cfg.SupportedProfiles == WellKnownManifest.supported_profiles).
+	profiles := effectiveProfiles(req.GetSupportedProfiles(), s.cfg.SupportedProfiles)
 	flatOffers := make([]*rampv1.Offer, 0, len(uris))
 	groups := make([]*rampv1.OfferGroup, 0, len(uris))
 	for _, uri := range uris {
 		entry, verdict := snap.Lookup(uri)
-		group, groupOffers, err := s.groupFor(uri, entry, verdict)
+		group, groupOffers, err := s.groupFor(uri, entry, verdict, req.GetRequester(), profiles)
 		if err != nil {
 			return nil, err
 		}
@@ -171,7 +212,6 @@ func (s *ExchangeService) DiscoverResources(
 	}
 	resp := &rampv1.ResourceResponse{
 		Ver:         rampproto.Ver,
-		Id:          req.GetId(),
 		Exchange:    s.cfg.Exchange,
 		Offers:      flatOffers,
 		OfferGroups: groups,
@@ -182,109 +222,35 @@ func (s *ExchangeService) DiscoverResources(
 	return resp, nil
 }
 
-// ExecuteTransaction verifies the caller's identity, the offer, and the
-// billing authorization, then writes the transaction log in a single
-// transaction and returns the signed URL. Write-before-sign is enforced: the
-// signed URL hash lands in the DB in the same transaction as all other
-// transaction fields, and the URL is only returned after commit.
+// ExecuteTransaction verifies the caller's identity, each item's offer and
+// billing authorization, then writes one transaction_log row per item and
+// returns the signed URLs. There is exactly ONE pipeline — the items[] batch
+// loop (executeBatch); N=1 is just a one-element batch. Write-before-sign is
+// enforced per item: each signed-URL hash lands in the DB in the same
+// transaction as the rest of that item's fields, and the URL is only returned
+// after commit. Per-item business denials stay in-body (HTTP 200,
+// TransactionResultItem.denial_reason); an envelope/internal failure aborts the
+// whole batch with the corresponding connect.Code.
 func (s *ExchangeService) ExecuteTransaction(
 	ctx context.Context,
 	req *rampv1.TransactionRequest,
 ) (*rampv1.TransactionResponse, error) {
-	if err := s.validateTxRequest(req); err != nil {
-		return nil, err
-	}
-	if rec, found := s.idempotencyHit(req.GetId()); found {
-		return nil, exchange.Newf(exchange.KindIdempotent, "tx_request_id already processed: %s", rec)
-	}
-	resolved, err := s.resolveOfferForTx(req)
-	if err != nil {
-		return nil, err
-	}
-	tenant, err := s.tenants.ByID(ctx, resolved.entry.TenantID)
-	if err != nil {
-		return nil, exchange.Wrap(exchange.KindInternal, err, "load tenant")
-	}
-	// Resolve caller (single-sig or multisig), authorize, and compute the agent
-	// binding. resolveCallerAndBinding runs the authz gate internally and binds
-	// the delivery URL to the proven caller key (its RFC 7638 thumbprint is the
-	// URL's agent_id param, echoed on the response — ADR-013). Binding is
-	// computed before billing so a (near-impossible) bad-key failure reserves
-	// no funds.
-	//
-	// Runs BEFORE resolveAgentID: a self-acting caller whose keyID is not yet in
-	// ramp.agents is lazy-registered here (ADR-009 D2), populating the row that
-	// resolveAgentID then attributes the transaction to. Authz compares the
-	// proven caller against the wire requester.id; resolveAgentID returns that
-	// same id once validated, so passing it in directly is equivalent. (A broker
-	// relaying for an unregistered agent still fails resolveAgentID with
-	// NotFound — only the authenticated caller's own keyID lazy-registers.)
-	caller, binding, err := s.resolveCallerAndBinding(ctx, req.GetRequester().GetId(), tenant)
-	if err != nil {
-		return nil, err
-	}
-	agentID, err := s.resolveAgentID(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	// Deny agents holding an overdue reporting obligation before any funds are
-	// reserved (v1.1 enforce-reporting-overdue gate): runs after authorization
-	// so an unauthorized caller is rejected first, and before resolveBilling so
-	// a blocked agent reserves no funds.
-	if oerr := s.denyIfReportingOverdue(ctx, caller, &tenant, agentID); oerr != nil {
-		return nil, oerr
-	}
-	// idempotencyKey anchors the whole billing lifecycle for this transaction:
-	// Authorize/Record/Release share it so a retry of ExecuteTransaction reuses
-	// the chain. A Release frees the key adapter-side, so a retry after a
-	// hot-path failure re-authorizes fresh and charges (no stale-hold leak).
-	idempotencyKey := req.GetId()
-	auth, err := s.resolveBilling(ctx, billingResolution{
-		tenantID: tenant.ID, agentID: agentID, pricing: resolved.pricing, idempotencyKey: idempotencyKey,
-	})
-	if err != nil {
-		return nil, err
-	}
-	signed, err := s.mintSignedURL(ctx, tenant, resolved.entry, binding.thumbprint)
-	if err != nil {
-		s.releaseHold(ctx, auth.BillingID, idempotencyKey, "url sign failed")
-		return nil, err
-	}
-	rec, err := s.persistTransaction(ctx, persistInput{
-		tenant: tenant, entry: resolved.entry, pricing: resolved.pricing,
-		req: req, agentID: agentID, auth: auth, signed: signed, agentHash: binding.digest,
-	})
-	if err != nil {
-		s.releaseHold(ctx, auth.BillingID, idempotencyKey, "persist failed")
-		return nil, err
-	}
-	// DOUBLE-CHARGE INVARIANT: Record MUST run after persistTransaction. The
-	// in-memory idempotency LRU (idempotencyHit) is bounded and may evict; the
-	// durable backstop against a re-charged retry is the tx_request_id UNIQUE
-	// constraint (db/migrations 000001), which fails the persist INSERT before
-	// Record is ever reached. Reordering Record ahead of persist would charge a
-	// duplicate tx_request_id before the UNIQUE violation can block it.
-	//
-	// Record at Execute, best-effort, with the estimated quantity. Failure is
-	// logged and the transaction stays committed — the agent already has the
-	// signed URL and the transaction_log row is durable. Reconciliation /
-	// adapter-side idempotency cover the gap (design-exchange.md:555-569).
-	//
-	// PERSISTED-ADAPTER MIGRATION: the in-memory adapter's Record cannot
-	// fail with a live hold (its only error is ErrUnknownBillingID = no hold), so
-	// no hold leaks today. A persisted adapter (TigerBeetle) whose Record can
-	// transiently fail WITH the hold still live leaves that hold neither recorded
-	// nor released, and best-effort means it is never retried — the reconciliation
-	// job owns recovering these orphaned holds.
-	if rErr := s.billing.Record(ctx, auth.BillingID, int64(resolved.pricing.EstQty), idempotencyKey); rErr != nil {
-		s.logger.ErrorContext(ctx, "exchange.execute_transaction billing record failed (best-effort)",
-			"transaction_id", rec.TransactionID,
-			"billing_id", auth.BillingID,
-			"err", rErr.Error())
-	}
-	s.idempotencyRecord(req.GetId(), rec.TransactionID)
-	s.logOutcome(ctx, "execute_transaction", "VALIDATED", caller, &tenant, agentID, rec.TransactionID, nil)
-	return s.buildTxResponse(req, rec, signed, resolved.pricing, binding.thumbprint), nil
+	return s.executeBatch(ctx, req)
+}
+
+// logBillingRecordFailed emits the best-effort billing-Record-failure line
+// through the request-scoped logger so it carries request_id, same
+// rationale as logOutcome. The message is the short,
+// low-cardinality event name; the specific condition lives in the "event" attr
+// so this line shares logOutcome's greppable style instead of embedding the
+// condition in a free-text message. Shared by every batch item's
+// billing path.
+func (s *ExchangeService) logBillingRecordFailed(ctx context.Context, txID, billingID string, rErr error) {
+	reqctx.FromContext(ctx).ErrorContext(ctx, "exchange.execute_transaction",
+		"event", "billing_record_failed_best_effort",
+		"transaction_id", txID,
+		"billing_id", billingID,
+		"err", rErr.Error())
 }
 
 // releaseHold returns a previously-held reservation on the ExecuteTransaction
@@ -292,11 +258,21 @@ func (s *ExchangeService) ExecuteTransaction(
 // returning an error to the agent; Release's own failure cannot fail the
 // request again. ErrUnknownBillingID is treated as a successful no-op
 // (idempotent — Release was already called or the reservation was already
-// consumed by Record).
+// consumed by Record). An empty billingID means no reservation was ever taken
+// (the price-zero free path, ADR-009 D2), so there is nothing to release.
 func (s *ExchangeService) releaseHold(ctx context.Context, billingID, idempotencyKey, reason string) {
+	if hasNoReservation(billingID) {
+		return
+	}
 	err := s.billing.Release(ctx, billingID, idempotencyKey)
 	if err != nil && !errors.Is(err, billing.ErrUnknownBillingID) {
-		s.logger.ErrorContext(ctx, "exchange.execute_transaction release hold failed",
+		// Through the request-scoped logger so the line carries request_id
+		// for correlation, same rationale as logOutcome. The message
+		// is the short, low-cardinality event name; the specific condition lives
+		// in the "event" attr so this line shares logOutcome's greppable style
+		// instead of embedding the condition in a free-text message.
+		reqctx.FromContext(ctx).ErrorContext(ctx, "exchange.execute_transaction",
+			"event", "release_hold_failed",
 			"billing_id", billingID,
 			"reason", reason,
 			"err", err.Error())
@@ -305,179 +281,100 @@ func (s *ExchangeService) releaseHold(ctx context.Context, billingID, idempotenc
 
 // resolvedOffer carries the outcome of matching the caller's offer_id to a
 // catalog entry, with pricing rebuilt to reflect the selected variant.
+// offerCanonicalBytes is what verifyPresentedOffer checked the Exchange signature
+// over, carried from there so the evidence row stores the verified bytes rather
+// than a second derivation of them.
 type resolvedOffer struct {
-	entry   repo.CatalogEntry
-	pricing PricingDoc
+	entry               repo.CatalogEntry
+	pricing             PricingDoc
+	offerCanonicalBytes []byte
 }
 
-// resolveOfferForTx maps req.offer_id to a catalog entry and verifies the
-// caller's offer signature against the reconstructed offer.
+// resolveOfferForTx verifies the PRESENTED reflected Offer statelessly, then
+// maps its SIGNED offer_id to a catalog entry for delivery/resource binding and
+// derives the charge from the SIGNED offer's pricing.
+//
+// Trust model:
+//   - The SIGNED offer.offer_id is the only offer identity. The catalog lookup
+//     keys on it. There is no unsigned top-level correlation scalar to reconcile
+//     against — offer identity lives inside the signed Offer, so a genuine offer
+//     for resource A cannot be redeemed against B.
+//   - Verification is over the PRESENTED bytes via verifyPresentedOffer (signature
+//   - expiry), never a reconstruct-from-catalog. A post-discovery tamper of any
+//     covered field breaks the signature.
+//   - Billing reads the VERIFIED offer's signed pricing (the agent pays exactly
+//     what it signed; catalog price drift between discover and execute is the
+//     publisher's problem). The catalog entry is used only for delivery/resource
+//     binding (entry.URI → SignURL, tenant, tx_log keys).
 func (s *ExchangeService) resolveOfferForTx(req *rampv1.TransactionRequest) (resolvedOffer, error) {
-	offerID := req.GetOfferId()
-	snap := s.catalog.Snapshot()
-	entry, ok := snap.byID[offerID]
-	if !ok {
-		return resolvedOffer{}, exchange.Newf(exchange.KindNotFound, "offer %q not found in catalog", offerID)
-	}
-	var pricing PricingDoc
-	if err := json.Unmarshal(entry.PricingJSON, &pricing); err != nil {
-		return resolvedOffer{}, exchange.Wrap(exchange.KindInternal, err, "unmarshal pricing")
-	}
-	if err := s.verifyOffer(entry, req.GetOfferSignature()); err != nil {
+	// Items-only: the offer is presented in items[0] (executeBatchItem
+	// re-projects each item onto a 1-item synthetic request). The signed offer_id
+	// is the only authority for catalog binding — there is no separate top-level
+	// offer to cross-check.
+	presented := req.GetItems()[0].GetOffer()
+	signedOfferID := presented.GetOfferId()
+	// Verify the presented offer (signature over presented bytes + signed expiry)
+	// BEFORE trusting any of its fields for binding or billing. The canonical
+	// bytes it checked ride along to persistence.
+	canonical, err := s.verifyPresentedOffer(presented)
+	if err != nil {
 		return resolvedOffer{}, err
 	}
-	return resolvedOffer{entry: entry, pricing: pricing}, nil
-}
-
-type persistInput struct {
-	tenant  repo.Tenant
-	entry   repo.CatalogEntry
-	pricing PricingDoc
-	req     *rampv1.TransactionRequest
-	agentID string
-	auth    billing.AuthorizeResult
-	signed  signing.SignedURL
-	// agentHash is the 32-byte SHA-256 digest of the agent's RFC 7638
-	// thumbprint, persisted to transaction_log.agent_identity_hash (ADR-013
-	// 17.6). Same value whose base64url form rides in the URL's agent_id param.
-	agentHash []byte
-}
-
-func (s *ExchangeService) persistTransaction(ctx context.Context, in persistInput) (repo.TransactionRecord, error) {
-	intent := s.buildPersistIntent(in)
-	var rec repo.TransactionRecord
-	err := s.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		created, err := s.transactions.CreateForOffer(ctx, tx, intent)
-		if err != nil {
-			return err
-		}
-		rec = created
-		_, err = s.obligations.CreateForOffer(ctx, tx, intent)
-		return err
-	})
+	snap := s.catalog.Snapshot()
+	entry, ok := snap.byID[signedOfferID]
+	if !ok {
+		return resolvedOffer{}, exchange.Newf(exchange.KindNotFound, "offer %q not found in catalog", signedOfferID)
+	}
+	// Charge the SIGNED offer's pricing — the price the agent verifiably accepted.
+	// Not a recompute from the live catalog (which may have drifted since
+	// discovery): the signature authenticates this exact price (MEDIUM1).
+	pricing, err := pricingDocFromPricing(presented.GetPricing())
 	if err != nil {
-		return repo.TransactionRecord{}, exchange.Wrap(exchange.KindInternal, err, "write transaction")
+		return resolvedOffer{}, exchange.Wrap(exchange.KindInvalidRequest, err, "parse signed offer pricing")
 	}
-	return rec, nil
+	return resolvedOffer{entry: entry, pricing: pricing, offerCanonicalBytes: canonical}, nil
 }
 
-// buildPersistIntent assembles the PersistTxIntent the repos consume. All
-// derived values (IDs, agent-identity hash, reporting-policy defaults,
-// obligation window/deadline) are computed here so persistTransaction
-// reduces to "build intent, run tx, call both repos".
-func (s *ExchangeService) buildPersistIntent(in persistInput) repo.PersistTxIntent {
-	policy := decodeReportingPolicy(in.tenant.ReportingPolicy)
-	tolerance := defaultQuantityTolerance
-	if policy.QuantityTolerance != nil {
-		tolerance = *policy.QuantityTolerance
-	}
-	windowSeconds := windowSecondsForObligation(policy, s.cfg.ReportWindow)
-	// Normalize required_fields to a non-nil slice so the NOT NULL TEXT[]
-	// column receives an empty array rather than NULL when the tenant
-	// policy did not pin any fields. sqlc passes the Go slice straight
-	// through, so a nil here would violate the column constraint.
-	requiredFields := policy.RequiredFields
-	if requiredFields == nil {
-		requiredFields = []string{}
-	}
-	return repo.PersistTxIntent{
-		TransactionID:     uuid.NewString(),
-		TxRequestID:       in.req.GetId(),
-		ObligationID:      uuid.NewString(),
-		TenantID:          in.tenant.ID,
-		AgentID:           in.agentID,
-		ResourceID:        in.entry.ResourceID,
-		OfferID:           in.entry.ResourceID,
-		AgentIdentityHash: in.agentHash,
-		SignedURLHash:     in.signed.Hash,
-		Expiry:            in.signed.Expiry,
-		BillingID:         in.auth.BillingID,
-		UnitCostDecimal:   fmt.Sprintf("%.8f", in.pricing.UnitCost),
-		Currency:          in.pricing.Currency,
-		State:             repo.ObligationStatePending,
-		WindowSeconds:     windowSeconds,
-		Deadline:          s.clk.Now().Add(time.Duration(windowSeconds) * time.Second),
-		RequiredFields:    requiredFields,
-		EstimatedQuantity: int64(in.pricing.EstQty),
-		QuantityTolerance: tolerance,
-	}
+// agentBinding carries the requesting agent's delivery-URL identity binding:
+// the RFC 7638 thumbprint of the proven caller key in both the base64url-no-pad
+// wire form (URL agent_id param + TransactionResponse.agent_identity_hash) and
+// the raw 32-byte digest persisted to transaction_log (ADR-013 D4/17.6/17.8).
+// pub is the raw key the thumbprint was derived from, retained so the success
+// path can persist it to transaction_evidence.agent_public_key for offline
+// acceptance re-verification (the digest is one-way and cannot recover it), and
+// discoveryURL is the anchored directory that key was pinned from, persisted
+// alongside it as the provenance the registry itself does not keep.
+// acceptanceBytes is the canonical payload the acceptance signature was verified
+// over, carried from the verify site for the same reason resolvedOffer carries
+// the offer's: the evidence row must store the bytes that were checked, not a
+// later re-derivation from a separately assembled argument list.
+type agentBinding struct {
+	thumbprint      string
+	digest          []byte
+	pub             ed25519.PublicKey
+	discoveryURL    string
+	acceptanceBytes []byte
 }
 
-// reportingPolicy is the JSON shape the tenant's reporting_policy column
-// carries. All fields optional; missing keys fall back to defaults.
-type reportingPolicy struct {
-	RequiredFields    []string `json:"required_fields,omitempty"`
-	QuantityTolerance *float64 `json:"quantity_tolerance,omitempty"`
-	// WindowSeconds, when set, overrides cfg.ReportWindow for new obligations
-	// minted against this tenant. The §B independent finding called for
-	// sourcing the window from the offer's ReportingObligation.window, but
-	// the wire TransactionRequest carries no reporting block — so the
-	// tenant-policy JSONB is the substitute granularity that does not
-	// require a protocol bump.
-	WindowSeconds *int32 `json:"window_seconds,omitempty"`
-}
-
-// decodeReportingPolicy unmarshals the raw JSONB blob. A blank / missing /
-// malformed policy yields a zero-value struct (no required fields, tolerance
-// falls back to the service default) — we deliberately do not surface decode
-// errors to the request path because the column has a `{}` DEFAULT and any
-// older row that survives is safe to treat as "no policy".
-func decodeReportingPolicy(raw []byte) reportingPolicy {
-	var p reportingPolicy
-	if len(raw) == 0 {
-		return p
-	}
-	_ = json.Unmarshal(raw, &p)
-	return p
-}
-
-// windowSecondsForObligation returns the obligation's reporting window:
-// tenants.reporting_policy.window_seconds when set (so publishers can shorten
-// or extend the protocol default per tenant), otherwise the service default
-// from cfg.ReportWindow. Encoded as int32 seconds on the obligation row.
-func windowSecondsForObligation(policy reportingPolicy, fallback time.Duration) int32 {
-	if policy.WindowSeconds != nil && *policy.WindowSeconds > 0 {
-		return *policy.WindowSeconds
-	}
-	return int32(fallback.Seconds())
-}
-
-// logOutcome emits one structured log line per ExecuteTransaction or
-// ReportUsage attempt — CLAUDE.md Rule 8. tenant may be nil (e.g. for
-// failures that happen before tenant resolution). err is the
-// outcome-classifying error; nil on success.
-func (s *ExchangeService) logOutcome(
-	ctx context.Context, op, outcome string,
-	caller Caller, tenant *repo.Tenant,
-	agentID, transactionID string,
-	err *exchange.Error,
-) {
-	attrs := []any{
-		"op", op,
-		"outcome", outcome,
-		"caller_keyid", caller.KeyID,
-		"caller_kind", callerKindLabel(caller.Kind),
-		"agent_id", agentID,
-		"transaction_id", transactionID,
-	}
-	if tenant != nil {
-		attrs = append(attrs, "tenant_id", tenant.ID)
-	}
+// agentBindingForKey computes the RFC 7638 thumbprint binding from a raw
+// Ed25519 public key, the directory it was pinned from, and the canonical
+// acceptance payload that key was just verified against. R4 binds the delivery
+// URL to the agent key proven by the BODY offer-acceptance signature (never the
+// transport caller / broker key), so the binding source is a bare key, not a
+// Caller. acceptanceBytes is taken as a parameter rather than filled in
+// afterwards so a binding is never half-built: every field describes the same
+// verification, or the value does not exist.
+func agentBindingForKey(pub ed25519.PublicKey, discoveryURL string, acceptanceBytes []byte) (agentBinding, error) {
+	sum, err := helpers.ThumbprintBytes(pub)
 	if err != nil {
-		attrs = append(attrs, "kind", err.Kind.String(), "err", err.Message)
-		s.logger.WarnContext(ctx, "exchange."+op, attrs...)
-		return
+		return agentBinding{}, exchange.Wrap(exchange.KindInternal, err, "compute agent thumbprint")
 	}
-	s.logger.InfoContext(ctx, "exchange."+op, attrs...)
-}
-
-func callerKindLabel(k CallerKind) string {
-	switch k {
-	case CallerAgent:
-		return "agent"
-	case CallerBroker:
-		return "broker"
-	default:
-		return "unknown"
-	}
+	digest := sum[:]
+	return agentBinding{
+		thumbprint:      base64.RawURLEncoding.EncodeToString(digest),
+		digest:          digest,
+		pub:             pub,
+		discoveryURL:    discoveryURL,
+		acceptanceBytes: acceptanceBytes,
+	}, nil
 }

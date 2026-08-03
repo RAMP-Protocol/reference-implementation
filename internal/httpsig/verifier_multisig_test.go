@@ -1,10 +1,12 @@
 package httpsig
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"io"
 	"net/http"
 	"testing"
 	"time"
@@ -18,9 +20,9 @@ import (
 // and chain-link emission (sig2 covers "signature";key="sig1") rather than a
 // hand-rolled twin that could drift from production. Content-Digest is preserved
 // from sig1, so a nil body is fine here.
-func addMultisigSignature(t *testing.T, req *http.Request, keyID string, priv ed25519.PrivateKey, created, expires int64) {
+func addMultisigSignature(t *testing.T, req *http.Request, keyID string, priv ed25519.PrivateKey, expires int64) {
 	t.Helper()
-	if err := AppendSignatureRAMP(req, nil, keyID, priv, created, expires); err != nil {
+	if err := AppendSignatureRAMP(req, nil, keyID, priv, expires); err != nil {
 		t.Fatalf("append signature: %v", err)
 	}
 }
@@ -34,10 +36,10 @@ func TestVerifyMultisigRequest_BothValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen2: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"query":"foo"}`)
 	req := newRAMPSignedRequest(t, body, priv1, now)
-	addMultisigSignature(t, req, "agent-demo.v2", priv2, now.Unix(), now.Add(30*time.Second).Unix())
+	addMultisigSignature(t, req, "agent-demo.v2", priv2, now.Add(30*time.Second).Unix())
 
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
 		testKeyID:       pub1,
@@ -71,10 +73,10 @@ func TestVerifyMultisigRequest_FirstInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen2: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"query":"bar"}`)
 	req := newRAMPSignedRequest(t, body, priv1Wrong, now)
-	addMultisigSignature(t, req, "agent-demo.v2", priv2, now.Unix(), now.Add(30*time.Second).Unix())
+	addMultisigSignature(t, req, "agent-demo.v2", priv2, now.Add(30*time.Second).Unix())
 
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
 		testKeyID:       pub1,
@@ -99,10 +101,10 @@ func TestVerifyMultisigRequest_SecondInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen2 wrong: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"query":"baz"}`)
 	req := newRAMPSignedRequest(t, body, priv1, now)
-	addMultisigSignature(t, req, "agent-demo.v2", priv2Wrong, now.Unix(), now.Add(30*time.Second).Unix())
+	addMultisigSignature(t, req, "agent-demo.v2", priv2Wrong, now.Add(30*time.Second).Unix())
 
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
 		testKeyID:       pub1,
@@ -118,7 +120,7 @@ func TestVerifyMultisigRequest_SecondInvalid(t *testing.T) {
 // appended-label (sig2) path: a valid sig1 with an EXPIRED sig2 must fail with
 // ErrExpired. The single-sig path covers the window in verifier_test.go, but the
 // multisig path enforces it independently per label inside verifySingleSignature
-// (TQ-04) — this asserts an expired co-signature cannot ride through on a valid
+// — this asserts an expired co-signature cannot ride through on a valid
 // primary signature.
 func TestVerifyMultisigRequest_SecondExpired(t *testing.T) {
 	pub1, priv1, err := ed25519.GenerateKey(rand.Reader)
@@ -129,11 +131,11 @@ func TestVerifyMultisigRequest_SecondExpired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen2: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"query":"expired-sig2"}`)
 	req := newRAMPSignedRequest(t, body, priv1, now)
 	// sig2 expired one second before the verifier's clock; sig1 still valid.
-	addMultisigSignature(t, req, "agent-demo.v2", priv2, now.Add(-120*time.Second).Unix(), now.Add(-time.Second).Unix())
+	addMultisigSignature(t, req, "agent-demo.v2", priv2, now.Add(-time.Second).Unix())
 
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
 		testKeyID:       pub1,
@@ -165,7 +167,7 @@ func TestVerifyMultisigRequest_SignatureIsPerLabelReplayStable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen2b: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"query":"foo"}`)
 	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
 		testKeyID:        pub1,
@@ -174,9 +176,17 @@ func TestVerifyMultisigRequest_SignatureIsPerLabelReplayStable(t *testing.T) {
 	})
 	opts := VerifyRequestOptions{Clk: clock.NewDeterministic(now)}
 
+	// Sign the agent's sig1 ONCE, then clone for each leg so both requests carry a
+	// byte-identical sig1 by construction. yaronf stamps created = time.Now() per
+	// sign call, so re-signing sig1 via a second newRAMPSignedRequest would desync
+	// the bytes across a wall-clock second boundary and fail the cross-request
+	// equality assertion below spuriously.
+	base := newRAMPSignedRequest(t, body, priv1, now)
+
 	// Request A: agent sig1 + broker relay-a sig2.
-	reqA := newRAMPSignedRequest(t, body, priv1, now)
-	addMultisigSignature(t, reqA, "broker.relay.a", priv2a, now.Unix(), now.Add(30*time.Second).Unix())
+	reqA := base.Clone(base.Context())
+	reqA.Body = io.NopCloser(bytes.NewReader(body))
+	addMultisigSignature(t, reqA, "broker.relay.a", priv2a, now.Add(30*time.Second).Unix())
 	verifiedA, err := VerifyMultisigRequest(reqA, resolver, opts)
 	if err != nil {
 		t.Fatalf("verify A: %v", err)
@@ -189,19 +199,20 @@ func TestVerifyMultisigRequest_SignatureIsPerLabelReplayStable(t *testing.T) {
 			verifiedA[0].Signature)
 	}
 	// And each Signature is exactly the base64 of that label's own signature bytes.
-	sig1Bytes, err := parseSignatureField(reqA.Header.Get("Signature"), "sig1")
+	_, sigMapA, err := parseAllSignatures(reqA.Header)
 	if err != nil {
 		t.Fatalf("parse sig1: %v", err)
 	}
-	wantSig1 := base64.StdEncoding.EncodeToString(sig1Bytes)
+	wantSig1 := base64.StdEncoding.EncodeToString(sigMapA["sig1"])
 	if verifiedA[0].Signature != wantSig1 {
 		t.Fatalf("sig1 Signature = %q, want per-label %q", verifiedA[0].Signature, wantSig1)
 	}
 
-	// Request B: the SAME agent sig1 (same key, body, params → deterministic
-	// ed25519), re-wrapped under a DIFFERENT broker sig2.
-	reqB := newRAMPSignedRequest(t, body, priv1, now)
-	addMultisigSignature(t, reqB, "broker.relay.b", priv2b, now.Unix(), now.Add(60*time.Second).Unix())
+	// Request B: the SAME agent sig1 (byte-identical via clone of base),
+	// re-wrapped under a DIFFERENT broker sig2.
+	reqB := base.Clone(base.Context())
+	reqB.Body = io.NopCloser(bytes.NewReader(body))
+	addMultisigSignature(t, reqB, "broker.relay.b", priv2b, now.Add(60*time.Second).Unix())
 	verifiedB, err := VerifyMultisigRequest(reqB, resolver, opts)
 	if err != nil {
 		t.Fatalf("verify B: %v", err)
@@ -220,7 +231,7 @@ func TestVerifyMultisigRequest_SingleSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	now := time.Unix(1700000000, 0)
+	now := signNow()
 	body := []byte(`{"query":"single"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 

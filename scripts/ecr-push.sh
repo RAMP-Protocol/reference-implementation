@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build + push exchange, broker, mcp images to ECR for the AWS demo deploy.
+# Build + push exchange, broker, identity images to ECR for the AWS demo deploy.
 #
 # Usage:
 #   scripts/ecr-push.sh [--tag=<tag>]
@@ -50,10 +50,13 @@ push_image() {
 cd "${REPO_ROOT}"
 push_image exchange src/exchange/Dockerfile .
 push_image broker   src/broker/Dockerfile   .
-push_image mcp      src/mcp/Dockerfile      src/mcp
+# The identity service replaced the retired MCP shim as the agent-facing surface
+# (it now hosts /mcp). Its Dockerfile builds from the repo root — it COPYs the
+# root go.mod plus internal/ and src/identity/ — so the context is "." not a subdir.
+push_image identity src/identity/Dockerfile .
 
 cat <<EOS
 done via profile '${AWS_PROFILE}'. roll the ECS services to pick up the new images:
   make aws-roll-services   # or:
-  aws --profile ${AWS_PROFILE} ecs update-service --cluster ramp-demo --service ramp-demo-{exchange,broker,mcp} --force-new-deployment
+  aws --profile ${AWS_PROFILE} ecs update-service --cluster ramp-demo --service ramp-demo-{exchange,broker,identity} --force-new-deployment
 EOS

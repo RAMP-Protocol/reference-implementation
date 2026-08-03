@@ -1,7 +1,10 @@
-// Package server builds and serves a RAMP /.well-known/ramp.json document for
-// a single participant role. Every in-repo producer (exchange, broker, edge,
-// mcp shim) assembles its manifest through Build/Handler so the wire shape,
-// enum encoding, and schema conformance are identical across roles.
+// Package server builds and serves the two RAMP discovery documents for a
+// single participant role: the commercial overlay manifest at
+// /.well-known/ramp.json and the pure Web Bot Auth directory (WBAFile) at
+// /.well-known/http-message-signatures-directory. Every in-repo producer
+// (exchange, broker, edge, mcp shim) assembles both through Build/BuildWBA and
+// serves them through Handler so the wire shape, enum encoding, and schema
+// conformance are identical across roles.
 package server
 
 import (
@@ -16,10 +19,9 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 )
 
-// KeySource yields the JWKs to publish in public_keys, in document order. A
-// producer that rotates keys returns the live set on each call; Handler.Rebuild
-// re-reads it. Roles that publish no keys (e.g. a publisher declaring only
-// authorized exchanges) may supply a nil KeySource.
+// KeySource yields the JWKs to publish in the WBA directory, in document order.
+// A producer that rotates keys returns the live set on each call; Handler.Rebuild
+// re-reads it. A WBA directory always publishes at least one key.
 type KeySource interface {
 	Keys() []*rampwellknown.Key
 }
@@ -32,15 +34,14 @@ func (s staticKeys) Keys() []*rampwellknown.Key { return s.keys }
 // common case for a producer whose keys are injected at construction.
 func StaticKeys(keys ...*rampwellknown.Key) KeySource { return staticKeys{keys: keys} }
 
-// Config describes a manifest to build. Role/Domain are always required;
-// remaining fields are populated per role (exchanges/catalog_contributors for
-// publishers, capability fields for exchanges, keys for agents/brokers/exchanges).
+// Config describes a commercial overlay manifest to build. Role/Domain are
+// always required; remaining fields are populated per role
+// (exchanges/catalog_contributors for publishers, capability fields for
+// exchanges). Identity keys are NOT part of the overlay — see WBAConfig.
 type Config struct {
-	Role            rampwellknown.Role
-	Domain          string
-	Contact         string
-	InvalidationURL string
-	Keys            KeySource
+	Role    rampwellknown.Role
+	Domain  string
+	Contact string
 
 	// Publisher-only.
 	Exchanges           []*rampv1.AuthorizedExchange
@@ -57,7 +58,15 @@ type Config struct {
 	MaxIntermediaryHops *int32
 }
 
-// Build assembles, marshals, and schema-validates the manifest for cfg,
+// WBAConfig describes a WBA directory to build. Keys is required (a directory
+// publishes at least one key); RevocationURL is the optional directory-level
+// emergency revocation channel advertised to peers.
+type WBAConfig struct {
+	Keys          KeySource
+	RevocationURL string
+}
+
+// Build assembles, marshals, and schema-validates the overlay manifest for cfg,
 // returning the protojson bytes (snake_case fields, full enum names). A
 // validation failure is a producer-side configuration error.
 func Build(cfg Config) ([]byte, error) {
@@ -75,6 +84,27 @@ func Build(cfg Config) ([]byte, error) {
 	return raw, nil
 }
 
+// BuildWBA assembles, marshals, and schema-validates the WBA directory for cfg,
+// returning the protojson bytes. A validation failure (e.g. no keys) is a
+// producer-side configuration error.
+func BuildWBA(cfg WBAConfig) ([]byte, error) {
+	f := &rampwellknown.WBAFile{}
+	if cfg.Keys != nil {
+		f.Keys = cfg.Keys.Keys()
+	}
+	if cfg.RevocationURL != "" {
+		f.RevocationUrl = proto.String(cfg.RevocationURL)
+	}
+	raw, err := (protojson.MarshalOptions{UseProtoNames: true}).Marshal(f)
+	if err != nil {
+		return nil, fmt.Errorf("rampwellknown/server: marshal wba: %w", err)
+	}
+	if err := rampwellknown.ValidateWBA(raw); err != nil {
+		return nil, fmt.Errorf("rampwellknown/server: built wba directory invalid: %w", err)
+	}
+	return raw, nil
+}
+
 func assemble(cfg Config) (*rampwellknown.Manifest, error) {
 	if cfg.Domain == "" {
 		return nil, fmt.Errorf("rampwellknown/server: domain required")
@@ -87,9 +117,6 @@ func assemble(cfg Config) (*rampwellknown.Manifest, error) {
 		Role:   cfg.Role,
 		Domain: cfg.Domain,
 	}
-	if cfg.Keys != nil {
-		m.PublicKeys = cfg.Keys.Keys()
-	}
 	setOptional(m, cfg)
 	return m, nil
 }
@@ -99,9 +126,6 @@ func assemble(cfg Config) (*rampwellknown.Manifest, error) {
 func setOptional(m *rampwellknown.Manifest, cfg Config) {
 	if cfg.Contact != "" {
 		m.Contact = proto.String(cfg.Contact)
-	}
-	if cfg.InvalidationURL != "" {
-		m.InvalidationUrl = proto.String(cfg.InvalidationURL)
 	}
 	m.Exchanges = cfg.Exchanges
 	m.CatalogContributors = cfg.CatalogContributors
@@ -127,26 +151,43 @@ func setOptional(m *rampwellknown.Manifest, cfg Config) {
 	m.MaxIntermediaryHops = cfg.MaxIntermediaryHops
 }
 
-// Handler serves the manifest at GET /.well-known/ramp.json. Serialized bytes
-// are cached in an atomic.Pointer so ServeHTTP is lock-free; Rebuild swaps in a
-// freshly marshaled document (e.g. after key rotation).
+// Handler serves one built discovery document (overlay manifest or WBA
+// directory) at its canonical path. Serialized bytes are cached in an
+// atomic.Pointer so ServeHTTP is lock-free; Rebuild swaps in a freshly
+// marshaled document (e.g. after key rotation).
 type Handler struct {
-	cfg   Config
-	bytes atomic.Pointer[[]byte]
+	build       func() ([]byte, error)
+	contentType string
+	path        string
+	bytes       atomic.Pointer[[]byte]
 }
 
-// NewHandler builds the initial manifest and returns a ready Handler.
+// NewHandler builds the initial overlay manifest and returns a ready Handler
+// that serves it at /.well-known/ramp.json.
 func NewHandler(cfg Config) (*Handler, error) {
-	h := &Handler{cfg: cfg}
+	return newHandler(func() ([]byte, error) { return Build(cfg) },
+		"application/json", rampwellknown.Path)
+}
+
+// NewWBAHandler builds the initial WBA directory and returns a ready Handler
+// that serves it at /.well-known/http-message-signatures-directory with the
+// JWK-Set content type.
+func NewWBAHandler(cfg WBAConfig) (*Handler, error) {
+	return newHandler(func() ([]byte, error) { return BuildWBA(cfg) },
+		"application/jwk-set+json", rampwellknown.WBAPath)
+}
+
+func newHandler(build func() ([]byte, error), contentType, path string) (*Handler, error) {
+	h := &Handler{build: build, contentType: contentType, path: path}
 	if err := h.Rebuild(); err != nil {
 		return nil, err
 	}
 	return h, nil
 }
 
-// Rebuild re-reads the KeySource and re-marshals the manifest.
+// Rebuild re-runs the document builder (re-reading the KeySource) and re-marshals.
 func (h *Handler) Rebuild() error {
-	raw, err := Build(h.cfg)
+	raw, err := h.build()
 	if err != nil {
 		return err
 	}
@@ -154,7 +195,7 @@ func (h *Handler) Rebuild() error {
 	return nil
 }
 
-// Bytes returns the currently served manifest document.
+// Bytes returns the currently served document.
 func (h *Handler) Bytes() []byte {
 	if p := h.bytes.Load(); p != nil {
 		return *p
@@ -162,13 +203,29 @@ func (h *Handler) Bytes() []byte {
 	return nil
 }
 
-// ServeHTTP writes the cached manifest document.
+// ServeHTTP writes the cached document with its content type.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", h.contentType)
 	_, _ = w.Write(h.Bytes())
 }
 
-// RegisterRoutes mounts the manifest route on mux at the canonical path.
+// RegisterRoutes mounts the document route on mux at its canonical path.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET "+rampwellknown.Path, h.ServeHTTP)
+	mux.HandleFunc("GET "+h.path, h.ServeHTTP)
+}
+
+// Handlers bundles a participant's two discovery-surface handlers — the RAMP
+// commercial overlay manifest (/.well-known/ramp.json) and the pure Web Bot Auth
+// directory (/.well-known/http-message-signatures-directory) — so a caller mounts
+// both routes with a single RegisterRoutes call. Every in-repo producer that
+// serves both documents (exchange, broker) returns this pair.
+type Handlers struct {
+	Manifest *Handler
+	WBA      *Handler
+}
+
+// RegisterRoutes mounts both the overlay-manifest and WBA-directory routes on mux.
+func (h Handlers) RegisterRoutes(mux *http.ServeMux) {
+	h.Manifest.RegisterRoutes(mux)
+	h.WBA.RegisterRoutes(mux)
 }

@@ -100,12 +100,10 @@ type Prober struct {
 // is rejected before routing. To share one Cache across Probers in the same
 // process, construct the Cache directly and use NewFromCache instead.
 func New(client HTTPDoer, logger *slog.Logger, opts Options) *Prober {
-	if client == nil {
-		// Fail safe: an omitted client gets the SSRF-guarded env client
-		// (mirroring rampwellknown.NewCache), never the unguarded
-		// http.DefaultClient.
-		client = rampwellknown.NewGuardedClientFromEnv()
-	}
+	// client is REQUIRED and injected: the SSRF guard is SDK-owned, so the caller
+	// constructs it once from resolvers.NewGuardedClientFromEnv at the composition
+	// root and passes it here (never an unguarded http.DefaultClient, and this
+	// package never re-wraps the SDK factory as a fallback).
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -157,7 +155,7 @@ func (p *Prober) Probe(ctx context.Context, domain string) (Result, error) {
 	case errors.Is(err, rampwellknown.ErrNoManifest):
 		return Result{}, ErrManifestMissing
 	default:
-		p.logger.InfoContext(ctx, "ramp.json probe failed",
+		p.logger.InfoContext(ctx, "broker.probe",
 			"domain", domain, "err", err)
 		return Result{}, fmt.Errorf("%w: %w", ErrProbeFailed, err)
 	}

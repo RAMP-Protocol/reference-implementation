@@ -1,0 +1,13 @@
+{
+  "name": "Distant Thunder Rumble",
+  "slug": "thunder-rumble",
+  "category": "weather/impacts",
+  "duration_seconds": 9.8,
+  "sample_rate_hz": 48000,
+  "bit_depth": 24,
+  "channels": 2,
+  "loopable": false,
+  "format": "WAV",
+  "tags": ["thunder", "storm", "rumble", "weather", "low-frequency"],
+  "description": "A long, rolling clap of distant thunder fading into a low sub-bass rumble. Spaced stereo field recording with natural reverberation. Original field recording metadata for demo purposes."
+}

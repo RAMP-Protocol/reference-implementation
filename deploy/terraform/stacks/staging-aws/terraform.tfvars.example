@@ -1,0 +1,75 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Keep the two secrets
+# (cloudflare_api_token, registry_password) in a separate gitignored
+# secrets.auto.tfvars, or export them as TF_VAR_* environment variables.
+#
+# Before the first apply:
+#   1. ../../scripts/gen-staging-keys.sh    # writes ./keys/ (gitignored)
+#   2. ../../scripts/build-push-images.sh   # builds + pushes the images
+#   3. ../../scripts/build-cloudflare-edge.sh   # builds the worker bundle
+
+# AWS — the credentials must be able to create EC2/VPC/EIP resources.
+aws_region = "us-east-1"
+# aws_profile = "my-profile"   # omit to use your default AWS credentials
+
+ssh_public_key   = "ssh-ed25519 AAAA... operator@laptop"
+ssh_ingress_cidr = "203.0.113.7/32" # your address: curl ifconfig.me
+# Not one of your default ssh keys? Give the private-key path so the
+# ssh_command output includes -i (the key itself never leaves your machine):
+# ssh_private_key_path = "~/.ssh/ramp-staging"
+
+# Cloudflare — the zone the staging hostnames live under.
+cloudflare_account_id = "0123456789abcdef0123456789abcdef"
+cloudflare_zone_id    = "abcdef0123456789abcdef0123456789"
+domain                = "staging-zone.example"
+
+# Hostname labels default to exchange/broker/mcp/login/origin/demo under
+# `domain`; override only if one collides with a record you already have.
+# `mcp` (identity_subdomain) also gets a WILDCARD record: every agent a
+# developer signs up gets its Web Bot Auth directory at
+# <agent-slug>.mcp.<domain>, and those names cannot be known ahead of time.
+# identity_subdomain = "mcp"
+# zitadel_subdomain  = "login"
+
+# Images: <image_registry>/<image_prefix>/{exchange,broker,identity,publisher}:<image_tag>,
+# as pushed by ../../scripts/build-push-images.sh. Use the same values here
+# that you gave the push script as REGISTRY= and PREFIX=.
+# image_prefix must be LOWERCASE even when the GitLab group/project name is
+# not: Docker repository paths reject uppercase, and GitLab publishes the
+# registry under the lowercased project path.
+# image_registry = "registry.gitlab.com"   # default; e.g. "ghcr.io", "<acct>.dkr.ecr.<region>.amazonaws.com", "registry.postindustria.com"
+image_prefix = "your-group/your-project"  # e.g. pi-ai/prebid-agentic-content-access
+image_tag    = "latest"
+# Private registry? Set a read token (password in secrets.auto.tfvars):
+# registry_username = "gitlab+deploy-token-123"
+
+acme_email = "ops@example.com"
+# Iterating on apply/destroy? Use the LE staging CA (untrusted certs):
+# acme_staging = true
+
+# Identity that pushes the demo catalog. MUST equal CONTRIBUTOR_ID in
+# ../../scripts/lib/staging-env.sh — key files and ramp.agents rows are keyed
+# by that id, so a mismatch breaks staging auth silently. The variable carries
+# no default on purpose; change it only together with that file.
+catalog_contributor_id = "catalog-contributor-staging"
+
+# The stack also deploys its own Cloudflare edge worker (demo.<domain>) by
+# default. Set false to skip ONLY the worker — the backend and the demo origin
+# still run in full. That is the mode for fronting a client hostname with a
+# separately applied stacks/edge (see the client-simulation section in
+# ../../docs/deploy-edge-standalone.md):
+# deploy_edge = false
+
+# In that mode the tenant is seeded under the CLIENT publisher's hostname
+# (PUBLISHER_DOMAIN in seed-staging.sh), so name it here too — this is the
+# tenant agent registration reads its activation policy from, and a mismatch
+# makes every agent registration fail. Leave it out for the normal
+# deploy_edge = true stack, where it defaults to this stack's demo hostname:
+# default_tenant_domain = "client-news.example.com"
+
+# Agent-key proof-of-possession on staging's own edge worker (deploy_edge =
+# true). Left unset (as here), the worker enforces the proof — the
+# production posture. Uncomment to let a signed URL be fetched without the
+# bound-key proof — handy for smoking the backend alone.
+# ramp_enforce_binding = "false"
+
+# The secrets do NOT belong in this file — copy secrets.auto.tfvars.example to secrets.auto.tfvars.

@@ -1,11 +1,15 @@
 package signing_test
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
 	"testing"
+	"time"
+
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 )
@@ -33,8 +37,23 @@ func TestURLSignerFor_Ed25519(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dispatcher: %v", err)
 	}
-	if _, ok := sgn.(*signing.Ed25519URLSigner); !ok {
-		t.Fatalf("got %T", sgn)
+	// Behavioral check (the concrete type is an unexported SDK adapter): the
+	// returned signer mints a URL that SDK-verifies against the tenant key and
+	// carries the thumbprint kid.
+	out, err := sgn.SignURL(context.Background(), "https://cdn.example/r", "", time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	verified, err := helpers.VerifyURLEd25519(out.URL, pub, time.Now())
+	if err != nil {
+		t.Fatalf("verify minted url: %v", err)
+	}
+	thumb, err := helpers.Thumbprint(pub)
+	if err != nil {
+		t.Fatalf("thumbprint: %v", err)
+	}
+	if verified.KeyID != thumb {
+		t.Fatalf("kid = %q, want thumbprint %q", verified.KeyID, thumb)
 	}
 }
 

@@ -22,10 +22,23 @@ func billingErrorKind(err error) exchange.Kind {
 	case errors.Is(err, billing.ErrRefundBeforeRecord),
 		errors.Is(err, billing.ErrRefundExceedsRecord):
 		return exchange.KindFailedPrecondition
+	case errors.Is(err, billing.ErrUnknownPayee):
+		// The offer's resource-owner payee was not attested upstream (a state
+		// precondition the catalog push gate normally enforces).
+		return exchange.KindFailedPrecondition
 	case errors.Is(err, billing.ErrInvalidAmount):
+		return exchange.KindInvalidRequest
+	case errors.Is(err, billing.ErrAmountNotRepresentable):
+		// A price with finer precision than the ledger's asset scale is a
+		// malformed input (4xx), not a server fault.
 		return exchange.KindInvalidRequest
 	case errors.Is(err, billing.ErrInsufficientBalance):
 		return exchange.KindBillingDenied
+	case errors.Is(err, billing.ErrBackendUnavailable):
+		// A ledger outage is retryable infrastructure, not a code bug: surface
+		// CodeUnavailable (503-class) so callers retry rather than treating it as
+		// a 500.
+		return exchange.KindUnavailable
 	default:
 		return exchange.KindInternal
 	}

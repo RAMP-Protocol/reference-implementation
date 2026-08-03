@@ -19,11 +19,32 @@ UPDATE ramp.tenants
    SET allow_broker_relay = $2
  WHERE tenant_id = $1;
 
--- name: SetTenantReportingPolicy :exec
--- Replaces the reporting_policy JSONB for a tenant. Admin / fixture path
--- for tests that need to seed required_fields, quantity_tolerance, or
--- window_seconds defaults without bypassing the repo layer (review
--- finding 7 — no raw pool.Exec in tests).
+-- name: SetTenantReportingPolicy :execrows
+-- Replaces the reporting_policy JSONB for a tenant. The admin SetReportingPolicy
+-- RPC write path (also used by fixtures to seed required_fields,
+-- quantity_tolerance, or window_seconds without bypassing the repo layer).
+-- Returns rows-affected so the caller can tell a real update from a no-op on a
+-- missing tenant.
 UPDATE ramp.tenants
    SET reporting_policy = $2
+ WHERE tenant_id = $1;
+
+-- name: SetTenantActivateNewAgentsByDefault :exec
+-- Flips the per-tenant policy for whether a newly registered agent starts
+-- active in the billing system-of-record. Admin / fixture path; the column
+-- defaults to TRUE on insert, so this is only needed to opt a tenant out.
+-- Mirrors SetTenantAllowBrokerRelay.
+UPDATE ramp.tenants
+   SET activate_new_agents_by_default = $2
+ WHERE tenant_id = $1;
+
+-- name: SetTenantFeeRateBps :execrows
+-- Replaces the tenant-level default commission rate (basis points) and the
+-- operator note in one write. The admin SetTenantFeeRate RPC write path (also a
+-- fixture mutator). Full replace: fee_rate_notes is set to $3, which is NULL
+-- when the operator omits it. Returns rows-affected so a call for a missing
+-- tenant is a detectable no-op rather than a silent success.
+UPDATE ramp.tenants
+   SET fee_rate_bps = $2,
+       fee_rate_notes = $3
  WHERE tenant_id = $1;

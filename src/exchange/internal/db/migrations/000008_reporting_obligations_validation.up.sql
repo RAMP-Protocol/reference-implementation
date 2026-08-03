@@ -13,7 +13,7 @@
 -- ---------------------------------------------------------------------------
 -- Validation-outcome enum (replaces the TEXT+CHECK form the first cut shipped
 -- with). Native ENUM gives sqlc a typed Go string instead of pgtype.Text and
--- restores compile-time safety at every comparison site. See review finding 6.
+-- restores compile-time safety at every comparison site.
 -- ---------------------------------------------------------------------------
 
 CREATE TYPE ramp.validation_outcome AS ENUM (

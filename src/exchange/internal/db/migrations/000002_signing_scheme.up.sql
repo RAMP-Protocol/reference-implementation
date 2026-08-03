@@ -1,5 +1,5 @@
 -- Adds the tenant-level signing scheme selector introduced for the
--- asymmetric-signed-URL plan (CLAUDE.md: no HMAC, Ed25519 for
+-- asymmetric-signed-URL plan (no HMAC, Ed25519 for
 -- Cloudflare/Fastly, RSA CloudFront for AWS-fronted publishers).
 
 CREATE TYPE ramp.signing_scheme AS ENUM (

@@ -18,8 +18,11 @@ type SetupOptions struct {
 }
 
 // Setup opens a pool and applies embedded migrations. If DSN is empty it
-// returns (nil, nil) — callers can operate DB-less when configuration is
-// absent (useful for early demo phases).
+// returns (nil, nil) rather than deciding for the caller: the shared helper
+// stays neutral so each service picks its own contract. Every caller in this
+// repository refuses an empty DSN — either by rejecting it before calling or by
+// treating the nil pool as a hard error — so nothing here runs without a
+// database.
 func Setup(ctx context.Context, opts SetupOptions, logger *slog.Logger) (*pgxpool.Pool, error) {
 	if opts.DSN == "" {
 		logger.Info("database disabled: no DSN set")

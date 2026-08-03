@@ -1,14 +1,11 @@
 # ADR-003 — Key Rotation and Revocation Across the RAMP Stack
 
 **Status:** Accepted (2026-04-21)
-**Tracks:** ye6f-16 / agentic-content-access-ej87
-**Drives:** ye6f-12 (Exchange policy gates), ye6f-13 (resource-owner mint), ye6f-17 (renewal endpoint), ye6f-19 (revocation list endpoint), ye6f-20 (protocol spec update), ye6f-21 (dedicated revocation signing key), ye6f-22 (per-subscriber kid)
+**Tracks:** key rotation and revocation.
+**Drives:** the Exchange policy gates, the resource-owner mint, the renewal endpoint, the revocation-list endpoint, the protocol-spec update, the dedicated revocation signing key, and the per-subscriber kid convention.
 **Companion documents:**
 - `docs/architecture/adr-001-three-layer-auth.md` — why RFC 9421 + JWT + Biscuit coexist
 - `docs/architecture/adr-002-entitlement-biscuit-model.md` — identity + entitlement biscuit split
-- `docs/design/request-lifecycle.md` — end-to-end runtime flow (§2 key discovery, §3 biscuits)
-- `docs/design/idp-migration.md` — Zitadel extension surface
-- `docs/protocol/ramp-protocol.md` — canonical implementer-facing narrative for the key-discovery, renewal endpoint, keyed revocation list, and per-subscriber kid surfaces specified by this ADR; includes worked examples for enterprise / platform-hosted / individual buyers
 
 ---
 
@@ -20,9 +17,9 @@ The RAMP stack carries at least five distinct long-lived cryptographic keys per 
 2. **Buyer delegation key** — buyer-side root (e.g. acme) whose pubkey is embedded inside entitlement biscuits; buyer's own attenuation blocks are signed by this key.
 3. **Agent RFC 9421 key** — per-agent (or per-MCP-shim) Ed25519 used to sign every HTTP request at the transport layer.
 4. **Broker relay key** — Broker's outbound RFC 9421 key on the Broker→Exchange hop.
-5. **Revocation-list signing key** — dedicated per-issuer Ed25519 used only to sign revocation-list responses (see ye6f-21).
+5. **Revocation-list signing key** — dedicated per-issuer Ed25519 used only to sign revocation-list responses (see §5c).
 
-(A sixth, **Zitadel / OIDC JWT signing key**, rotates via standard OIDC JWKS mechanisms and is out of scope for this ADR — see `docs/design/idp-migration.md`.)
+(A sixth, **Zitadel / OIDC JWT signing key**, rotates via standard OIDC JWKS mechanisms and is out of scope for this ADR.)
 
 Two design forces shape the rotation story:
 
@@ -56,7 +53,7 @@ This rule applies uniformly: every explicit URL field in the authority block or 
 
 - **Resource-owner mint** (e.g. examplenews's mint) pulls the buyer's pubkey from `buyer_keys_url` at contract-signing time, and re-pulls on every renewal.
 - **Exchange** pulls the resource-owner's pubkey from the URL carried in the entitlement biscuit and the buyer's pubkey from `buyer_keys_url` at verification time (cached per §4 below).
-- **Broker** pulls the agent's pubkey from the consolidated Broker-hosted keys JWKS (ye6f-11) based on the `keyid` in the RFC 9421 signature.
+- **Broker** pulls the agent's pubkey from the consolidated Broker-hosted keys JWKS based on the `keyid` in the RFC 9421 signature.
 
 **Rotation implication.** Because discovery is pull-only, rotation is a one-sided operation: the party holding the key updates the JWKS at its keys URL, and counterparties pick up the new pubkey the next time they verify a credential that references the new kid. The party rotating does not need to notify anyone, subject to the narrow exception below.
 
@@ -88,7 +85,7 @@ Buyer rotation requires a resource-owner round-trip because the buyer's pubkey i
 
 #### 3c. Agent RFC 9421 key
 
-Agent keys rotate via the Broker-hosted consolidated keys JWKS introduced in ye6f-11. The model is identical:
+Agent keys rotate via the Broker-hosted consolidated keys consolidated JWKS. The model is identical:
 
 1. Agent generates new keypair; registers the new kid with Broker (Broker merges it into the JWKS it serves at its opaque keys URL).
 2. Agent starts signing new outbound requests under the new kid.
@@ -102,7 +99,7 @@ Identical pattern. Broker generates a new relay keypair, publishes the new kid a
 
 #### 3e. Revocation-list signing key
 
-See §5. This is a dedicated key (use=`revoke`) separate from the issuer's subscription-signing key. It rotates via the same add-new-kid / remove-old-kid pattern, published in the same JWKS (or a sibling discovery path per the ye6f-20 spec decision), with the discriminator being `use=revoke` or an equivalent marker.
+See §5. This is a dedicated key (use=`revoke`) separate from the issuer's subscription-signing key. It rotates via the same add-new-kid / remove-old-kid pattern, published in the same JWKS (or a sibling discovery path per the protocol-spec decision), with the discriminator being `use=revoke` or an equivalent marker.
 
 #### 3f. Zitadel / OIDC JWT signing key (out of RAMP scope)
 
@@ -128,7 +125,7 @@ The model is therefore: **compromise rotates the key and revokes the old kid.** 
 
 #### 5a. Endpoint model
 
-The revocation-list URL is **OPAQUE** per the same rule as the keys URL. RAMP RECOMMENDS the convention `{domain}/.well-known/ramp-revoked-keys` for parties that want a predictable location, but any `https://` URL works. In practice the discovery mechanism (pinned by the protocol-spec update ye6f-20) is one of:
+The revocation-list URL is **OPAQUE** per the same rule as the keys URL. RAMP RECOMMENDS the convention `{domain}/.well-known/ramp-revoked-keys` for parties that want a predictable location, but any `https://` URL works. In practice the discovery mechanism (pinned by the protocol spec) is one of:
 
 - The issuer's keys JWKS carries a top-level `"revocation_url"` metadata entry pointing to the revocation endpoint, OR
 - Verifiers use the sibling-path convention `{keys_url_with_/ramp-keys_replaced_by_/ramp-revoked-keys}` as a default.
@@ -156,9 +153,9 @@ Either way, no well-known path is mandatory; the JWKS metadata entry is authorit
 - `signature` — Ed25519 signature over the canonical-JSON serialization of `{issuer, generation, revoked}`. Canonicalization rules: UTF-8, sorted object keys, no insignificant whitespace, arrays in the order written.
 - `signing_kid` — kid of the **dedicated revocation signing key** that produced the signature. This kid appears in the issuer's keys JWKS with `use=revoke` (see §5c).
 
-#### 5c. Dedicated revocation signing key (ye6f-21)
+#### 5c. Dedicated revocation signing key
 
-The revocation list is signed by a **separate** key from the issuer's subscription signing key. The issuer's keys JWKS exposes both — the subscription signing key (used to sign biscuits) and the revocation signing key (used to sign revocation lists) — distinguished by the `use` field: `use=verify` for the subscription signing key, `use=revoke` for the revocation signing key. Verifiers select by `(kid, use)` and MUST NOT chain-verify a biscuit against a `use=revoke` entry, nor verify a revocation-list signature against a `use=verify` entry. (The convention is finalized by ye6f-20 / `docs/protocol/ramp-protocol.md` §1.1.)
+The revocation list is signed by a **separate** key from the issuer's subscription signing key. The issuer's keys JWKS exposes both — the subscription signing key (used to sign biscuits) and the revocation signing key (used to sign revocation lists) — distinguished by the `use` field: `use=verify` for the subscription signing key, `use=revoke` for the revocation signing key. Verifiers select by `(kid, use)` and MUST NOT chain-verify a biscuit against a `use=revoke` entry, nor verify a revocation-list signature against a `use=verify` entry.
 
 ##### Why dedicated revocation key
 
@@ -168,11 +165,11 @@ The dedicated revocation key is the cryptographic mechanism that keeps the revoc
 2. **Different operational environments.** The two keys SHOULD live in different operational environments — different HSM slot, different signing machine, different access policy, ideally different on-call rotation. The signing key is exercised continuously at contract-issuance time and must be reachable from automation; the revocation key is exercised only during incident response and can sit behind tighter access controls (e.g. break-glass-only). A breach of the signing-key environment does not automatically yield the revocation key.
 3. **Different rotation cadences.** The signing key rotates on a quarterly or per-incident schedule; the revocation key can rotate annually or only on revocation-key-specific compromise. The split lets each key follow the cadence that fits its risk profile rather than forcing a single rotation cycle.
 4. **Auditability.** Every signature the revocation key produces is by construction a revocation event. A monitoring system that watches the revocation key for any signing activity at all sees only true positives — there is no signing-list noise to filter out. With a shared key, every routine signing event would have to be classified.
-5. **Audience separation.** Verifiers know in advance which `use` value to expect for which signature. A revocation-list verifier that receives a `signing_kid` resolving to a `use=verify` entry MUST refuse to validate the list (the JWKS-side filter in `internal/jwks.ResolveRevoke` enforces this); a biscuit-chain verifier that receives a kid resolving to `use=revoke` MUST refuse to chain-verify (`Resolve` enforces this). The `use` field gives both sides an unambiguous typing rule and makes confused-deputy attacks impossible at the API surface.
+5. **Audience separation.** Verifiers know in advance which `use` value to expect for which signature. A revocation-list verifier that receives a `signing_kid` resolving to a `use=verify` entry MUST refuse to validate the list; a biscuit-chain verifier that receives a kid resolving to `use=revoke` MUST refuse to chain-verify. These remain design requirements: the shared JWKS package that enforced them was deleted, and nothing enforces them today. The `use` field gives both sides an unambiguous typing rule and makes confused-deputy attacks impossible at the API surface.
 
 **Rotation.** The revocation key rotates by the same add-new-kid / remove-old-kid pattern as every other key. If the revocation key itself is compromised, the issuer publishes a rotated revocation key (under a new kid with `use=revoke`) and the next revocation-list fetch uses the new kid. Verifiers that cached the old revocation-key pubkey reject the next-generation list (signed by the new kid not in cache) with a "kid miss" and refresh.
 
-**Implementation pointer.** The shared JWKS package `internal/jwks` exposes `Resolve(set, kid)` (filters to `use=verify`) and `ResolveRevoke(set, kid)` (filters to `use=revoke`); legacy entries with `use=sig` or empty `use` are treated as `use=verify` for backward compatibility with pre-ye6f-21 JWKS bodies. The Exchange-side delegation pubkey resolver `src/exchange/internal/delegation/pubkey.go` applies the same filter to the §6.6 manifest schema. The issuer-side helpers `scripts/gen-resource-owner-key.sh` and `scripts/gen-buyer-delegation-key.sh` generate both keypairs and publish both pubkeys as a single JWKS in one shot.
+**Implementation status.** The `use=verify` / `use=revoke` split described here is no longer how keys are published: the shared JWKS package that resolved by `use`, and the Exchange-side delegation resolver that applied the same filter to the manifest schema, were both deleted. Key material is now published uniformly and revocation is a separate signed document rather than a per-key `use` discriminator. Of the issuer-side helpers, only `scripts/gen-buyer-delegation-key.sh` survives, still generating a verify/revoke pair as one JWKS; the resource-owner counterpart was deleted with the subscription fixtures, and `scripts/gen-examplenews-publisher-key.sh` is the surviving publisher-side generator.
 
 ### 6. Authority TTL ≤ 7 days is REQUIRED; renewal is mandatory
 
@@ -186,7 +183,7 @@ Every entitlement-biscuit authority block MUST carry an `expires_at` fact set to
 
 Seven days is the hard ceiling on "compromise-to-natural-expiry without any online check." Operations MAY choose shorter TTLs per tenant (24 h or 1 h for high-sensitivity publishers); 7 days is the protocol-wide cap.
 
-### 7. Per-subscriber kid is an operational best practice (ye6f-22)
+### 7. Per-subscriber kid is an operational best practice
 
 The resource-owner mint SHOULD assign a **distinct kid per subscriber** at contract-signing time — e.g. `examplenews.sub.2026q2.subscriber-acme-01`, `examplenews.sub.2026q2.subscriber-contoso-07` — even though each is derived from the same subscription signing root. This is an operational convention, not a protocol requirement; a shared kid across all subscribers is valid.
 
@@ -209,7 +206,7 @@ The per-subscriber kid is derived deterministically from the root key and subscr
 
 ### Negative / costs accepted
 
-- **Every verifier fetches JWKS and revocation list at runtime.** The cache TTLs (§4) bound this, but the p99 verification that hits cache-miss pays an HTTPS round-trip. Cold-start verification on Edge is already a hard-real-time concern (see `docs/design/request-lifecycle.md` §2 for Edge's 503-on-miss rule); other verifiers accept the occasional miss latency.
+- **Every verifier fetches JWKS and revocation list at runtime.** The cache TTLs (§4) bound this, but the p99 verification that hits cache-miss pays an HTTPS round-trip. Cold-start verification on Edge is already a hard-real-time concern (Edge answers 503 on a cache miss rather than serving unverified); other verifiers accept the occasional miss latency.
 - **Five runbooks instead of one.** Each key type has its own compromise procedure (§Runbooks below). Operations documentation is larger but the per-runbook steps are short and mechanical.
 - **Revocation generation monotonicity is a discipline.** Issuers MUST bump `generation` on every revocation-list publication; a bug that re-publishes a stale list with the prior generation number will be rejected by verifiers as a rollback. This is the intended behavior — verifiers treat rollback as hostile — but it means issuer tooling must persist the last generation across restarts.
 - **Per-subscriber kid is derivation-heavy.** Mint code must implement deterministic per-kid derivation (HKDF or similar). This is one-time engineering cost; runtime cost is negligible.
@@ -258,7 +255,7 @@ The per-subscriber kid is derived deterministically from the root key and subscr
 
 1. **Declare incident.**
 2. **Generate replacement agent keypair** under a fresh kid.
-3. **De-register the compromised kid from the Broker-hosted consolidated keys JWKS** (ye6f-11). Broker's keys URL drops the compromised kid.
+3. **De-register the compromised kid from the Broker-hosted consolidated keys JWKS**. Broker's keys URL drops the compromised kid.
 4. **Register the new kid** in the same JWKS.
 5. **Rotate the keypair on the agent host** so the agent starts signing with the new kid immediately. In-flight requests signed by the old kid fail verification at Broker/Exchange as soon as the old kid is gone from the JWKS (cache TTL bounds this to 24 h; operations MAY force-refresh by calling Broker's reload endpoint).
 6. **Post-incident:** audit the agent host for persistence; rotate any derived credentials the agent held.
@@ -317,8 +314,8 @@ Because RFC 9421 signatures are short-lived (sub-minute `created`/`expires` wind
 
 - **ADR-001** (three-layer auth): RFC 9421 + JWT + Biscuit coexistence. This ADR specifies how each of those layers' keys rotate.
 - **ADR-002** (entitlement-biscuit model): defines the authority-block structure that carries `buyer_keys_url` and `renewal_url`. This ADR specifies how those URLs are discovered and how rotation at their endpoints flows through to Exchange.
-- **ye6f-11** (Broker consolidated keys JWKS): sources the agent and broker-relay kids referenced in Runbooks D and E.
-- **ye6f-19** (revocation list endpoint): implements §5 on the issuer side.
-- **ye6f-20** (RAMP protocol spec update): pins the discovery mechanism (JWKS metadata entry vs sibling-path convention) for the revocation-list URL.
-- **ye6f-21** (dedicated revocation signing key): implements §5c on the issuer side.
-- **ye6f-22** (per-subscriber kid): implements §7 on the resource-owner mint side.
+- **Broker consolidated keys JWKS**: sources the agent and broker-relay kids referenced in Runbooks D and E.
+- **revocation list endpoint**: implements §5 on the issuer side.
+- **RAMP protocol spec update**: pins the discovery mechanism (JWKS metadata entry vs sibling-path convention) for the revocation-list URL.
+- **dedicated revocation signing key**: implements §5c on the issuer side.
+- **per-subscriber kid**: implements §7 on the resource-owner mint side.

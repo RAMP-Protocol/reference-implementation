@@ -1,7 +1,6 @@
 """Obligation 05 — happy 01: a signature from an unknown signer is refused.
 
-Verbatim scenario (``docs/obligations/05-system-refuses-when-authority-is-bad.md``,
-second happy-path bullet):
+Verbatim scenario (second happy-path bullet):
 
 > The agent presents a signature whose keyid is not advertised in any
 > known /.well-known/ramp.json. The platform refuses the request and
@@ -96,7 +95,7 @@ def test_unknown_signer_is_refused_with_specific_reason(
        unknown signer with a two-category match
        (unknown-ness × key-naming).
     """
-    body_obj = {"requester": {"uris": ["http://edge:8787/premium/any.html"]}}
+    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/any.html"]}
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = generate_random_keypair("ghost-agent-not-in-any-ramp-json")

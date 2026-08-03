@@ -17,8 +17,15 @@ type CatalogEntry struct {
 	URI            string
 	URIPrefix      string
 	PricingJSON    []byte
-	LicensingJSON  []byte
+	TermsJSON      []byte
 	DeliveryMethod string
+	// MetadataJSON is the serialized resource extension metadata,
+	// nullable: nil round-trips to a NULL column and back to nil.
+	MetadataJSON []byte
+	// ResourceOwnerID is the owner-attested payee the entry's revenue settles to,
+	// distinct from TenantID (the operational slot). Sourced server-side from the
+	// owner manifest at push; the push gate guarantees it is non-empty.
+	ResourceOwnerID string
 }
 
 // CatalogRepo is the narrow contract CatalogService needs.
@@ -51,13 +58,15 @@ func (r *catalogRepo) UpsertTx(ctx context.Context, tx pgx.Tx, e CatalogEntry) (
 // querier (Upsert) or a tx-bound one created via sqlc.New(tx) (UpsertTx).
 func upsertCatalog(ctx context.Context, q sqlc.Querier, e CatalogEntry) (CatalogEntry, error) {
 	row, err := q.UpsertCatalogEntry(ctx, sqlc.UpsertCatalogEntryParams{
-		ResourceID:     e.ResourceID,
-		TenantID:       e.TenantID,
-		Uri:            e.URI,
-		UriPrefix:      e.URIPrefix,
-		Pricing:        e.PricingJSON,
-		LicensingRules: jsonOrEmpty(e.LicensingJSON),
-		DeliveryMethod: sqlc.RampDeliveryMethod(e.DeliveryMethod),
+		ResourceID:      e.ResourceID,
+		TenantID:        e.TenantID,
+		Uri:             e.URI,
+		UriPrefix:       e.URIPrefix,
+		Pricing:         e.PricingJSON,
+		Terms:           termsOrEmpty(e.TermsJSON),
+		DeliveryMethod:  sqlc.RampDeliveryMethod(e.DeliveryMethod),
+		Metadata:        e.MetadataJSON,
+		ResourceOwnerID: e.ResourceOwnerID,
 	})
 	if err != nil {
 		return CatalogEntry{}, fmt.Errorf("upsert catalog entry: %w", err)
@@ -90,19 +99,24 @@ func (r *catalogRepo) ByID(ctx context.Context, resourceID string) (CatalogEntry
 
 func catalogFromRow(row sqlc.RampCatalog) CatalogEntry {
 	return CatalogEntry{
-		ResourceID:     row.ResourceID,
-		TenantID:       row.TenantID,
-		URI:            row.Uri,
-		URIPrefix:      row.UriPrefix,
-		PricingJSON:    row.Pricing,
-		LicensingJSON:  row.LicensingRules,
-		DeliveryMethod: string(row.DeliveryMethod),
+		ResourceID:      row.ResourceID,
+		TenantID:        row.TenantID,
+		URI:             row.Uri,
+		URIPrefix:       row.UriPrefix,
+		PricingJSON:     row.Pricing,
+		TermsJSON:       row.Terms,
+		DeliveryMethod:  string(row.DeliveryMethod),
+		MetadataJSON:    row.Metadata,
+		ResourceOwnerID: row.ResourceOwnerID,
 	}
 }
 
-func jsonOrEmpty(b []byte) []byte {
+// termsOrEmpty defaults an absent terms payload to an empty JSON array so the
+// NOT NULL terms JSONB column (DEFAULT '[]') always receives a well-formed
+// array, matching the repeated LicenseTerm shape the publisher pushes.
+func termsOrEmpty(b []byte) []byte {
 	if len(b) == 0 {
-		return []byte(`{}`)
+		return []byte(`[]`)
 	}
 	return b
 }

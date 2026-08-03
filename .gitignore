@@ -9,6 +9,26 @@ dist/
 deploy/mcp/agent-key.json
 # RFC 9421 broker-relay private key — generated at bootstrap, never committed.
 deploy/broker/broker-key.json
+
+# No Ed25519 private-key material under deploy/ may be re-committed.
+# Demo/contributor/publisher signing keys are generated at bootstrap (see
+# scripts/gen-*-key.sh) and mounted at runtime. This broad pattern blocks any
+# accidental re-add of a *key*.json under deploy/.
+deploy/**/*key*.json
+# Exception: the Broker pubkey registry carries NO private material and is the
+# checked-in source of truth for verify-side keys, so it must stay tracked.
+!deploy/broker/keys.json
+
+# The E2E harness private signing fixtures are generated at
+# bootstrap (scripts/gen-e2e-keys.sh, wired into `make e2e-up`) and never
+# committed. This blocks any accidental re-add of private key material under
+# the harness fixtures dir.
+tests/e2e/harness/fixtures/*_key.json
+tests/e2e/**/*key*.json
+# Per-edge MANIFEST_PUBLIC_KEYS_JSON env_files (PUBLIC keys only) are
+# generated at bootstrap by gen-e2e-keys.sh from the same private fixtures and
+# injected into the demo edges via env_file. Generated material — not committed.
+deploy/edge-keys/*.env
 *.tsbuildinfo
 coverage/
 .turbo/
@@ -53,6 +73,10 @@ Thumbs.db
 # Claude Code harness — per-spawn worktrees from Agent tool isolation: "worktree"
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+# Local code-review runs: transient reports that quote the tree verbatim, so they
+# preserve whatever the source said at the time — including names a later sweep
+# removed. They belong on disk, never in git.
+.claude/code-review/
 
 # Runtime logs and ephemeral reports
 logs/
@@ -67,7 +91,8 @@ logs/
 # committed — a 33 MB binary was previously committed by accident.
 **/cmd/server/server
 
-# Leftovers from directories whose canonical home moved to the piarch repo
+# Scratch output from the requirements-derivation tooling, which is not part of
+# this repository. Ignored so a stray local run cannot be committed.
 .derive-ensemble/
 derive-ensemble/
 
@@ -77,3 +102,9 @@ derive-ensemble/
 .dolt/
 *.db
 .beads-credential-key
+
+# Obsidian editor workspace (local-only, not part of the docs source)
+docs/.obsidian/
+
+# Runtime artifact written by the cross-container revocation e2e (test_revocation_channel).
+tests/e2e/harness/revocations/revocations.json

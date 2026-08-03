@@ -4,90 +4,45 @@
 package transport
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
-	"strings"
 
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig/transportconnect"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 )
-
-// contextKey is the local key type used for request-scoped values.
-type contextKey string
-
-const requestIDKey contextKey = "request_id"
-
-// RequestIDFromContext returns the request id propagated by the middleware.
-func RequestIDFromContext(ctx context.Context) string {
-	if v, ok := ctx.Value(requestIDKey).(string); ok {
-		return v
-	}
-	return ""
-}
-
-// WithRequestID returns a context annotated with the given request id.
-func WithRequestID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, requestIDKey, id)
-}
 
 // RequestIDMiddleware extracts (or mints) X-Request-ID, annotates the context,
 // writes the header back on the response, and attaches a request-id-scoped logger
 // to the context (reqctx.IntoContext) so downstream handlers log with correlation
-// without re-passing the id by hand. The shared body lives in reqctx; this
-// service passes its own WithRequestID context-key setter.
+// without re-passing the id by hand. The shared body lives in reqctx, which also
+// owns the context key: both services store the id under it, so any layer reads
+// the same value with reqctx.RequestID without importing a transport package.
 func RequestIDMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
-	return reqctx.RequestIDMiddleware(logger, WithRequestID, next)
+	return reqctx.RequestIDMiddleware(logger, next)
 }
 
-// LogHTTPSigReject is the OnError callback for the global RFC 9421 httpsig gate
-// (wired in cmd/server). It logs the rejection through the request-scoped logger
-// so the line carries the request_id RequestIDMiddleware stamped — these are the
-// auth-rejection lines, the highest-value ones to correlate. RequestIDMiddleware
-// is outermost, so r.Context() already carries the scoped logger; reqctx
-// falls back to slog.Default() if a request ever bypasses the middleware. The
-// httpsig interceptor only invokes OnError with a non-nil err.
-func LogHTTPSigReject(r *http.Request, err error) {
-	reqctx.FromContext(r.Context()).WarnContext(r.Context(), "httpsig: reject",
-		"path", r.URL.Path, "outcome", transportconnect.RejectOutcome(err), "err", err.Error())
-}
-
-// GlobalSigRequestPredicate decides whether a request must clear the
-// static-resolver httpsig gate. Every non-Catalog /ramp.* request MUST be
-// signed and MUST be verified — RFC 9421 is the universal transport-layer
-// authentication. Catalog paths are excluded only because
-// CatalogSignatureMiddleware runs a different signer further down the stack
-// (per-contributor with lazy ramp.json self-signup); they are still verified,
-// just via a different mechanism. Paths outside the /ramp.* namespace (healthz,
-// /.well-known, etc.) are public.
-func GlobalSigRequestPredicate(r *http.Request) bool {
-	path := r.URL.Path
-	if strings.HasPrefix(path, "/ramp.v1.CatalogService/") {
-		return false
-	}
-	return strings.HasPrefix(path, "/ramp.")
-}
+// LogHTTPSigReject is the exchange's connectserver.WithOnReject observer for the
+// global RFC 9421 verify gate — the shared reqctx.NewRejectLogger body keyed on
+// the "exchange" audit namespace. See reqctx.NewRejectLogger for the request-id
+// correlation + outcome-classification contract.
+var LogHTTPSigReject = reqctx.NewRejectLogger("exchange")
 
 // WrapPublicSurface assembles the Exchange's public HTTP middleware stack —
-// RequestIDMiddleware → RFC 9421 httpsig.Middleware → CatalogSignatureMiddleware
-// → mux. Shared by cmd/server (buildWrapped) and the integration harness
-// (startExchangeServer) so both exercise identical wiring, including the
-// hop-bound MaxSignatures (ADR-013 D5 / RAMP-56). maxSignatures == 0 means
-// unbounded (per httpsig.InterceptorOptions.MaxSignatures).
+// the shared runhttp.WrapPublicSurface stack (request-id → URL normalization →
+// opt-in proxy trust) around CatalogSignatureMiddleware → mux, the Exchange's
+// one extra inner layer. ExchangeService request verification is handled by
+// the connectserver handler registered in cmd/server's registerConnect (which
+// wraps ExchangeService with its own request-id + RFC 9421 verify layers);
+// mounting the URL-normalizing layers outside the mux fixes the @target-uri
+// before BOTH that verify seam and the catalog capture see the request — layer
+// order and rationale are documented on runhttp.WrapPublicSurface.
+// CatalogService uses its own per-contributor signature check in
+// CatalogHandler.verifyCallerSignature. Shared by cmd/server (buildWrapped) and
+// the integration harness (startExchangeServer) so both exercise identical wiring.
 func WrapPublicSurface(
 	logger *slog.Logger,
-	resolver httpsig.KeyResolver,
-	replay httpsig.ReplayStore,
-	maxSignatures int,
 	mux http.Handler,
+	opts runhttp.PublicSurfaceOptions,
 ) http.Handler {
-	inner := CatalogSignatureMiddleware(mux)
-	sig := httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{
-		RequestPredicate: GlobalSigRequestPredicate,
-		OnError:          LogHTTPSigReject,
-		OnReject:         transportconnect.WriteError,
-		MaxSignatures:    maxSignatures,
-	}, inner)
-	return RequestIDMiddleware(logger, sig)
+	return runhttp.WrapPublicSurface(logger, CatalogSignatureMiddleware(mux), opts)
 }

@@ -2,7 +2,7 @@
 --
 -- Conventions:
 --   * Enum types are native PostgreSQL ENUMs (sqlc generates typed Go strings).
---   * Foreign keys are fully-qualified with schema name (CLAUDE.md rule).
+--   * Foreign keys are fully-qualified with schema name.
 --   * Timestamps use TIMESTAMPTZ.
 --   * IDs are TEXT (externally generated, e.g. UUIDv7 / ULID) for portability.
 

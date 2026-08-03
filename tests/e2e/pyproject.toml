@@ -1,3 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# This is a flat-layout tree with several non-package sibling dirs (fixtures/,
+# aws-edge/, fastly-edge/, mock-publisher/). Restrict package discovery to the
+# importable `harness` package (+ its subpackages) so the editable build that
+# `make test-e2e-aws` performs (uv run --with-editable .) does not fail with
+# setuptools' "Multiple top-level packages discovered in a flat-layout" error.
+[tool.setuptools.packages.find]
+include = ["harness*"]
+
 [project]
 name = "ramp-e2e"
 version = "0.0.1"
@@ -10,31 +22,39 @@ dependencies = [
     "pytest-asyncio>=0.24",
     # RFC 9421 signer in tests/e2e/harness/catalog_push.py (PushResources RPC).
     "cryptography>=44.0.0",
+    "rfc8785>=0.1.4",
     # Docker SDK for Python — used by obligation tests that drive container
     # lifecycle (restart, inspect, exec) directly against the docker socket
     # instead of shelling out to the docker CLI. Required because the runner
     # image (tests/e2e/Dockerfile) does NOT carry docker-cli; the SDK reaches
-    # the docker daemon over the bind-mounted socket. See diagnostic
-    # docs/diagnostics/8r0a-eimu-test-runner-no-docker-cli.md §4 (Shape A).
+    # the docker daemon over the bind-mounted socket. Shelling out to `docker`
+    # from inside the runner fails with "command not found", which is what
+    # drove the switch to the SDK.
     "docker>=7.0",
-    # In-tree MCP shim — the obligation tests that drive ramp_fetch use the
-    # public surface (ResolveRequest, RampFetchResult). Both the host venv
-    # and the runner image resolve this via the [tool.uv.sources] path entry
-    # below; the runner re-roots the path to /mcp at build time (see
-    # tests/e2e/Dockerfile and diagnostic
-    # docs/diagnostics/r7frv-canonical-e2e-sweep.md §4 for the convergence
-    # mechanism).
-    "ramp-mcp-shim",
+    # MCP client + JWT minting for the identity MCP-endpoint e2e
+    # (test_mcp_endpoint.py drives the Go adapter over the MCP protocol).
+    "fastmcp>=2.0",
+    "pyjwt>=2.9",
+    # L1 protocol-mechanics helpers (thumbprint, RFC 9421 sign, JCS acceptance,
+    # base64url) — the harness's former hand-rolled copies now import these.
+    "ramp-protocol-sdk",
+    # Generated wire types (the `wire` package). ramp_sdk.acceptance imports
+    # `wire.models`, so the SDK is unusable without it. The harness used to get
+    # this transitively through the in-tree Python shim; the shim is gone (the MCP
+    # surface is the Go adapter), so it is named directly here.
+    "ramp-protocol",
 ]
 
 [tool.uv.sources]
-# Path-based editable install of the in-tree MCP shim. The host venv reads
-# this entry as-is (cwd `tests/e2e/` → `../../src/mcp` resolves to the
-# in-tree shim). The runner image (tests/e2e/Dockerfile) re-roots the path
-# to `/mcp` via a build-time `sed` so the editable install resolves inside
-# the container. Both paths converge on the same installed package; see
-# r7frv diagnostic §4 for the fix mechanism.
-ramp-mcp-shim = { path = "../../src/mcp", editable = true }
+# Pinned off-commit from the protocol git repo (subdirectory=sdk/python). The pin
+# must match the Go module pin in the root go.mod, so the harness signs with the
+# same canonical wire form the services verify. No sibling checkout required.
+# Switch to a published release pin once one exists.
+ramp-protocol-sdk = { git = "https://github.com/RAMP-Protocol/protocol.git", subdirectory = "sdk/python", rev = "104d867aa9a15a316723af6c3dd61d73ed490363" }
+# Generated wire types, pinned off the SAME revision as the SDK above — a split
+# between the two would mean the harness signs one payload shape and the services
+# verify another.
+ramp-protocol = { git = "https://github.com/RAMP-Protocol/protocol.git", subdirectory = "gen/python", rev = "104d867aa9a15a316723af6c3dd61d73ed490363" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -51,10 +71,11 @@ markers = [
 # Lint-only dev group. Test execution lives in docker-compose (`make test-e2e`)
 # and does not require these tools; the host-side `make lint` / `make fmt`
 # delegation does. `ruff` here is what `tests/e2e/Makefile` resolves via
-# `uv run ruff …`, closing the lint-coverage gap surfaced by
-# `agentic-content-access-ygdhj` (audit) / `agentic-content-access-gz1uo` (fix).
+# `uv run ruff …`, closing the gap where this tree was linted by no host-side
+# target at all.
 dev = [
     "ruff>=0.9.0",
+    "mypy>=1.13",
 ]
 
 [tool.uv]
@@ -66,14 +87,21 @@ target-version = "py312"
 
 # This is a TEST harness — every file is test infrastructure. The selection
 # below pins ruff's default rule set (E4/E7/E9 + F) explicitly so the host-side
-# `make lint` and the audit-time `ruff check .` referenced in
-# docs/diagnostics/ygdhj-build-tag-pocket-audit.md §2.6 stay aligned. Heavier
-# rule families (PL/SIM/PERF/TCH/I/etc.) are intentionally OFF for the same
-# reason `tests/**` in `src/mcp/pyproject.toml` carries broad exemptions:
-# this tree is harness code, not production logic. Gap closure under
-# agentic-content-access-gz1uo (fix) / agentic-content-access-ygdhj (audit).
+# `make lint` and a bare `ruff check .` run from this directory stay
+# aligned — the two must not disagree about which rules apply. Heavier
+# rule families (PL/SIM/PERF/TCH/I/etc.) are intentionally OFF because this
+# tree is harness code, not production logic.
 [tool.ruff.lint]
 select = [
     "E4", "E7", "E9",  # pycodestyle errors (ruff default subset)
     "F",               # pyflakes (includes F401 unused-import, F841 unused-local)
 ]
+
+[tool.mypy]
+python_version = "3.12"
+# Deliberately not strict — see tests/e2e/Makefile:typecheck for why. The point
+# is that a Python type gate exists and runs in `make quality` again; tightening
+# it is a separate, incremental job.
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true

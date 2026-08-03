@@ -7,20 +7,16 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/base64"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	clockpkg "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 )
-
-const testKid = "integration-agent.v1"
 
 func signRAMPCall(tb testing.TB, target, bodyStr, authz string, priv ed25519.PrivateKey) *http.Request {
 	tb.Helper()
@@ -32,7 +28,12 @@ func signRAMPCall(tb testing.TB, target, bodyStr, authz string, priv ed25519.Pri
 	req.Header.Set("Authorization", authz)
 	created := time.Now().Unix()
 	expires := created + 30
-	if err := httpsig.SignRequestRAMP(req, []byte(bodyStr), testKid, priv, created, expires); err != nil {
+	// After the WBA split the RFC 9421 keyid is the key's RFC 7638 thumbprint.
+	keyid, err := helpers.Thumbprint(priv.Public().(ed25519.PublicKey))
+	if err != nil {
+		tb.Fatalf("thumbprint: %v", err)
+	}
+	if err := httpsig.SignRequestRAMP(req, []byte(bodyStr), keyid, priv, expires); err != nil {
 		tb.Fatalf("sign: %v", err)
 	}
 	return req
@@ -51,7 +52,11 @@ func TestIntegration_ExchangeRejectsUnsigned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	resolver := httpsig.NewStaticResolver(map[string]ed25519.PublicKey{testKid: pub})
+	tp, tperr := helpers.Thumbprint(pub)
+	if tperr != nil {
+		t.Fatalf("thumbprint: %v", tperr)
+	}
+	resolver := httpsig.NewStaticResolver(map[string]ed25519.PublicKey{tp: pub})
 	replay := httpsig.NewRedisReplayStore(redisCli, "httpsig:integ:replay:")
 
 	handler := httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -101,87 +106,6 @@ func TestIntegration_ExchangeRejectsUnsigned(t *testing.T) {
 	_ = resp3.Body.Close()
 	if resp3.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("replay status = %d, want 401", resp3.StatusCode)
-	}
-}
-
-// TestIntegration_KeyRotation stands up a fake well-known JWKS endpoint,
-// hands keyA in the first fetch, rotates to keyB, and verifies the resolver
-// accepts a request signed with keyB after TTL expiry.
-func TestIntegration_KeyRotation(t *testing.T) {
-	pubA, privA, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("gen A: %v", err)
-	}
-	pubB, privB, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("gen B: %v", err)
-	}
-
-	// A tiny JWKS server that flips from keyA → keyB on each fetch.
-	fetches := 0
-	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fetches++
-		var active ed25519.PublicKey
-		if fetches == 1 {
-			active = pubA
-		} else {
-			active = pubB
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"keys": []map[string]any{
-				{
-					"kid": testKid, "kty": "OKP", "crv": "Ed25519",
-					"x": base64.RawURLEncoding.EncodeToString(active),
-				},
-			},
-		})
-	}))
-	t.Cleanup(jwksSrv.Close)
-
-	clk := clockpkg.NewDeterministic(time.Now())
-	resolver := httpsig.NewWellKnownResolver(jwksSrv.URL, httpsig.WellKnownOptions{
-		TTL: 5 * time.Second,
-		Clk: clk,
-	})
-	replay := httpsig.NewMemoryReplayStore(clk.Now)
-
-	handler := httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{
-		Clk: clk,
-	}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	srv := httptest.NewServer(handler)
-	t.Cleanup(srv.Close)
-
-	// Phase 1: sign with keyA — resolver loads keyA, verify succeeds.
-	target := srv.URL + "/ramp.v1.ExchangeService/DiscoverResources"
-	reqA := signRAMPCall(t, target, `{}`, "", privA)
-	respA, err := srv.Client().Do(reqA)
-	if err != nil {
-		t.Fatalf("phase1 do: %v", err)
-	}
-	_ = respA.Body.Close()
-	if respA.StatusCode != http.StatusOK {
-		t.Fatalf("phase1 status = %d, want 200", respA.StatusCode)
-	}
-	_ = privB
-
-	// Rotate: advance clk past resolver TTL, sign with keyB. The next
-	// resolver fetch returns pubB, and verification must succeed.
-	clk.Advance(30 * time.Second)
-	reqB := signRAMPCall(t, target, `{}`, "", privB)
-	respB, err := srv.Client().Do(reqB)
-	if err != nil {
-		t.Fatalf("phase2 do: %v", err)
-	}
-	_ = respB.Body.Close()
-	if respB.StatusCode != http.StatusOK {
-		t.Fatalf("phase2 status = %d, want 200", respB.StatusCode)
-	}
-
-	if fetches < 2 {
-		t.Fatalf("expected resolver to refetch JWKS after rotation, got fetches=%d", fetches)
 	}
 }
 

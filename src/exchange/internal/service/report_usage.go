@@ -1,5 +1,5 @@
 // ReportUsage and its helpers. Extracted from exchange.go to keep the
-// service files under the 500-line per-file cap (CLAUDE.md) and to give the
+// service files under the 500-line per-file cap and to give the
 // idempotency / authz / validation choreography a single home.
 
 package service
@@ -43,7 +43,7 @@ func (s *ExchangeService) ReportUsage(
 	if req.GetTransactionId() == "" {
 		return nil, exchange.Newf(exchange.KindInvalidRequest, "transaction_id required")
 	}
-	if req.GetId() == "" {
+	if req.GetIdempotencyKey() == "" {
 		// UsageReport.id is the dispute-chain anchor and the idempotency key;
 		// reject empty at the boundary rather than silently treating it as
 		// "no idempotency".
@@ -59,7 +59,7 @@ func (s *ExchangeService) ReportUsage(
 	// A hit means we already processed this exact UsageReport.id and must
 	// return the same response without writing again.
 	if existing, lookupErr := s.obligations.FindBySourceReportID(
-		ctx, req.GetTransactionId(), req.GetId(),
+		ctx, req.GetTransactionId(), req.GetIdempotencyKey(),
 	); lookupErr == nil {
 		return s.buildReplayResponse(ctx, caller, existing), nil
 	} else if !errors.Is(lookupErr, repo.ErrObligationNotFound) {
@@ -111,7 +111,7 @@ func (s *ExchangeService) runReportUsageTx(
 			&repo.Tenant{ID: rc.TenantID}, rc.AgentID, rc.TransactionID, authzErr)
 		return authzErr
 	}
-	outcome, vErr := Validate(ReportInput{
+	outcome, vErr := ValidateUsageReport(ReportInput{
 		Obligation:    rc.Obligation,
 		TransactionID: rc.TransactionID,
 		BillingID:     rc.BillingID,
@@ -132,7 +132,7 @@ func (s *ExchangeService) persistRejection(
 	vErr *exchange.Error, validationErr **exchange.Error,
 ) error {
 	if _, mErr := s.obligations.MarkValidationRejected(
-		ctx, tx, rc.Obligation.ID, outcome, req.GetId(),
+		ctx, tx, rc.Obligation.ID, outcome, req.GetIdempotencyKey(),
 	); mErr != nil {
 		return exchange.Wrap(exchange.KindInternal, mErr, "persist validation rejection")
 	}
@@ -154,7 +154,7 @@ func (s *ExchangeService) persistValidation(
 	}
 	issuedReportID := uuid.NewString()
 	updated, mErr := s.obligations.MarkValidationValidated(
-		ctx, tx, rc.Obligation.ID, req.GetId(), issuedReportID, consumed,
+		ctx, tx, rc.Obligation.ID, req.GetIdempotencyKey(), issuedReportID, consumed,
 	)
 	if mErr != nil {
 		if errors.Is(mErr, repo.ErrObligationAlreadyReported) {
@@ -164,7 +164,6 @@ func (s *ExchangeService) persistValidation(
 		return exchange.Wrap(exchange.KindInternal, mErr, "persist validation outcome")
 	}
 	*out = &rampv1.UsageReportResponse{
-		Accepted: true,
 		ReportId: updated.IssuedReportID,
 	}
 	s.logOutcome(ctx, "report_usage", "VALIDATED", caller,
@@ -173,14 +172,16 @@ func (s *ExchangeService) persistValidation(
 }
 
 // buildReplayResponse mirrors the response we returned on the first call for
-// this UsageReport.id. The replay path does not re-run validation; the
-// idempotent contract is "same input → same output."
+// this UsageReport.idempotency_key. The replay path does not re-run validation;
+// the idempotent contract is "same input → same output." Acceptance/rejection
+// is no longer an in-body flag (ADR-019 §2: a rejected report is a transport
+// error); the success replay returns the issued report id. Precise error-replay
+// semantics for a non-received obligation are wired under the idempotency work.
 func (s *ExchangeService) buildReplayResponse(
 	ctx context.Context, caller Caller, existing repo.Obligation,
 ) *rampv1.UsageReportResponse {
 	s.logOutcome(ctx, "report_usage", "REPLAY", caller, nil, "", existing.TransactionID, nil)
 	return &rampv1.UsageReportResponse{
-		Accepted: existing.State == repo.ObligationStateReceived,
 		ReportId: existing.IssuedReportID,
 	}
 }

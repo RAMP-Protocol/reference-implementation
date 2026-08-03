@@ -125,7 +125,7 @@ func (r *obligationRepo) Create(ctx context.Context, tx pgx.Tx, o Obligation) (O
 	if err != nil {
 		return Obligation{}, fmt.Errorf("create obligation: %w", err)
 	}
-	return obligationFromRow(row), nil
+	return obligationFromRow(row)
 }
 
 // CreateForOffer projects a PersistTxIntent onto an Obligation and delegates
@@ -152,7 +152,7 @@ func (r *obligationRepo) ByTransaction(ctx context.Context, transactionID string
 		}
 		return Obligation{}, fmt.Errorf("get obligation by transaction: %w", err)
 	}
-	return obligationFromRow(row), nil
+	return obligationFromRow(row)
 }
 
 func (r *obligationRepo) LoadForReport(
@@ -165,7 +165,7 @@ func (r *obligationRepo) LoadForReport(
 		}
 		return ReportValidationContext{}, fmt.Errorf("load obligation with transaction: %w", err)
 	}
-	return reportContextFromJoinRow(joinRowFromGetObligation(row)), nil
+	return reportContextFromJoinRow(joinRowFromGetObligation(row))
 }
 
 func (r *obligationRepo) LoadForReportTx(
@@ -179,7 +179,7 @@ func (r *obligationRepo) LoadForReportTx(
 		}
 		return ReportValidationContext{}, fmt.Errorf("load obligation with transaction for update: %w", err)
 	}
-	return reportContextFromJoinRow(joinRowFromGetObligationForUpdate(row)), nil
+	return reportContextFromJoinRow(joinRowFromGetObligationForUpdate(row))
 }
 
 func (r *obligationRepo) FindBySourceReportID(
@@ -195,7 +195,7 @@ func (r *obligationRepo) FindBySourceReportID(
 		}
 		return Obligation{}, fmt.Errorf("find obligation by source_report_id: %w", err)
 	}
-	return obligationFromRow(row), nil
+	return obligationFromRow(row)
 }
 
 func (r *obligationRepo) MarkValidationValidated(
@@ -218,7 +218,7 @@ func (r *obligationRepo) MarkValidationValidated(
 		}
 		return Obligation{}, fmt.Errorf("mark validation validated: %w", err)
 	}
-	return obligationFromRow(row), nil
+	return obligationFromRow(row)
 }
 
 func (r *obligationRepo) MarkValidationRejected(
@@ -237,7 +237,7 @@ func (r *obligationRepo) MarkValidationRejected(
 	if err != nil {
 		return Obligation{}, fmt.Errorf("mark validation rejected: %w", err)
 	}
-	return obligationFromRow(row), nil
+	return obligationFromRow(row)
 }
 
 func (r *obligationRepo) ListOutstanding(
@@ -252,7 +252,11 @@ func (r *obligationRepo) ListOutstanding(
 	}
 	out := make([]Obligation, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, obligationFromRow(row))
+		o, err := obligationFromRow(row)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, o)
 	}
 	return out, nil
 }
@@ -261,7 +265,7 @@ func (r *obligationRepo) ListOutstanding(
 // mapping. Both join-row paths (LoadForReport / LoadForReportTx) synthesise a
 // RampReportingObligation via joinRowFromGetObligation* and route through here,
 // so the ~16-field mapping lives in exactly one place.
-func obligationFromRow(row sqlc.RampReportingObligation) Obligation {
+func obligationFromRow(row sqlc.RampReportingObligation) (Obligation, error) {
 	o := Obligation{
 		ID:                row.ObligationID,
 		TransactionID:     row.TransactionID,
@@ -287,15 +291,21 @@ func obligationFromRow(row sqlc.RampReportingObligation) Obligation {
 	if row.ValidatedAt.Valid {
 		o.ValidatedAt = row.ValidatedAt.Time
 	}
-	if dec, err := decimalFromNumeric(row.ConsumedQuantity); err == nil {
-		o.ConsumedQuantity = dec
+	// Propagate NUMERIC decode errors rather than swallowing them: a consumed-
+	// quantity or tolerance must never be silently zeroed by a decode failure.
+	dec, err := decimalFromNumeric(row.ConsumedQuantity)
+	if err != nil {
+		return Obligation{}, fmt.Errorf("decode consumed_quantity for obligation %q: %w", row.ObligationID, err)
 	}
-	if tol, err := floatFromNumeric(row.QuantityTolerance); err == nil {
-		o.QuantityTolerance = tol
+	o.ConsumedQuantity = dec
+	tol, err := floatFromNumeric(row.QuantityTolerance)
+	if err != nil {
+		return Obligation{}, fmt.Errorf("decode quantity_tolerance for obligation %q: %w", row.ObligationID, err)
 	}
+	o.QuantityTolerance = tol
 	o.SourceReportID = textOrEmpty(row.SourceReportID)
 	o.IssuedReportID = textOrEmpty(row.IssuedReportID)
-	return o
+	return o, nil
 }
 
 // obligationJoinRow is the narrow shape obligationFromRow consumes when called
@@ -349,9 +359,13 @@ func joinRowFromGetObligationForUpdate(r sqlc.GetObligationWithTransactionForUpd
 	return joinRowFromGetObligation(sqlc.GetObligationWithTransactionRow(r))
 }
 
-func reportContextFromJoinRow(jr obligationJoinRow) ReportValidationContext {
+func reportContextFromJoinRow(jr obligationJoinRow) (ReportValidationContext, error) {
+	obligation, err := obligationFromRow(jr.core)
+	if err != nil {
+		return ReportValidationContext{}, err
+	}
 	ctx := ReportValidationContext{
-		Obligation:       obligationFromRow(jr.core),
+		Obligation:       obligation,
 		TransactionID:    jr.core.TransactionID,
 		BillingID:        textOrEmpty(jr.txBillingID),
 		TenantID:         jr.txTenantID,
@@ -361,7 +375,7 @@ func reportContextFromJoinRow(jr obligationJoinRow) ReportValidationContext {
 	if jr.txCreatedAt.Valid {
 		ctx.CreatedAt = jr.txCreatedAt.Time
 	}
-	return ctx
+	return ctx, nil
 }
 
 func stateOrDefault(s ObligationState) ObligationState {

@@ -21,9 +21,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	rwktestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
 
 // agentHarness is a thin wrapper around pushHarness that adds an admin-path
@@ -63,6 +66,41 @@ func (h *agentHarness) publishAgentOrigin(t *testing.T, agentID string, pub ed25
 	return h.pushHarness.publishAgent(t, agentID, pub)
 }
 
+// seedPublisherEntries stands up a publisher caller with its own directory and
+// pushes entries under the harness tenant through the signed catalog surface,
+// asserting every one was accepted.
+//
+// It is the precondition several tests in this package need, and none of them
+// varies it: a caller domain distinct from the publisher's keeps the two
+// ramp.json documents on separate hosts so the rewriting map routes them to
+// different httptest servers, and the caller is a listed contributor with a
+// reachable manifest so CatalogHandler.verifyCallerSignature admits it on first
+// contact. Each entry must carry a priced term to yield an offer.
+func (h *agentHarness) seedPublisherEntries(
+	t *testing.T, pubCallerID string, entries ...*rampv1.ResourceEntry,
+) {
+	t.Helper()
+	h.publisher.setContributors(pubCallerID)
+	pubPub, pubPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("publisher keypair: %v", err)
+	}
+	h.publishAgentOrigin(t, pubCallerID, pubPub)
+	pushResp, err := h.signedCat(pubCallerID, pubPriv).PushResources(h.ctx,
+		connect.NewRequest(&rampv1.PushResourcesRequest{
+			TenantId: h.tenantID, CallerId: pubCallerID, Entries: entries,
+		}))
+	if err != nil {
+		t.Fatalf("seed push as %q: %v", pubCallerID, err)
+	}
+	// PushResourcesResponse carries only accepted/rejected counts (per-entry
+	// detail lives in the service-internal diagnostic log), so surface the split.
+	if got, want := pushResp.Msg.GetAccepted(), int32(len(entries)); got != want {
+		t.Fatalf("seed push accepted = %d, want %d (rejected=%d)",
+			got, want, pushResp.Msg.GetRejected())
+	}
+}
+
 // insertTenant inserts a fresh Ed25519-scheme tenant row for domain.
 func (h *agentHarness) insertTenant(t *testing.T, tenantID, domain string) {
 	t.Helper()
@@ -82,7 +120,7 @@ func (h *agentHarness) insertTenant(t *testing.T, tenantID, domain string) {
 // agentCombinedOrigin serves the /.well-known/ramp.json of a publisher that
 // also self-registers to push its own catalog. In the unified RAMP model a
 // manifest has a single role, so this is a role=PUBLISHER manifest that carries
-// the publisher's signing key in public_keys (consumed by lazy self-signup via
+// the publisher's signing key in its WBA directory (consumed by lazy self-signup via
 // agentreg, which resolves a caller's key regardless of role) alongside its
 // catalog_contributors (consumed by the publisher cache for contributor authz).
 type agentCombinedOrigin struct {
@@ -108,17 +146,41 @@ func newAgentCombinedOrigin(t *testing.T, provider string, contributors []string
 func (o *agentCombinedOrigin) handle(w http.ResponseWriter, r *http.Request) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	// After the WBA split identity keys live in the pure WBA directory, not the
+	// keyless ramp.json overlay. Serve the agent's key by thumbprint there so the
+	// Exchange's self-signup fetch (which resolves the Signature-Agent directory)
+	// learns it.
+	if r.URL.Path == rampwellknown.WBAPath {
+		key := rampwellknown.NewKey(o.agentPub, agentKeyValidFrom(), agentKeyValidUntil())
+		w.Header().Set("Content-Type", "application/jwk-set+json")
+		_, _ = w.Write(rwktestutil.MarshalWBA(rwktestutil.WBAFile(key)))
+		return
+	}
 	if r.URL.Path != "/.well-known/ramp.json" {
 		http.NotFound(w, r)
+		return
+	}
+	ownerExt, err := structpb.NewStruct(map[string]any{"resource_owner_id": harnessResourceOwner})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	m := &rampv1.WellKnownManifest{
 		Ver:    rampwellknown.Version,
 		Role:   rampwellknown.RolePublisher,
 		Domain: o.provider,
-		PublicKeys: []*rampv1.JsonWebKey{
-			rampwellknown.NewKey("k1", o.agentPub, agentKeyValidFrom(), agentKeyValidUntil()),
-		},
+		// Attest the resource_owner_id payee the catalog resource-owner gate reads
+		// for this Exchange. endpoint + relationship are required by the well-known
+		// schema (this manifest is fetched and schema-validated on lazy self-signup).
+		// PublicKeys stays OUT: after the WBA split the ramp.json overlay is keyless
+		// (the signing key is served at the WBA-directory path above), so the
+		// resource-owner feature from v1.1 is grafted WITHOUT re-adding keys here.
+		Exchanges: []*rampv1.AuthorizedExchange{{
+			Domain:       harnessExchangeDomain,
+			Endpoint:     "https://exchange.ramp.test/ramp",
+			Relationship: rampv1.ProviderRelationship_PROVIDER_RELATIONSHIP_DIRECT,
+			Ext:          ownerExt,
+		}},
 	}
 	for _, c := range o.contributors {
 		m.CatalogContributors = append(m.CatalogContributors, &rampv1.CatalogContributor{
@@ -150,7 +212,7 @@ func (a *agentAdminGuardTransport) RoundTrip(req *http.Request) (*http.Response,
 	return a.base.RoundTrip(req)
 }
 
-// TestAgentSelfSignup_ExplicitRegister walks design-demo-bootstrap.md §7.2:
+// TestAgentSelfSignup_ExplicitRegister walks the explicit-register path:
 // pre-seed a three-URI catalog via a signed publisher push, stand up a fresh
 // agent, POST /exchange/v1/agents/register, then DiscoverResources →
 // ExecuteTransaction → ReportUsage, end-to-end Ed25519-verified, zero admin
@@ -158,46 +220,16 @@ func (a *agentAdminGuardTransport) RoundTrip(req *http.Request) (*http.Response,
 func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 	h := newAgentHarness(t)
 
-	// Step 1: a separate publisher caller pushes three URIs against the
-	// harness's tenant domain. Mirrors TestPushResources auto-register
-	// path — caller is listed as contributor and manifest is reachable,
-	// so CatalogHandler.verifyCallerSignature admits on first contact.
-	// Using a distinct caller domain keeps ramp.json (publisher) and
-	// ramp.json (caller) on separate hosts so the rewriting map
-	// routes them to different httptest servers.
-	const pubCallerID = "pub-caller.example"
-	h.publisher.setContributors(pubCallerID)
-
-	pubPub, pubPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("publisher keypair: %v", err)
-	}
-	h.publishAgentOrigin(t, pubCallerID, pubPub)
-
-	// EstimatedQuantity is set so the zero-estimate strict-reject branch
-	// of the validator (implementation plan Q2) does not fire when the
+	// Step 1: a separate publisher caller pushes three URIs against the harness's
+	// tenant domain. The term's Pricing.estimated_quantity is set so the
+	// zero-estimate strict-reject branch of the validator does not fire when the
 	// e2e flow later reports ConsumedQuantity = 1.
-	est := int32(1)
 	entries := []*rampv1.ResourceEntry{
-		{Domain: h.publisherDom, Path: "/articles/one", EstimatedQuantity: &est},
-		{Domain: h.publisherDom, Path: "/articles/two", EstimatedQuantity: &est},
-		{Domain: h.publisherDom, Path: "/articles/three", EstimatedQuantity: &est},
+		{Domain: h.publisherDom, Path: "/articles/one", Terms: []*rampv1.LicenseTerm{seedPricedTermEst(1)}},
+		{Domain: h.publisherDom, Path: "/articles/two", Terms: []*rampv1.LicenseTerm{seedPricedTermEst(1)}},
+		{Domain: h.publisherDom, Path: "/articles/three", Terms: []*rampv1.LicenseTerm{seedPricedTermEst(1)}},
 	}
-	pushResp, err := h.signedCat(pubCallerID, pubPriv).PushResources(h.ctx,
-		connect.NewRequest(&rampv1.PushResourcesRequest{
-			TenantId: h.tenantID, CallerId: pubCallerID, Entries: entries,
-		}))
-	if err != nil {
-		t.Fatalf("pre-seed push: %v", err)
-	}
-	if got := pushResp.Msg.GetAccepted(); got != 3 {
-		// PushResourcesResponse no longer carries a per-entry Rejections
-		// slice (W4 of t3vk reduced the wire shape to accepted/rejected
-		// counts; per-entry detail is kept only in the service-internal
-		// CatalogPushRejection diagnostic log). Surface the count split.
-		t.Fatalf("pre-seed accepted = %d, want 3 (rejected=%d)",
-			got, pushResp.Msg.GetRejected())
-	}
+	h.seedPublisherEntries(t, "pub-caller.example", entries...)
 
 	// Step 2-3: fresh agent stands up its own /.well-known/ramp.json.
 	const agentID = "test-agent.example"
@@ -210,8 +242,8 @@ func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 	// Step 4: POST /exchange/v1/agents/register. Uses the harness's
 	// guarded base transport so any accidental /admin/* hit fails the test.
 	registerBody, _ := json.Marshal(map[string]string{
-		"agent_id":     agentID,
-		"manifest_url": agentID,
+		"agent_id":      agentID,
+		"discovery_url": agentID,
 	})
 	regReq, err := http.NewRequestWithContext(h.ctx, http.MethodPost,
 		h.server.URL+"/exchange/v1/agents/register", bytes.NewReader(registerBody))
@@ -230,14 +262,20 @@ func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 	}
 	_ = regResp.Body.Close()
 
-	// Step 5: agents row now carries the fixture pubkey.
-	row, err := h.queries.GetAgent(h.ctx, agentID)
+	// Step 5: agents row now carries the fixture pubkey. Read through the
+	// production repository surface, not the raw sqlc Querier (Testing Doctrine pt9).
+	agent, err := repo.NewAgentRepo(h.queries).ByID(h.ctx, agentID)
 	if err != nil {
-		t.Fatalf("GetAgent: %v", err)
+		t.Fatalf("AgentRepo.ByID: %v", err)
 	}
-	if !bytes.Equal(row.PublicKey, agentPub) {
+	if !bytes.Equal(agent.PublicKey, agentPub) {
 		t.Fatalf("stored pubkey != fixture pubkey")
 	}
+
+	// The agent is directory-registered but not yet billing-registered; a paid
+	// transaction needs a billing_ref, so register it for billing
+	// through the public Register RPC before the execute below.
+	h.registerForBilling(t, agentID, agentPub, agentPriv)
 
 	// Step 6: DiscoverResources returns three Ed25519-signed offers.
 	uris := make([]string, len(entries))
@@ -245,11 +283,10 @@ func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 		uris[i] = "https://" + e.GetDomain() + e.GetPath()
 	}
 	discResp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver: "1.0", Id: "q-" + uuid.NewString(),
+		Ver: "1.0", Uris: uris,
 		Requester: &rampv1.Requester{
 			Id: agentID, Domain: agentID,
 			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-			Uris: uris,
 		},
 	}))
 	if err != nil {
@@ -265,70 +302,73 @@ func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 	}
 
 	// Step 7: ExecuteTransaction → signed URL + transaction_log row.
-	// ADR-013 D5 requires multisig (agent + broker). Register the agent's pubkey
-	// in the httpsig resolver so the signature can be verified, then create a
-	// multisig client that signs with both the agent's key and the broker's key.
-	h.resolver.Put(agentID, agentPub)
-	multisigClient := newMultisigClient(h.baseRT, h.server.URL, agentID, agentPriv, h.discoverKeyID, h.discoverPriv)
-	txRequestID := "tx-" + uuid.NewString()
-	offerID := first.GetOfferId()
-	offerSig := first.GetSignature()
-	execResp, err := multisigClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", Id: txRequestID,
-		OfferId:        &offerID,
-		OfferSignature: &offerSig,
-		Requester: &rampv1.Requester{
-			Id: agentID, Domain: agentID,
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
+	// Items-only contract (C4 collapse) with body AgentAcceptance binding
+	// The self-registered agent's key — the agents-row key the
+	// Exchange verifies the acceptance against — was learned via the well-known
+	// manifest fetch during self-signup, so no manual resolver seeding or
+	// multisig transport client is needed here.
+	idempotencyKey := "tx-" + uuid.NewString()
+	execReqr := &rampv1.Requester{Id: agentID, Domain: agentID, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT}
+	execResp, err := h.exchange.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
+		Ver: "1.0", IdempotencyKey: idempotencyKey,
+		Requester: execReqr,
+		// R4: body acceptance signed by the self-registered agent's
+		// key (the agents-row key the Exchange verifies against), over the EXACT
+		// requester (domain == agentID) the request carries.
+		Items: []*rampv1.TransactionItem{
+			{Offer: first, AgentAcceptance: signAcceptanceFor(t, agentPriv, first, execReqr, idempotencyKey)},
 		},
 	}))
 	if err != nil {
 		t.Fatalf("ExecuteTransaction: %v", err)
 	}
-	if execResp.Msg.GetTransactionId() == "" {
+	item := singleResultItem(t, execResp)
+	if item.GetTransactionId() == "" {
 		t.Fatal("transaction id empty")
 	}
-	signedURL := extractSignedURL(t, execResp.Msg)
-	if _, err := url.Parse(signedURL); err != nil {
+	if item.GetRetrievalEndpoint() == "" {
+		t.Fatal("retrieval_endpoint missing from the single batch item")
+	}
+	if _, err := url.Parse(item.GetRetrievalEndpoint()); err != nil {
 		t.Fatalf("signed url parse: %v", err)
 	}
-	txRow, err := h.queries.GetTransactionByRequestID(h.ctx, txRequestID)
+	// The items[] path persists under the DERIVED key idempotency_key:offer_id.
+	txRec, err := repo.NewTransactionRepo(h.queries).ByIdempotencyKey(h.ctx, idempotencyKey+":"+first.GetOfferId())
 	if err != nil {
-		t.Fatalf("GetTransactionByRequestID: %v", err)
+		t.Fatalf("TransactionRepo.ByIdempotencyKey: %v", err)
 	}
-	if len(txRow.SignedUrlHash) != 32 {
-		t.Fatalf("signed_url_hash len = %d, want 32", len(txRow.SignedUrlHash))
+	if len(txRec.SignedURLHash) != 32 {
+		t.Fatalf("signed_url_hash len = %d, want 32", len(txRec.SignedURLHash))
 	}
 
 	// Step-7 invariant: the registered pubkey really does verify a
 	// signature produced by the matching private key. Future RFC 9421
 	// gates on Discover/Execute will rely on this.
 	probe := []byte("post-register probe payload")
-	if !ed25519.Verify(ed25519.PublicKey(row.PublicKey), probe, ed25519.Sign(agentPriv, probe)) {
+	if !ed25519.Verify(ed25519.PublicKey(agent.PublicKey), probe, ed25519.Sign(agentPriv, probe)) {
 		t.Fatal("registered pubkey does not verify agent signatures")
 	}
 
 	// Step 8: ReportUsage accepted=true.
 	repResp, err := h.exchange.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-" + uuid.NewString(),
-		TransactionId: execResp.Msg.GetTransactionId(),
-		BillingId:     execResp.Msg.GetBillingId(),
+		Ver: "1.0", IdempotencyKey: "r-" + uuid.NewString(),
+		TransactionId: item.GetTransactionId(),
+		BillingId:     item.GetBillingId(),
 		Usage:         &rampv1.Usage{ConsumedQuantity: 1, Function: []string{"ai_input"}},
 	}))
 	if err != nil {
 		t.Fatalf("ReportUsage: %v", err)
 	}
-	if !repResp.Msg.GetAccepted() {
-		t.Fatalf("report accepted=false, reason=%q", repResp.Msg.GetRejectionReason())
+	if repResp.Msg.GetReportId() == "" {
+		t.Fatalf("accepted report missing report_id")
 	}
 }
 
-// TestAgentSelfSignup_LazyFirstSeen exercises the design-demo-bootstrap.md
-// §5.3 first-seen path. A brand-new publisher "lazy-agent.example" signs
+// TestAgentSelfSignup_LazyFirstSeen exercises the first-seen path. A brand-new publisher "lazy-agent.example" signs
 // PushResources without any prior /agents/register call. Its ramp.json
 // lists itself as the sole catalog_contributor and its ramp.json is
 // reachable, so CatalogHandler.verifyCallerSignature sees ErrUnknown,
-// invokes RegisterFromManifest(caller_id, caller_id), re-verifies, and
+// invokes RegisterFromDirectory(caller_id, caller_id), re-verifies, and
 // admits. No admin endpoint is touched.
 func TestAgentSelfSignup_LazyFirstSeen(t *testing.T) {
 	h := newAgentHarness(t)
@@ -348,7 +388,7 @@ func TestAgentSelfSignup_LazyFirstSeen(t *testing.T) {
 	h.registerHost(lazyAgentID, combined.server.URL)
 
 	// Precondition: no agents row yet.
-	if _, err := h.queries.GetAgent(h.ctx, lazyAgentID); err == nil {
+	if _, err := repo.NewAgentRepo(h.queries).ByID(h.ctx, lazyAgentID); err == nil {
 		t.Fatal("agent row exists before lazy first-seen; setup bug")
 	}
 
@@ -371,16 +411,85 @@ func TestAgentSelfSignup_LazyFirstSeen(t *testing.T) {
 		t.Fatalf("rejected = %d, want 0", got)
 	}
 
-	// Lazy first-seen populated the agents row with the fixture key and
-	// the canonical ramp.json URL.
-	row, err := h.queries.GetAgent(h.ctx, lazyAgentID)
+	// Lazy first-seen populated the agents row with the fixture key and the
+	// WBA directory URL (after the WBA split identity keys are learned from the
+	// pure WBA directory, not the keyless ramp.json overlay).
+	agent, err := repo.NewAgentRepo(h.queries).ByID(h.ctx, lazyAgentID)
 	if err != nil {
-		t.Fatalf("GetAgent after lazy signup: %v", err)
+		t.Fatalf("AgentRepo.ByID after lazy signup: %v", err)
 	}
-	if !bytes.Equal(row.PublicKey, pub) {
+	if !bytes.Equal(agent.PublicKey, pub) {
 		t.Fatalf("stored pubkey != fixture pubkey")
 	}
-	if !row.ManifestUrl.Valid || !strings.Contains(row.ManifestUrl.String, "/.well-known/ramp.json") {
-		t.Fatalf("manifest_url = %+v, want ramp.json URL", row.ManifestUrl)
+	if !strings.Contains(agent.DiscoveryURL, rampwellknown.WBAPath) {
+		t.Fatalf("discovery_url = %q, want WBA directory URL", agent.DiscoveryURL)
+	}
+}
+
+// TestAgentSelfSignup_RotatedKeyRepinnedAndAccepted proves the key-rotation
+// lockout fix on the catalog-push surface (finding pair with the ReportUsage
+// binding): a contributor that self-signed up with keyA, then rotated its
+// directory to keyB, has its next push re-pinned and accepted — no operator DB
+// surgery. Before the fix a rotated key was a terminal Unauthenticated because
+// self-signup fired only on ErrUnknown, never on a known-caller key mismatch.
+//
+// Round-trip: both pushes drive CatalogService/PushResources through the
+// Connect-Go router + RFC 9421 verification; the re-pin is observed back through
+// the production repository surface (AgentRepo.ByID), never a raw DB read
+// (Testing Doctrine §9).
+func TestAgentSelfSignup_RotatedKeyRepinnedAndAccepted(t *testing.T) {
+	h := newAgentHarness(t)
+
+	const agentID = "rotating-agent.example"
+	tenantID := "t_" + uuid.NewString()
+	h.insertTenant(t, tenantID, agentID)
+
+	// keyA: the contributor's initial key. The first push is first-contact
+	// self-signup (ErrUnknown) and TOFU-pins keyA.
+	keyAPub, keyAPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keyA: %v", err)
+	}
+	originA := newAgentCombinedOrigin(t, agentID, []string{agentID}, agentID, keyAPub)
+	h.registerHost(agentID, originA.server.URL)
+
+	if _, err := h.signedCat(agentID, keyAPriv).PushResources(h.ctx,
+		connect.NewRequest(&rampv1.PushResourcesRequest{
+			TenantId: tenantID, CallerId: agentID,
+			Entries: []*rampv1.ResourceEntry{{Domain: agentID, Path: "/feed/a"}},
+		})); err != nil {
+		t.Fatalf("first push (self-signup with keyA): %v", err)
+	}
+
+	// The contributor rotates its signing key: its directory now publishes keyB.
+	keyBPub, keyBPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keyB: %v", err)
+	}
+	originB := newAgentCombinedOrigin(t, agentID, []string{agentID}, agentID, keyBPub)
+	h.registerHost(agentID, originB.server.URL) // overwrite: the host now serves keyB
+
+	// A push signed with the ROTATED key keyB: the pinned key is still keyA, so
+	// verify fails; the handler re-pins from the directory (now keyB) and the
+	// re-verify succeeds → accepted.
+	resp, err := h.signedCat(agentID, keyBPriv).PushResources(h.ctx,
+		connect.NewRequest(&rampv1.PushResourcesRequest{
+			TenantId: tenantID, CallerId: agentID,
+			Entries: []*rampv1.ResourceEntry{{Domain: agentID, Path: "/feed/b"}},
+		}))
+	if err != nil {
+		t.Fatalf("post-rotation push (should re-pin keyB and accept): %v", err)
+	}
+	if got := resp.Msg.GetAccepted(); got != 1 {
+		t.Fatalf("post-rotation accepted = %d, want 1 (rejected=%d)", got, resp.Msg.GetRejected())
+	}
+
+	// The agents row now carries the rotated key keyB — the re-pin persisted.
+	agent, err := repo.NewAgentRepo(h.queries).ByID(h.ctx, agentID)
+	if err != nil {
+		t.Fatalf("AgentRepo.ByID after rotation: %v", err)
+	}
+	if !bytes.Equal(agent.PublicKey, keyBPub) {
+		t.Fatal("stored pubkey != rotated key keyB (re-pin did not persist)")
 	}
 }

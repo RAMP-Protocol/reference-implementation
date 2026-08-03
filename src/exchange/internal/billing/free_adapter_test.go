@@ -17,6 +17,22 @@ func TestFreeAdapter_SatisfiesAdapterInterface(_ *testing.T) {
 	var _ billing.Adapter = billing.NewFreeAdapter()
 }
 
+// TestFreeAdapter_EnsureAgentAccountNoOp proves EnsureAgentAccount succeeds
+// (repeatably) without a ledger, while an empty billing_ref is still rejected
+// per the interface contract.
+func TestFreeAdapter_EnsureAgentAccountNoOp(t *testing.T) {
+	t.Parallel()
+	a := billing.FreeAdapter{}
+	for i := 0; i < 2; i++ {
+		if err := a.EnsureAgentAccount(context.Background(), "billing-ref-1"); err != nil {
+			t.Errorf("EnsureAgentAccount call %d = %v, want nil", i+1, err)
+		}
+	}
+	if err := a.EnsureAgentAccount(context.Background(), ""); err == nil {
+		t.Error(`EnsureAgentAccount("") = nil, want error`)
+	}
+}
+
 // TestFreeAdapter_ReleaseNoOp proves Release is a no-op for the free tier.
 func TestFreeAdapter_ReleaseNoOp(t *testing.T) {
 	t.Parallel()
@@ -46,9 +62,9 @@ func TestFreeAdapter_AuthorizeApproves(t *testing.T) {
 	a := billing.FreeAdapter{}
 
 	cases := []billing.AuthorizeRequest{
-		{TenantID: "t", AgentID: "ag", UnitCost: billing.Amount{Value: big.NewRat(0, 1), Currency: "USD"}, Quantity: 0},
-		{TenantID: "t", AgentID: "ag", UnitCost: billing.Amount{Value: big.NewRat(5, 100), Currency: "USD"}, Quantity: 10, Unit: "tokens"},
-		{TenantID: "t", AgentID: "", UnitCost: billing.Amount{Value: big.NewRat(1, 1), Currency: "EUR"}, Quantity: -1},
+		{TenantID: "t", BillingRef: "ag", UnitCost: billing.Amount{Value: big.NewRat(0, 1), Currency: "USD"}, Quantity: 0},
+		{TenantID: "t", BillingRef: "ag", UnitCost: billing.Amount{Value: big.NewRat(5, 100), Currency: "USD"}, Quantity: 10, Unit: "tokens"},
+		{TenantID: "t", BillingRef: "", UnitCost: billing.Amount{Value: big.NewRat(1, 1), Currency: "EUR"}, Quantity: -1},
 	}
 	for i, req := range cases {
 		res, err := a.Authorize(context.Background(), req)
@@ -71,7 +87,7 @@ func TestFreeAdapter_AuthorizeUniqueBillingIDs(t *testing.T) {
 	a := billing.FreeAdapter{}
 	seen := make(map[string]struct{}, 64)
 	for i := 0; i < 64; i++ {
-		res, err := a.Authorize(context.Background(), billing.AuthorizeRequest{AgentID: "ag"})
+		res, err := a.Authorize(context.Background(), billing.AuthorizeRequest{BillingRef: "ag"})
 		if err != nil {
 			t.Fatalf("authorize %d: %v", i, err)
 		}

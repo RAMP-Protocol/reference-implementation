@@ -19,7 +19,7 @@ def retrieval_endpoint_of(payload: object) -> str | None:
     """
     if not isinstance(payload, dict):
         return None
-    value = payload.get("retrievalEndpoint") or payload.get("retrieval_endpoint")
+    value = payload.get("retrieval_endpoint")
     if isinstance(value, str) and value:
         return value
     return None

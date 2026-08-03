@@ -11,7 +11,7 @@ Anchor docs:
   vocabulary) and ``ResourceResponse.absence_reason_oneof``.
 
 This module exercises the wire surface for the request-level vocabulary
-the boio task added (UNKNOWN_RESOURCE, NO_AGENT_ENTITLEMENT,
+the absence-reason task added (UNKNOWN_RESOURCE, NO_AGENT_ENTITLEMENT,
 GRANTS_DO_NOT_COVER, etc.). It deliberately sticks to the easiest
 asserted-on-enum case — UNKNOWN_RESOURCE for a never-seeded URI —
 because the harder causes (BILLING_BLOCK, OUTSTANDING_OBLIGATIONS,
@@ -29,16 +29,11 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Iterator
 
 import pytest
 
-from ..conftest import COMPOSE_FILE, StackURLs
-from ..seed import (
-    _resolve_pg_dsn,
-    _upsert_agent,
-    _upsert_tenant_ed25519,
-)
+from ..conftest import StackURLs
+from ..seed import DEMO_PHILOSOPHY_DOMAIN, EUR_AGENT_ID, SeededFixture
 from ..signing import sign_post
 
 
@@ -47,27 +42,23 @@ pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 
 _LIST_OFFERS_PATH = "/ramp.v1.ExchangeService/DiscoverResources"
 
-_TENANT_ID = "tenant-e2e-adr008-d2"
-_TENANT_DOMAIN = f"{_TENANT_ID}.local"
-_AGENT_ID = "agent-e2e-adr008-d2"
+_TENANT_DOMAIN = DEMO_PHILOSOPHY_DOMAIN
+_AGENT_ID = EUR_AGENT_ID
 
 
-@pytest.fixture(scope="module")
-def absence_reason_seed() -> Iterator[str]:
-    """Seed a per-test tenant with no catalog rows; return an unknown URI."""
-    dsn = _resolve_pg_dsn(str(COMPOSE_FILE))
-    _upsert_tenant_ed25519(dsn, tenant_id=_TENANT_ID, domain=_TENANT_DOMAIN)
-    _upsert_agent(dsn, agent_id=_AGENT_ID)
-    unknown_uri = f"http://edge:8787/adr008-d2-never-seeded-{uuid.uuid4().hex}.html"
-    yield unknown_uri
+@pytest.fixture
+def absence_reason_seed(seeded: SeededFixture) -> str:
+    """Return a never-seeded demo URI (the demo catalog has no entry for it)."""
+    del seeded  # ordering: the session seed registered the demo tenant + buyer
+    return f"http://{DEMO_PHILOSOPHY_DOMAIN}/articles/never-seeded-{uuid.uuid4().hex}.txt"
 
 
 def _flatten_for_key(obj: object, key: str, out: list[object]) -> None:
     """Walk a JSON-ish structure collecting every value at ``key``.
 
-    The proto-JSON-camelCase carrier name for the new oneof field is
-    ``absenceReason``; some Connect-RPC frameworks emit ``absence_reason``
-    directly. The walk picks up either form regardless of nesting depth.
+    Matches the exact ``key`` given (a single casing) at any nesting depth.
+    The Exchange's Connect-Go codec emits proto ``snake_case`` field names, so
+    the absence-reason carrier arrives as ``absence_reason`` on this wire.
     """
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -82,15 +73,26 @@ def _flatten_for_key(obj: object, key: str, out: list[object]) -> None:
 def _extract_absence_reasons(payload: object) -> list[str]:
     """Return every absence_reason value found in ``payload``.
 
-    Looks for both the camelCase wire name (``absenceReason``, the
-    proto-JSON default) and the snake_case alias some clients normalise
-    to. Returns the matched values verbatim so the assertion below
-    asserts on the exact enum string.
+    Scans the snake_case wire name ``absence_reason`` (what the Exchange's
+    Connect-Go proto-JSON codec emits) once, at any nesting depth. Returns the
+    matched values verbatim so the assertion below asserts on the exact enum
+    string.
     """
     out: list[object] = []
-    _flatten_for_key(payload, "absenceReason", out)
     _flatten_for_key(payload, "absence_reason", out)
     return [str(v) for v in out if isinstance(v, str)]
+
+
+@pytest.mark.stack_isolation("isolated")  # pure helper meta-test — needs no stack
+def test_extract_absence_reasons_does_not_double_count() -> None:
+    """The extractor returns each matched value ONCE (no duplicate scan).
+
+    Pure meta-test of the module helper — no stack. A single ``absence_reason``
+    occurrence in the payload must yield exactly one element; a helper that scans
+    the same key twice would return it twice and silently inflate every count.
+    """
+    payload = {"resource_responses": [{"absence_reason": "OFFER_ABSENCE_REASON_NOT_IN_CATALOG"}]}
+    assert _extract_absence_reasons(payload) == ["OFFER_ABSENCE_REASON_NOT_IN_CATALOG"]
 
 
 def test_unknown_uri_discover_resources_sets_not_in_catalog_enum(
@@ -105,12 +107,12 @@ def test_unknown_uri_discover_resources_sets_not_in_catalog_enum(
     emits OFFER_ABSENCE_REASON_UNSPECIFIED, or collapses every cause to
     one value, fails this test at the wire boundary.
 
-    (W1 of t3vk renamed the never-seeded-URI cause from the
+    (W1 of the proto-rename wave renamed the never-seeded-URI cause from the
     project-specific ``OFFER_ABSENCE_REASON_UNKNOWN_RESOURCE`` to the
     canonical RAMP-protocol ``OFFER_ABSENCE_REASON_NOT_IN_CATALOG``.)
     """
     # Canonical ramp.proto ResourceQuery body: URIs ride on requester.uris.
-    # The legacy {"resourceUrl": ...} shape is silently dropped by the
+    # The legacy {"resource_url": ...} shape is silently dropped by the
     # Connect-Go JSON codec (DiscardUnknown=true,
     # src/exchange/internal/transport/jsoncodec.go) and the handler then
     # rejects with KindInvalidRequest "requester required"
@@ -125,8 +127,9 @@ def test_unknown_uri_discover_resources_sets_not_in_catalog_enum(
         "requester": {
             "id": _AGENT_ID,
             "domain": _TENANT_DOMAIN,
-            "uris": [absence_reason_seed],
+            "type": "REQUESTER_TYPE_AGENT",
         },
+        "uris": [absence_reason_seed],
     }
     url = f"{compose_stack.exchange}{_LIST_OFFERS_PATH}"
     resp = sign_post(url, body=body)

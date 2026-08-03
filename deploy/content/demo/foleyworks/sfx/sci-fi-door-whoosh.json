@@ -1,0 +1,13 @@
+{
+  "name": "Sci-Fi Door Whoosh",
+  "slug": "sci-fi-door-whoosh",
+  "category": "designed/sci-fi",
+  "duration_seconds": 2.1,
+  "sample_rate_hz": 48000,
+  "bit_depth": 24,
+  "channels": 2,
+  "loopable": false,
+  "format": "WAV",
+  "tags": ["sci-fi", "door", "whoosh", "designed", "synthetic"],
+  "description": "Pneumatic pressurized whoosh of a sliding spaceship door, layered from synthesized air and a low servo hum. Fully designed sound, no source recording. Original synthesis metadata for demo purposes."
+}

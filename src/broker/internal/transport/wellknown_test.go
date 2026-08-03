@@ -16,16 +16,18 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/signing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport"
 )
 
-// brokerManifest builds a broker well-known handler for keys + invURL, serves it
-// over httptest, and returns the parsed role=ROLE_BROKER manifest. The relay
-// signer is freshly generated per call.
-func brokerManifest(t *testing.T, keys *transport.KeyRegistry, invURL string) *rampwellknown.Manifest {
+// brokerDiscovery builds a broker well-known handler pair (keyless manifest +
+// WBA directory) for keys + revURL, serves both routes over httptest, and
+// returns the server plus the relay signer's public key so callers can assert
+// on thumbprints. The relay signer is freshly generated per call.
+func brokerDiscovery(t *testing.T, keys *transport.KeyRegistry, revURL string) (*httptest.Server, ed25519.PublicKey) {
 	t.Helper()
-	_, relayPriv, err := ed25519.GenerateKey(rand.Reader)
+	relayPub, relayPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("relay keygen: %v", err)
 	}
@@ -34,15 +36,21 @@ func brokerManifest(t *testing.T, keys *transport.KeyRegistry, invURL string) *r
 		t.Fatalf("cosigner: %v", err)
 	}
 	h, err := transport.NewWellKnown(transport.WellKnownConfig{
-		Signer: signer, BrokerID: "broker-1", Keys: keys, InvalidationURL: invURL,
+		Signer: signer, BrokerID: "broker-1", Keys: keys, RevocationURL: revURL,
 	})
 	if err != nil {
 		t.Fatalf("new well-known: %v", err)
 	}
-	srv := httptest.NewServer(http.HandlerFunc(h.ServeHTTP))
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
+	return srv, relayPub
+}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+rampwellknown.Path, http.NoBody)
+func getBody(t *testing.T, url string) []byte {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
@@ -52,56 +60,66 @@ func brokerManifest(t *testing.T, keys *transport.KeyRegistry, invURL string) *r
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
-	m, err := rampwellknown.ParseManifest(body, rampwellknown.RoleBroker)
-	if err != nil {
-		t.Fatalf("served broker manifest invalid: %v", err)
-	}
-	return m
+	return body
 }
 
-// TestWellKnownHandler_ServesBrokerManifest asserts the Broker serves a
-// schema-valid role=ROLE_BROKER manifest carrying both the relay key and every
-// key folded in from the agent registry.
-func TestWellKnownHandler_ServesBrokerManifest(t *testing.T) {
+// TestWellKnownHandler_ServesBrokerDiscovery asserts the Broker serves a
+// schema-valid keyless role=ROLE_BROKER overlay manifest AND a WBA directory
+// carrying both the relay key and every key folded in from the agent registry.
+func TestWellKnownHandler_ServesBrokerDiscovery(t *testing.T) {
 	t.Parallel()
 	reg := transport.NewKeyRegistry()
 	agentPub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("agent keygen: %v", err)
 	}
-	reg.PutPublicKey("agent.demo.v1", agentPub)
+	reg.PutPublicKey(agentPub)
 
-	m := brokerManifest(t, reg, "")
+	srv, relayPub := brokerDiscovery(t, reg, "")
+
+	m, err := rampwellknown.ParseManifest(getBody(t, srv.URL+rampwellknown.Path), rampwellknown.RoleBroker)
+	if err != nil {
+		t.Fatalf("served broker manifest invalid: %v", err)
+	}
 	if m.GetDomain() != "broker.example" {
 		t.Errorf("domain = %q, want broker.example", m.GetDomain())
 	}
-	for _, kid := range []string{"broker-1-ed25519", "agent.demo.v1"} {
-		if _, ok := rampwellknown.KeyByKid(m, kid); !ok {
-			t.Errorf("manifest missing expected kid %q", kid)
+
+	f, err := rampwellknown.ParseWBA(getBody(t, srv.URL+rampwellknown.WBAPath))
+	if err != nil {
+		t.Fatalf("served WBA directory invalid: %v", err)
+	}
+	for _, tp := range []string{rwtestutil.MustThumbprint(t, relayPub), rwtestutil.MustThumbprint(t, agentPub)} {
+		if _, ok := rampwellknown.KeyByThumbprint(f, tp); !ok {
+			t.Errorf("WBA directory missing expected thumbprint %q", tp)
 		}
 	}
-	// No invalidation URL configured → the field is omitted.
-	if got := m.GetInvalidationUrl(); got != "" {
-		t.Errorf("unexpected invalidation_url %q with no URL configured", got)
+	// No revocation URL configured → the field is omitted.
+	if got := f.GetRevocationUrl(); got != "" {
+		t.Errorf("unexpected revocation_url %q with no URL configured", got)
 	}
 }
 
-// TestWellKnownHandler_AdvertisesInvalidationURL asserts a configured
-// invalidation URL is published in the manifest so verifiers learn where to
-// poll the Broker's KeyInvalidationList.
-func TestWellKnownHandler_AdvertisesInvalidationURL(t *testing.T) {
+// TestWellKnownHandler_AdvertisesRevocationURL asserts a configured revocation
+// URL is published in the WBA directory so verifiers learn where to poll the
+// Broker's KeyRevocationList.
+func TestWellKnownHandler_AdvertisesRevocationURL(t *testing.T) {
 	t.Parallel()
-	const invURL = "https://broker.example/.well-known/ramp-invalidations.json"
-	m := brokerManifest(t, transport.NewKeyRegistry(), invURL)
-	if got := m.GetInvalidationUrl(); got != invURL {
-		t.Errorf("invalidation_url = %q, want %q", got, invURL)
+	const revURL = "https://broker.example/.well-known/ramp-key-revocations.json"
+	srv, _ := brokerDiscovery(t, transport.NewKeyRegistry(), revURL)
+	f, err := rampwellknown.ParseWBA(getBody(t, srv.URL+rampwellknown.WBAPath))
+	if err != nil {
+		t.Fatalf("served WBA directory invalid: %v", err)
+	}
+	if got := f.GetRevocationUrl(); got != revURL {
+		t.Errorf("revocation_url = %q, want %q", got, revURL)
 	}
 }
 
-// TestInvalidationHandler exercises the file-driven KeyInvalidationList route:
+// TestRevocationHandler exercises the file-driven KeyRevocationList route:
 // absent/no file → epoch-empty snapshot; present file served verbatim; a
 // malformed file → 500 (never an empty snapshot that could un-revoke a key).
-func TestInvalidationHandler(t *testing.T) {
+func TestRevocationHandler(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	good := filepath.Join(dir, "revoked.json")
@@ -127,7 +145,7 @@ func TestInvalidationHandler(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			srv := httptest.NewServer(transport.NewInvalidationHandler(tc.path))
+			srv := httptest.NewServer(transport.NewRevocationHandler(tc.path))
 			defer srv.Close()
 			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, http.NoBody)
 			if err != nil {
@@ -145,10 +163,10 @@ func TestInvalidationHandler(t *testing.T) {
 			if tc.wantStatus != http.StatusOK {
 				return
 			}
-			if err := rampwellknown.ValidateInvalidation(body); err != nil {
+			if err := rampwellknown.ValidateRevocation(body); err != nil {
 				t.Fatalf("served list invalid: %v", err)
 			}
-			var list rampv1.KeyInvalidationList
+			var list rampv1.KeyRevocationList
 			if err := protojson.Unmarshal(body, &list); err != nil {
 				t.Fatalf("decode list: %v", err)
 			}

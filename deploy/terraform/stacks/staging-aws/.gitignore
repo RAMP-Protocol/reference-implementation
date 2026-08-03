@@ -1,0 +1,10 @@
+# Local state, secrets, and generated key material. The state file embeds the
+# rendered user data (key PEMs, DSNs) — it is a secret. Never commit any of
+# this.
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+terraform.tfvars
+*.auto.tfvars
+crash.log
+keys/

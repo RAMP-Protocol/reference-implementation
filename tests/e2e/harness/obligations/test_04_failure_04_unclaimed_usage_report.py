@@ -1,7 +1,6 @@
 """Obligation 04, failure-mode 2: an unclaimed usage report is refused.
 
-Traces to `docs/obligations/04-public-endpoints-without-login.md`,
-failure-mode bullet 2 (verbatim):
+Traces to failure-mode bullet 2 (verbatim):
 
 > The agent attempts to report usage for a transaction whose ``agent_id``
 > does not match its own. The report is refused; the transaction belongs
@@ -71,7 +70,6 @@ from ..seed import (
     CONTRIBUTOR_KEY_PATH,
     SeededFixture,
     _resolve_pg_dsn,
-    seed_stack,
 )
 
 
@@ -92,12 +90,6 @@ _REFUSAL_CODES: frozenset[str] = frozenset(
         "invalid_argument",
     }
 )
-
-
-@pytest.fixture(scope="module")
-def seeded(compose_stack: StackURLs) -> SeededFixture:
-    """Ensure the stack is seeded so baseline table counts are stable."""
-    return seed_stack(str(COMPOSE_FILE), compose_stack.exchange)
 
 
 def _post_signed_json(url: str, body: dict[str, Any]) -> httpx.Response:
@@ -122,7 +114,16 @@ def _post_signed_json(url: str, body: dict[str, Any]) -> httpx.Response:
 
 
 def _snapshot_counts(dsn: str) -> tuple[int, int]:
-    """Return (transaction_log rows, agents rows) at this moment."""
+    """Return (transaction_log rows, agents rows) at this moment.
+
+    BLACK-BOX e2e exception: the transaction ledger has NO
+    protocol read surface BY DESIGN — record-read/reporting is downstream
+    observability over the operator's datastore, out of RAMP's protocol scope,
+    so no public read RPC will be added. A full-stack e2e observing the
+    deployment's datastore directly is NOT the pt9 layer-bypass that rule
+    forbids (an in-process test reaching past a production layer); it is the
+    only way to assert these ledger side effects (here, their absence) end-to-end.
+    """
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM ramp.transaction_log")
         tx_row = cur.fetchone()
@@ -188,10 +189,15 @@ def test_report_for_unclaimed_tx_is_refused_by_exchange(
         service-layer "no such transaction" check; both flavours are
         accepted refusals.
       - Platform invariant: no ledger side effects — ``transaction_log``
-        row count is unchanged, and no synthetic ``agents`` row is
-        inserted (the obligation's "no separate principal was
-        delegated" framing forbids inventing an agent identity to
-        accept a phantom transaction).
+        row count is unchanged (the obligation's "no separate principal
+        was delegated" framing forbids inventing an agent identity to
+        accept a phantom transaction). The ``agents`` table MAY grow by
+        at most one: the request is signed by the caller's own published
+        well-known key, so the Exchange lazy-registers that caller
+        before refusing on the unknown transaction. That is the
+        validly-signed caller registering itself — not a synthetic
+        principal invented to accept the phantom tx; the refusal and the
+        untouched ``transaction_log`` are the load-bearing guarantees.
 
     The Exchange is the canonical (and currently sole) HTTP entry
     point for ReportUsage; see the module-level docstring on the
@@ -203,11 +209,11 @@ def test_report_for_unclaimed_tx_is_refused_by_exchange(
     unknown_tx_id = f"tx-never-accepted-{uuid.uuid4().hex}"
     url = f"{compose_stack.exchange}{_REPORT_USAGE_PATH}"
     body: dict[str, Any] = {
-        "ver": "1.0",
-        "id": f"report-{uuid.uuid4().hex}",
-        "transactionId": unknown_tx_id,
-        "billingId": "",
-        "usage": {"consumedQuantity": 1, "function": ["ai_input"]},
+        "ver": "0.3",
+        "idempotency_key": f"report-{uuid.uuid4().hex}",
+        "transaction_id": unknown_tx_id,
+        "billing_id": "",
+        "usage": {"consumed_quantity": 1, "function": ["ai_input"]},
     }
 
     resp = _post_signed_json(url, body)
@@ -217,10 +223,24 @@ def test_report_for_unclaimed_tx_is_refused_by_exchange(
     assert after_tx == before_tx, (
         f"refused report mutated transaction_log: {before_tx} -> {after_tx}"
     )
-    assert after_agents == before_agents, (
-        f"refused report synthesised an agent row: {before_agents} -> {after_agents}"
+    # The ledger invariant above is load-bearing: NO phantom transaction is
+    # accepted (the report is refused and leaves no transaction_log row, asserted
+    # above/below). Lazy/just-in-time registration (ADR-009 D2, adopted
+    # from v1.1) resolves the CALLER from its own well-known BEFORE the
+    # no-such-transaction check, so a cryptographically-verified caller may
+    # legitimately gain its own ramp.agents row — that is the real signer, NOT a
+    # synthetic identity invented to accept the phantom tx (which would require a
+    # row keyed to the tx's nonexistent agent_id). The agents table may therefore
+    # grow by at most one (the caller's own lazy registration) and must never
+    # decrease; never more.
+    assert 0 <= after_agents - before_agents <= 1, (
+        f"refused report changed agents by more than the lazy-registered "
+        f"caller: {before_agents} -> {after_agents}"
     )
 
+    # BLACK-BOX e2e exception — same rationale as
+    # _snapshot_counts above: assert the unknown tx left no ledger row, observed
+    # directly on the deployment datastore (no protocol read surface exists).
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT 1 FROM ramp.transaction_log WHERE transaction_id = %s",

@@ -1,15 +1,13 @@
 # ADR-006 — Broker Intermediation and Transparency Chain (`authorized_intermediaries`)
 
 **Status:** Accepted (2026-04-23)
-**Tracks:** agentic-content-access-af1u.
+**Tracks:** broker intermediation.
 **Depends on:**
 - `docs/architecture/adr-005-biscuit-transport-canonical-binding.md` Part 3 — Pattern-2 attenuation-append as the sanctioned intermediation mechanism. ADR-006 specifies *who* is permitted to append.
 - `docs/architecture/adr-004-protocol-layers.md` — intermediation authorization lives in the inner (biscuit) layer; ramp.json discovery lives in the outer (deployment) layer.
 **Companion documents:**
 - `docs/architecture/adr-002-entitlement-biscuit-model.md` — authority-block fact convention this ADR extends.
 - `docs/architecture/adr-003-key-rotation-revocation.md` — intermediary pubkey rotation inherits the biscuit-layer mechanics.
-- `docs/design/request-lifecycle.md` — end-to-end runtime flow (updated when Gate G lands).
-- `docs/protocol/ramp-protocol.md` — implementer-facing spec; ramp.json schema extension described here.
 
 ---
 
@@ -150,7 +148,7 @@ Rejected. Without an attenuation block, the broker's participation in the chain 
 
 ## Implementation follow-up
 
-Separate beads tasks (not in scope for this ADR atom):
+Out of scope for this ADR atom, tracked separately:
 
 - **Gate G implementation** — Exchange `policygate` extension, unit + integration tests.
 - **Authority-block mint extension** — biscuit mint tool to accept and emit `authorized_intermediaries`.
@@ -167,5 +165,3 @@ All deferred until a multi-hop broker scenario exists. For now, the protocol sur
 - ADR-003 — key rotation and revocation (applies to intermediary kids).
 - ADR-004 — protocol layers (authorization inner-layer, discovery outer-layer).
 - ADR-005 Part 3 — Pattern-2 attenuation-append mechanism this ADR governs.
-- `docs/protocol/ramp-protocol.md` — ramp.json discovery surface.
-- `docs/design/request-lifecycle.md` — end-to-end flow; updated when Gate G lands.

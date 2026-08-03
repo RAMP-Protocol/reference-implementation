@@ -1,0 +1,403 @@
+# RAMP staging stack — rendered by Terraform (modules/compose-stack).
+# Do not edit on the VM: changes belong in the Terraform templates.
+#
+# This file is also the own-DC reference bundle: a publisher running the stack
+# on their own hardware runs exactly these services with their own values.
+
+name: ramp
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ramp
+      POSTGRES_PASSWORD: "${postgres_password}"
+      POSTGRES_DB: ramp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # First-cluster-init SQL (extra exchange databases, if any). Runs once;
+      # wiping the pgdata volume re-runs it.
+      - /opt/ramp/init-sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ramp -d ramp"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+%{ if tigerbeetle_enabled }
+  # Single-replica TigerBeetle ledger for per-article accounting. The flags
+  # are mandatory: Docker >= 25 blocks io_uring without seccomp=unconfined,
+  # and TigerBeetle locks memory (IPC_LOCK). --development relaxes Direct IO
+  # for overlay/cloud volumes. Static IP because the Exchange's
+  # EXCHANGE_BILLING_TB_ADDRESS accepts IP:port only, never a hostname.
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.17.8
+    restart: unless-stopped
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        [ -f /data/0_0.tigerbeetle ] || /tigerbeetle format --cluster=0 --replica=0 --replica-count=1 --development /data/0_0.tigerbeetle
+        exec /tigerbeetle start --addresses=0.0.0.0:3000 --cache-grid=256MiB --development /data/0_0.tigerbeetle
+    security_opt:
+      - "seccomp=unconfined"
+    cap_add:
+      - "IPC_LOCK"
+    volumes:
+      - tbdata:/data
+    networks:
+      default:
+        ipv4_address: ${tigerbeetle_ip}
+%{ endif }
+  exchange:
+    image: ${exchange_image}
+    restart: unless-stopped
+%{ if tigerbeetle_enabled }
+    # The embedded TigerBeetle client uses io_uring, which Docker >= 25
+    # blocks in its default seccomp profile — the Exchange needs the same
+    # exception as the tigerbeetle service or the client dies with
+    # "failed to initialize IO: PermissionDenied" at boot.
+    security_opt:
+      - "seccomp=unconfined"
+%{ endif }
+    environment:
+      EXCHANGE_DSN: "postgres://ramp:${postgres_password}@postgres:5432/ramp?sslmode=disable"
+      # System of Record — its OWN logical database, a second pool distinct from
+      # EXCHANGE_DSN above. RAMP_SOR_ADAPTER defaults to postgres and there is
+      # no "off", so this is required: unset, the Exchange exits at boot with
+      # "sor: EXCHANGE_SOR_DSN is required for RAMP_SOR_ADAPTER=postgres". The
+      # database is created by the init SQL (see main.tf locals.databases) —
+      # the Exchange migrates it but never creates it.
+      EXCHANGE_SOR_DSN: "postgres://ramp:${postgres_password}@postgres:5432/sor?sslmode=disable"
+      EXCHANGE_ADDR: ":8081"
+      # Offer.exchange routing key: the public hostname, port-less — the
+      # Broker fetches https://<domain>/.well-known/ramp.json from it.
+      EXCHANGE_DOMAIN: "${exchange_hostname}"
+      EXCHANGE_PUBLIC_ORIGIN: "https://${exchange_hostname}"
+      # The tenant whose activation policy agent Register reads. It is the
+      # PUBLISHER's domain, not the Exchange's: the seed step creates the tenant
+      # row under the publisher hostname. Left unset the binary falls back to
+      # EXCHANGE_DOMAIN above, no tenant row matches, and every Register fails
+      # with a default-tenant-not-seeded error — which also means no agent ever
+      # gets a billing_ref, so nothing can be charged.
+      EXCHANGE_DEFAULT_TENANT: "${default_tenant_domain}"
+      RAMP_BILLING_ADAPTER: "${billing_adapter}"
+%{ if tigerbeetle_enabled }
+      EXCHANGE_BILLING_TB_ADDRESS: "${tigerbeetle_ip}:3000"
+      # ISO 4217 numeric currency of the ledger — the adapter refuses to boot
+      # without it.
+      EXCHANGE_BILLING_LEDGER: "${billing_ledger}"
+%{ endif }
+      # https is the production default; stated explicitly so this file never
+      # silently inherits a compose-network http override.
+      RAMP_WELLKNOWN_SCHEME: "https"
+      # Caddy terminates TLS and proxies plain HTTP to this container; it sets
+      # X-Forwarded-Proto (replacing any client-supplied value), so signature
+      # verification must run against the https URL the caller signed, not the
+      # plain-HTTP socket scheme. Safe here ONLY because the service is not
+      # directly reachable — Caddy owns the public ports.
+      RAMP_TRUST_PROXY_HEADERS: "true"
+      # Revocation authority — the Exchange refuses to boot without it. On
+      # first boot this crash-loops until DNS + Caddy certs + the Broker are
+      # live (a few minutes); restart: unless-stopped rides it out.
+      EXCHANGE_BROKER_WELLKNOWN_URL: "https://${broker_hostname}/.well-known/ramp.json"
+      # Env name is fixed by the Exchange binary. The Broker mounts the SAME
+      # keys.json under BROKER_KEYS_FILE — the differing prefixes are
+      # service-mandated, do not "unify" one to match the other.
+      RAMP_KEYS_FILE: "/keys/keys.json"
+      RAMP_ED25519_PRIVATE_PEM_FILE: "/keys/ed25519-private.pem"
+%{ if rsa_enabled }
+      # Only AWS_CLOUDFRONT_RSA tenants use this. Omitting it is a supported
+      # posture, not a broken one: the Exchange starts without an RSA key and
+      # refuses only the requests that would need it, naming the setting to add.
+      RAMP_RSA_PRIVATE_PEM_FILE: "/keys/rsa-private.pem"
+%{ endif }
+    volumes:
+      # Per-service key directory: each container sees ONLY its own keys, so a
+      # compromise of one service does not hand over another service's signing
+      # identity.
+      - /opt/ramp/keys/exchange:/keys:ro
+    # The image is distroless (no shell/curl), so the probe is the service
+    # binary itself (`exchange healthcheck` GETs the local /healthz). During
+    # the documented first-boot crash-loop the container reports unhealthy —
+    # that is the honest status; restart: unless-stopped rides it out.
+    healthcheck:
+      test: ["CMD", "/exchange", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+%{ if tigerbeetle_enabled }
+      tigerbeetle:
+        condition: service_started
+%{ endif }
+      broker:
+        condition: service_healthy
+
+  broker:
+    image: ${broker_image}
+    restart: unless-stopped
+    environment:
+      BROKER_DSN: "postgres://ramp:${postgres_password}@postgres:5432/ramp?sslmode=disable"
+      REDIS_URL: "redis://redis:6379/0"
+      BROKER_ADDR: ":8082"
+      BROKER_ID: "${broker_id}"
+      BROKER_DOMAIN: "${broker_hostname}"
+      RAMP_WELLKNOWN_SCHEME: "https"
+      # Same TLS-termination contract as the exchange: Caddy sets
+      # X-Forwarded-Proto and owns the public ports, so verification runs
+      # against the https URL the agent signed.
+      RAMP_TRUST_PROXY_HEADERS: "true"
+      # Env name is fixed by the Broker binary. The Exchange mounts the SAME
+      # keys.json under RAMP_KEYS_FILE — the differing prefixes are
+      # service-mandated, do not "unify" one to match the other.
+      BROKER_KEYS_FILE: "/keys/keys.json"
+      BROKER_RELAY_KEY_FILE: "/keys/broker-relay-key.json"
+      # The Broker's IDENTITY key — NOT the relay key above. Its public half is
+      # published in the Broker's WBA directory with a 90-day validity window,
+      # so it has to survive a restart: the Broker refuses to boot without it
+      # rather than mint a throwaway that breaks the window it just published.
+      # A key FILE, not a BROKER_ED25519_SEED env value: this compose file is
+      # world-readable on the VM, the mounted key directory is not. The loader
+      # wants a raw 64-byte ed25519 key as the PEM payload — a shape openssl
+      # does not write; gen-staging-keys.sh derives it from the seed into
+      # keys/broker-identity-key.pem.
+      BROKER_ED25519_KEY_FILE: "/keys/broker-identity-key.pem"
+      BROKER_REVOCATION_URL: "https://${broker_hostname}/.well-known/ramp-key-revocations.json"
+%{ if exa_api_key != null }
+      EXA_API_KEY: "${exa_api_key}"
+%{ endif }
+    volumes:
+      - /opt/ramp/keys/broker:/keys:ro
+    # Same distroless-image constraint as the exchange: the binary is the probe.
+    healthcheck:
+      test: ["CMD", "/broker", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Identity plane ─────────────────────────────────────────────────────────
+  # The Identity Service custodies each agent's signing key (identity-vault),
+  # provisions agents through real OIDC sign-up (zitadel), publishes each
+  # agent's Web Bot Auth directory on its own subdomain, and exposes the MCP
+  # endpoint agents connect to.
+
+  # Agent key custody. DEV MODE, and that is a deliberate staging trade-off:
+  # the store is in-memory, so restarting this container destroys every agent
+  # key it holds and the developers who own them must sign up again. Dev mode
+  # also auto-unseals and pre-enables the KV v2 mount at `secret/` that
+  # IDENTITY_KV_MOUNT points at. A production deployment runs a sealed Vault
+  # with real storage and a real auth method instead of a root token.
+  identity-vault:
+    image: hashicorp/vault:1.20
+    restart: unless-stopped
+    cap_add:
+      - "IPC_LOCK"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "${vault_root_token}"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    command: ["server", "-dev"]
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Zitadel's own database, deliberately not the `ramp` cluster: Zitadel runs
+  # heavy schema migrations under its own roles, and keeping them off the
+  # cluster that serves the Exchange and Broker means neither can take the
+  # other down.
+  zitadel-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zitadel
+      POSTGRES_PASSWORD: "${zitadel_db_password}"
+      POSTGRES_DB: zitadel
+    volumes:
+      - zitadeldata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zitadel -d zitadel"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Upstream OIDC provider for developer sign-up. ExternalDomain/Secure
+  # describe the PUBLIC address because the OIDC issuer must be one URL
+  # everywhere: the developer's browser is redirected to it, and the Identity
+  # Service validates tokens against the same string. tlsMode external because
+  # Caddy terminates TLS in front.
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:v3.4.9
+    restart: unless-stopped
+    # Runs as root so first init can write its PAT into the bootstrap volume,
+    # which Docker creates owned by root. Staging-only shortcut; a production
+    # deployment pre-creates the volume with the image's own uid instead.
+    user: "0"
+    command:
+      - start-from-init
+      - --masterkey
+      - "${zitadel_masterkey}"
+      - --tlsMode
+      - external
+      - --steps
+      - /etc/zitadel/init-steps.yaml
+    environment:
+      ZITADEL_EXTERNALDOMAIN: "${zitadel_hostname}"
+      ZITADEL_EXTERNALPORT: "443"
+      ZITADEL_EXTERNALSECURE: "true"
+      ZITADEL_PORT: "8080"
+      ZITADEL_TLS_ENABLED: "false"
+      ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
+      ZITADEL_DATABASE_POSTGRES_PORT: "5432"
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: "${zitadel_db_password}"
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: "${zitadel_db_password}"
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+    volumes:
+      - /opt/ramp/zitadel/init-steps.yaml:/etc/zitadel/init-steps.yaml:ro
+      # First init writes the bootstrap machine user's PAT here; the identity
+      # bootstrap script reads it, and writes the minted OIDC client id and
+      # secret back into the same volume for the identity service to read.
+      - zitadelbootstrap:/bootstrap
+    depends_on:
+      zitadel-db:
+        condition: service_healthy
+
+  identity:
+    image: ${identity_image}
+    restart: unless-stopped
+    environment:
+      IDENTITY_ADDR: ":8083"
+      IDENTITY_DSN: "postgres://ramp:${postgres_password}@postgres:5432/identity?sslmode=disable"
+      # Its own zone: agent directories are served at <slug>.<this>, and the
+      # service refuses any host that is not a single label under it.
+      IDENTITY_BASE_DOMAIN: "${identity_hostname}"
+      IDENTITY_WELLKNOWN_SCHEME: "https"
+      # The service's own public origin. It is the OAuth issuer, the audience
+      # of the bearers it mints, and the base of the /callback URL registered
+      # with Zitadel — changing it invalidates that registration.
+      IDENTITY_AUTH_ISSUER: "https://${identity_hostname}"
+      IDENTITY_OIDC_ISSUER: "https://${zitadel_hostname}"
+      # Minted by the identity bootstrap script into the shared volume. Until
+      # it has run, this container crash-loops on the missing files — the same
+      # documented first-boot behaviour as the Exchange, and restart:
+      # unless-stopped picks it up once the files appear.
+      IDENTITY_OIDC_CLIENT_ID_FILE: "/bootstrap/identity_client_id"
+      IDENTITY_OIDC_CLIENT_SECRET_FILE: "/bootstrap/identity_client_secret"
+      IDENTITY_OIDC_SCOPES: "openid profile email"
+      # Both are generated once and held in Terraform state. Left unset the
+      # service invents them per boot, which silently invalidates every live
+      # session and every bearer it has issued on each restart.
+      IDENTITY_SESSION_KEY: "${identity_session_key}"
+      IDENTITY_TOKEN_SIGNING_KEY: "${identity_token_signing_key}"
+      VAULT_ADDR: "http://identity-vault:8200"
+      VAULT_TOKEN: "${vault_root_token}"
+      IDENTITY_KV_MOUNT: "secret"
+      # In-network hops for the RAMP legs the MCP tools drive.
+      IDENTITY_MCP_BROKER_URL: "http://broker:8082"
+      IDENTITY_MCP_EXCHANGE_URL: "http://exchange:8081"
+      IDENTITY_MCP_WELLKNOWN_SCHEME: "https"
+    volumes:
+      - zitadelbootstrap:/bootstrap:ro
+    # The image is distroless (no shell/curl), so the probe is the service
+    # binary itself (`identity healthcheck` GETs the local /healthz) — same
+    # shape as the Exchange and Broker. During the documented first-boot
+    # crash-loop the container reports unhealthy — that is the honest status;
+    # restart: unless-stopped rides it out.
+    healthcheck:
+      test: ["CMD", "/identity", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+      identity-vault:
+        condition: service_healthy
+      zitadel:
+        condition: service_started
+
+%{ if publisher_enabled }
+  # Demo publisher origin (staging only): serves the demo content tree the
+  # edge worker's ORIGIN_URL points at.
+  publisher:
+    image: ${publisher_image}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/articles/philosophers/thales-of-miletus.txt >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+%{ endif }
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /opt/ramp/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      # Deliberately NOT service_healthy: the Exchange's first boot needs
+      # Caddy live (its broker well-known fetch goes over public HTTPS
+      # through this proxy), so waiting for a healthy Exchange here would
+      # deadlock the cold boot. Caddy answers 502 until the Exchange is up.
+      exchange:
+        condition: service_started
+      broker:
+        condition: service_healthy
+      # Both for the same reason as the Exchange: the Identity Service reaches
+      # Zitadel's issuer over public HTTPS through this proxy, so Caddy must
+      # not wait on either of them — service_healthy here would deadlock the
+      # cold boot even though identity now has its own healthcheck.
+      identity:
+        condition: service_started
+      zitadel:
+        condition: service_started
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${network_subnet}
+
+volumes:
+  pgdata:
+  redisdata:
+%{ if tigerbeetle_enabled }
+  tbdata:
+%{ endif }
+  zitadeldata:
+  # Zitadel's first-init PAT plus the OIDC client id/secret the bootstrap
+  # script mints from it. Wiping this without also wiping zitadeldata (or the
+  # other way round) leaves the two out of step — treat them as one unit.
+  zitadelbootstrap:
+  caddydata:
+  caddyconfig:
+  # identity-vault runs in dev mode and stores nothing on disk, so it has no
+  # volume here. That is what makes a restart lose the agent keys.

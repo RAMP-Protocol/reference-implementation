@@ -5,14 +5,14 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"net/http"
-	"net/http/httptest"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 )
 
 func TestStaticResolver_LookupAndPut(t *testing.T) {
@@ -48,141 +48,76 @@ func TestStaticResolver_LookupAndPut(t *testing.T) {
 	}
 }
 
-func TestWellKnownResolver_FetchAndCache(t *testing.T) {
+// TestStaticResolver_ValidityWindow pins that a statically-loaded key with a
+// not_before/not_after window is enforced: outside the window it resolves to
+// ErrKeyExpired (an authoritative negative, NOT ErrUnknownKey, so the composite
+// rejects rather than falling through), while an unbounded key is always valid.
+func TestStaticResolver_ValidityWindow(t *testing.T) {
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	fetches := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fetches++
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"keys": []map[string]any{
-				{
-					"kid": "agent1.v1",
-					"kty": "OKP",
-					"crv": "Ed25519",
-					"x":   base64.RawURLEncoding.EncodeToString(pub),
-					"use": "sig",
-					"alg": "EdDSA",
-				},
-			},
-		})
-	}))
-	t.Cleanup(srv.Close)
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	r := NewStaticResolver(nil)
+	r.SetClock(func() time.Time { return base })
+	r.PutTimed("windowed", pub, base.Add(-time.Hour), base.Add(time.Hour))
+	r.Put("unbounded", pub)
 
-	clk := clock.NewDeterministic(time.Unix(1700000000, 0))
-	r := NewWellKnownResolver(srv.URL, WellKnownOptions{
-		TTL: 1 * time.Minute,
-		Clk: clk,
-	})
-	got, err := r.Resolve(context.Background(), "agent1.v1")
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
+	// Within the window and the unbounded key both resolve.
+	if _, err := r.Resolve(context.Background(), "windowed"); err != nil {
+		t.Fatalf("within window: unexpected err %v", err)
 	}
-	if !got.Equal(pub) {
-		t.Fatalf("pubkey mismatch")
+	if _, err := r.Resolve(context.Background(), "unbounded"); err != nil {
+		t.Fatalf("unbounded: unexpected err %v", err)
 	}
-	if fetches != 1 {
-		t.Fatalf("expected 1 JWKS fetch, got %d", fetches)
+
+	// Past not_after → ErrKeyExpired, and specifically NOT ErrUnknownKey.
+	r.SetClock(func() time.Time { return base.Add(2 * time.Hour) })
+	_, err = r.Resolve(context.Background(), "windowed")
+	if !errors.Is(err, ErrKeyExpired) {
+		t.Fatalf("expired key: want ErrKeyExpired, got %v", err)
 	}
-	// Cache hit — no new fetch.
-	if _, err := r.Resolve(context.Background(), "agent1.v1"); err != nil {
-		t.Fatalf("second resolve: %v", err)
+	if errors.Is(err, ErrUnknownKey) {
+		t.Fatal("expired key must NOT be ErrUnknownKey (composite must not fall through)")
 	}
-	if fetches != 1 {
-		t.Fatalf("expected cached resolve, got %d fetches", fetches)
+	if _, err := r.Resolve(context.Background(), "unbounded"); err != nil {
+		t.Fatalf("unbounded after clock advance: unexpected err %v", err)
 	}
-	// Advance clock past TTL — refetch.
-	clk.Advance(2 * time.Minute)
-	if _, err := r.Resolve(context.Background(), "agent1.v1"); err != nil {
-		t.Fatalf("post-ttl resolve: %v", err)
-	}
-	if fetches != 2 {
-		t.Fatalf("expected refetch after TTL, got %d fetches", fetches)
+
+	// Before not_before → ErrKeyExpired too.
+	r.SetClock(func() time.Time { return base.Add(-2 * time.Hour) })
+	if _, err := r.Resolve(context.Background(), "windowed"); !errors.Is(err, ErrKeyExpired) {
+		t.Fatalf("not-yet-valid key: want ErrKeyExpired, got %v", err)
 	}
 }
 
-func TestWellKnownResolver_AllowlistRejects(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
-		t.Fatalf("allowlist rejection should short-circuit before fetch")
-	}))
-	t.Cleanup(srv.Close)
-
-	r := NewWellKnownResolver(srv.URL, WellKnownOptions{
-		Allow: func(keyID string) bool { return keyID == "allowed.v1" },
-	})
-	_, err := r.Resolve(context.Background(), "rogue.v1")
-	if !errors.Is(err, ErrUnknownKey) {
-		t.Fatalf("want ErrUnknownKey, got %v", err)
-	}
-}
-
-func TestWellKnownResolver_BadStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "nope", http.StatusInternalServerError)
-	}))
-	t.Cleanup(srv.Close)
-	r := NewWellKnownResolver(srv.URL, WellKnownOptions{})
-	_, err := r.Resolve(context.Background(), "any")
-	if err == nil {
-		t.Fatalf("want error on bad status")
-	}
-}
-
-func TestWellKnownResolver_KeyRotation(t *testing.T) {
-	// First JWKS answers with keyA; subsequent fetches swap to keyB. Simulates
-	// a rotation pushed by the operator while the resolver is long-lived.
-	pubA, _, err := ed25519.GenerateKey(rand.Reader)
+// TestLoadKeysFile_EnforcesValidityWindow proves the static bootstrap loader
+// carries a key's not_before/not_after through to the resolver: a keys.json
+// entry whose window already ended resolves to ErrKeyExpired, not the pubkey.
+func TestLoadKeysFile_EnforcesValidityWindow(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
-	pubB, _, err := ed25519.GenerateKey(rand.Reader)
+	x := base64.RawURLEncoding.EncodeToString(pub)
+	tp, err := helpers.Thumbprint(pub)
 	if err != nil {
-		t.Fatalf("gen: %v", err)
+		t.Fatalf("thumbprint: %v", err)
 	}
-	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
-		var active ed25519.PublicKey
-		if calls == 1 {
-			active = pubA
-		} else {
-			active = pubB
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"keys": []map[string]any{
-				{
-					"kid": "rot.v1", "kty": "OKP", "crv": "Ed25519",
-					"x": base64.RawURLEncoding.EncodeToString(active),
-				},
-			},
-		})
-	}))
-	t.Cleanup(srv.Close)
+	doc := fmt.Sprintf(
+		`{"keys":[{"kty":"OKP","crv":"Ed25519","x":%q,`+
+			`"not_before":"2020-01-01T00:00:00Z","not_after":"2020-01-02T00:00:00Z"}]}`, x)
+	path := filepath.Join(t.TempDir(), "keys.json")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write keys file: %v", err)
+	}
 
-	clk := clock.NewDeterministic(time.Unix(1700000000, 0))
-	r := NewWellKnownResolver(srv.URL, WellKnownOptions{
-		TTL: 10 * time.Second,
-		Clk: clk,
-	})
-
-	gotA, err := r.Resolve(context.Background(), "rot.v1")
-	if err != nil {
-		t.Fatalf("first resolve: %v", err)
+	r := NewStaticResolver(nil)
+	if err := loadKeysFile(r, path); err != nil {
+		t.Fatalf("loadKeysFile: %v", err)
 	}
-	if !gotA.Equal(pubA) {
-		t.Fatalf("expected pubA from first fetch")
-	}
-	// Advance past TTL so the second Resolve triggers a fresh fetch.
-	clk.Advance(1 * time.Minute)
-	gotB, err := r.Resolve(context.Background(), "rot.v1")
-	if err != nil {
-		t.Fatalf("second resolve: %v", err)
-	}
-	if !gotB.Equal(pubB) {
-		t.Fatalf("expected pubB after rotation")
+	// The key loaded, but its window ended in 2020 → expired at time.Now().
+	if _, err := r.Resolve(context.Background(), tp); !errors.Is(err, ErrKeyExpired) {
+		t.Fatalf("expired windowed key from file: want ErrKeyExpired, got %v", err)
 	}
 }

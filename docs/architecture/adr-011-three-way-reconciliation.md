@@ -2,7 +2,7 @@
 
 **Status:** Accepted (2026-06-02)
 
-Refines the MR !2 follow-up (post-commit `billing.Record`, pure-audit `ReportUsage`, `Refund` + `IdempotencyKey`) and the persisted-ledger ticket (`integrate-tigerbeetle-as-billing-adapter`). Consumes ADR-009 (identity binding at dispute submission), ADR-010 (inverse-posting policy for partial refunds), ADR-012 (Edge delivery-log contract), ADR-008 D1 (`Clock` port), and the dispute types in `proto/ramp/v1/ramp.proto` (lines 2014–2158).
+Refines the follow-up contract (post-commit `billing.Record`, pure-audit `ReportUsage`, `Refund` + `IdempotencyKey`) and the persisted-ledger ticket (`integrate-tigerbeetle-as-billing-adapter`). Consumes ADR-009 (identity binding at dispute submission), ADR-010 (inverse-posting policy for partial refunds), ADR-012 (Edge delivery-log contract), ADR-008 D1 (`Clock` port), and the dispute types in `ramp.proto` (module `github.com/RAMP-Protocol/protocol`) (lines 2014–2158).
 
 ---
 
@@ -34,7 +34,7 @@ All four paths consume the same rule table (D3) and produce the same outcome sha
 
 **Clock port.** Time reads go through ADR-008 D1's `Clock` interface. Tests advance the clock manually; production wires the system clock.
 
-**Cross-tenant scope.** The sweep is cross-tenant. Each query carries the `admin:cross_tenant` marker (CLAUDE.md Rule 4); per-tick logs include `sweep_id`, `rows_scanned`, `rows_reconciled`, `rows_flagged_for_review`, `rows_per_tenant`, `duration_ms`.
+**Cross-tenant scope.** The sweep is cross-tenant. Each query carries the `admin:cross_tenant` marker; per-tick logs include `sweep_id`, `rows_scanned`, `rows_reconciled`, `rows_flagged_for_review`, `rows_per_tenant`, `duration_ms`.
 
 ### D2 — The three signed sources
 
@@ -99,7 +99,7 @@ CREATE INDEX rec_log_flagged        ON reconciliation_log (outcome) WHERE outcom
 
 | Field | Carries | Why |
 |---|---|---|
-| `id` | `sha256("refund:" + reconciliation_id)` | RAMP-3 convention: transfer-id derived from idempotency key; re-runs dedupe at the database layer. |
+| `id` | `sha256("refund:" + reconciliation_id)` | Ledger convention: transfer-id derived from idempotency key; re-runs dedupe at the database layer. |
 | `user_data_128` | `reconciliation_log.id` UUID raw bytes | UUIDs are 16 bytes; pass directly. `query_transfers(user_data_128: <id>)` returns every transfer for that run. |
 | `code` | `RECONCILED_OK=1`, `RECONCILED_REFUNDED=2`, `RECONCILED_DISPUTED=3`, `RECONCILED_OPERATOR_OVERRIDE=4` | TigerBeetle's `code` is categorisation; enables "every full refund the reconciler issued in this window." |
 
@@ -178,7 +178,7 @@ The policy is defined by ADR-010. This ADR consumes it via `billing.Refund`. Min
 
 1. A partial refund reverses publisher revenue and platform fee in the same `refund_fraction`.
 2. `refund_fraction` comes from the rule table — quantity reconciliation: `1 - bytes_served / bytes_authorized`; rows 5/7/8/11: `1.0`; rows 3/10: operator picks.
-3. The adapter rejects over-refund (cumulative > original recorded) per the MR !2 follow-up contract.
+3. The adapter rejects over-refund (cumulative > original recorded) per the follow-up contract.
 4. Refund idempotency keys derive from the reconciliation row, not the transaction. A second reconciliation of the same transaction issues a new key; the adapter rejects an over-refund. Dedup is on the decision, not the transaction.
 
 ### D8 — Conformance test surface
@@ -207,6 +207,7 @@ The fake `EdgeLogReader` returns ADR-012-schema records; it is the adapter bound
 - **Bitemporal `tenant_capability_history`** — full enable/disable audit for delivery logs. Single `delivery_log_enabled_from` column suffices for v1.
 - **Reconciler horizontal scaling** — shard by `tenant_id % N`. `sweep.tick_duration_ms` is the scale-out signal.
 - **Content-attestation reconciliation** — when offer carries `content_hash` AND Edge attests `content_hash_served`, rows 3/7/10 collapse to deterministic outcomes. Strict-subset optimization; doesn't change the table.
+- **Settlement-completeness sweep (committed `transaction_log` row vs posted ledger transfer)** — this ADR's D3 rule table reconciles *delivered bytes vs recorded charge*; it assumes the money leg exists. It does NOT cover the crash window between the WAL commit and the best-effort `Record`: if the Exchange process dies there, a delivered transaction has a committed row but its TigerBeetle hold expires natively — a **bounded, one-sided under-charge** (deterministic ids prevent any double-charge). Accepted for v1: the loss is bounded and one-sided. The reconciliation sweep that would re-post such rows is filed as a post-v1 follow-up (deferred past v1). Additive: a periodic query over committed rows with no settled transfer, idempotently re-settling or flagging them.
 
 ---
 

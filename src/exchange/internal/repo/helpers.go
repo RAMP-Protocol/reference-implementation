@@ -14,6 +14,50 @@ func pgText(s string) pgtype.Text {
 	return pgtype.Text{String: s, Valid: true}
 }
 
+// pgTextPtr encodes an optional string as a pgtype.Text: a nil pointer becomes
+// SQL NULL, a non-nil pointer (including the empty string) becomes a present
+// value. Distinct from pgText, which treats "" as NULL — callers that must
+// clear a column to NULL on omission use this.
+func pgTextPtr(s *string) pgtype.Text {
+	if s == nil {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: *s, Valid: true}
+}
+
+// textFromPG decodes a nullable pgtype.Text to *string: SQL NULL becomes nil, a
+// present value (including "") becomes a pointer. The read-side dual of
+// pgTextPtr, used where absent must stay distinguishable from empty. Named
+// FromPG, not textPtr, so it does not read as the tree-wide xxxPtr convention
+// for "take the address of a value" -- this decodes, it does not borrow.
+func textFromPG(t pgtype.Text) *string {
+	if !t.Valid {
+		return nil
+	}
+	s := t.String
+	return &s
+}
+
+// pgBoolPtr encodes an optional bool as a pgtype.Bool: a nil pointer becomes SQL
+// NULL, a non-nil pointer becomes a present value. The bool analogue of
+// pgTextPtr, for columns where "unknown" is a third state alongside true/false.
+func pgBoolPtr(b *bool) pgtype.Bool {
+	if b == nil {
+		return pgtype.Bool{}
+	}
+	return pgtype.Bool{Bool: *b, Valid: true}
+}
+
+// boolFromPG decodes a nullable pgtype.Bool to *bool: SQL NULL becomes nil. The
+// read-side dual of pgBoolPtr; named for the same reason as textFromPG.
+func boolFromPG(b pgtype.Bool) *bool {
+	if !b.Valid {
+		return nil
+	}
+	v := b.Bool
+	return &v
+}
+
 // numericFromFloat encodes a float64 (e.g. a tolerance fraction) as the
 // pgtype.Numeric the NUMERIC(5,4) tolerance column expects. Routes via the
 // canonical decimal string so the round-trip matches pgx's internal Scan

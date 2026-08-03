@@ -1,8 +1,0 @@
-{
-  "kid": "test-signer-e2e.v1",
-  "kty": "OKP",
-  "crv": "Ed25519",
-  "alg": "EdDSA",
-  "private_key": "SvgS549af0gh9-5BPGyy3VpyFuPYPlNozAFDSeU7Yoo",
-  "public_key": "-J62HVQUfS28zJEOqG_vu0nrc4D9Eo9S2UqiUQTSIUo"
-}

@@ -1,6 +1,6 @@
--- Drop ye6f-9 (000005_offers_and_reports) schema.
+-- Drop the 000005_offers_and_reports schema.
 --
--- EPIC agentic-content-access-t3vk renames the local repo to upstream proto
+-- The proto-rename epic renames the local repo to upstream proto
 -- (DiscoverResources / ExecuteTransaction / ReportUsage). The legacy
 -- ListOffers / AcceptOffer / Report bindings backed by ramp.offers,
 -- ramp.report_tokens, ramp.transaction_reports, and the
@@ -11,7 +11,7 @@
 -- Mirror of 000005_offers_and_reports.up.sql in reverse order: drop the
 -- tables (transaction_reports → report_tokens → offers) before the enum
 -- types they reference, restore the transaction_log resource_id FK that
--- 000005 relaxed to allow ofxz AcceptOffer to write offer-id-bearing rows,
+-- 000005 relaxed to allow the legacy AcceptOffer path to write offer-id-bearing rows,
 -- then drop the lifecycle column and its enum.
 
 DROP TABLE IF EXISTS ramp.transaction_reports CASCADE;

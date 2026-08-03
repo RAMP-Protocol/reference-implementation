@@ -1,0 +1,51 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Put the API token in a
+# separate gitignored secrets.auto.tfvars, or export
+# TF_VAR_cloudflare_api_token instead of writing it to disk.
+
+cloudflare_account_id = "0123456789abcdef0123456789abcdef"
+cloudflare_zone_id    = "abcdef0123456789abcdef0123456789"
+
+# Publisher hostname the worker fronts.
+worker_hostname = "news.example.com" # remove if the hostname already has a proxied DNS record
+
+# The worker routes on "<provider_domain>/*" by default. Set route_patterns
+# only when it must match more (or other) patterns:
+# route_patterns = ["news.example.com/*", "news.example.com/api/*", "content.example.com/*"]
+
+# Exchange the publisher is onboarded to (values come from the SSP / Exchange Operator).
+exchange_url = "https://exchange.operator.example"
+
+# The Web Bot Auth directory URL defaults to
+# <exchange_url>/.well-known/http-message-signatures-directory (the standard
+# path). Set exchange_wba_url only if your Exchange operator tells you it
+# lives elsewhere.
+# exchange_wba_url = ""
+
+# Publisher identity advertised in /.well-known/ramp.json.
+#
+# provider_domain is the exact host where the licensed content lives, INCLUDING
+# the subdomain — "news.example.com", not the bare "example.com". It becomes the
+# manifest's "domain" field, and (unless route_patterns above overrides it) the
+# host the worker runs on ("<provider_domain>/*").
+#
+# It must match the host that actually serves the content and this ramp.json.
+# If the manifest says "example.com" but readers reach the content at
+# "news.example.com", the identity does not line up and agents cannot verify it.
+# Use the bare "example.com" only when the content really sits at the apex.
+#
+# exchanges_json is the list of Exchanges this publisher works with.
+provider_domain = "news.example.com"
+exchanges_json  = "[{\"domain\":\"exchange.operator.example\",\"endpoint\":\"https://exchange.operator.example\",\"supported_profiles\":[\"ramp-news-v1\"]}]"
+
+# Origin the worker forwards verified requests to. Remove when the CDN
+# already routes to origin (CloudFront-native style setups).
+origin_url = "https://origin.example.com"
+
+# Agent-key proof-of-possession. Left unset (as here), the worker enforces
+# the proof — the production posture. Uncomment to let a signed URL be
+# fetched on its own, with no bound-key proof — the right setting for an
+# edge whose fetcher cannot hold the bound key.
+# ramp_enforce_binding = "false"
+
+# The secret does NOT belong in this file — copy secrets.auto.tfvars.example
+# to secrets.auto.tfvars.

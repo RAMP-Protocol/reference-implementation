@@ -2,15 +2,12 @@
 
 **Status:** Accepted (2026-04-21)
 **Supersedes:** `docs/architecture/adr-002-two-biscuit-model.md` (previous draft — retracted; the identity-biscuit concept duplicated the JWT's job)
-**Tracks:** ye6f-15 / agentic-content-access-e23e
+**Tracks:** the entitlement-biscuit model.
 **Companion documents:**
 - `docs/architecture/adr-001-three-layer-auth.md` — why RFC 9421 + JWT + Biscuit coexist
-- `docs/design/request-lifecycle.md` — end-to-end runtime flow
-- Paused-methodology origin: original Biscuit choice (ADR-040) tracked in the `piarch` repo.
 
 **See also:**
 - `docs/architecture/adr-003-key-rotation-revocation.md` — rotation and revocation mechanics for the entitlement-biscuit signing key, buyer delegation key, and the opaque-URL discovery model for `buyer_keys_url` / `renewal_url`.
-- `docs/protocol/ramp-protocol.md` — canonical implementer-facing narrative for how this biscuit shape composes with the renewal endpoint, keyed revocation list, and per-subscriber kid guidance, with worked examples for enterprise / platform-hosted / individual buyers.
 
 ---
 
@@ -31,7 +28,7 @@ Three forces pushed the model to a single-biscuit shape:
 This ADR locks in:
 - A **single** entitlement biscuit on the wire, signed at authority-block level by the **resource owner**.
 - **Mandatory per-request attenuation**, signed by a **buyer-side delegation key**, with a ≤10-minute TTL and a `sub(...)` fact bound to the JWT principal.
-- **Resource-owner-neutral terminology** throughout (`resource_owner`, `subscriber_org`, `/.well-known/ramp-keys` hosted on each resource owner per ADR-001 amendment ye6f-11). "Publisher" appears only in demo examples.
+- **Resource-owner-neutral terminology** throughout (`resource_owner`, `subscriber_org`, `/.well-known/ramp-keys` hosted on each resource owner per the ADR-001 amendment). "Publisher" appears only in demo examples.
 
 ---
 
@@ -41,11 +38,11 @@ RAMP carries **one** Biscuit artifact on every authorized request — the **enti
 
 ### A. Authority block — resource-owner-signed, minted at contract time
 
-The authority block is produced by the resource owner's contract-time minting tool (tracked as ye6f-13, `3hon`). It is handed out-of-band to the buyer along with the buyer-side delegation private key (see §C).
+The authority block is produced by the resource owner's contract-time minting tool. It is handed out-of-band to the buyer along with the buyer-side delegation private key (see §C).
 
 - **Issuer:** resource owner (e.g. `examplenews-as-resource-owner` in the demo; `reuters-data`, `ft-api`, `acme-dataset-vendor` in production).
 - **Signing key:** resource owner's Ed25519 subscription key, distinct from any IdP key.
-- **Pubkey discovery:** `https://<resource-owner-host>/.well-known/ramp-keys` (JWKS; see ADR-001 amendment ye6f-11 for the everyone-signs convention).
+- **Pubkey discovery:** `https://<resource-owner-host>/.well-known/ramp-keys` (JWKS; see the ADR-001 amendment for the everyone-signs convention).
 - **Lifetime:** short relative to contract term — `valid_until ≤ now + 7d` at mint time, re-issued periodically via `renewal_url`. This is a deliberate departure from the previous draft's months-to-years TTL; see "Consequences" below.
 - **Authority-block facts:**
 
@@ -108,7 +105,7 @@ The authority block's `subscriber_org(...)` fact is the buyer's tenant identifie
 
 ### E. Authorizer
 
-Exchange's authz path runs biscuit-lib chain verification first, then layers five service-level policy gates on top (tracked as ye6f-12, `x9pr`). The gates consume JWT-derived facts that are injected into the Datalog world at authz time, plus structural properties of the attenuation blocks that biscuit-lib does not enforce natively.
+Exchange's authz path runs biscuit-lib chain verification first, then layers five service-level policy gates on top. The gates consume JWT-derived facts that are injected into the Datalog world at authz time, plus structural properties of the attenuation blocks that biscuit-lib does not enforce natively.
 
 **Fact sources (Datalog world at authz time):**
 
@@ -127,7 +124,7 @@ Exchange's authz path runs biscuit-lib chain verification first, then layers fiv
 | D — org binding | `jwt.org == authority.subscriber_org` | `"org mismatch"` |
 | E — authority TTL | `authority.valid_until > now` | `"authority expired"` |
 
-Gate specifics (discovery URLs, cache TTLs, JWKS shapes) are authoritative in the `x9pr` ticket; this ADR fixes the gate surface and ordering.
+Gate specifics (discovery URLs, cache TTLs, JWKS shapes) are settled by the biscuit-transport slice; this ADR fixes the gate surface and ordering.
 
 **Datalog query (after gates pass):**
 
@@ -154,7 +151,7 @@ Denial reason is the first-missing rule element — stable identifiers for audit
 
 ## Wire shape
 
-Per ye6f-12 (`x9pr`), the single entitlement biscuit travels in an HTTP header, **not** in the proto body. The proto does not carry any biscuit field.
+The single entitlement biscuit travels in an HTTP header, **not** in the proto body. The proto does not carry any biscuit field.
 
 ```http
 POST /ramp.broker.v1.BrokerService/DiscoverResources HTTP/2
@@ -176,7 +173,7 @@ RFC 9421 coverage extends over both the `Authorization` header (JWT) and the `X-
 
 Examplenews is *one* resource owner in the demo stack. The terminology below uses `resource_owner("examplenews")` everywhere in the biscuit; "publisher" appears only in this example to anchor the demo narrative. Other resource owners (data vendors, API providers) use the same biscuit shape with their own identifiers — no protocol change.
 
-Examplenews's contract-time CLI (tool from ye6f-13) mints an authority block with:
+Examplenews's contract-time CLI (the contract-time mint tool) mints an authority block with:
 - `resource_owner("examplenews")`
 - `subscriber_org("acme")`
 - `buyer_delegation_pubkey(hex("…acme's Ed25519 pubkey bytes…"))`, pulled from `https://acme.com/.well-known/ramp-keys`
@@ -210,9 +207,9 @@ For each request, acme's MCP shim appends an attenuation block signed by acme's 
 
 ### Out of scope for this ADR
 
-- The exact JWKS-discovery protocol for revocation lists (tracked in ye6f-20 and referenced by gate C).
+- The exact JWKS-discovery protocol for revocation lists (referenced by gate C).
 - Multi-resource-owner aggregators / reseller chains. The delegation chain supports them structurally; Exchange semantics for cross-resource-owner resolution are a v2 design question.
-- Buyer-side delegation key management tooling (the buyer analogue of ye6f-13's mint tool). The demo uses a hand-managed keypair; production buyers will want a key-management service.
+- Buyer-side delegation key management tooling (the buyer analogue of the mint tool). The demo uses a hand-managed keypair; production buyers will want a key-management service.
 
 ---
 
@@ -225,7 +222,7 @@ The earlier draft carried **two** biscuits on the wire: an identity biscuit mint
 Rejected because:
 - **Redundant with JWT.** The identity biscuit's `user/email/org/identity_source` facts are already present in the JWT (`jwt.sub`, `jwt.email`, `jwt.org`, `jwt.idp_alias`). ADR-001 requires JWT verification anyway for SIEM/gateway compatibility. Verifying the same facts twice through independent trust chains adds a key hierarchy with no authz-surface benefit.
 - **Extra failure mode for no gain.** The identity biscuit requires the IdP mint webhook to be healthy at every login. `interruptOnError=true` on the Zitadel Actions Target makes a mint failure cause OIDC login failure. The biscuit path is a second reason an otherwise-valid login can fail, without a matching authz-surface justification.
-- **Two `/.well-known/*` endpoints instead of one.** The previous draft had `/.well-known/biscuit-keys` on `idp-mint` and `/.well-known/ramp-subscription-keys` on publishers. Retiring the identity biscuit consolidates to `/.well-known/ramp-keys` on resource owners only (per ADR-001 amendment ye6f-11).
+- **Two `/.well-known/*` endpoints instead of one.** The previous draft had `/.well-known/biscuit-keys` on `idp-mint` and `/.well-known/ramp-subscription-keys` on publishers. Retiring the identity biscuit consolidates to `/.well-known/ramp-keys` on resource owners only (per the ADR-001 amendment).
 
 ### (b) Single chain rooted at publisher with IdP-signed identity attenuation block — rejected
 
@@ -260,9 +257,8 @@ Rejected because the biscuit's delegation chain IS the registry. The authority b
 
 - **ADR-001** (three-layer auth): JWT ≠ authz. The JWT carries principal identity (`jwt.sub`, `jwt.org`); the entitlement biscuit carries authorization. This ADR adjusts the Layer-3 row of ADR-001's summary table from "identity biscuit + entitlement biscuit" to "entitlement biscuit only".
 - **ADR-040** (paused; Biscuit delegation tokens): locks in biscuit-v2 as the token format. This ADR applies that choice to one artifact with mandatory attenuation, rather than two.
-- **ye6f-11** (`qrhi`, ADR-001 amendment): everyone-signs + `/.well-known/ramp-keys` convention hosted on each resource owner. This ADR consumes the `/.well-known/ramp-keys` endpoint for authority-block key discovery.
-- **ye6f-12** (`x9pr`): single-biscuit-in-header + five Exchange policy gates. This ADR fixes the gate surface and ordering; `x9pr` is authoritative for URL shapes, cache TTLs, and JWKS structures.
-- **ye6f-13** (`3hon`): resource-owner contract-time minting tool. Produces the authority blocks described in §A.
-- **ye6f-14** (`bnk2`): retire `src/idp-mint/`. Deletes the identity-biscuit mint webhook (Zitadel Actions v2 Target, `/.well-known/biscuit-keys`) now that this ADR removes the identity biscuit from the wire.
-- **ADR-003** (key rotation/revocation; tracked as ye6f-16): defines resource-owner and buyer revocation mechanics referenced by gate C.
-- **`docs/design/request-lifecycle.md`** — authoritative for the runtime flow; updated to the single-biscuit + mandatory-attenuation story alongside this ADR.
+- everyone-signs + `/.well-known/ramp-keys` convention hosted on each resource owner. This ADR consumes the `/.well-known/ramp-keys` endpoint for authority-block key discovery.
+- single-biscuit-in-header + five Exchange policy gates. This ADR fixes the gate surface and ordering; the biscuit-transport slice is authoritative for URL shapes, cache TTLs, and JWKS structures.
+- resource-owner contract-time minting tool. Produces the authority blocks described in §A.
+- retire the identity-biscuit mint webhook (a Zitadel Actions v2 target serving `/.well-known/biscuit-keys`), now that this ADR removes the identity biscuit from the wire. **Done** — retired on 2026-04-23; identity now lives entirely in the Zitadel JWT. Its successor, a contract-time entitlement mint, was itself deleted when v1 dropped the subscription path.
+- **ADR-003** (key rotation/revocation): defines resource-owner and buyer revocation mechanics referenced by gate C.

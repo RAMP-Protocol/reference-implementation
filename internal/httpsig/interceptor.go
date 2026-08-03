@@ -36,7 +36,7 @@ type InterceptorOptions struct {
 	// MaxSignatures bounds the signature (hop) count on a multisig request.
 	// 0 (the zero value) means unbounded — only the Exchange-terminal middleware
 	// sets it (= max_intermediary_hops + 1); Broker ingress must leave it 0 so
-	// the relay hop is not double-bounded (RAMP-56 change set G).
+	// the relay hop is not double-bounded.
 	MaxSignatures int
 	// OnVerified is called on successful verification. Handlers can use this
 	// to stash the verified keyID into request-scoped state for audit
@@ -210,7 +210,7 @@ func (c middlewareConfig) verifyMultisig(
 		return nil, err
 	}
 	// Replay is checked in two phases so a rejected multisig request never burns
-	// the replay key of its other signatures (SEC-03). Phase 1: reject if ANY
+	// the replay key of its other signatures. Phase 1: reject if ANY
 	// signature is already recorded, adding nothing. Phase 2: commit them all.
 	// SeenOrAdd in phase 2 still guards a concurrent duplicate that races between
 	// the phases — its first (agent) label trips here.

@@ -1,42 +1,67 @@
 // Agent-id resolution for ExecuteTransaction.
 //
-// Pre-MR behavior lazy-registered unknown ids with a placeholder public_key so
-// any wire-claimed requester.id could be persisted to transaction_log.agent_id.
-// The caller-identity authz layer (resolveCaller / authorizeForAgent) now
-// requires every accepted caller to be a registered agent or broker, so the
-// lazy-upsert path is gone — an unknown requester.id is a hard NotFound. For
-// the broker-relay flow the on-the-wire requester.id MUST already correspond
-// to a registered AGENT (the broker cannot mint identities on the fly).
+// An unknown requester.id is lazily registered (ADR-009 D2, v1.1): the Exchange
+// pulls→verifies→persists the agent from its OWN /.well-known/ramp.json before
+// the transaction proceeds. This adds NO new trust surface — the re-package
+// execute path already fetches and trusts the agent's well-known key to verify
+// the body AgentAcceptance binding, so persisting the agent row here records the
+// same key the delivery URL will be bound to. A forged keyID cannot self-register
+// (agentreg refuses a key the keyID's own manifest does not publish). When lazy
+// registration is not configured (a harness without agentReg), resolveAgentLazily
+// falls back to a registration-required rejection.
 
 package service
 
 import (
 	"context"
-	"errors"
+	"fmt"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
 
-// resolveAgentID returns the agent_id to attribute the transaction to. The
-// id MUST exist in ramp.agents — unknown ids are rejected with NotFound so
-// transaction_log.agent_id (FK to agents) is always satisfied. requester.id
-// is guaranteed non-empty by validateTxRequest.
+// resolveAgentID returns the agent_id to attribute the transaction to plus the
+// agent's billing_ref (the account handle the paid path charges, ADR-021 D5).
+// The id MUST resolve to a row in ramp.agents (so transaction_log.agent_id's FK
+// is satisfied); an unknown id is lazily registered from its well-known, or
+// rejected if it cannot be. The billing_ref comes ONLY from that resolved row —
+// never from anything the caller sends — and is empty when the agent has not
+// registered for paid content. When lazy registration is not wired (s.agents ==
+// nil, a bare harness) the requester id is returned with an empty ref.
+// requester.id is guaranteed non-empty by validateBatchRequest.
+//
+// requester.id is normalized to its directory host first (internal/agentid), so
+// the id attributed to the transaction is the same one the caller's signed
+// Signature-Agent resolves to. The two are constructed independently — one is the
+// header the outbound signer emits, the other a body field — and nothing on the
+// wire forces them into the same spelling. RAMP's own identity service does build
+// both from one value, so its requests agree by construction; an external client
+// is under no such obligation, and that is the case this normalization exists for.
+// Left raw, transaction_log.agent_id would hold a different string from the row
+// lookupCaller authorized, and the FK would point at a second registration for one
+// agent.
+//
+// The SIGNED bytes are preserved separately: transaction_evidence.requester_id
+// keeps requester.id verbatim, so what the agent attested and what the ledger
+// attributes are both recoverable. They are joined through FromDirectory rather
+// than by equality — see migration 000024's column comment.
 func (s *ExchangeService) resolveAgentID(
 	ctx context.Context, req *rampv1.TransactionRequest,
-) (string, error) {
-	requesterID := req.GetRequester().GetId()
+) (agentID, billingRef string, err error) {
+	requesterID, err := agentid.FromDirectory(req.GetRequester().GetId())
+	if err != nil {
+		return "", "", exchange.Wrap(exchange.KindInvalidRequest, err,
+			fmt.Sprintf("requester.id %q does not name a host", req.GetRequester().GetId())).
+			WithField("requester.id")
+	}
 	if s.agents == nil {
-		return requesterID, nil
+		return requesterID, "", nil
 	}
-	if _, err := s.agents.ByID(ctx, requesterID); err != nil {
-		if errors.Is(err, repo.ErrAgentNotFound) {
-			return "", exchange.Newf(exchange.KindNotFound,
-				"agent %q not registered", requesterID)
-		}
-		return "", exchange.Wrap(exchange.KindInternal, err, "lookup agent")
+	agent, err := s.resolveAgentLazily(ctx, requesterID)
+	if err != nil {
+		return "", "", err
 	}
-	return requesterID, nil
+	return requesterID, agent.BillingRef, nil
 }

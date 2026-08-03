@@ -1,21 +1,29 @@
-"""Shared producers for the RAMP-56 two-phase Broker-relay flow.
+"""Two-phase Broker-relay execute producer for the E2E suites (re-package).
 
 Why this exists
 ---------------
-Five e2e tests independently rebuilt the discovery RAMPRequest body and the
-"sign a TransactionRequest with the Exchange ``@target-uri``, then POST it to
-the Broker relay" block. The copies had drifted on real contract fields —
-``requester.domain`` present in some and absent in others, ``offerSignature``
-conditional in some and unconditional in others — exactly the silent
-divergence the repo's "shared fixtures, not copy-pasted" rule exists to
-prevent. This module is the single producer of both request shapes.
+On the modern protocol line the AGENT originates ExecuteTransaction, and under the
+re-package model it is topology-decoupled from the Exchange. Phase 2 of
+the relay flow is: the agent reflects the discovered, signed Offer onto
+``TransactionRequest.offer``, detached-signs an ``AgentAcceptance`` over that offer
+(R4 made acceptance REQUIRED at execute), serializes the request ONCE,
+RFC 9421-signs those exact bytes (sig1) against the **Broker relay route** it POSTs
+to (NOT the Exchange URL — the agent never knows or signs over an Exchange
+endpoint), then POSTs the identical bytes to ``POST /broker/v1/exchange/execute``.
+The Broker verifies sig1 as received, reads the signed ``offer.exchange`` from the
+body, resolves the Exchange endpoint via that exchange's own ``/.well-known/ramp.json``,
+RE-PACKAGES a fresh broker-signed ExecuteTransaction, and the Exchange verifies the
+offer signature + the acceptance and binds the signed retrieval URL to the agent's
+proven key. Routing flows entirely from the first-class signed ``Offer.exchange``.
+
+The body is serialized exactly once and the SAME bytes are both signed and posted —
+re-marshaling would change the bytes and break the agent's Content-Digest binding
+(and sig1), which the Broker reconstructs and verifies.
 
 Public surface
 --------------
-:func:`build_resolve_body` — build a canonical RAMPRequest body for discovery.
-:func:`resolve` — POST a signed RAMPRequest to ``/broker/v1/resolve``.
-:func:`relay_execute` — phase 2: sign a TransactionRequest with the Exchange
-``@target-uri`` and POST it to the Broker relay endpoint.
+:func:`relay_execute` — phase 2: build + sign + relay one discovered Offer,
+returning the raw ``httpx.Response`` so callers own their status/body assertions.
 """
 
 from __future__ import annotations
@@ -27,123 +35,127 @@ from typing import Any
 
 import httpx
 
+from ramp_sdk.core import sign_offer_acceptance_jcs
+from .httpsig_signer import load_keypair
 from .signing import (
     AGENT_E2E_KEY_PATH,
-    EXCHANGE_ENDPOINT_HEADER,
     build_signed_headers,
-    sign_post,
 )
 
-
-def build_resolve_body(
-    agent_id: str, *, uri: str | None = None, query: str | None = None
-) -> dict[str, Any]:
-    """Build a canonical RAMPRequest body for ``/broker/v1/resolve`` (discovery).
-
-    The per-call unique ``id`` keeps the signed bytes — hence the Content-Digest
-    and the signature — distinct, so the Broker's (keyID, signature) replay store
-    never treats two resolves of the same {agent, uri} as a duplicate. The Broker
-    decodes the body with a DiscardUnknown protojson decoder, so forward-
-    compatible extras are ignored.
-    """
-    requester: dict[str, Any] = {"id": agent_id}
-    if uri:
-        requester["uris"] = [uri]
-    body: dict[str, Any] = {
-        "ver": "1.0",
-        "id": f"rampreq-{uuid.uuid4().hex}",
-        "requester": requester,
-    }
-    if query:
-        body["query"] = query
-    return body
-
-
-def resolve(
-    broker_url: str, body: dict[str, Any], *, key_path: Path = AGENT_E2E_KEY_PATH
-) -> httpx.Response:
-    """POST a signed canonical RAMPRequest to ``/broker/v1/resolve`` as the agent.
-
-    The Broker requires every ``/broker/v1/*`` call to carry a valid RFC 9421
-    signature whose keyID equals the request's ``requester.id`` (self-act); the
-    default ``AGENT_E2E_KEY_PATH`` signs as ``agent-e2e`` (kid == requester.id),
-    the identity the seed both credits and registers.
-    """
-    return sign_post(f"{broker_url}/broker/v1/resolve", body=body, key_path=key_path)
-
-
-def build_transaction_body(
-    *,
-    agent_id: str,
-    offer_id: str,
-    offer_signature: str | None = None,
-    domain: str | None = None,
-    tx_request_id: str | None = None,
-) -> dict[str, Any]:
-    """Build a RAMP TransactionRequest body for the relay execute phase.
-
-    ``offer_signature`` and ``domain`` are included only when truthy, so one
-    shape serves both the always-set obligation callers and the conditional
-    full-stack/multisig callers without re-diverging. ``tx_request_id`` defaults
-    to a fresh ``tx-<uuid>`` when not supplied.
-    """
-    requester: dict[str, Any] = {"id": agent_id, "type": "REQUESTER_TYPE_AGENT"}
-    if domain:
-        requester["domain"] = domain
-    body: dict[str, Any] = {
-        "ver": "1.0",
-        "id": tx_request_id or f"tx-{uuid.uuid4().hex}",
-        "offerId": offer_id,
-        "requester": requester,
-    }
-    if offer_signature:
-        body["offerSignature"] = offer_signature
-    return body
+_RELAY_ROUTE = "/broker/v1/exchange/execute"
 
 
 def relay_execute(
-    *,
     broker_url: str,
-    exchange_endpoint: str,
+    offer: dict[str, Any],
+    *,
     agent_id: str,
-    offer_id: str,
-    offer_signature: str | None = None,
-    domain: str | None = None,
-    tx_request_id: str | None = None,
+    domain: str,
     key_path: Path = AGENT_E2E_KEY_PATH,
+    idempotency_key: str | None = None,
     timeout: float = 30.0,
 ) -> httpx.Response:
-    """RAMP-56 phase 2: sign a TransactionRequest with the Exchange ``@target-uri``
-    (the final destination, per the RFC 9421 relay pattern — the signature must
-    cover where it is verified, the Exchange, not the intermediate Broker hop)
-    and POST it to the Broker relay endpoint. The Broker preserves the agent's
-    sig1 and appends its own sig2 (multisig). Returns the raw ``httpx.Response``
-    so callers own their own status/body assertions.
+    """Phase 2: relay-execute one discovered ``offer`` (re-package).
+
+    Reflects the FULL discovered ``offer`` verbatim onto ``TransactionRequest.offer``
+    (the tightened proto verifies ``offer.signature`` over the exact
+    presented bytes — XOR ``items``), detached-signs an ``AgentAcceptance`` over
+    ``offer.signature`` + ``requester`` + ``idempotency_key``, then
+    sig1-signs the serialized body against the **Broker relay route** and POSTs the
+    SAME bytes there. ``key_path`` MUST match ``agent_id`` — both sig1's keyID and
+    the acceptance key are this agent (the Exchange binds the response to the agent
+    that signed the acceptance). The broker derives the Exchange target from the
+    signed ``offer.exchange`` in the body, so no Exchange URL is supplied.
+
+    Returns the raw ``httpx.Response`` (a successful relay carries the Exchange's
+    ``TransactionResponse`` with the agent-bound ``retrievalEndpoint`` in
+    ``items[0]``); callers own the status/body verdict and read ``items[0]``.
+
+    A single offer is the degenerate 1-element batch — this folds
+    onto :func:`relay_execute_batch` so the wire body is a 1-item ``items[]`` (never
+    the deprecated top-level ``offer``/``agentAcceptance``). The agent-facing
+    signature is unchanged; only the wire shape collapses onto the batch envelope.
     """
-    body = build_transaction_body(
+    resp, _ = relay_execute_batch(
+        broker_url,
+        [offer],
         agent_id=agent_id,
-        offer_id=offer_id,
-        offer_signature=offer_signature,
         domain=domain,
-        tx_request_id=tx_request_id,
-    )
-    payload = json.dumps(body, separators=(",", ":")).encode()
-    exchange_url = f"{exchange_endpoint}/ramp.v1.ExchangeService/ExecuteTransaction"
-    headers = build_signed_headers(
-        method="POST", target_uri=exchange_url, body=payload, key_path=key_path
-    )
-    headers[EXCHANGE_ENDPOINT_HEADER] = exchange_endpoint
-    return httpx.post(
-        f"{broker_url}/broker/v1/exchange/execute",
-        content=payload,
-        headers=headers,
+        key_path=key_path,
+        idempotency_key=idempotency_key,
         timeout=timeout,
     )
+    return resp
 
 
-__all__ = [
-    "build_resolve_body",
-    "build_transaction_body",
-    "relay_execute",
-    "resolve",
-]
+def relay_execute_batch(
+    broker_url: str,
+    offers: list[dict[str, Any]],
+    *,
+    agent_id: str,
+    domain: str,
+    key_path: Path = AGENT_E2E_KEY_PATH,
+    idempotency_key: str | None = None,
+    timeout: float = 30.0,
+) -> tuple[httpx.Response, bytes]:
+    """Batch relay: relay-execute a BATCH of discovered ``offers``.
+
+    Builds ONE ``TransactionRequest`` carrying ``items[]`` (offer absent), one
+    item per ``offer`` — each item reflects the FULL discovered offer and carries
+    its own detached ``AgentAcceptance`` signed over THAT offer's signature + the
+    SHARED requester + the SHARED ``idempotency_key`` (Core Invariant: the broker
+    forwards each item byte-identical, so every item's acceptance still verifies at
+    the exchange it routes to). The agent sig1-signs the serialized body against
+    the Broker relay route and POSTs the SAME bytes; the broker groups the items by
+    each item's signed ``offer.exchange``, fans out one broker-signed sub-request
+    per exchange, and merges the per-exchange ``items[]`` back in original order.
+
+    Returns ``(response, payload)`` — the raw ``httpx.Response`` (a successful
+    batch carries a 200 ``TransactionResponse`` with one ``items[]`` entry per
+    offer, in original order; per-item denials stay in-body) AND the exact body
+    bytes posted, so callers can assert the inbound batch body stays under the
+    broker's 64 KiB pre-auth bound. ``key_path`` MUST match ``agent_id``.
+    """
+    idem = idempotency_key or f"tx-{uuid.uuid4().hex}"
+    _, priv = load_keypair(key_path)
+    requester = {"id": agent_id, "domain": domain, "type": "REQUESTER_TYPE_AGENT"}
+
+    items: list[dict[str, Any]] = []
+    for offer in offers:
+        offer_signature = offer.get("signature")
+        assert offer_signature, f"discovered offer carries no signature: {offer!r}"
+        acceptance_sig, acceptance_alg = sign_offer_acceptance_jcs(
+            seed=priv.private_bytes_raw(),
+            offer_sig=str(offer_signature),
+            requester_id=agent_id,
+            requester_domain=domain,
+            idempotency_key=idem,
+        )
+        items.append(
+            {
+                "offer": offer,
+                "agent_acceptance": {
+                    "signature": acceptance_sig,
+                    "signature_algorithm": acceptance_alg,
+                },
+            }
+        )
+
+    body: dict[str, Any] = {
+        "ver": "1.0",
+        "idempotency_key": idem,
+        "requester": requester,
+        "items": items,
+    }
+    payload = json.dumps(body, separators=(",", ":")).encode()
+    relay_url = f"{broker_url}{_RELAY_ROUTE}"
+    headers = build_signed_headers(
+        method="POST",
+        target_uri=relay_url,
+        body=payload,
+        key_path=key_path,
+    )
+    return httpx.post(relay_url, content=payload, headers=headers, timeout=timeout), payload
+
+
+__all__ = ["relay_execute", "relay_execute_batch"]

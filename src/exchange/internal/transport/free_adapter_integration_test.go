@@ -5,7 +5,6 @@ package transport_test
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"net/http"
 	"testing"
 
@@ -14,8 +13,10 @@ import (
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 	"github.com/oklog/ulid/v2"
 
+	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 )
 
@@ -32,17 +33,22 @@ func TestFreeAdapter_DropInForExchangeService(t *testing.T) {
 	if _, err := h.catalogClient.PushResources(ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
 		TenantId: h.tenantID,
 		CallerId: "agent-free",
-		Entries:  []*rampv1.ResourceEntry{{Domain: h.tenantDomain, Path: "/articles/free"}},
+		Entries: []*rampv1.ResourceEntry{{
+			Domain: h.tenantDomain, Path: "/articles/free",
+			// A priced term is required for an offer; the FreeAdapter
+			// ignores the amount but the entry still needs a real term to price.
+			Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
+		}},
 	})); err != nil {
 		t.Fatalf("push: %v", err)
 	}
 
 	// Discover to get the signed offer.
 	discovered, err := h.exchangeClient.DiscoverResources(ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver: "1.0", Id: "q-free",
+		Ver:  "1.0",
+		Uris: []string{"https://" + h.tenantDomain + "/articles/free"},
 		Requester: &rampv1.Requester{
 			Id: "agent-free", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-			Uris: []string{"https://" + h.tenantDomain + "/articles/free"},
 		},
 	}))
 	if err != nil {
@@ -54,24 +60,25 @@ func TestFreeAdapter_DropInForExchangeService(t *testing.T) {
 	}
 	offer := offers[0]
 
-	offerID := offer.GetOfferId()
-	offerSig := offer.GetSignature()
+	requester := &rampv1.Requester{
+		Id: "agent-free", Domain: "agent.example",
+		Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
+	}
 	execResp, err := h.exchangeClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", Id: "tx-free",
-		OfferId:        &offerID,
-		OfferSignature: &offerSig,
-		Requester: &rampv1.Requester{
-			Id: "agent-free", Domain: "agent.example",
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
+		Ver: "1.0", IdempotencyKey: "tx-free",
+		Requester: requester,
+		Items: []*rampv1.TransactionItem{
+			{Offer: offer, AgentAcceptance: signAcceptanceFor(t, h.callerPriv, offer, requester, "tx-free")},
 		},
 	}))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if execResp.Msg.GetTransactionId() == "" {
+	item := singleResultItem(t, execResp)
+	if item.GetTransactionId() == "" {
 		t.Fatal("transaction id empty")
 	}
-	billingID := execResp.Msg.GetBillingId()
+	billingID := item.GetBillingId()
 	if billingID == "" {
 		t.Fatal("billing id empty in response")
 	}
@@ -79,19 +86,22 @@ func TestFreeAdapter_DropInForExchangeService(t *testing.T) {
 		t.Fatalf("billing id %q not a valid ULID: %v", billingID, err)
 	}
 
-	// Verify transaction log row was written with our billing ID.
-	row, err := h.queries.GetTransactionByRequestID(ctx, "tx-free")
+	// Verify transaction log row was written with our billing ID, under the
+	// DERIVED per-item key (items-only path).
+	// Production repository surface, not the raw sqlc Querier (Testing Doctrine pt9).
+	derivedKey := "tx-free" + ":" + offer.GetOfferId()
+	rec, err := repo.NewTransactionRepo(h.queries).ByIdempotencyKey(ctx, derivedKey)
 	if err != nil {
-		t.Fatalf("GetTransactionByRequestID: %v", err)
+		t.Fatalf("TransactionRepo.ByIdempotencyKey: %v", err)
 	}
-	if row.TxRequestID != "tx-free" {
-		t.Fatalf("tx_request_id = %q", row.TxRequestID)
+	if rec.IdempotencyKey != derivedKey {
+		t.Fatalf("idempotency_key = %q", rec.IdempotencyKey)
 	}
-	if !row.BillingID.Valid || row.BillingID.String != billingID {
-		t.Fatalf("logged billing id = %+v, response billing id = %q", row.BillingID, billingID)
+	if rec.BillingID != billingID {
+		t.Fatalf("logged billing id = %q, response billing id = %q", rec.BillingID, billingID)
 	}
-	if len(row.SignedUrlHash) != 32 {
-		t.Fatalf("signed_url_hash len = %d", len(row.SignedUrlHash))
+	if len(rec.SignedURLHash) != 32 {
+		t.Fatalf("signed_url_hash len = %d", len(rec.SignedURLHash))
 	}
 }
 
@@ -105,6 +115,9 @@ type freeAdapterHarness struct {
 	catalogClient  rampconnect.CatalogServiceClient
 	tenantID       string
 	tenantDomain   string
+	// callerPriv signs the body offer-acceptance with agent-free's registered
+	// key.
+	callerPriv ed25519.PrivateKey
 }
 
 func newFreeAdapterHarness(t *testing.T) *freeAdapterHarness {
@@ -119,31 +132,41 @@ func newFreeAdapterHarness(t *testing.T) *freeAdapterHarness {
 	}
 
 	callerID := "agent-free"
-	callerPub, callerPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("caller ed25519: %v", err)
-	}
+	// Sign with the seeded agent's key so the verified key matches the pinned
+	// agents-row key for callerID (identity↔key binding).
+	callerPub, callerPriv := fx.agentPub, fx.agentPriv
 	registry := newAllowAllRegistry()
 	registry.put(callerID, callerPub)
-	manifests := &allowAllManifestCache{caller: callerID}
+	manifests := newAllowAllManifestCache(callerID)
 
 	srv := startExchangeServer(t, exchangeServerDeps{
 		pool: pool, queries: queries, registry: registry, manifests: manifests,
 		bill: billing.FreeAdapter{}, signer: offerSigner, keystore: keystore, logger: logger,
-		httpsigKeys: map[string]ed25519.PublicKey{callerID: callerPub},
+		httpsigKeys: map[string]ed25519.PublicKey{rwtestutil.MustThumbprintPriv(callerPriv): callerPub},
+		// The seeded tenant doubles as the default tenant Register reads its
+		// activation policy from, so agent-free can billing-register
+		// before its paid transaction. billingRefGen stays nil → uuid (the
+		// FreeAdapter keeps no ledger, so the ref value is never asserted).
+		defaultTenantDomain: tenantDomain,
 	})
 	if err := srv.catalogSvc.Bootstrap(ctx); err != nil {
 		t.Fatalf("catalog bootstrap: %v", err)
 	}
 
 	signingClient := &http.Client{Transport: newSigningTransport(srv.baseTransport, callerID, callerPriv)}
+	exchangeClient := rampconnect.NewExchangeServiceClient(signingClient, srv.server.URL, connect.WithGRPC())
+	// agent-free is seeded with an agents row but no billing_ref; the paid
+	// transaction the test drives needs one, so register it for billing
+	// through the public Register RPC.
+	registerCaller(t, ctx, exchangeClient)
 
 	return &freeAdapterHarness{
 		ctx:            ctx,
 		queries:        queries,
-		exchangeClient: rampconnect.NewExchangeServiceClient(signingClient, srv.server.URL, connect.WithGRPC()),
+		exchangeClient: exchangeClient,
 		catalogClient:  rampconnect.NewCatalogServiceClient(signingClient, srv.server.URL, connect.WithGRPC()),
 		tenantID:       tenantID,
 		tenantDomain:   tenantDomain,
+		callerPriv:     callerPriv,
 	}
 }

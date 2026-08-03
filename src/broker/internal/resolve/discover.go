@@ -1,0 +1,190 @@
+package resolve
+
+import (
+	"context"
+	"errors"
+
+	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/probe"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/selection"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/xclient"
+)
+
+// discover.go — the S2 route-per-URL discovery dispatch. Each requested URL is
+// routed ONLY to the exchange its publisher's /.well-known/ramp.json names
+// (buildRoutePlan, routing.go); each routed exchange is queried with ONLY its
+// URL subset; the per-URL OfferGroups returned are CONCATENATED (no
+// cross-exchange merge). The EXA-query path keeps the legacy broadcast.
+
+// discover routes the resolve to the right discovery strategy and returns the
+// per-URL OfferGroups (response order). The URL path (route-per-URL) routes
+// each URL ONLY to the exchange(s) its publisher manifest names and concatenates
+// the per-URL groups each exchange returns; the EXA-query path (no URLs) keeps
+// the legacy broadcast (relay the free-text query to every manifest-named
+// exchange). A non-nil *Response is a request-level refusal the caller
+// returns verbatim (no healthy exchange / no route).
+func (h *Service) discover(
+	ctx context.Context, req Request, manifests map[string]probe.Manifest,
+) ([]OfferGroup, discoverFlags, *Response, error) {
+	if uris := requestURIs(req); len(uris) > 0 {
+		return h.discoverByRoute(ctx, req, uris, manifests)
+	}
+	exchanges, hasHealthy := h.exchangesFor(ctx, manifests)
+	if !hasHealthy {
+		return nil, discoverFlags{}, noHealthyExchangeResponse(), nil
+	}
+	groups, flags, err := h.broadcastQuery(ctx, req, exchanges)
+	return groups, flags, nil, err
+}
+
+// discoverByRoute implements the route-per-URL model: build the
+// publisher-manifest-derived plan (URL -> manifest-named exchange), query each
+// exchange with ONLY its routed URL subset, and CONCATENATE the per-URL groups
+// each exchange returns in request order. Unroutable URLs (no
+// registered+healthy exchange named) surface as typed-absence groups, so a batch
+// where no URL routes anywhere still yields a per-URL absence response rather
+// than a bare refusal.
+func (h *Service) discoverByRoute(
+	ctx context.Context, req Request, uris []string, manifests map[string]probe.Manifest,
+) ([]OfferGroup, discoverFlags, *Response, error) {
+	plan, anyRouted := h.buildRoutePlan(ctx, uris, manifests)
+	flags := discoverFlags{}
+	byURL := make(map[string]OfferGroup, len(uris))
+	failures := 0
+	for _, domain := range plan.exchangeOrder {
+		ex := plan.exchanges[domain]
+		resp, err := h.queryExchange(ctx, req, ex, plan.exchangeURLs[domain])
+		if err != nil {
+			if errors.Is(err, errSignForward) {
+				return nil, flags, nil, err
+			}
+			reqctx.FromContext(ctx).WarnContext(ctx, "broker.discover",
+				"exchange", ex.Domain, "err", err)
+			failures++
+			continue
+		}
+		h.collectGroups(ctx, byURL, exchangeRefOf(ex), resp, &flags)
+	}
+	flags.allUpstreamFailed = anyRouted && failures > 0 && failures == len(plan.exchangeOrder)
+	return plan.assemble(byURL), flags, nil, nil
+}
+
+// broadcastQuery is the EXA-query discovery path: relay the free-text query to
+// every manifest-named exchange (no per-URL routing — there are no URLs) and
+// concatenate the groups returned. Retained unchanged in spirit from the
+// pre-route-per-URL broker so the query suites stay green.
+func (h *Service) broadcastQuery(
+	ctx context.Context, req Request, exchanges []repo.Exchange,
+) ([]OfferGroup, discoverFlags, error) {
+	flags := discoverFlags{}
+	byURL := make(map[string]OfferGroup)
+	var order []string
+	failures := 0
+	for _, ex := range exchanges {
+		resp, err := h.queryExchange(ctx, req, ex, nil)
+		if err != nil {
+			if errors.Is(err, errSignForward) {
+				return nil, flags, err
+			}
+			reqctx.FromContext(ctx).WarnContext(ctx, "broker.discover",
+				"exchange", ex.Domain, "err", err)
+			failures++
+			continue
+		}
+		order = appendGroupOrder(order, byURL, resp)
+		h.collectGroups(ctx, byURL, exchangeRefOf(ex), resp, &flags)
+	}
+	flags.allUpstreamFailed = failures > 0 && failures == len(exchanges)
+	return groupsInOrder(order, byURL), flags, nil
+}
+
+// errSignForward marks a forward-signing failure so the dispatch loops can
+// distinguish it (a broker-internal error to surface) from a per-exchange RPC
+// failure (tolerated, counted toward allUpstreamFailed).
+var errSignForward = errors.New("sign forward")
+
+// queryExchange signs and issues one DiscoverResources call to a single
+// exchange, scoped to the supplied URL subset (nil for the broadcast-query
+// path). The route-per-URL caller passes ONLY the URLs routed to this exchange.
+func (h *Service) queryExchange(
+	ctx context.Context, req Request, ex repo.Exchange, uris []string,
+) (*rampv1.ResourceResponse, error) {
+	rq := buildResourceQuery(ctx, req, h.deps.Clk, uris)
+	sig, err := h.deps.Signer.SignForward(rq)
+	if err != nil {
+		return nil, errors.Join(errSignForward, err)
+	}
+	callCtx := xclient.WithSignature(ctx, sig)
+	return h.deps.Exchange.DiscoverResources(callCtx, ex.Endpoint, rq)
+}
+
+// collectGroups folds one exchange's per-URL OfferGroups into byURL: each group
+// is keyed on its requested URL and carries the offers tagged with the
+// originating exchange (the exchange already emits one group per URL with offers
+// or a NOT_IN_CATALOG absence_reason). Every offer is sorted through the SDK
+// Verifier FIRST (Core Invariant): only verified offers become
+// candidates; a doctored/unverifiable offer is logged and dropped before it can
+// reach selection. No cross-exchange merge — under route-per-URL each URL is
+// routed to exactly one exchange, so a URL key is seen once; multiple offers for
+// one URL are Dedup+Ranked within the group at assembly. flags accumulate the
+// scope/upstream signals for the all-empty fallback.
+func (h *Service) collectGroups(
+	ctx context.Context, byURL map[string]OfferGroup, ref selection.ExchangeRef,
+	resp *rampv1.ResourceResponse, flags *discoverFlags,
+) {
+	for _, group := range resp.GetOfferGroups() {
+		uri := group.GetUri()
+		acc := byURL[uri]
+		acc.URI = uri
+		sorted := h.deps.Verifier.Sort(ctx, group.GetOffers())
+		for _, rej := range sorted.Rejected {
+			reqctx.FromContext(ctx).WarnContext(ctx, "broker.discover.offer_rejected",
+				"exchange", ref.Domain, "uri", uri,
+				"offer_id", rej.Offer.GetOfferId(), "reason", rej.Reason)
+		}
+		for _, offer := range sorted.Verified {
+			acc.cands = append(acc.cands, selection.Candidate{Offer: offer, Exchange: ref})
+		}
+		if reason := group.GetAbsenceReason(); reason != rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_UNSPECIFIED {
+			acc.AbsenceReason = reason
+			flags.upstreamReason = reason
+			if isCredentialsRestricted(reason) {
+				flags.scopeRestricted = true
+			}
+		}
+		byURL[uri] = acc
+	}
+}
+
+// appendGroupOrder records first-seen URL order for the broadcast-query path,
+// which has no request-order to seed from.
+func appendGroupOrder(order []string, byURL map[string]OfferGroup, resp *rampv1.ResourceResponse) []string {
+	for _, group := range resp.GetOfferGroups() {
+		uri := group.GetUri()
+		if _, seen := byURL[uri]; !seen {
+			order = append(order, uri)
+		}
+	}
+	return order
+}
+
+// groupsInOrder finalises the broadcast-query groups (Dedup+Rank within each).
+func groupsInOrder(order []string, byURL map[string]OfferGroup) []OfferGroup {
+	out := make([]OfferGroup, 0, len(order))
+	for _, uri := range order {
+		out = append(out, byURL[uri].finalize())
+	}
+	return out
+}
+
+func exchangeRefOf(ex repo.Exchange) selection.ExchangeRef {
+	return selection.ExchangeRef{
+		Domain:   ex.Domain,
+		Endpoint: ex.Endpoint,
+		Trust:    ex.TrustLevel,
+		Priority: ex.Priority,
+	}
+}

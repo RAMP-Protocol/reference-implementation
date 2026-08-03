@@ -1,0 +1,8 @@
+# Local state and secrets — the state file records every variable value,
+# including sensitive ones. Never commit any of this.
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+terraform.tfvars
+*.auto.tfvars
+crash.log

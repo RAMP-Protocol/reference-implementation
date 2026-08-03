@@ -141,6 +141,11 @@ cmd_up() {
     )
     wait_healthy "${project}" postgres 60 || true
     wait_healthy "${project}" redis 30 || true
+    # TigerBeetle formats its data file on first boot before it starts listening,
+    # so the first `up` takes noticeably longer than a restart. Waiting here keeps
+    # an Exchange started straight after `devstack up` from racing it — the
+    # Exchange checks the ledger once at boot and exits if it does not answer.
+    wait_healthy "${project}" tigerbeetle 45 || true
     emit_exports "${project}"
 }
 

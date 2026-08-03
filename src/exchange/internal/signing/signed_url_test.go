@@ -11,13 +11,34 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 )
+
+// ed25519SignerFor builds the production Ed25519 URL signer through the public
+// dispatcher surface (URLSignerFor), exactly as the service layer does. The
+// returned signer's kid is the key's RFC 7638 thumbprint.
+func ed25519SignerFor(t *testing.T, pub ed25519.PublicKey, priv ed25519.PrivateKey) (signing.URLSigner, string) {
+	t.Helper()
+	sgn, err := signing.URLSignerFor(
+		signing.TenantKeys{Scheme: signing.SchemeEd25519, Ed25519Ref: "k"},
+		&stubStore{pub: pub, priv: priv},
+	)
+	if err != nil {
+		t.Fatalf("URLSignerFor: %v", err)
+	}
+	thumb, err := helpers.Thumbprint(pub)
+	if err != nil {
+		t.Fatalf("thumbprint: %v", err)
+	}
+	return sgn, thumb
+}
 
 func TestEd25519URLSigner_RoundTripVerifies(t *testing.T) {
 	t.Parallel()
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	s := &signing.Ed25519URLSigner{Private: priv, Public: pub, KeyID: "k1"}
+	s, thumb := ed25519SignerFor(t, pub, priv)
 	expiry := time.Now().Add(5 * time.Minute).UTC()
 
 	out, err := s.SignURL(context.Background(), "https://cdn.example/resource/abc", "", expiry)
@@ -33,8 +54,8 @@ func TestEd25519URLSigner_RoundTripVerifies(t *testing.T) {
 	if sigB64 == "" {
 		t.Fatal("sig param missing")
 	}
-	if q.Get("kid") != "k1" {
-		t.Fatalf("kid param = %q", q.Get("kid"))
+	if q.Get("kid") != thumb {
+		t.Fatalf("kid param = %q, want the key thumbprint %q", q.Get("kid"), thumb)
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(sigB64)
 	if err != nil {
@@ -54,7 +75,7 @@ func TestEd25519URLSigner_RoundTripVerifies(t *testing.T) {
 func TestEd25519URLSigner_EmbedsAgentIDUnderSignature(t *testing.T) {
 	t.Parallel()
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	s := &signing.Ed25519URLSigner{Private: priv, Public: pub, KeyID: "k1"}
+	s, _ := ed25519SignerFor(t, pub, priv)
 	const thumb = "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k"
 
 	out, err := s.SignURL(context.Background(), "https://cdn.example/r", thumb, time.Now().Add(time.Minute).UTC())
@@ -66,7 +87,7 @@ func TestEd25519URLSigner_EmbedsAgentIDUnderSignature(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	q := parsed.Query()
-	if got := q.Get(signing.AgentIDParam); got != thumb {
+	if got := q.Get(helpers.AgentIDParam); got != thumb {
 		t.Fatalf("agent_id = %q, want %q", got, thumb)
 	}
 	// The signature must cover agent_id: stripping only sig and verifying the
@@ -80,7 +101,7 @@ func TestEd25519URLSigner_EmbedsAgentIDUnderSignature(t *testing.T) {
 	if !ed25519.Verify(pub, []byte("GET\n"+parsed.String()), sig) {
 		t.Fatal("expected verification with agent_id present to succeed")
 	}
-	q.Set(signing.AgentIDParam, "tampered")
+	q.Set(helpers.AgentIDParam, "tampered")
 	parsed.RawQuery = q.Encode()
 	if ed25519.Verify(pub, []byte("GET\n"+parsed.String()), sig) {
 		t.Fatal("expected agent_id tamper to invalidate signature")
@@ -90,13 +111,13 @@ func TestEd25519URLSigner_EmbedsAgentIDUnderSignature(t *testing.T) {
 func TestEd25519URLSigner_EmptyAgentIDOmitsParam(t *testing.T) {
 	t.Parallel()
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	s := &signing.Ed25519URLSigner{Private: priv, Public: pub, KeyID: "k1"}
+	s, _ := ed25519SignerFor(t, pub, priv)
 	out, err := s.SignURL(context.Background(), "https://cdn.example/r", "", time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 	parsed, _ := url.Parse(out.URL)
-	if parsed.Query().Has(signing.AgentIDParam) {
+	if parsed.Query().Has(helpers.AgentIDParam) {
 		t.Fatal("agent_id param must be absent for an unbound URL")
 	}
 }
@@ -117,7 +138,7 @@ func TestCloudFrontURLSigner_EmbedsAgentID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if got := parsed.Query().Get(signing.AgentIDParam); got != thumb {
+	if got := parsed.Query().Get(helpers.AgentIDParam); got != thumb {
 		t.Fatalf("agent_id = %q, want %q", got, thumb)
 	}
 }
@@ -125,7 +146,7 @@ func TestCloudFrontURLSigner_EmbedsAgentID(t *testing.T) {
 func TestEd25519URLSigner_TamperedURLFailsVerify(t *testing.T) {
 	t.Parallel()
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	s := &signing.Ed25519URLSigner{Private: priv, Public: pub}
+	s, _ := ed25519SignerFor(t, pub, priv)
 	out, err := s.SignURL(context.Background(), "https://cdn.example/a", "", time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatalf("sign: %v", err)
@@ -144,8 +165,13 @@ func TestEd25519URLSigner_TamperedURLFailsVerify(t *testing.T) {
 
 func TestEd25519URLSigner_MissingKeyRejected(t *testing.T) {
 	t.Parallel()
-	s := &signing.Ed25519URLSigner{}
-	if _, err := s.SignURL(context.Background(), "https://x.example/", "", time.Now()); err == nil {
+	// A tenant whose key store yields no usable key material cannot obtain a
+	// signer: the dispatcher fails building the kid thumbprint from a nil key.
+	_, err := signing.URLSignerFor(
+		signing.TenantKeys{Scheme: signing.SchemeEd25519, Ed25519Ref: "k"},
+		&stubStore{},
+	)
+	if err == nil {
 		t.Fatal("expected missing-key error")
 	}
 }

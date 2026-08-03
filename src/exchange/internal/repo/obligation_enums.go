@@ -1,7 +1,7 @@
 // Domain enums for obligation rows. The repo layer is the single owner of the
 // sqlc-generated PG enum types (RampValidationOutcome, RampObligationState);
 // services consume these typed string aliases and translate at the repo
-// boundary. Enforces CLAUDE.md Rule 5 layering: a service-public
+// boundary. Enforces transport→service→repository layering: a service-public
 // function MUST NOT surface sqlc types.
 
 package repo

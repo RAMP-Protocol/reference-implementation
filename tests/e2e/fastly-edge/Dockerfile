@@ -8,7 +8,7 @@ FROM node:22-bookworm-slim AS builder
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates tar \
+    && apt-get install -y --no-install-recommends curl ca-certificates tar git \
     && rm -rf /var/lib/apt/lists/*
 
 # Fastly CLI — pinned version, architecture-aware.
@@ -27,6 +27,9 @@ COPY tests/e2e/fastly-edge/src ./src
 # link. We create a tiny local package.json under node_modules to expose it.
 COPY src/edge/package.json /app/edge-src/package.json
 COPY src/edge/src /app/edge-src/src
+# edge-src's @ramp-protocol/sdk-l1 is a git dependency (git+https://…/protocol
+# #<sha>); the npm install below clones it (git installed above) — no sibling
+# checkout is mirrored in.
 
 # Rewrite the @ramp/edge reference to point at the sibling workspace. Placing
 # edge-src under /app lets esbuild resolve hono/zod from /app/node_modules.

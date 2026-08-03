@@ -27,9 +27,9 @@ const maxRawKeyLen = 256
 // reservation tracks a pending Authorize that has not yet been Record'd or
 // Release'd.
 type reservation struct {
-	AgentID string
-	EstAmt  Amount // estimated total charge; the amount Record settles
-	EstQty  int64  // authorized quantity; restored to quota on Release
+	BillingRef string
+	EstAmt     Amount // estimated total charge; the amount Record settles
+	EstQty     int64  // authorized quantity; restored to quota on Release
 	// AuthKey is the IdempotencyKey supplied at Authorize ("" if none). Record
 	// and Release use it to free the live-hold dedup entry on resolve. Stored
 	// raw; the bounded form is derived at map-access time via authMapKey.
@@ -40,8 +40,8 @@ type reservation struct {
 // can validate against it. (Record removes the reservation; without this the
 // refund path could not tell "recorded" from "never issued".)
 type recordedTx struct {
-	AgentID string
-	Amt     Amount
+	BillingRef string
+	Amt        Amount
 }
 
 // RefundEntry is the audit memo for a single applied refund. Reason carries the
@@ -58,20 +58,20 @@ type RefundEntry struct {
 //
 // Balance semantics: the actual balance only decreases when Record is called.
 // Authorize checks whether the available balance (actual balance minus all
-// pending reservations for the same agent and currency) covers the requested
+// pending reservations for the same account and currency) covers the requested
 // charge; on approval it stores the reservation without touching the actual
 // balance. Release returns the reservation with no balance change. Record
 // deducts the reservation amount and releases the hold. Refund credits the
-// agent's balance back, capped at the recorded charge.
+// account's balance back, capped at the recorded charge.
 type InMemoryAdapter struct {
 	mu        sync.Mutex
-	balances  map[string]Amount        // agent_id → actual balance
-	quotas    map[string]int64         // agent_id → remaining quota (unit-agnostic)
+	balances  map[string]Amount        // billing_ref → actual balance
+	quotas    map[string]int64         // billing_ref → remaining quota (unit-agnostic)
 	reserved  map[string]reservation   // billing_id → pending reservation
 	recorded  map[string]recordedTx    // billing_id → settled charge (for Refund)
 	refunded  map[string]*big.Rat      // billing_id → cumulative refunded amount
 	refundLog map[string][]RefundEntry // billing_id → ordered refund memos
-	authSeen  map[string]string        // (agent_id, auth_key) → billing_id (live holds)
+	authSeen  map[string]string        // (billing_ref, auth_key) → billing_id (live holds)
 	// opSeen records processed (billing_id, op, key) tuples for Record/Release/
 	// Refund idempotency. It is deliberately NOT bounded by an LRU: evicting a
 	// refund entry would let a same-key refund replay re-run validateRefund and
@@ -79,7 +79,7 @@ type InMemoryAdapter struct {
 	// breaking refund idempotency. Eviction would be safe for record/release
 	// (a replay degrades to ErrUnknownBillingID, never a double-charge) but not
 	// for refund, so no eviction happens at all. Count growth is one entry per
-	// committed transaction (tx_request_id is UNIQUE); durable unbounded-volume
+	// committed transaction (idempotency_key is UNIQUE); durable unbounded-volume
 	// idempotency is the persisted adapter's (TigerBeetle) responsibility, not
 	// the demo-tier in-memory adapter's. Per-entry size is bounded by boundKey.
 	opSeen   map[string]struct{}
@@ -132,11 +132,11 @@ func boundKey(key string) string {
 	return "h:" + hex.EncodeToString(sum[:])
 }
 
-// authMapKey composes the authSeen map key for an agent + raw idempotency key.
+// authMapKey composes the authSeen map key for an account + raw idempotency key.
 // boundKey is applied here (not at the call sites) so the Authorize write and
 // the freeAuth delete always agree on the stored form.
-func authMapKey(agentID, rawKey string) string {
-	return seenKey(agentID, boundKey(rawKey))
+func authMapKey(billingRef, rawKey string) string {
+	return seenKey(billingRef, boundKey(rawKey))
 }
 
 // opAlreadyDone reports whether (billingID, op, key) was already processed.
@@ -158,66 +158,135 @@ func (a *InMemoryAdapter) markOpDone(billingID, op, key string) {
 	a.opSeen[seenKey(billingID, op, boundKey(key))] = struct{}{}
 }
 
+// EnsureAgentAccount creates a zero-balance account entry under billingRef so
+// the freshly registered agent exists for subsequent balance reads. A repeat
+// call — or a ref that already holds a (possibly funded) balance — is a no-op
+// success: the existing balance is never reset. The zero balance is denominated
+// in USD, the demo tier's currency.
+func (a *InMemoryAdapter) EnsureAgentAccount(_ context.Context, billingRef string) error {
+	if billingRef == "" {
+		return errEmptyBillingRef
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.balances[billingRef]; !ok {
+		a.balances[billingRef] = Amount{Value: new(big.Rat), Currency: "USD"}
+	}
+	return nil
+}
+
 // Authorize holds funds for the transaction. A repeat call with the same
 // non-empty IdempotencyKey while the hold is live returns the same BillingID
-// (no second reservation). Otherwise denies on unknown agent, zero/negative
+// (no second reservation). Otherwise denies on unknown account, zero/negative
 // request, currency mismatch, insufficient available balance, or exhausted
 // quota. Available balance = actual balance − pending reservations.
+//
+// Zero-cost short-circuit: when the total charge (UnitCost × Quantity) is zero —
+// a FREE term, or any PER_UNIT term with a rate/unit_cost of 0 — there is
+// nothing to charge, so the currency-match and balance gates do NOT apply. Such
+// a term is authorized regardless of which currency the agent holds (it need not
+// hold the term's currency at all). The agent must still exist and the quota cap
+// still applies: the bypass relaxes only the money gate, not eligibility or the
+// unit-count quota. The reservation is recorded with the term's own currency at
+// a zero amount, so a later Record settles nothing and the agent's real balance —
+// in whatever currency it is denominated — is untouched.
+//
+// Reachability: the Exchange service short-circuits a price-zero term BEFORE
+// calling Authorize — it floors quantity to ≥1 and bypasses the adapter entirely
+// for unit_cost == 0 (ADR-009 D2), persisting a NULL billing_id with no quota or
+// eligibility check. So this zero-charge branch is reached only by a direct
+// caller passing a genuine zero charge (e.g. a non-zero unit_cost at quantity 0),
+// for whom the agent-existence and quota gates below deliberately still apply.
 func (a *InMemoryAdapter) Authorize(_ context.Context, req AuthorizeRequest) (AuthorizeResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if req.IdempotencyKey != "" {
-		if bid, ok := a.authSeen[authMapKey(req.AgentID, req.IdempotencyKey)]; ok {
+		if bid, ok := a.authSeen[authMapKey(req.BillingRef, req.IdempotencyKey)]; ok {
 			return AuthorizeResult{BillingID: bid, Approved: true}, nil
 		}
 	}
 
-	bal, ok := a.balances[req.AgentID]
+	bal, ok := a.balances[req.BillingRef]
 	if !ok {
-		return AuthorizeResult{Approved: false, Reason: "unknown agent"}, nil
+		return AuthorizeResult{Approved: false, Reason: "unknown account"}, nil
 	}
 	if req.Quantity <= 0 {
 		return AuthorizeResult{Approved: false, Reason: "non-positive quantity"}, nil
 	}
-	if bal.Currency != req.UnitCost.Currency {
-		return AuthorizeResult{Approved: false, Reason: "currency mismatch"}, nil
+
+	charge := totalCharge(req.UnitCost, req.Quantity).Value
+
+	// A zero charge bypasses the currency-match and balance gates: there is
+	// nothing to charge, so neither the held currency nor the available balance
+	// can be a reason to refuse. Non-zero charges fall through to the full gate.
+	if charge.Sign() != 0 {
+		if denial, ok := a.checkCurrencyAndBalance(req, bal, charge); !ok {
+			return denial, nil
+		}
 	}
 
-	charge := new(big.Rat).Mul(req.UnitCost.Value, big.NewRat(req.Quantity, 1))
+	if denial, ok := a.consumeQuota(req); !ok {
+		return denial, nil
+	}
 
-	// Compute available balance: actual balance minus pending reservations for
-	// this agent in the same currency.
+	return a.reserve(req, charge), nil
+}
+
+// checkCurrencyAndBalance enforces the money gate for a non-zero charge: the
+// agent's balance currency must match the term's currency, and the available
+// balance (actual minus same-currency pending reservations) must cover the
+// charge. Returns (denial, false) on refusal, (zero, true) on pass. Caller holds
+// a.mu. Only reached for non-zero charges (the zero-cost path skips it).
+func (a *InMemoryAdapter) checkCurrencyAndBalance(
+	req AuthorizeRequest, bal Amount, charge *big.Rat,
+) (AuthorizeResult, bool) {
+	if bal.Currency != req.UnitCost.Currency {
+		return AuthorizeResult{Approved: false, Reason: "currency mismatch"}, false
+	}
 	totalReserved := new(big.Rat)
 	for _, r := range a.reserved {
-		if r.AgentID == req.AgentID && r.EstAmt.Currency == bal.Currency {
+		if r.BillingRef == req.BillingRef && r.EstAmt.Currency == bal.Currency {
 			totalReserved.Add(totalReserved, r.EstAmt.Value)
 		}
 	}
 	available := new(big.Rat).Sub(new(big.Rat).Set(bal.Value), totalReserved)
 	if available.Cmp(charge) < 0 {
-		return AuthorizeResult{Approved: false, Reason: "insufficient balance"}, nil
+		return AuthorizeResult{Approved: false, Reason: "insufficient balance"}, false
 	}
+	return AuthorizeResult{}, true
+}
 
-	if q, hasQuota := a.quotas[req.AgentID]; hasQuota {
+// consumeQuota enforces and decrements the unit-count quota cap. It applies to
+// every authorization, zero-cost or not — quota is independent of money. Returns
+// (denial, false) when the request exceeds remaining quota, (zero, true)
+// otherwise. Caller holds a.mu.
+func (a *InMemoryAdapter) consumeQuota(req AuthorizeRequest) (AuthorizeResult, bool) {
+	if q, hasQuota := a.quotas[req.BillingRef]; hasQuota {
 		if q < req.Quantity {
-			return AuthorizeResult{Approved: false, Reason: "quota exhausted"}, nil
+			return AuthorizeResult{Approved: false, Reason: "quota exhausted"}, false
 		}
-		a.quotas[req.AgentID] = q - req.Quantity
+		a.quotas[req.BillingRef] = q - req.Quantity
 	}
+	return AuthorizeResult{}, true
+}
 
+// reserve records the pending reservation and the live-hold dedup entry, then
+// returns the approval. The reservation carries the term's own currency at the
+// computed charge (zero for a zero-cost term). Caller holds a.mu.
+func (a *InMemoryAdapter) reserve(req AuthorizeRequest, charge *big.Rat) AuthorizeResult {
 	a.nextIdx++
 	id := fmt.Sprintf("%s%06d", a.idPrefix, a.nextIdx)
 	a.reserved[id] = reservation{
-		AgentID: req.AgentID,
-		EstAmt:  Amount{Value: charge, Currency: req.UnitCost.Currency},
-		EstQty:  req.Quantity,
-		AuthKey: req.IdempotencyKey,
+		BillingRef: req.BillingRef,
+		EstAmt:     Amount{Value: charge, Currency: req.UnitCost.Currency},
+		EstQty:     req.Quantity,
+		AuthKey:    req.IdempotencyKey,
 	}
 	if req.IdempotencyKey != "" {
-		a.authSeen[authMapKey(req.AgentID, req.IdempotencyKey)] = id
+		a.authSeen[authMapKey(req.BillingRef, req.IdempotencyKey)] = id
 	}
-	return AuthorizeResult{BillingID: id, Approved: true}, nil
+	return AuthorizeResult{BillingID: id, Approved: true}
 }
 
 // Record settles the transaction against the authorized reservation. Deducts
@@ -239,12 +308,12 @@ func (a *InMemoryAdapter) Record(_ context.Context, billingID string, _ int64, i
 		return ErrUnknownBillingID
 	}
 
-	bal := a.balances[res.AgentID]
+	bal := a.balances[res.BillingRef]
 	bal.Value.Sub(bal.Value, new(big.Rat).Set(res.EstAmt.Value))
-	a.balances[res.AgentID] = bal
+	a.balances[res.BillingRef] = bal
 	a.recorded[billingID] = recordedTx{
-		AgentID: res.AgentID,
-		Amt:     Amount{Value: new(big.Rat).Set(res.EstAmt.Value), Currency: res.EstAmt.Currency},
+		BillingRef: res.BillingRef,
+		Amt:        Amount{Value: new(big.Rat).Set(res.EstAmt.Value), Currency: res.EstAmt.Currency},
 	}
 	delete(a.reserved, billingID)
 	a.freeAuth(res)
@@ -269,8 +338,8 @@ func (a *InMemoryAdapter) Release(_ context.Context, billingID string, idempoten
 	if !ok {
 		return ErrUnknownBillingID
 	}
-	if _, hasQuota := a.quotas[res.AgentID]; hasQuota {
-		a.quotas[res.AgentID] += res.EstQty
+	if _, hasQuota := a.quotas[res.BillingRef]; hasQuota {
+		a.quotas[res.BillingRef] += res.EstQty
 	}
 	delete(a.reserved, billingID)
 	a.freeAuth(res)
@@ -296,9 +365,9 @@ func (a *InMemoryAdapter) Refund(
 		return err
 	}
 
-	bal := a.balances[rec.AgentID]
+	bal := a.balances[rec.BillingRef]
 	bal.Value.Add(bal.Value, new(big.Rat).Set(amount.Value))
-	a.balances[rec.AgentID] = bal
+	a.balances[rec.BillingRef] = bal
 	prev := a.refunded[billingID]
 	if prev == nil {
 		prev = new(big.Rat)
@@ -341,7 +410,7 @@ func (a *InMemoryAdapter) validateRefund(billingID string, amount Amount) (recor
 // Caller holds a.mu.
 func (a *InMemoryAdapter) freeAuth(res reservation) {
 	if res.AuthKey != "" {
-		delete(a.authSeen, authMapKey(res.AgentID, res.AuthKey))
+		delete(a.authSeen, authMapKey(res.BillingRef, res.AuthKey))
 	}
 }
 
@@ -357,23 +426,23 @@ func (a *InMemoryAdapter) RefundLog(billingID string) []RefundEntry {
 	return out
 }
 
-// GetBalance returns the actual settled balance for an agent. Pending
+// GetBalance returns the actual settled balance for an account. Pending
 // reservations are not included (they represent authorised but not yet
 // consumed funds).
-func (a *InMemoryAdapter) GetBalance(_ context.Context, agentID string) (Amount, error) {
+func (a *InMemoryAdapter) GetBalance(_ context.Context, billingRef string) (Amount, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	bal, ok := a.balances[agentID]
+	bal, ok := a.balances[billingRef]
 	if !ok {
-		return Amount{}, fmt.Errorf("billing: unknown agent %q", agentID)
+		return Amount{}, fmt.Errorf("billing: unknown account %q", billingRef)
 	}
 	return Amount{Value: new(big.Rat).Set(bal.Value), Currency: bal.Currency}, nil
 }
 
-// GetQuota returns the remaining quota for an agent. Zero when the agent
+// GetQuota returns the remaining quota for an account. Zero when the account
 // has no quota cap configured.
-func (a *InMemoryAdapter) GetQuota(_ context.Context, agentID string) (int64, error) {
+func (a *InMemoryAdapter) GetQuota(_ context.Context, billingRef string) (int64, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.quotas[agentID], nil
+	return a.quotas[billingRef], nil
 }

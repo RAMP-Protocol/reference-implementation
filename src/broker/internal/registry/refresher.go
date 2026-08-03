@@ -55,7 +55,7 @@ func (r *Refresher) Run(ctx context.Context) {
 func (r *Refresher) tick(ctx context.Context) {
 	entries, err := r.repo.List(ctx)
 	if err != nil {
-		r.logger.WarnContext(ctx, "registry: list failed", "err", err)
+		r.logger.WarnContext(ctx, "broker.registry.list", "err", err)
 		return
 	}
 	for _, m := range entries {
@@ -64,7 +64,7 @@ func (r *Refresher) tick(ctx context.Context) {
 			continue
 		}
 		if setErr := r.repo.SetHealth(ctx, m.ID, healthy); setErr != nil {
-			r.logger.WarnContext(ctx, "registry: set health failed",
+			r.logger.WarnContext(ctx, "broker.registry.set_health",
 				"exchange_id", m.ID, "err", setErr)
 		}
 	}

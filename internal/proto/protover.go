@@ -2,7 +2,7 @@ package proto
 
 // Ver is the project-wide RAMP protocol version stamped on every RAMP proto
 // message this system authors: ResourceQuery (Broker→Exchange), ResourceResponse
-// and TransactionResponse (Exchange), and RAMPResponse (Broker). The agent-
+// and TransactionResponse (Exchange), and DiscoveryResponse (Broker). The agent-
 // authored messages — TransactionRequest and UsageReport — are NOT stamped here:
 // the agent originates and signs them and the Broker relays the bytes verbatim
 // (it must not re-marshal, or it would break the agent's Content-Digest), so their

@@ -1,15 +1,19 @@
 # ADR-005 — Biscuit Transport Carriage and Canonical-Form Request Binding (Gate F)
 
-**Status:** Accepted + Implemented (2026-04-26)
-**Tracks:** ye6f-12 (agentic-content-access-x9pr, shipped) + agentic-content-access-xp2e (this ADR) + agentic-content-access-e9vt (Gate F implementation, forthcoming).
+**Status:** Accepted as a design (2026-04-26). **Not implemented — superseded by the shipped
+authorization model.** Gate F, the canonical request-binding helper and the entitlement-biscuit
+verifier were all built and then deleted during the v1 scope cut; the biscuit layer this ADR
+binds to no longer exists in the codebase. What ships instead is RFC 9421 request signing plus
+Ed25519 offer-acceptance verification (ADR-009, ADR-013, ADR-019). This record is kept for the
+reasoning, not as a description of running code.
+**Tracks:** the biscuit transport binding and the Gate F implementation — neither of which survives, as the status above records.
 **Refines / extends:**
 - `docs/architecture/adr-002-entitlement-biscuit-model.md` — single biscuit + mandatory per-request attenuation; this ADR pins WHERE the biscuit lives on the wire and HOW it binds to the request body.
 - `docs/architecture/adr-004-protocol-layers.md` — this ADR is the concrete realization of ADR-004's "inner layer is transport-independent" claim. Canonical-form request-hash is the mechanism.
 **Companion documents:**
 - `docs/architecture/adr-003-key-rotation-revocation.md` — rotation semantics for the keys that sign the attenuation block.
 - `docs/architecture/adr-006-broker-intermediation.md` (forthcoming) — depends on Pattern-2 attenuation-append, established here.
-- `docs/design/request-lifecycle.md` §2a — runtime flow.
-- `proto/ramp/v1/ramp.proto` — top comment documents the three-tier rule.
+- `ramp.proto` (module `github.com/RAMP-Protocol/protocol`) — top comment documents the three-tier rule.
 
 ---
 
@@ -66,7 +70,7 @@ where `$bytes = sha256(canonical_request_form)`.
 
 **Gate F at Exchange.** Between Gates A–E and the final authorizer, compute `sha256(canonical_form(received_request))` and assert equal to `attenuation.request_hash`. Denial reason: `request_body_tamper`. Maps to `connect.CodePermissionDenied`. Gate F runs after carrier resolution (ResolveBiscuit / CanonicalBiscuit) and before biscuit-chain verification — in order, A/B/C/D/E/F all independent.
 
-**Attenuator responsibility.** The MCP shim's per-request attenuator (`src/mcp/src/ramp_mcp_shim/entitlement.py`, `entitlement_biscuit_py.py`) computes `sha256(canonical_form(outbound_request))` immediately before appending the attenuation block and emits it as the `request_hash` fact. The attenuation block's existing `sub(...)`, `operation(...)`, `resource_prefix(...)`, `time(T<T+ttl)` facts are preserved.
+**Attenuator responsibility.** As designed, the buyer-side per-request attenuator computes `sha256(canonical_form(outbound_request))` immediately before appending the attenuation block and emits it as the `request_hash` fact. No such attenuator exists today — the shim that carried it was retired with the biscuit layer. The attenuation block's existing `sub(...)`, `operation(...)`, `resource_prefix(...)`, `time(T<T+ttl)` facts are preserved.
 
 **Bridges are free.** Because canonical form strips all biscuit-carrier fields, an intermediary that moves the biscuit from envelope to header (or any other tier transition) does not change the canonical form and does not invalidate the `request_hash` fact. The hash covers what it was designed to cover: request substance, not carriage.
 
@@ -134,17 +138,15 @@ Rejected on user direction (2026-04-23): "We want full transparency between the 
 
 ## Implementation follow-up
 
-Filed as beads `agentic-content-access-e9vt` (Implement Gate F) — **closed**. Scope: canonical-form helper + MCP shim request_hash emission + Exchange Gate F + unit + integration tests + request-lifecycle.md update.
+Gate F was built in April 2026 and wired at `ExecuteTransaction`, then removed. The gate
+primitive, the canonical-hash helper, the entitlement verifier that extracted `request_hash`,
+and the Gate F integration test were all deleted during the v1 scope cut, together with the
+entitlement-biscuit layer they operated on. Nothing replaced them: there is no request-hash
+binding on any surface today, and no test covers one.
 
-Wire-in landed via beads `agentic-content-access-ihgb` (Wire Gate F into Exchange service-layer authorizer) — **closed**, commit `6f5d102` on `refactor/state-schema-redesign` (2026-04-26). Gate F is wired end-to-end at Exchange `ExecuteTransaction`:
-
-- ExecuteTransaction authorizer: `src/exchange/internal/service/execute_transaction.go` (`authorizeAccept` → `runGateF`).
-- Verifier extracts `request_hash` via `tok.Code()` regex: `src/exchange/internal/entitlement/verifier.go`.
-- Gate F primitive: `src/exchange/internal/policygate/fivegate.go`.
-- Canonical hash: `internal/rampcanonical/hash.go`.
-- E2E tests (happy / tamper / staged-rollout): `src/exchange/internal/transport/gatef_integration_test.go`.
-
-**Staged rollout still active.** When the inbound biscuit's attenuation block lacks a `request_hash` fact, Gate F is a no-op (passes). Strict presence will be enforced once buyer-side MCP shims emit `request_hash` in production; the no-op path is retained until then so partner integrations that have not yet upgraded their attenuator do not break.
+The design below stands on its own merits; treat it as the record of what was decided, not as
+a description of the running system. Reinstating it means rebuilding against the current
+de-biscuited protocol, not restoring the deleted code.
 
 ---
 
@@ -154,5 +156,4 @@ Wire-in landed via beads `agentic-content-access-ihgb` (Wire Gate F into Exchang
 - ADR-003 — key rotation and revocation (the keys that sign the attenuation and the rotation lifecycle that governs them).
 - ADR-004 — protocol layers (the two-layer framing that makes "biscuit is transport-independent" meaningful).
 - ADR-006 (forthcoming) — broker intermediation and transparency chain, which depends on this ADR's Part 3.
-- `docs/design/request-lifecycle.md` §2a — end-to-end runtime flow; updated in e9vt to reflect Gate F.
-- `proto/ramp/v1/ramp.proto` — top comment documents the three-tier rule and (post-e9vt) the six-gate verification order.
+- `ramp.proto` (module `github.com/RAMP-Protocol/protocol`) — top comment documents the three-tier rule and (post-e9vt) the six-gate verification order.

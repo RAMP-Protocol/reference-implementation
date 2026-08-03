@@ -1,0 +1,41 @@
+{
+  "_note": "Full RFC 9421 proof-of-possession SIGNING vectors for the bound-retrieval GET (ADR-013 D1/D3). Copied verbatim from the protocol SDK's own generated corpus at sdk/go/helpers/testdata/pop-vectors.json, module github.com/RAMP-Protocol/protocol v0.1.1-0.20260731084709-104d867aa9a1, whose TestGenerateVectors is the emitter and drift gate. The SDK is the source of truth: refresh this copy from there rather than editing values by hand. Copied rather than read from the module cache because testdata cannot cross a module boundary (go:embed will not reach it) and a cache read breaks in vendored or air-gapped CI; testdata/thumbprint-vectors.json is the same arrangement. Where pop-signature-base-vectors.json pins only the signature BASE string, these pin the emitted wire values end to end: presented_key_b64url is the X-RAMP-Agent-Key value (base64url-no-pad raw 32-byte public key), signature_input and signature are the header values verbatim, and signature is STANDARD base64 inside the byte-string colons while the key is base64url — an encoding asymmetry that a hand-rolled signer gets wrong silently. signer_seed_hex is the RFC 8032 seed the private key is derived from. The wrong_key vector signs with a different key than agent_id names, so its signature is an independent byte pin as well as the thumbprint-mismatch case; expected_valid and now_unix describe VERIFIER outcomes and are unused by a signer-side test.",
+  "vectors": [
+    {
+      "name": "valid",
+      "method": "GET",
+      "url": "https://cdn.example/doc?agent_id=wSp1Ud8Phi33WBixrTcV5U38Q5JZ0VGpTAetgQUQw2k",
+      "agent_id": "wSp1Ud8Phi33WBixrTcV5U38Q5JZ0VGpTAetgQUQw2k",
+      "presented_key_b64url": "TjDlN9oNdK3AZCssMw2ncymUxGBYXjmnCh3VEaYIxHs",
+      "signer_seed_hex": "333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152",
+      "signature_input": "sig1=(\"@method\" \"@target-uri\");keyid=\"wSp1Ud8Phi33WBixrTcV5U38Q5JZ0VGpTAetgQUQw2k\";alg=\"ed25519\";created=1700000000;expires=1700000600",
+      "signature": "sig1=:F1K10oqhRMtfu/P3lPakPs9IQIPQ9vuJ/nkE8tJ8q6dc/ypLA/33kqkRVedzutM6Xz1kuPcabfemwdh2loBVDw==:",
+      "now_unix": 1700000100,
+      "expected_valid": true
+    },
+    {
+      "name": "expired",
+      "method": "GET",
+      "url": "https://cdn.example/doc?agent_id=wSp1Ud8Phi33WBixrTcV5U38Q5JZ0VGpTAetgQUQw2k",
+      "agent_id": "wSp1Ud8Phi33WBixrTcV5U38Q5JZ0VGpTAetgQUQw2k",
+      "presented_key_b64url": "TjDlN9oNdK3AZCssMw2ncymUxGBYXjmnCh3VEaYIxHs",
+      "signer_seed_hex": "333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152",
+      "signature_input": "sig1=(\"@method\" \"@target-uri\");keyid=\"wSp1Ud8Phi33WBixrTcV5U38Q5JZ0VGpTAetgQUQw2k\";alg=\"ed25519\";created=1700000000;expires=1700000600",
+      "signature": "sig1=:F1K10oqhRMtfu/P3lPakPs9IQIPQ9vuJ/nkE8tJ8q6dc/ypLA/33kqkRVedzutM6Xz1kuPcabfemwdh2loBVDw==:",
+      "now_unix": 1700000700,
+      "expected_valid": false
+    },
+    {
+      "name": "wrong_key_thumbprint_mismatch",
+      "method": "GET",
+      "url": "https://cdn.example/doc?agent_id=wSp1Ud8Phi33WBixrTcV5U38Q5JZ0VGpTAetgQUQw2k",
+      "agent_id": "wSp1Ud8Phi33WBixrTcV5U38Q5JZ0VGpTAetgQUQw2k",
+      "presented_key_b64url": "veZ1AUYlq175jmwkThrBf5IZJ3wnexftHNhaXsI-lE4",
+      "signer_seed_hex": "4445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263",
+      "signature_input": "sig1=(\"@method\" \"@target-uri\");keyid=\"wSp1Ud8Phi33WBixrTcV5U38Q5JZ0VGpTAetgQUQw2k\";alg=\"ed25519\";created=1700000000;expires=1700000600",
+      "signature": "sig1=:6qydchDwyjKPLaOvZZt2i/yxMMSSa6gikSHRQx2mxT8q8yi3dDq+YGA5NrEnXsIVzHJJ0OSHNE2mmCr7xuXpBA==:",
+      "now_unix": 1700000100,
+      "expected_valid": false
+    }
+  ]
+}

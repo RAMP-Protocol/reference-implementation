@@ -1,0 +1,35 @@
+# FirstInstance provisioning Zitadel runs under `start-from-init`: it creates the
+# instance, the `ramp` org, a human admin, and the `ramp-bootstrap` machine user
+# whose PAT scripts/zitadel-bootstrap.sh then authenticates with.
+#
+# The PAT lands in /bootstrap — a named volume shared with the zitadel-init
+# one-shot, which is how the bootstrap reads it. (The `zitadel` test tier writes
+# the same PAT under /app instead, because `docker cp` cannot read a tmpfs and the
+# testcontainer has no shared volume; see internal/testutil/zitadel.go.)
+#
+# The passwords here are local-development defaults published in a tracked file.
+# Nothing outside a laptop stack may use this file.
+FirstInstance:
+  InstanceName: "ramp-poc"
+  MachineKeyPath: /bootstrap/zadmin.key
+  PatPath: /bootstrap/zadmin.pat
+  Org:
+    Name: "ramp"
+    Human:
+      UserName: "zadmin"
+      FirstName: "Z"
+      LastName: "Admin"
+      Email:
+        Address: "zadmin@ramp.localhost"
+        Verified: true
+      Password: "ZAdmin123!"
+      PasswordChangeRequired: false
+    Machine:
+      Machine:
+        Username: "ramp-bootstrap"
+        Name: "RAMP bootstrap service account"
+      MachineKey:
+        ExpirationDate: "2099-01-01T00:00:00Z"
+        Type: 1
+      Pat:
+        ExpirationDate: "2099-01-01T00:00:00Z"

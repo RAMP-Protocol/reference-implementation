@@ -1,7 +1,8 @@
 // Package testutil provides shared fixtures for rampwellknown tests: seeded
-// (deterministic) signing keys, manifest/invalidation builders, and an
-// httptest origin that serves both documents. Keys are derived from the kid so
-// fixtures are reproducible and never depend on a non-deterministic RNG.
+// (deterministic) signing keys, overlay-manifest / WBA-directory / revocation
+// builders, and an httptest origin that serves all three documents. Keys are
+// derived from a seed label so fixtures are reproducible and never depend on a
+// non-deterministic RNG.
 package testutil
 
 import (
@@ -20,25 +21,32 @@ import (
 )
 
 // NewSigningKey returns a deterministic Ed25519 private key plus its published
-// JWK for kid, valid over [notBefore, notAfter). The seed is derived from kid
-// so the same kid always yields the same key across test runs.
-func NewSigningKey(kid string, notBefore, notAfter time.Time) (ed25519.PrivateKey, *rampwellknown.Key) {
-	seed := make([]byte, ed25519.SeedSize)
-	copy(seed, kid)
-	priv := ed25519.NewKeyFromSeed(seed)
+// JWK, valid over [notBefore, notAfter). The seed is derived from the seed label
+// so the same label always yields the same key across test runs. Keys carry no
+// kid — they are identified by their RFC 7638 thumbprint (rampwellknown.Thumbprint).
+func NewSigningKey(seed string, notBefore, notAfter time.Time) (ed25519.PrivateKey, *rampwellknown.Key) {
+	raw := make([]byte, ed25519.SeedSize)
+	copy(raw, seed)
+	priv := ed25519.NewKeyFromSeed(raw)
 	pub, _ := priv.Public().(ed25519.PublicKey)
-	return priv, rampwellknown.NewKey(kid, pub, notBefore, notAfter)
+	return priv, rampwellknown.NewKey(pub, notBefore, notAfter)
 }
 
-// Manifest assembles a manifest value with the given role/domain/keys; callers
-// mutate the returned message for role-specific fields before marshaling.
-func Manifest(role rampwellknown.Role, domain string, keys ...*rampwellknown.Key) *rampwellknown.Manifest {
+// Manifest assembles a keyless commercial-overlay manifest value with the given
+// role/domain; callers mutate the returned message for role-specific fields
+// before marshaling. Identity keys live in the WBA directory (see WBAFile).
+func Manifest(role rampwellknown.Role, domain string) *rampwellknown.Manifest {
 	return &rampwellknown.Manifest{
-		Ver:        rampwellknown.Version,
-		Role:       role,
-		Domain:     domain,
-		PublicKeys: keys,
+		Ver:    rampwellknown.Version,
+		Role:   role,
+		Domain: domain,
 	}
+}
+
+// WBAFile assembles a WBA directory carrying the given keys; callers set
+// RevocationUrl before marshaling when exercising the revocation channel.
+func WBAFile(keys ...*rampwellknown.Key) *rampwellknown.WBAFile {
+	return &rampwellknown.WBAFile{Keys: keys}
 }
 
 // MarshalManifest renders m as canonical protojson (snake_case, full enums).
@@ -47,9 +55,16 @@ func MarshalManifest(m *rampwellknown.Manifest) []byte {
 	return raw
 }
 
-// MarshalInvalidation renders a KeyInvalidationList as canonical protojson.
-func MarshalInvalidation(asOf time.Time, revoked ...string) []byte {
-	list := &rampv1.KeyInvalidationList{
+// MarshalWBA renders a WBA directory as canonical protojson.
+func MarshalWBA(f *rampwellknown.WBAFile) []byte {
+	raw, _ := (protojson.MarshalOptions{UseProtoNames: true}).Marshal(f)
+	return raw
+}
+
+// MarshalRevocation renders a KeyRevocationList (as_of + revoked thumbprints)
+// as canonical protojson.
+func MarshalRevocation(asOf time.Time, revoked ...string) []byte {
+	list := &rampv1.KeyRevocationList{
 		AsOf:    timestamppb.New(asOf.UTC()),
 		Revoked: revoked,
 	}
@@ -76,97 +91,128 @@ func Client() *http.Client {
 	return &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 }
 
-// Origin is an httptest server that serves a manifest at /.well-known/ramp.json
-// and a revocation list at /.well-known/ramp-invalidations.json. Both documents
-// are swappable mid-test; ManifestStatus overrides the manifest response code
-// (e.g. 404) when non-zero. The manifest endpoint counts requests (Hits), can
-// emit a Cache-Control header (SetCacheControl), and can be gated (Block) to
-// force concurrent callers to overlap inside one in-flight fetch.
-type Origin struct {
-	*httptest.Server
-	manifest       atomic.Pointer[[]byte]
-	invalidation   atomic.Pointer[[]byte]
-	manifestStatus atomic.Int32
-	cacheControl   atomic.Pointer[string]
-	gate           atomic.Pointer[chan struct{}]
-	hits           atomic.Int64
+// endpoint is one swappable well-known document endpoint: a body, an optional
+// forced status code, an optional Cache-Control header, a request gate (to force
+// concurrent callers to overlap inside a single in-flight fetch), and a hit
+// counter. The manifest and WBA endpoints share this machinery.
+type endpoint struct {
+	contentType  string
+	doc          atomic.Pointer[[]byte]
+	status       atomic.Int32
+	cacheControl atomic.Pointer[string]
+	gate         atomic.Pointer[chan struct{}]
+	hits         atomic.Int64
 }
 
-// InvalidationPath is where Origin serves its KeyInvalidationList. Re-exported
-// from the production constant so fixtures and producers share one source.
-const InvalidationPath = rampwellknown.InvalidationPath
-
-// NewOrigin starts an Origin serving the given initial manifest bytes.
-func NewOrigin(manifest []byte) *Origin {
-	o := &Origin{}
-	o.SetManifest(manifest)
-	mux := http.NewServeMux()
-	mux.HandleFunc(rampwellknown.Path, o.serveManifest)
-	mux.HandleFunc(InvalidationPath, o.serveInvalidation)
-	o.Server = httptest.NewServer(mux)
-	return o
-}
-
-// SetManifest swaps the served manifest document.
-func (o *Origin) SetManifest(b []byte) { o.manifest.Store(&b) }
-
-// SetInvalidation swaps the served revocation document.
-func (o *Origin) SetInvalidation(b []byte) { o.invalidation.Store(&b) }
-
-// SetManifestStatus forces the manifest endpoint to return code (0 resets to 200).
-func (o *Origin) SetManifestStatus(code int) { o.manifestStatus.Store(int32(code)) } //nolint:gosec // small status code
-
-// SetCacheControl sets the Cache-Control header the manifest endpoint emits on a
-// 2xx response (empty clears it). Exercises the Cache's max-age TTL clamping.
-func (o *Origin) SetCacheControl(value string) {
-	if value == "" {
-		o.cacheControl.Store(nil)
+func (e *endpoint) serve(w http.ResponseWriter, _ *http.Request) {
+	if g := e.gate.Load(); g != nil {
+		<-*g
+	}
+	e.hits.Add(1)
+	if code := e.status.Load(); code != 0 {
+		w.WriteHeader(int(code))
 		return
 	}
-	o.cacheControl.Store(&value)
+	if cc := e.cacheControl.Load(); cc != nil {
+		w.Header().Set("Cache-Control", *cc)
+	}
+	w.Header().Set("Content-Type", e.contentType)
+	if p := e.doc.Load(); p != nil {
+		_, _ = w.Write(*p)
+	}
 }
 
-// Hits reports how many times the manifest endpoint has produced a response.
-func (o *Origin) Hits() int64 { return o.hits.Load() }
-
-// Block arms a gate: every manifest request blocks until the returned release is
-// called, so concurrent callers provably overlap inside a single in-flight fetch
-// (single-flight). release is idempotent; call it once to unblock and disarm.
-func (o *Origin) Block() (release func()) {
+func (e *endpoint) block() (release func()) {
 	ch := make(chan struct{})
-	o.gate.Store(&ch)
+	e.gate.Store(&ch)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			o.gate.Store(nil)
+			e.gate.Store(nil)
 			close(ch)
 		})
 	}
 }
 
-// InvalidationURL is the absolute URL clients poll for the revocation list.
-func (o *Origin) InvalidationURL() string { return o.URL + InvalidationPath }
-
-func (o *Origin) serveManifest(w http.ResponseWriter, _ *http.Request) {
-	if g := o.gate.Load(); g != nil {
-		<-*g
-	}
-	o.hits.Add(1)
-	if code := o.manifestStatus.Load(); code != 0 {
-		w.WriteHeader(int(code))
-		return
-	}
-	if cc := o.cacheControl.Load(); cc != nil {
-		w.Header().Set("Cache-Control", *cc)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if p := o.manifest.Load(); p != nil {
-		_, _ = w.Write(*p)
-	}
+// Origin is an httptest server that serves an overlay manifest at
+// /.well-known/ramp.json, a WBA directory at
+// /.well-known/http-message-signatures-directory, and a revocation list at
+// RevocationPath. Every document is swappable mid-test; the manifest and WBA
+// endpoints can force a status code (Set*Status), the manifest endpoint can emit
+// a Cache-Control header (SetCacheControl), count requests (Hits), and be gated
+// (Block) to force concurrent callers to overlap inside one in-flight fetch.
+type Origin struct {
+	*httptest.Server
+	manifest   *endpoint
+	wba        *endpoint
+	revocation atomic.Pointer[[]byte]
 }
 
-func (o *Origin) serveInvalidation(w http.ResponseWriter, _ *http.Request) {
-	p := o.invalidation.Load()
+// RevocationPath is where Origin serves its KeyRevocationList. Re-exported from
+// the production constant so fixtures and producers share one source.
+const RevocationPath = rampwellknown.RevocationPath
+
+// NewOrigin starts an Origin serving the given initial manifest bytes. The WBA
+// and revocation documents start empty; set them with SetWBA / SetRevocation.
+func NewOrigin(manifest []byte) *Origin {
+	o := &Origin{
+		manifest: &endpoint{contentType: "application/json"},
+		wba:      &endpoint{contentType: "application/jwk-set+json"},
+	}
+	o.SetManifest(manifest)
+	mux := http.NewServeMux()
+	mux.HandleFunc(rampwellknown.Path, o.manifest.serve)
+	mux.HandleFunc(rampwellknown.WBAPath, o.wba.serve)
+	mux.HandleFunc(RevocationPath, o.serveRevocation)
+	o.Server = httptest.NewServer(mux)
+	return o
+}
+
+// SetManifest swaps the served overlay manifest document.
+func (o *Origin) SetManifest(b []byte) { o.manifest.doc.Store(&b) }
+
+// SetWBA swaps the served WBA directory document.
+func (o *Origin) SetWBA(b []byte) { o.wba.doc.Store(&b) }
+
+// SetRevocation swaps the served revocation document.
+func (o *Origin) SetRevocation(b []byte) { o.revocation.Store(&b) }
+
+// SetManifestStatus forces the manifest endpoint to return code (0 resets to 200).
+func (o *Origin) SetManifestStatus(code int) {
+	o.manifest.status.Store(int32(code)) //nolint:gosec // small status code
+}
+
+// SetWBAStatus forces the WBA endpoint to return code (0 resets to 200).
+func (o *Origin) SetWBAStatus(code int) { o.wba.status.Store(int32(code)) } //nolint:gosec // small status code
+
+// SetCacheControl sets the Cache-Control header the manifest endpoint emits on a
+// 2xx response (empty clears it). Exercises the Cache's max-age TTL clamping.
+func (o *Origin) SetCacheControl(value string) {
+	if value == "" {
+		o.manifest.cacheControl.Store(nil)
+		return
+	}
+	o.manifest.cacheControl.Store(&value)
+}
+
+// Hits reports how many times the manifest endpoint has produced a response.
+func (o *Origin) Hits() int64 { return o.manifest.hits.Load() }
+
+// WBAHits reports how many times the WBA-directory endpoint has produced a
+// response — used to assert a burst of unknown-keyid lookups coalesced into a
+// bounded number of directory fetches.
+func (o *Origin) WBAHits() int64 { return o.wba.hits.Load() }
+
+// Block arms the manifest gate: every manifest request blocks until the returned
+// release is called, so concurrent callers provably overlap inside a single
+// in-flight fetch (single-flight). release is idempotent.
+func (o *Origin) Block() (release func()) { return o.manifest.block() }
+
+// RevocationURL is the absolute URL clients poll for the revocation list.
+func (o *Origin) RevocationURL() string { return o.URL + RevocationPath }
+
+func (o *Origin) serveRevocation(w http.ResponseWriter, _ *http.Request) {
+	p := o.revocation.Load()
 	if p == nil {
 		w.WriteHeader(http.StatusNotFound)
 		return

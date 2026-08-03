@@ -34,7 +34,7 @@ const timestampSkewPast = 5 * time.Second
 // arithmetic. Six decimal places of precision; no float comparison.
 const toleranceScale = 1_000_000
 
-// ReportInput carries every input Validate consumes. Pure data; no DB access.
+// ReportInput carries every input ValidateUsageReport consumes. Pure data; no DB access.
 // Exchange is the configured exchange domain (cfg.Exchange) so the
 // validator can refuse reports addressed at a different exchange.
 type ReportInput struct {
@@ -47,14 +47,14 @@ type ReportInput struct {
 	Exchange      string
 }
 
-// Validate runs the seven RAMP §3.2 #4 + L6-remainder checks in protocol order.
-// Returns (repo.ValidationOutcomeValidated, nil) on success and
+// ValidateUsageReport runs the seven RAMP §3.2 #4 + L6-remainder checks in
+// protocol order. Returns (repo.ValidationOutcomeValidated, nil) on success and
 // (outcome, *exchange.Error) on the first failing check.
 //
 // The validator is a pure function (no struct receiver, no state, no allocations
 // on the happy path) so the service can call it without wiring a dep and tests
 // drive it without constructing a fixture.
-func Validate(in ReportInput) (repo.ValidationOutcome, *exchange.Error) {
+func ValidateUsageReport(in ReportInput) (repo.ValidationOutcome, *exchange.Error) {
 	if out, err := validateRequiredFields(in); err != nil {
 		return out, err
 	}
@@ -82,7 +82,7 @@ func validateRequiredFields(in ReportInput) (repo.ValidationOutcome, *exchange.E
 			return repo.ValidationOutcomeRejectedFields, exchange.Newf(
 				exchange.KindInvalidRequest,
 				"required field %q missing or empty", field,
-			)
+			).WithField(field)
 		}
 	}
 	return repo.ValidationOutcomeValidated, nil
@@ -98,7 +98,7 @@ func validateWindow(in ReportInput) (repo.ValidationOutcome, *exchange.Error) {
 		return repo.ValidationOutcomeRejectedWindow, exchange.Newf(
 			exchange.KindFailedPrecondition,
 			"reporting window expired",
-		)
+		).WithField("window")
 	}
 	return repo.ValidationOutcomeValidated, nil
 }
@@ -109,7 +109,7 @@ func validateTolerance(in ReportInput) (repo.ValidationOutcome, *exchange.Error)
 		return repo.ValidationOutcomeRejectedTolerance, exchange.Newf(
 			exchange.KindInvalidRequest,
 			"consumed_quantity %d is negative", consumed,
-		)
+		).WithField("consumed_quantity")
 	}
 	estimated := in.Obligation.EstimatedQuantity
 	if estimated == 0 {
@@ -122,7 +122,7 @@ func validateTolerance(in ReportInput) (repo.ValidationOutcome, *exchange.Error)
 				exchange.KindInvalidRequest,
 				"consumed quantity %d reported against zero-estimate obligation",
 				consumed,
-			)
+			).WithField("consumed_quantity")
 		}
 		return repo.ValidationOutcomeValidated, nil
 	}
@@ -131,7 +131,11 @@ func validateTolerance(in ReportInput) (repo.ValidationOutcome, *exchange.Error)
 		diff = -diff
 	}
 	tol := in.Obligation.QuantityTolerance
-	if tol <= 0 {
+	// A stamped 0 is an explicit exact-match policy, not "unset": buildPersistIntent
+	// resolves a nil policy to defaultQuantityTolerance before persisting, so a 0
+	// reaching the validator can only be a deliberate zero-tolerance. Only the
+	// impossible negative falls back to the default.
+	if tol < 0 {
 		tol = defaultQuantityTolerance
 	}
 	// Integer arithmetic: diff*toleranceScale > tol*toleranceScale*estimated
@@ -141,26 +145,29 @@ func validateTolerance(in ReportInput) (repo.ValidationOutcome, *exchange.Error)
 		return repo.ValidationOutcomeRejectedTolerance, exchange.Newf(
 			exchange.KindInvalidRequest,
 			"consumed quantity outside ±%.0f%% of estimate", tol*100,
-		)
+		).WithField("consumed_quantity")
 	}
 	return repo.ValidationOutcomeValidated, nil
 }
 
 func validateBillingID(in ReportInput) (repo.ValidationOutcome, *exchange.Error) {
-	// Only enforced when a billing_id was assigned (FREE-tier rows have none).
-	if in.BillingID == "" {
-		return repo.ValidationOutcomeValidated, nil
-	}
+	// The report's billing_id must equal the transaction's (RAMP §3.2 #4). A
+	// free-tier transaction reserved no funds and stored an empty billing_id
+	// (ADR-009 D5), so a conformant report carries an empty billing_id too; a
+	// non-empty value names a reservation handle absent from this Exchange's
+	// transaction log and is rejected as a forged handle (threat model T25 — the
+	// Exchange validates the reported billing_id exists before accepting).
 	got := []byte(in.Report.GetBillingId())
 	want := []byte(in.BillingID)
-	// Constant-time compare (defence-in-depth). Length
-	// mismatch returns 0 from subtle.ConstantTimeCompare without leaking the
-	// length via timing — a length difference is itself a mismatch.
+	// Constant-time compare (defence-in-depth). A length mismatch returns 0 from
+	// subtle.ConstantTimeCompare without leaking the length via timing — a length
+	// difference is itself a mismatch. Two empty values compare equal, so a
+	// free-tier report that carries no billing_id validates.
 	if subtle.ConstantTimeCompare(got, want) != 1 {
 		return repo.ValidationOutcomeRejectedBillingID, exchange.Newf(
 			exchange.KindInvalidRequest,
-			"billing_id mismatch (field: billing_id)",
-		)
+			"billing_id mismatch",
+		).WithField("billing_id")
 	}
 	return repo.ValidationOutcomeValidated, nil
 }
@@ -179,14 +186,14 @@ func validateTimestamp(in ReportInput) (repo.ValidationOutcome, *exchange.Error)
 			"report timestamp %s precedes transaction created_at %s",
 			reported.UTC().Format(time.RFC3339Nano),
 			in.CreatedAt.UTC().Format(time.RFC3339Nano),
-		)
+		).WithField("timestamp")
 	}
 	if reported.After(in.Now.Add(timestampSkewFuture)) {
 		return repo.ValidationOutcomeRejectedTimestamp, exchange.Newf(
 			exchange.KindInvalidRequest,
 			"report timestamp %s is more than %s in the future",
 			reported.UTC().Format(time.RFC3339Nano), timestampSkewFuture,
-		)
+		).WithField("timestamp")
 	}
 	return repo.ValidationOutcomeValidated, nil
 }
@@ -200,18 +207,55 @@ func validateExchange(in ReportInput) (repo.ValidationOutcome, *exchange.Error) 
 	if in.Exchange != "" && got != in.Exchange {
 		return repo.ValidationOutcomeRejectedExchange, exchange.Newf(
 			exchange.KindInvalidRequest,
-			"report exchange %q does not match exchange %q (field: exchange)",
+			"report exchange %q does not match exchange %q",
 			got, in.Exchange,
-		)
+		).WithField("exchange")
 	}
 	return repo.ValidationOutcomeValidated, nil
 }
 
+// knownReportFields is the canonical set of usage-report field names the
+// Exchange understands. It is the single source of truth shared by reportHasField
+// (which rejects an unknown name fail-closed) and the admin SetReportingPolicy
+// write-side check ValidateRequiredFieldNames (which rejects a policy naming an
+// unknown field up front). Keep it in lockstep with reportHasField's switch —
+// TestReportHasFieldCoversKnownFields fails if they drift.
+var knownReportFields = map[string]struct{}{
+	"billing_id":        {},
+	"transaction_id":    {},
+	"consumed_quantity": {},
+	"function":          {},
+	"exchange":          {},
+	"timestamp":         {},
+	"id":                {},
+}
+
+// ValidateRequiredFieldNames rejects a reporting policy that names a field the
+// validator cannot enforce. Every required_fields token must be a member of the
+// canonical known set; an unknown token would make reportHasField return false
+// for every report, permanently failing validation for that tenant — an
+// availability lever on a plane with no per-operator identity. Names are matched
+// literally: the '*' the wire pattern permits is a character, not a glob.
+func ValidateRequiredFieldNames(names []string) *exchange.Error {
+	for _, name := range names {
+		if _, ok := knownReportFields[name]; !ok {
+			return exchange.Newf(
+				exchange.KindInvalidRequest,
+				"unknown required_fields token %q", name,
+			)
+		}
+	}
+	return nil
+}
+
 // reportHasField returns true when the named protocol field is present and
-// non-empty in the report. Unknown field names return FALSE (fail-closed) so a
-// typo in tenants.reporting_policy.required_fields surfaces as a rejected
-// report rather than a silently disabled check; review finding L5.
+// non-empty in the report. A name outside knownReportFields returns FALSE
+// (fail-closed) so a typo in tenants.reporting_policy.required_fields surfaces
+// as a rejected report rather than a silently disabled check.
 func reportHasField(report *rampv1.UsageReport, field string) bool {
+	if _, ok := knownReportFields[field]; !ok {
+		return false
+	}
 	switch field {
 	case "billing_id":
 		return report.GetBillingId() != ""
@@ -226,7 +270,7 @@ func reportHasField(report *rampv1.UsageReport, field string) bool {
 	case "timestamp":
 		return report.GetTimestamp() != nil
 	case "id":
-		return report.GetId() != ""
+		return report.GetIdempotencyKey() != ""
 	default:
 		return false
 	}

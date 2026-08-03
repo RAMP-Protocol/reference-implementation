@@ -1,0 +1,2 @@
+# Placeholder so the bind-mount target exists (host-owned) before docker compose up.
+# The revocation e2e writes revocations.json here at runtime; that file is gitignored.

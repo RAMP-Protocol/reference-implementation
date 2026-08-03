@@ -60,12 +60,16 @@ exchanges:
 	}
 }
 
-func TestDefaultBootstrap_Parses(t *testing.T) {
-	got, err := registry.LoadFromReader(bytes.NewReader(registry.DefaultBootstrap))
+// An empty document is a legitimate operator file — "I have no Exchanges yet" —
+// and must parse to zero entries rather than erroring. Note this is NOT the same
+// as a zero-BYTE reader, which yields io.EOF; callers must not reach the decoder
+// when they have nothing to decode.
+func TestLoadFromReader_EmptyDocumentYieldsNoEntries(t *testing.T) {
+	got, err := registry.LoadFromReader(bytes.NewReader([]byte("---\n")))
 	if err != nil {
-		t.Fatalf("parse default bootstrap: %v", err)
+		t.Fatalf("empty document should parse: %v", err)
 	}
-	if len(got) == 0 {
-		t.Fatal("expected at least one bootstrap entry")
+	if len(got) != 0 {
+		t.Fatalf("expected zero entries, got %d", len(got))
 	}
 }

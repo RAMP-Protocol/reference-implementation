@@ -1,0 +1,370 @@
+{
+  "$schema_description": "Machine-readable expected-outcome manifest for the RAMP resource-metadata round-trip corpus. DOCUMENTATION-ONLY: no runner currently loads this file or asserts against its `cases[*].expected` blocks — it records the intended per-line behaviour only. The executed guarantees live in Go integration tests: catalog_metadata_integration_test.go (Offer projection — an explicit resource_mutability is honored and not leaked to ext; an omitted value defaults to STATIC) and ingest_metadata_e2e_test.go (ingest parse/map layer). See README.md for the full scenario matrix. Wiring a runner that consumes this manifest is a separate follow-up.",
+  "conventions": {
+    "file": "JSONL fixture filename in this directory.",
+    "line_number": "1-based line within `file` (matches the parser's line numbering).",
+    "case_id": "stable, descriptive identifier; assertion names derive from this.",
+    "expected.parse": "\"ok\" when ParseJSONL accepts the line; {\"reject\": \"<reason>\", \"layer\": \"parser|mapper\"} when it must fail. `layer` says WHERE the reject lands once Record is extended: `parser` = Go json decode (DisallowUnknownFields / typed-field decode / trailing-content / RFC3339 decode); `mapper` = MapRecords token/enum validation after a clean parse.",
+    "expected.push": "\"accepted\" when CatalogService.PushResources persists the entry; {\"rejected\": \"<reason>\"} when the push RPC (or the pre-push map step) rejects. For lines whose parse already fails, push is not reached; push is then null.",
+    "expected.offer": "null when DiscoverResources yields no offer (e.g. parse/push rejected, or requester entitled to no priced term). Otherwise an object of field-level assertions on the signed Offer. Absent keys mean 'do not assert'. A key set to null asserts the Offer field is UNSET.",
+    "expected.offer.identity_content_hash": "expected Offer.identity.content_hash (string) or null for unset.",
+    "expected.offer.identity_hash_method": "expected Offer.identity.hash_method (string) or null for unset.",
+    "expected.offer.identity_resource_mutability": "expected Offer.identity.resource_mutability enum name; \"RESOURCE_MUTABILITY_STATIC\" (buildOffer default) when the feed omits the typed resource_mutability field. The typed ingest field is authoritative; a value in ext is not read.",
+    "expected.offer.previews": "expected Offer.previews; either an integer count or an array of {url,media_type,width?,height?,duration?,size?} to assert proto-equal element-wise.",
+    "expected.offer.attestations": "expected Offer.attestations; either an integer count or an array of {verifier,kid,attested_at,uri,claims,signature} to assert proto-equal.",
+    "expected.offer.ext": "subset object that MUST be present (proto-equal) within Offer.ext; other ext keys may exist.",
+    "expected.offer.ext_critical": "expected Offer.ext_critical string[] (exact set).",
+    "expected.offer.data_as_of": "expected Offer.data_as_of as RFC3339; null asserts unset.",
+    "expected.offer.terms_unchanged": "true asserts the projected Offer.terms set + order is identical to the metadata-free baseline for the same resource shape (entanglement invariant).",
+    "expected.offer.price_unchanged": "true asserts Offer.pricing (model+rate+currency+unit) is identical to the metadata-free baseline (entanglement invariant).",
+    "expected.transact_parity": "true => the e2e MUST drive ExecuteTransaction for this offer and assert the reconstructed offer signature re-verifies (buildOffer at verifyOffer time reproduces identical metadata bytes). false/absent => not exercised."
+  },
+  "requester_profiles": {
+    "default": "no scopes (public). Used for every case unless the case names `requester`.",
+    "premium": "scopes:[\"subscription:premium\"]. Used by the scope-projection premium cases."
+  },
+  "files": [
+    {
+      "file": "valid_full.jsonl",
+      "cases": [
+        {
+          "line_number": 1,
+          "case_id": "valid_full_all_fields",
+          "description": "Happy path: every extended metadata field + a priced term. Every field must surface on the Offer.",
+          "expected": {
+            "parse": "ok",
+            "push": "accepted",
+            "offer": {
+              "identity_content_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "identity_hash_method": "sha256",
+              "identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC",
+              "previews": [
+                {"url": "https://cdn.publisher.example/p/rt-0001-thumb.jpg", "media_type": "image/jpeg", "width": 150, "height": 100, "size": "thumbnail"},
+                {"url": "https://cdn.publisher.example/p/rt-0001-snippet.txt", "media_type": "text/plain", "size": "preview"}
+              ],
+              "attestations": 1,
+              "ext": {"editorial_desk": "science"},
+              "ext_critical": ["previews"],
+              "data_as_of": "2026-03-18T09:30:00Z",
+              "terms_unchanged": true,
+              "price_unchanged": true
+            },
+            "transact_parity": false
+          }
+        }
+      ]
+    },
+    {
+      "file": "valid_partial.jsonl",
+      "cases": [
+        {
+          "line_number": 1,
+          "case_id": "valid_partial_hash_only",
+          "description": "Only content_hash + hash_method present; all other metadata unset on the Offer.",
+          "expected": {
+            "parse": "ok",
+            "push": "accepted",
+            "offer": {
+              "identity_content_hash": "sha256:aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888",
+              "identity_hash_method": "sha256",
+              "identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC",
+              "previews": 0,
+              "attestations": 0,
+              "data_as_of": null,
+              "terms_unchanged": true,
+              "price_unchanged": true
+            }
+          }
+        },
+        {
+          "line_number": 2,
+          "case_id": "valid_partial_provenance_only",
+          "description": "Only provenance fields + source present; data_as_of set, identity hashes unset.",
+          "expected": {
+            "parse": "ok",
+            "push": "accepted",
+            "offer": {
+              "identity_content_hash": null,
+              "identity_hash_method": null,
+              "identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC",
+              "previews": 0,
+              "attestations": 0,
+              "data_as_of": "2026-04-01T12:00:00Z",
+              "terms_unchanged": true,
+              "price_unchanged": true
+            }
+          }
+        },
+        {
+          "line_number": 3,
+          "case_id": "valid_partial_ext_mutability_only",
+          "description": "Only the typed resource_mutability present; sets Offer.identity.resource_mutability=DYNAMIC, nothing else.",
+          "expected": {
+            "parse": "ok",
+            "push": "accepted",
+            "offer": {
+              "identity_content_hash": null,
+              "identity_hash_method": null,
+              "identity_resource_mutability": "RESOURCE_MUTABILITY_DYNAMIC",
+              "previews": 0,
+              "attestations": 0,
+              "data_as_of": null,
+              "terms_unchanged": true,
+              "price_unchanged": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "file": "legacy_no_metadata.jsonl",
+      "cases": [
+        {
+          "line_number": 1,
+          "case_id": "legacy_zero_metadata",
+          "description": "Today's sample.jsonl shape (zero metadata). Accepted; Offer metadata entirely empty (proves a NULL metadata row is unaffected by the feature).",
+          "expected": {
+            "parse": "ok",
+            "push": "accepted",
+            "offer": {
+              "identity_content_hash": null,
+              "identity_hash_method": null,
+              "identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC",
+              "previews": 0,
+              "attestations": 0,
+              "ext": {},
+              "ext_critical": [],
+              "data_as_of": null,
+              "terms_unchanged": true,
+              "price_unchanged": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "file": "source_enum_variants.jsonl",
+      "note": "One line per IngestionSource enum value (UNSPECIFIED excluded: it is the absent default, covered by legacy_zero_metadata). `source` is an ingest-side audit field on ResourceEntry; it has no dedicated typed Offer field, so the Offer assertion is that the line round-trips (offer present, terms/price unchanged). The e2e MAY additionally assert the persisted catalog row's source via the black-box transaction-log/catalog read exception.",
+      "cases": [
+        {"line_number": 1, "case_id": "source_ramp_sitemap", "description": "source=INGESTION_SOURCE_RAMP_SITEMAP", "expected": {"parse": "ok", "push": "accepted", "offer": {"terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 2, "case_id": "source_rsl", "description": "source=INGESTION_SOURCE_RSL", "expected": {"parse": "ok", "push": "accepted", "offer": {"terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 3, "case_id": "source_sitemap", "description": "source=INGESTION_SOURCE_SITEMAP", "expected": {"parse": "ok", "push": "accepted", "offer": {"terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 4, "case_id": "source_html_crawl", "description": "source=INGESTION_SOURCE_HTML_CRAWL", "expected": {"parse": "ok", "push": "accepted", "offer": {"terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 5, "case_id": "source_cms_api", "description": "source=INGESTION_SOURCE_CMS_API", "expected": {"parse": "ok", "push": "accepted", "offer": {"terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 6, "case_id": "source_manual", "description": "source=INGESTION_SOURCE_MANUAL", "expected": {"parse": "ok", "push": "accepted", "offer": {"terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 7, "case_id": "source_catalog_api", "description": "source=INGESTION_SOURCE_CATALOG_API", "expected": {"parse": "ok", "push": "accepted", "offer": {"terms_unchanged": true, "price_unchanged": true}}}
+      ]
+    },
+    {
+      "file": "mutability_variants.jsonl",
+      "cases": [
+        {"line_number": 1, "case_id": "mutability_static", "description": "resource_mutability=STATIC (typed field) -> Offer.identity.resource_mutability=STATIC", "expected": {"parse": "ok", "push": "accepted", "offer": {"identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC", "terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 2, "case_id": "mutability_dynamic", "description": "resource_mutability=DYNAMIC (typed field) -> DYNAMIC; provenance present so data_as_of set", "expected": {"parse": "ok", "push": "accepted", "offer": {"identity_resource_mutability": "RESOURCE_MUTABILITY_DYNAMIC", "data_as_of": "2026-03-18T09:30:00Z", "terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 3, "case_id": "mutability_live", "description": "resource_mutability=LIVE (typed field) -> LIVE", "expected": {"parse": "ok", "push": "accepted", "offer": {"identity_resource_mutability": "RESOURCE_MUTABILITY_LIVE", "terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 4, "case_id": "mutability_absent", "description": "no resource_mutability field -> STATIC (buildOffer default)", "expected": {"parse": "ok", "push": "accepted", "offer": {"identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC", "terms_unchanged": true, "price_unchanged": true}}}
+      ]
+    },
+    {
+      "file": "previews_variants.jsonl",
+      "cases": [
+        {"line_number": 1, "case_id": "previews_zero", "description": "ext.previews=[] -> Offer.previews empty", "expected": {"parse": "ok", "push": "accepted", "offer": {"previews": 0, "terms_unchanged": true, "price_unchanged": true}}},
+        {
+          "line_number": 2,
+          "case_id": "previews_one_minimal",
+          "description": "Single preview with only url+media_type; optional dims unset on the Offer Preview.",
+          "expected": {"parse": "ok", "push": "accepted", "offer": {"previews": [{"url": "https://cdn.publisher.example/p/one-snippet.txt", "media_type": "text/plain"}], "terms_unchanged": true, "price_unchanged": true}}
+        },
+        {
+          "line_number": 3,
+          "case_id": "previews_many_full_dims",
+          "description": "Three previews; image has width/height, video adds duration, json sample has neither.",
+          "expected": {"parse": "ok", "push": "accepted", "offer": {"previews": [
+            {"url": "https://cdn.publisher.example/p/thumb.jpg", "media_type": "image/jpeg", "width": 150, "height": 100, "size": "thumbnail"},
+            {"url": "https://cdn.publisher.example/p/clip.mp4", "media_type": "video/mp4", "width": 640, "height": 360, "duration": 15, "size": "preview"},
+            {"url": "https://cdn.publisher.example/p/sample.json", "media_type": "application/json", "size": "sample"}
+          ], "terms_unchanged": true, "price_unchanged": true}}
+        }
+      ]
+    },
+    {
+      "file": "attestations.jsonl",
+      "cases": [
+        {"line_number": 1, "case_id": "attestations_absent", "description": "No attestations (Level 0); Offer.attestations empty", "expected": {"parse": "ok", "push": "accepted", "offer": {"attestations": 0, "identity_content_hash": "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff", "identity_hash_method": "sha256", "terms_unchanged": true, "price_unchanged": true}}},
+        {
+          "line_number": 2,
+          "case_id": "attestations_one_selfattest",
+          "description": "One self-attestation (Level 1); proto-equal on the Offer.",
+          "expected": {"parse": "ok", "push": "accepted", "offer": {"attestations": [
+            {"verifier": "publisher.example", "kid": "pub-key-1", "attested_at": "2026-03-18T09:31:00Z", "uri": "https://publisher.example/article/attestations-one-selfattest", "claims": {"word_count": 640, "estimated_quantity": 845, "language": "de", "content_hash": "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff", "hash_method": "sha256"}, "signature": "FIXTURE_SIG_attest_one_selfattest"}
+          ], "terms_unchanged": true, "price_unchanged": true}}
+        },
+        {
+          "line_number": 3,
+          "case_id": "attestations_many_with_thirdparty",
+          "description": "Two attestations (self + third-party) with a non-trivial nested claims object; order + content proto-equal.",
+          "expected": {"parse": "ok", "push": "accepted", "offer": {"attestations": [
+            {"verifier": "publisher.example", "kid": "pub-key-1", "attested_at": "2026-03-18T09:31:00Z", "uri": "https://publisher.example/article/attestations-many-with-thirdparty", "claims": {"word_count": 640, "language": "de", "content_hash": "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff", "hash_method": "sha256"}, "signature": "FIXTURE_SIG_attest_many_self"},
+            {"verifier": "verifier.example", "kid": "dv-key-7", "attested_at": "2026-03-18T11:00:00Z", "uri": "https://publisher.example/article/attestations-many-with-thirdparty", "claims": {"estimated_quantity": 845, "iab_categories": ["IAB1", "IAB5"], "brand_safety": {"rating": "safe", "categories_flagged": []}, "nested": {"a": 1, "b": ["x", "y"], "c": {"deep": true}}}, "signature": "FIXTURE_SIG_attest_many_thirdparty"}
+          ], "terms_unchanged": true, "price_unchanged": true}}
+        }
+      ]
+    },
+    {
+      "file": "provenance.jsonl",
+      "cases": [
+        {"line_number": 1, "case_id": "provenance_present", "description": "provenance_timestamp present -> Offer.data_as_of equals it", "expected": {"parse": "ok", "push": "accepted", "offer": {"data_as_of": "2026-03-18T09:30:00Z", "terms_unchanged": true, "price_unchanged": true}}},
+        {"line_number": 2, "case_id": "provenance_absent", "description": "provenance_timestamp absent (provenance_source still set) -> Offer.data_as_of unset", "expected": {"parse": "ok", "push": "accepted", "offer": {"data_as_of": null, "terms_unchanged": true, "price_unchanged": true}}}
+      ]
+    },
+    {
+      "file": "reject_parse.jsonl",
+      "note": "Each line is invalid in EXACTLY ONE way. `layer` records where the reject lands once Record is extended (see conventions). Lines whose parse fails never reach push (push=null).",
+      "cases": [
+        {"line_number": 1, "case_id": "reject_unknown_key", "description": "Genuinely-unknown top-level key `totally_unknown_field`. DisallowUnknownFields must stay strict.", "expected": {"parse": {"reject": "unknown field \"totally_unknown_field\"", "layer": "parser"}, "push": null, "offer": null}},
+        {"line_number": 2, "case_id": "reject_malformed_provenance_timestamp", "description": "provenance_timestamp not RFC3339 (\"18.03.2026 09:30\"). Parser keeps provenance_timestamp as a raw string (pure DTO); the mapper validates it via time.Parse(RFC3339) and rejects, so layer is mapper (consistent with reject_garbage_source).", "expected": {"parse": {"reject": "malformed provenance_timestamp (expected RFC3339)", "layer": "mapper"}, "push": null, "offer": null}},
+        {"line_number": 3, "case_id": "reject_garbage_source", "description": "source=INGESTION_SOURCE_TELEPATHY is not a real IngestionSource value. Rejected at the mapper enum resolution (source decodes as a string at parse, fails enum lookup at map time).", "expected": {"parse": {"reject": "unknown ingestion source \"INGESTION_SOURCE_TELEPATHY\"", "layer": "mapper"}, "push": null, "offer": null}},
+        {"line_number": 4, "case_id": "reject_ext_not_object", "description": "ext is a JSON string, not an object. The parser models ext as json.RawMessage, which accepts any valid JSON including a bare string, so the parser does NOT reject. The mapper rejects when converting ext to *structpb.Struct (protojson.Unmarshal of a JSON string into a Struct fails), so layer is mapper (consistent with reject_garbage_source / reject_malformed_provenance_timestamp).", "expected": {"parse": {"reject": "ext must be a JSON object", "layer": "mapper"}, "push": null, "offer": null}},
+        {"line_number": 5, "case_id": "reject_attestation_claims_not_object", "description": "attestations[0].claims is a JSON string, not an object. The parser models attestation.claims as json.RawMessage, which accepts any valid JSON including a bare string, so the parser does NOT reject. The mapper rejects when converting claims to *structpb.Struct, so layer is mapper.", "expected": {"parse": {"reject": "attestation claims must be a JSON object", "layer": "mapper"}, "push": null, "offer": null}},
+        {"line_number": 6, "case_id": "reject_trailing_garbage", "description": "Trailing content after the JSON object. ParseJSONL's dec.More() guard rejects.", "expected": {"parse": {"reject": "unexpected trailing content after JSON object", "layer": "parser"}, "push": null, "offer": null}}
+      ]
+    },
+    {
+      "file": "reject_map_mutability.jsonl",
+      "note": "Both lines PARSE cleanly (resource_mutability is a known typed field) but are rejected at the MAPPER's enum resolution, mirroring reject_garbage_source: an explicit RESOURCE_MUTABILITY_UNSPECIFIED trips the {not_in:[0]} mirror, and an unknown name fails the enum-value lookup. MapRecords short-circuits, so a batch containing either persists NOTHING.",
+      "cases": [
+        {"line_number": 1, "case_id": "reject_mutability_unspecified", "description": "Explicit resource_mutability=RESOURCE_MUTABILITY_UNSPECIFIED. Rejected at mapResourceMutability (the ingest mirror of the Offer-side {not_in:[0]} rule).", "expected": {"parse": {"reject": "unknown resource mutability \"RESOURCE_MUTABILITY_UNSPECIFIED\"", "layer": "mapper"}, "push": null, "offer": null}},
+        {"line_number": 2, "case_id": "reject_mutability_unknown", "description": "resource_mutability=RESOURCE_MUTABILITY_TELEPATHY is not a real ResourceMutability value; fails the enum-value lookup at the mapper.", "expected": {"parse": {"reject": "unknown resource mutability \"RESOURCE_MUTABILITY_TELEPATHY\"", "layer": "mapper"}, "push": null, "offer": null}}
+      ]
+    },
+    {
+      "file": "reject_push_allornothing.jsonl",
+      "file_level_expectation": {
+        "case_id": "reject_push_allornothing_file",
+        "description": "A 3-line file where line 1 and line 3 are valid but line 2 is invalid (per_unit pricing with no unit -> mapPricing reject in MapRecords, before the PushResources RPC). The ingest run MUST fail as a whole and persist NOTHING: after the failed run, DiscoverResources for /article/aon-valid-before AND /article/aon-valid-after MUST both yield no offer. This proves the batch is all-or-nothing -- a single bad line voids the entire push, including the otherwise-valid lines around it.",
+        "expected": {
+          "run": {"rejected": "term 0: per_unit pricing requires a unit (line 2)"},
+          "persisted": "none",
+          "discover_aon_valid_before": {"offer": null},
+          "discover_aon_valid_after": {"offer": null}
+        }
+      },
+      "cases": [
+        {"line_number": 1, "case_id": "aon_valid_before", "description": "Valid line preceding the bad one; MUST NOT be persisted because the batch fails.", "expected": {"parse": "ok", "push": {"rejected": "batch voided by sibling line 2"}, "offer": null}},
+        {"line_number": 2, "case_id": "aon_invalid_per_unit_no_unit", "description": "The single bad line: per_unit pricing missing unit.", "expected": {"parse": "ok", "push": {"rejected": "per_unit pricing requires a unit"}, "offer": null}},
+        {"line_number": 3, "case_id": "aon_valid_after", "description": "Valid line following the bad one; MUST NOT be persisted because the batch fails.", "expected": {"parse": "ok", "push": {"rejected": "batch voided by sibling line 2"}, "offer": null}}
+      ]
+    },
+    {
+      "file": "passthrough_baseline.jsonl",
+      "note": "ENTANGLEMENT/pass-through invariant pair. Both lines carry an IDENTICAL terms[] block (same license, same per_unit term, same quota). Line 1 additionally carries the full metadata payload; line 2 carries none. The e2e MUST assert that the SELECTED term and the price (model+rate+currency+unit) are IDENTICAL across the two resulting offers -- metadata is inert to licenseterm.Select. This is the core proof that adding metadata does not change which term/price is chosen.",
+      "cases": [
+        {
+          "line_number": 1,
+          "case_id": "passthrough_baseline_with_meta",
+          "description": "Resource WITH full metadata; selected term + price must match the no-meta twin.",
+          "expected": {"parse": "ok", "push": "accepted", "offer": {
+            "identity_content_hash": "sha256:abc1230000000000000000000000000000000000000000000000000000000000",
+            "identity_hash_method": "sha256",
+            "identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC",
+            "previews": 1,
+            "attestations": 1,
+            "data_as_of": "2026-03-18T09:30:00Z",
+            "terms_unchanged": true,
+            "price_unchanged": true
+          }}
+        },
+        {
+          "line_number": 2,
+          "case_id": "passthrough_baseline_without_meta",
+          "description": "Same resource WITHOUT metadata; defines the baseline selected term + price the with-meta twin must equal.",
+          "expected": {"parse": "ok", "push": "accepted", "offer": {
+            "identity_content_hash": null,
+            "identity_hash_method": null,
+            "identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC",
+            "previews": 0,
+            "attestations": 0,
+            "data_as_of": null,
+            "terms_unchanged": true,
+            "price_unchanged": true
+          }}
+        }
+      ],
+      "pairwise_assertion": {
+        "case_id": "passthrough_invariant_select_inert",
+        "description": "Cross-line assertion: offer(passthrough_baseline_with_meta).pricing == offer(passthrough_baseline_without_meta).pricing AND the selected term (terms[0]) is proto-equal across the two offers. Metadata MUST NOT alter term/price selection.",
+        "left": "passthrough_baseline_with_meta",
+        "right": "passthrough_baseline_without_meta",
+        "assert": {"pricing_equal": true, "selected_term_equal": true}
+      }
+    },
+    {
+      "file": "multiterm_scope_projection.jsonl",
+      "note": "ENTANGLEMENT invariant under scope projection. The resource carries TWO enumerated terms in this order: [0] premium (scopes:[\"subscription:premium\"], flat 9.99), [1] public (no scopes, flat 4.99). The SAME metadata must be emitted on the Offer regardless of which term licenseterm.Select projects for the requester. Run this line TWICE: once with the `premium` requester (selects term[0], price 9.99) and once with the `default` requester (term[0] filtered out, selects the public term, price 4.99). Metadata fields are identical in both offers; only the selected term/price differs -- driven by scopes ONLY, never by metadata.",
+      "cases": [
+        {
+          "line_number": 1,
+          "case_id": "multiterm_meta_premium_requester",
+          "description": "premium requester -> premium term selected (9.99); full metadata present.",
+          "requester": "premium",
+          "expected": {"parse": "ok", "push": "accepted", "offer": {
+            "identity_content_hash": "sha256:def4560000000000000000000000000000000000000000000000000000000000",
+            "identity_hash_method": "sha256",
+            "identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC",
+            "previews": 1,
+            "attestations": 1,
+            "data_as_of": "2026-03-18T09:30:00Z",
+            "selected_price_rate": 9.99
+          }}
+        },
+        {
+          "line_number": 1,
+          "case_id": "multiterm_meta_default_requester",
+          "description": "default (no-scope) requester -> premium term filtered out, public term selected (4.99); SAME metadata present.",
+          "requester": "default",
+          "expected": {"parse": "ok", "push": "accepted", "offer": {
+            "identity_content_hash": "sha256:def4560000000000000000000000000000000000000000000000000000000000",
+            "identity_hash_method": "sha256",
+            "identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC",
+            "previews": 1,
+            "attestations": 1,
+            "data_as_of": "2026-03-18T09:30:00Z",
+            "selected_price_rate": 4.99
+          }}
+        }
+      ],
+      "pairwise_assertion": {
+        "case_id": "multiterm_metadata_invariant_across_scope",
+        "description": "Cross-requester assertion on the SAME line: metadata (identity hashes, mutability, previews, attestations, data_as_of) is proto-equal between the premium-requester offer and the default-requester offer, while selected_price_rate differs (9.99 vs 4.99). Proves metadata projection is independent of scope-driven term selection.",
+        "left": "multiterm_meta_premium_requester",
+        "right": "multiterm_meta_default_requester",
+        "assert": {"metadata_equal": true, "selected_price_rate_differs": true}
+      }
+    },
+    {
+      "file": "transact_parity.jsonl",
+      "cases": [
+        {
+          "line_number": 1,
+          "case_id": "transact_parity_full_meta",
+          "description": "Metadata-bearing line driven through the full push -> discover -> ExecuteTransaction path. After discovery returns the signed offer, the e2e calls ExecuteTransaction with that offer; the Exchange's verifyOffer reconstructs the offer via buildOffer and the signature MUST re-verify -- i.e. buildOffer reproduces byte-identical metadata (identity hashes, mutability, previews, attestations, ext, ext_critical, data_as_of) so the canonical signed bytes match. This is the signature-parity assertion that guards against metadata being included in discovery but dropped (or reordered) on reconstruction.",
+          "expected": {
+            "parse": "ok",
+            "push": "accepted",
+            "offer": {
+              "identity_content_hash": "sha256:tx00010000000000000000000000000000000000000000000000000000000000",
+              "identity_hash_method": "sha256",
+              "identity_resource_mutability": "RESOURCE_MUTABILITY_STATIC",
+              "previews": 2,
+              "attestations": 1,
+              "ext_critical": ["previews"],
+              "data_as_of": "2026-03-18T09:30:00Z",
+              "terms_unchanged": true,
+              "price_unchanged": true
+            },
+            "transact_parity": true
+          }
+        }
+      ]
+    }
+  ]
+}

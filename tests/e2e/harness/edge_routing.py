@@ -6,7 +6,7 @@ unset), those DNS names do not resolve; :func:`host_url` rewrites the netloc to
 the host-published port reported by ``compose_stack`` so the TCP connection can
 land on the edge container.
 
-Signature contract (verified 2026-05-20 under a9esw.4)
+Signature contract (verified 2026-05-20)
 ------------------------------------------------------
 - Exchange-side: ``src/exchange/internal/signing/signed_url.go:66`` builds the
   canonical as ``GET\\n<full URL minus sig>`` — scheme + host + path + query.
@@ -30,7 +30,7 @@ only; callers carry the Host header themselves.
 
 from __future__ import annotations
 
-from .conftest import StackURLs
+from .stack_urls import StackURLs
 
 _COMPOSE_INTERNAL_EDGE_HOSTS: tuple[tuple[str, str], ...] = (
     ("http://edge:8787", "edge"),

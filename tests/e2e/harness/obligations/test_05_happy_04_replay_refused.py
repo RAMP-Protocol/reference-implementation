@@ -1,7 +1,6 @@
 """Obligation 05 — happy 04: a replayed signature is refused.
 
-Verbatim scenario (``docs/obligations/05-system-refuses-when-authority-is-bad.md``,
-fifth happy-path bullet):
+Verbatim scenario (fifth happy-path bullet):
 
 > The agent presents a request that re-uses an exact (keyid,
 > signature) pair the platform has already accepted within the replay
@@ -115,7 +114,7 @@ def test_replayed_signature_is_refused_with_specific_reason(
     2. ``says the signature was replayed`` — the refusal reason names
        the replay with a token from the REPLAY bucket.
     """
-    body_obj = {"requester": {"uris": ["http://edge:8787/premium/replay.html"]}}
+    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/replay.html"]}
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)

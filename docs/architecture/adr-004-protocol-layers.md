@@ -7,7 +7,6 @@
 - `docs/architecture/adr-003-key-rotation-revocation.md` — rotation mechanics at the biscuit layer.
 - `docs/architecture/adr-005-biscuit-transport-canonical-binding.md` (forthcoming) — canonical-form request-hash attenuation that makes the inner layer transport-independent.
 - `docs/architecture/adr-006-broker-intermediation.md` (forthcoming) — `authorized_intermediaries` mechanism that keeps hop visibility enforceable at the inner layer.
-- `docs/design/request-lifecycle.md` §2a — end-to-end runtime flow reflecting the two-layer split.
 
 ---
 
@@ -140,5 +139,3 @@ Rejected. The enterprise integration value (§reasons 1–3 above) is in the JWT
 - ADR-003 (key rotation and revocation) — inner-layer mechanics.
 - ADR-005 (biscuit transport carriage + canonical-form binding) — forthcoming; makes the inner layer fully transport-independent.
 - ADR-006 (broker intermediation + transparency chain) — forthcoming; extends the inner layer to cover multi-hop authorization.
-- `docs/design/request-lifecycle.md` — end-to-end runtime flow.
-- `docs/protocol/ramp-protocol.md` — implementer-facing protocol narrative.

@@ -1,0 +1,13 @@
+{
+  "name": "Rain on Tin Roof",
+  "slug": "rain-on-tin-roof",
+  "category": "weather/ambience",
+  "duration_seconds": 120.0,
+  "sample_rate_hz": 48000,
+  "bit_depth": 24,
+  "channels": 2,
+  "loopable": true,
+  "format": "WAV",
+  "tags": ["rain", "roof", "metal", "ambience", "loop"],
+  "description": "Steady moderate rainfall drumming on a corrugated tin roof, recorded with a spaced stereo pair. Even rhythmic texture suitable for looping under dialogue or transitions. Original field recording metadata for demo purposes."
+}

@@ -30,6 +30,11 @@ type Error struct {
 	Kind    Kind
 	Message string
 	Err     error
+	// Metadata carries structured, machine-readable context (e.g. the offending
+	// field name) that the transport boundary stamps onto ErrorDetail.metadata
+	// (ADR-019). It exists so callers stop baking such context into the
+	// non-authoritative Message string. Optional; nil when there is none.
+	Metadata map[string]string
 }
 
 // Error implements the error interface.
@@ -54,6 +59,26 @@ func Newf(kind Kind, format string, args ...any) *Error {
 // Wrapf wraps an existing error with a kind and message.
 func Wrapf(kind Kind, err error, format string, args ...any) *Error {
 	return &Error{Kind: kind, Message: fmt.Sprintf(format, args...), Err: err}
+}
+
+// WithMeta records a structured, machine-readable key/value on the error so the
+// transport boundary stamps it onto ErrorDetail.metadata (ADR-019) instead of
+// the caller baking it into the non-authoritative Message string. Fluent; chains
+// off Newf/Wrapf and nil-inits the map on first use. WithMeta is the general API
+// for composite or non-"field" axes (e.g. required_one_of, item_index).
+func (e *Error) WithMeta(key, value string) *Error {
+	if e.Metadata == nil {
+		e.Metadata = make(map[string]string, 1)
+	}
+	e.Metadata[key] = value
+	return e
+}
+
+// WithField is the ergonomic shortcut for the common case — the offending input
+// field's identity, recorded under the conventional "field" key (verbatim mirror
+// of exchange.Error.WithField, implemented atop WithMeta).
+func (e *Error) WithField(name string) *Error {
+	return e.WithMeta("field", name)
 }
 
 // String renders Kind for logging.

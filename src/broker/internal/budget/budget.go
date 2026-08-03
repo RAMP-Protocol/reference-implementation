@@ -1,8 +1,9 @@
-// Package budget enforces per-license spending caps across periods.
+// Package budget enforces per-agent spending caps across periods.
 //
-// The Broker checks a caller's period budget before committing to an
-// Exchange transaction. Counters live in Redis keyed by license + period
-// (e.g. "budget:lic-42:2026-04"); when Redis is not configured, an
+// The Broker checks an agent's period budget before returning licensed offers,
+// keyed on the AUTHENTICATED agent identity (never the caller-written
+// billing_ref). Counters live in Redis keyed by that identity + period
+// (e.g. "budget:agent-42:2026-04"); when Redis is not configured, an
 // in-memory map is used for demo environments.
 package budget
 
@@ -34,9 +35,16 @@ type Decision struct {
 }
 
 // Service exposes Check + Record semantics to handlers.
+//
+// All money parameters and Decision fields are 1e8 FIXED-POINT int64 (8dp), NOT
+// minor units / cents (DECISION 1+3). The caller scales canonical wire money
+// strings to fixed-point at the transport boundary (moneyStringToFixedPoint) so
+// fractions of a cent are accounted EXACTLY while the Redis INCRBY counter stays
+// an atomic integer. The parameter names (limitMinor/costMinor) are retained to
+// avoid churn; the unit is fixed-point 1e8, not minor units.
 type Service interface {
-	Check(ctx context.Context, licenseID string, limitMinor int64) (Decision, error)
-	Record(ctx context.Context, licenseID string, costMinor int64) error
+	Check(ctx context.Context, agentID string, limitMinor int64) (Decision, error)
+	Record(ctx context.Context, agentID string, costMinor int64) error
 }
 
 // RedisService is the Redis-backed implementation.
@@ -60,8 +68,8 @@ func NewRedis(client *redis.Client, ttl time.Duration, clk clock.Clock) *RedisSe
 }
 
 // Check returns the budget decision without mutating state.
-func (s *RedisService) Check(ctx context.Context, licenseID string, limitMinor int64) (Decision, error) {
-	key := s.key(licenseID)
+func (s *RedisService) Check(ctx context.Context, agentID string, limitMinor int64) (Decision, error) {
+	key := s.key(agentID)
 	consumed, err := s.readConsumed(ctx, key)
 	if err != nil {
 		return Decision{}, err
@@ -76,11 +84,11 @@ func (s *RedisService) Check(ctx context.Context, licenseID string, limitMinor i
 }
 
 // Record increments the period counter after a transaction completes.
-func (s *RedisService) Record(ctx context.Context, licenseID string, costMinor int64) error {
+func (s *RedisService) Record(ctx context.Context, agentID string, costMinor int64) error {
 	if costMinor <= 0 {
 		return nil
 	}
-	key := s.key(licenseID)
+	key := s.key(agentID)
 	pipe := s.client.TxPipeline()
 	pipe.IncrBy(ctx, key, costMinor)
 	pipe.Expire(ctx, key, s.ttl)
@@ -101,8 +109,8 @@ func (s *RedisService) readConsumed(ctx context.Context, key string) (int64, err
 	return v, nil
 }
 
-func (s *RedisService) key(licenseID string) string {
-	return fmt.Sprintf("budget:%s:%s", licenseID, s.clk.Now().Format(periodLayout))
+func (s *RedisService) key(agentID string) string {
+	return fmt.Sprintf("budget:%s:%s", agentID, s.clk.Now().Format(periodLayout))
 }
 
 // MemoryService is the in-process fallback used when Redis is not configured.
@@ -123,10 +131,10 @@ func NewMemory(clk clock.Clock) *MemoryService {
 }
 
 // Check reports the budget decision without mutating state.
-func (s *MemoryService) Check(_ context.Context, licenseID string, limitMinor int64) (Decision, error) {
+func (s *MemoryService) Check(_ context.Context, agentID string, limitMinor int64) (Decision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	consumed := s.counts[s.key(licenseID)]
+	consumed := s.counts[s.key(agentID)]
 	remaining := limitMinor - consumed
 	return Decision{
 		Allowed:   remaining >= 0,
@@ -137,18 +145,18 @@ func (s *MemoryService) Check(_ context.Context, licenseID string, limitMinor in
 }
 
 // Record increments the counter for the current period.
-func (s *MemoryService) Record(_ context.Context, licenseID string, costMinor int64) error {
+func (s *MemoryService) Record(_ context.Context, agentID string, costMinor int64) error {
 	if costMinor <= 0 {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.counts[s.key(licenseID)] += costMinor
+	s.counts[s.key(agentID)] += costMinor
 	return nil
 }
 
-func (s *MemoryService) key(licenseID string) string {
-	return fmt.Sprintf("budget:%s:%s", licenseID, s.clk.Now().Format(periodLayout))
+func (s *MemoryService) key(agentID string) string {
+	return fmt.Sprintf("budget:%s:%s", agentID, s.clk.Now().Format(periodLayout))
 }
 
 // Select returns a Service backed by Redis when client != nil, memory otherwise.

@@ -72,13 +72,23 @@ func TestResolveEd25519Key_FailsClosedWhenUnset(t *testing.T) {
 	}
 }
 
-// TestResolveRSAKey_FailsClosedWhenUnset is the RSA counterpart.
-func TestResolveRSAKey_FailsClosedWhenUnset(t *testing.T) {
+// TestResolveRSAKeyIfConfigured_YieldsNothingWhenUnset is the RSA counterpart,
+// and deliberately NOT the same contract. The Ed25519 key above is required by
+// every tenant, so its absence fails closed at boot. The RSA key is needed only
+// by tenants on the AWS_CLOUDFRONT_RSA scheme, so an unset one yields no key and
+// no error here; the refusal is deferred to the first tenant that needs it (see
+// installRSAKey and rsa_deferred_test.go). A configured-but-broken key still
+// errors — covered by TestSetupDemoKeys_FailsOnMalformedRSAKey.
+func TestResolveRSAKeyIfConfigured_YieldsNothingWhenUnset(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	t.Setenv("RAMP_RSA_PRIVATE_PEM", "")
 	t.Setenv("RAMP_RSA_PRIVATE_PEM_FILE", "")
-	if _, err := resolveRSAKey(logger); err == nil {
-		t.Fatal("want error when no RSA key configured, got nil")
+	priv, err := resolveRSAKeyIfConfigured(logger)
+	if err != nil {
+		t.Fatalf("an absent RSA key must not be an error here: %v", err)
+	}
+	if priv != nil {
+		t.Fatal("want no key when neither RSA setting is set")
 	}
 }
 

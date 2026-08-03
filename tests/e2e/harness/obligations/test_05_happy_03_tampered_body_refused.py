@@ -1,7 +1,6 @@
 """Obligation 05 — happy 03: a tampered body is refused.
 
-Verbatim scenario (``docs/obligations/05-system-refuses-when-authority-is-bad.md``,
-fourth happy-path bullet):
+Verbatim scenario (fourth happy-path bullet):
 
 > The agent presents a request whose body bytes do not match the
 > Content-Digest the signature commits to. The platform refuses the
@@ -105,12 +104,12 @@ def test_tampered_body_is_refused_with_digest_mismatch(
        the digest mismatch with a token from the DIGEST bucket.
     """
     # Sign body A — the digest header commits to A's bytes.
-    body_a_obj = {"requester": {"uris": ["http://edge:8787/premium/article-a.html"]}}
+    body_a_obj = {"requester": {}, "uris": ["http://edge:8787/premium/article-a.html"]}
     body_a = json.dumps(body_a_obj, separators=(",", ":")).encode()
 
     # The wire payload is body B — different URI, different bytes,
     # different SHA-256. The signature still commits to body A.
-    body_b_obj = {"requester": {"uris": ["http://edge:8787/premium/article-b.html"]}}
+    body_b_obj = {"requester": {}, "uris": ["http://edge:8787/premium/article-b.html"]}
     body_b = json.dumps(body_b_obj, separators=(",", ":")).encode()
     assert body_a != body_b, "pre-condition: tampered body must differ from signed body"
 

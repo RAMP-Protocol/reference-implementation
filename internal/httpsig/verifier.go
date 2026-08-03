@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yaronf/httpsign"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
@@ -26,11 +29,12 @@ var requiredCoveredComponents = []string{
 	"@target-uri",
 	"content-digest",
 	"authorization",
+	signatureAgentLower,
 }
 
 // entitlementHeaderLower is the lowercase header name that, when present on
-// a signed request, MUST be part of the covered-component set (ADR-002,
-// ye6f-12). The header is optional at the protocol level — not every RPC
+// a signed request, MUST be part of the covered-component set (ADR-002).
+// The header is optional at the protocol level — not every RPC
 // carries a biscuit — so enforcement is conditional on presence. When the
 // header is present the signature MUST commit to it, otherwise a biscuit
 // could be injected or swapped under an existing RFC 9421 signature.
@@ -68,7 +72,7 @@ type VerifyRequestOptions struct {
 	// MaxFutureSkew overrides the created-in-the-future tolerance.
 	MaxFutureSkew time.Duration
 	// MaxSignatures bounds the number of signatures accepted on a multisig
-	// request — the Exchange hop bound (RAMP-56). 0 means unbounded; only the
+	// request — the Exchange hop bound. 0 means unbounded; only the
 	// Exchange-terminal middleware sets it (= max_intermediary_hops + 1). A
 	// request carrying more signatures is rejected with ErrTooManyHops before
 	// any signature is cryptographically verified.
@@ -94,6 +98,13 @@ type VerifiedRequest struct {
 	// claimed KeyID — notably the delivery-URL identity binding, which embeds
 	// the key's RFC 7638 thumbprint as agent_id (ADR-013 D5).
 	PublicKey ed25519.PublicKey
+	// SignatureAgent is the (covered, therefore signed) Signature-Agent header
+	// value: the signer's own directory origin. After the WBA split the KeyID is
+	// an RFC 7638 thumbprint (a proof of key possession) while the agent identity
+	// is the directory domain named here; authorization keys on this value and
+	// the thumbprint proves the named directory published the key. Empty when the
+	// signer set no Signature-Agent (the static bootstrap path).
+	SignatureAgent string
 }
 
 // VerifyRequest parses the Signature + Signature-Input headers off req,
@@ -210,7 +221,7 @@ func VerifyMultisigRequest(
 }
 
 // enforceSignatureChain checks that allParams form a valid forwarding chain
-// (RAMP-56): labels are exactly sig1..sigN contiguous in Signature-Input order,
+// labels are exactly sig1..sigN contiguous in Signature-Input order,
 // sig1 carries no "signature" component, and every sigK (K>1) covers exactly one
 // "signature";key="sig(K-1)" link to its immediate predecessor.
 //
@@ -297,7 +308,20 @@ func verifySingleSignature(
 		return nil, err
 	}
 
-	pub, err := resolver.Resolve(req.Context(), params.KeyID)
+	// Signature-Agent is a required covered component (enforced above), so its
+	// value is bound by this signature. Thread it to the resolver so a discovery
+	// resolver can fetch the named directory and match the keyid thumbprint
+	// against it; carry it on the result so authorization keys on the directory
+	// domain rather than the raw thumbprint.
+	//
+	// Read through agentid so this stack and the SDK's read the header identically.
+	// Web Bot Auth defines the value as a quoted structured-field String, and the
+	// bytes on the wire are left untouched — only the extracted value is unquoted,
+	// so the signature base above still covers what the signer signed. Reading the
+	// REQUEST rather than one header line is what makes that parity hold for a
+	// repeated Signature-Agent too; see agentid.DirectoryFromRequest.
+	sigAgent := agentid.DirectoryFromRequest(req.Header)
+	pub, err := resolver.Resolve(WithSignatureAgent(req.Context(), sigAgent), params.KeyID)
 	if err != nil {
 		return nil, err
 	}
@@ -305,28 +329,72 @@ func verifySingleSignature(
 		return nil, fmt.Errorf("httpsig: stored key length %d != %d", len(pub), ed25519.PublicKeySize)
 	}
 
-	base, err := buildSignatureBase(req, params)
-	if err != nil {
-		return nil, err
-	}
-
 	sigBytes, ok := sigMap[params.Label]
 	if !ok {
 		return nil, fmt.Errorf("%w: label %q not in Signature", ErrMalformedSignatureInput, params.Label)
 	}
-	if !ed25519.Verify(pub, []byte(base), sigBytes) {
-		return nil, ErrSignatureVerify
+
+	if err := verifyEd25519(req, params.Label, pub, body); err != nil {
+		return nil, err
 	}
 
 	return &VerifiedRequest{
-		KeyID:     params.KeyID,
-		Algorithm: params.Alg,
-		Label:     params.Label,
-		Signature: base64.StdEncoding.EncodeToString(sigBytes),
-		Created:   params.Created,
-		Expires:   params.Expires,
-		PublicKey: pub,
+		KeyID:          params.KeyID,
+		Algorithm:      params.Alg,
+		Label:          params.Label,
+		Signature:      base64.StdEncoding.EncodeToString(sigBytes),
+		Created:        params.Created,
+		Expires:        params.Expires,
+		PublicKey:      pub,
+		SignatureAgent: sigAgent,
 	}, nil
+}
+
+// verifyEd25519 reconstructs the RFC 9421 signature base from the request's
+// received Signature-Input bytes (order-agnostic) and checks the ed25519
+// signature for label via yaronf/httpsign. The verifier is built with an EMPTY
+// Headers() set so yaronf imposes no coverage policy of its own — RAMP's
+// enforceRequiredComponents owns coverage — and with SetRejectExpired(false) so
+// RAMP's enforceCreatedExpires owns the time window and its specific errors.
+// Any verify failure (bad signature, malformed structured field, missing label)
+// is WRAPPED as ErrSignatureVerify: the sentinel is preserved for callers that
+// branch with errors.Is, while yaronf's underlying cause stays on the error
+// chain so operators can distinguish a malformed Signature-Input from a bad key
+// or a tampered body (Rule 9). yaronf may read req.Body to canonicalize body-
+// derived components, so body is re-restored afterwards for the next label and
+// downstream handlers.
+func verifyEd25519(req *http.Request, label string, pub ed25519.PublicKey, body []byte) error {
+	// Disable BOTH of yaronf's built-in time policies so RAMP's
+	// enforceCreatedExpires (expires + maxFutureSkew) is the SOLE freshness
+	// authority. NewVerifyConfig defaults to verifyCreated=true with a 10s
+	// notOlderThan / 2s notNewerThan window — far tighter than RAMP's, and it
+	// would reject any signature more than 10s old: legitimate delays, retries,
+	// clock skew, and pre-existing signatures during the verifiers-first
+	// rollout. SetRejectExpired(false) alone leaves that created-window active.
+	vcfg := httpsign.NewVerifyConfig().SetVerifyCreated(false).SetRejectExpired(false)
+	verifier, err := httpsign.NewEd25519Verifier(pub, vcfg, httpsign.Headers())
+	if err != nil {
+		return fmt.Errorf("httpsig: build verifier: %w", err)
+	}
+	verr := httpsign.VerifyRequest(label, *verifier, req)
+	restoreBody(req, body)
+	if verr != nil {
+		return fmt.Errorf("%w: %w", ErrSignatureVerify, verr)
+	}
+	return nil
+}
+
+// restoreBody resets req.Body (and GetBody) to a fresh reader over body so a
+// reader consumed by a verify pass is replenished for the next signature and
+// for downstream handlers. A nil body leaves the request untouched.
+func restoreBody(req *http.Request, body []byte) {
+	if body == nil {
+		return
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
 }
 
 // readAndRestoreBody drains req.Body (if any) and puts the bytes back so
@@ -340,9 +408,6 @@ func readAndRestoreBody(req *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("httpsig: read body: %w", err)
 	}
 	_ = req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(body))
-	req.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
-	}
+	restoreBody(req, body)
 	return body, nil
 }

@@ -12,7 +12,7 @@ import (
 )
 
 const getAgent = `-- name: GetAgent :one
-SELECT agent_id, public_key, manifest_url, requester_type, registered_at FROM ramp.agents WHERE agent_id = $1
+SELECT agent_id, public_key, discovery_url, requester_type, registered_at, billing_ref FROM ramp.agents WHERE agent_id = $1
 `
 
 func (q *Queries) GetAgent(ctx context.Context, agentID string) (RampAgent, error) {
@@ -21,27 +21,60 @@ func (q *Queries) GetAgent(ctx context.Context, agentID string) (RampAgent, erro
 	err := row.Scan(
 		&i.AgentID,
 		&i.PublicKey,
-		&i.ManifestUrl,
+		&i.DiscoveryUrl,
 		&i.RequesterType,
 		&i.RegisteredAt,
+		&i.BillingRef,
+	)
+	return i, err
+}
+
+const setAgentBillingRef = `-- name: SetAgentBillingRef :one
+UPDATE ramp.agents
+   SET billing_ref = $2
+ WHERE agent_id = $1
+   AND billing_ref IS NULL
+RETURNING agent_id, public_key, discovery_url, requester_type, registered_at, billing_ref
+`
+
+type SetAgentBillingRefParams struct {
+	AgentID    string      `json:"agent_id"`
+	BillingRef pgtype.Text `json:"billing_ref"`
+}
+
+// Stores the billing account id for an agent, first write wins. The
+// billing_ref IS NULL guard makes a repeat call a no-op (zero rows →
+// pgx.ErrNoRows), so a stored ref is never overwritten (ADR-021 D4). The
+// column is deliberately absent from UpsertAgent's update list: a key
+// rotation re-upsert must leave billing_ref intact (ADR-021 D3).
+func (q *Queries) SetAgentBillingRef(ctx context.Context, arg SetAgentBillingRefParams) (RampAgent, error) {
+	row := q.db.QueryRow(ctx, setAgentBillingRef, arg.AgentID, arg.BillingRef)
+	var i RampAgent
+	err := row.Scan(
+		&i.AgentID,
+		&i.PublicKey,
+		&i.DiscoveryUrl,
+		&i.RequesterType,
+		&i.RegisteredAt,
+		&i.BillingRef,
 	)
 	return i, err
 }
 
 const upsertAgent = `-- name: UpsertAgent :one
-INSERT INTO ramp.agents (agent_id, public_key, manifest_url, requester_type)
+INSERT INTO ramp.agents (agent_id, public_key, discovery_url, requester_type)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (agent_id) DO UPDATE
     SET public_key = EXCLUDED.public_key,
-        manifest_url = EXCLUDED.manifest_url,
+        discovery_url = EXCLUDED.discovery_url,
         requester_type = EXCLUDED.requester_type
-RETURNING agent_id, public_key, manifest_url, requester_type, registered_at
+RETURNING agent_id, public_key, discovery_url, requester_type, registered_at, billing_ref
 `
 
 type UpsertAgentParams struct {
 	AgentID       string            `json:"agent_id"`
 	PublicKey     []byte            `json:"public_key"`
-	ManifestUrl   pgtype.Text       `json:"manifest_url"`
+	DiscoveryUrl  pgtype.Text       `json:"discovery_url"`
 	RequesterType RampRequesterType `json:"requester_type"`
 }
 
@@ -49,16 +82,17 @@ func (q *Queries) UpsertAgent(ctx context.Context, arg UpsertAgentParams) (RampA
 	row := q.db.QueryRow(ctx, upsertAgent,
 		arg.AgentID,
 		arg.PublicKey,
-		arg.ManifestUrl,
+		arg.DiscoveryUrl,
 		arg.RequesterType,
 	)
 	var i RampAgent
 	err := row.Scan(
 		&i.AgentID,
 		&i.PublicKey,
-		&i.ManifestUrl,
+		&i.DiscoveryUrl,
 		&i.RequesterType,
 		&i.RegisteredAt,
+		&i.BillingRef,
 	)
 	return i, err
 }

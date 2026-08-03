@@ -32,13 +32,13 @@ const (
 	// KindPermissionDenied signals that a biscuit chain-verified but the
 	// Exchange policy layer refused it — for example because the
 	// authority or attenuation kid is on the issuer's revocation list
-	// (ye6f-19, ADR-003 §5). Maps to connect.CodePermissionDenied.
+	// (ADR-003 §5). Maps to connect.CodePermissionDenied.
 	KindPermissionDenied
 	// KindUnimplemented signals an operation the adapter or handler does not
 	// implement — e.g. a billing adapter with no reverse-transfer primitive
 	// returning ErrRefundUnsupported. Maps to connect.CodeUnimplemented.
 	KindUnimplemented
-	// Refusal-reason taxonomy (cluster w54d, obligation 05). Each kind
+	// Refusal-reason taxonomy (obligation 05). Each kind
 	// names a distinct biscuit-failure mode at the wire boundary so
 	// operator tooling can triage. All map to CodeUnauthenticated at
 	// the Connect layer — the discriminator is the Kind tag plus the
@@ -67,19 +67,30 @@ const (
 	// buyer org but no buyer-side grant ties this caller to it. The
 	// biscuit is sound but does not name this caller's org.
 	KindEntitlementNotGranted
-	// KindEntitlementStaleAttenuation — the biscuit chain-verified but
-	// the per-request attenuation block is missing or stale beyond the
-	// platform's tolerance (ADR-002 §B mandate; ADR-007 wiring). The
-	// biscuit's authority is sound; only the freshness contract is
-	// broken. Distinct family so operator tooling can triage the
-	// "stolen authority replayed without fresh attenuation" mode
-	// separately from the missing/malformed/expired/wrong-buyer modes.
-	KindEntitlementStaleAttenuation
+	// KindOfferExpired signals that a presented offer's signature verified but
+	// its signed expires_at is in the past (or absent — fail-closed). Distinct
+	// from KindSignatureInvalid so the wire surfaces DENIAL_REASON_OFFER_EXPIRED
+	// rather than mislabeling a stale-but-authentic offer as a signature failure.
+	// Maps to connect.CodeUnauthenticated (the offer is no longer a valid bearer
+	// credential), like the signature-invalid family.
+	KindOfferExpired
 	// KindUnavailable signals a transient upstream dependency failure (e.g.
 	// the caller's /.well-known/ramp.json host is unreachable during ADR-009
 	// D2 lazy registration). Distinct from KindInternal so the caller learns
 	// the request is retryable rather than a server fault.
 	KindUnavailable
+	// KindAccountNotRegistered signals that a paid transaction came from an agent
+	// with no billing_ref — it never registered, so it has no account to charge
+	// (ADR-021 D5). A per-item business denial: it maps to the wire reason
+	// DENIAL_REASON_BILLING_REF_INACTIVE, not a server fault.
+	KindAccountNotRegistered
+	// KindAccountInactive signals that a paid transaction came from a registered
+	// agent whose account the operator switched off in the system of record (or
+	// whose account the SoR does not know at all). Same wire reason as
+	// KindAccountNotRegistered — DENIAL_REASON_BILLING_REF_INACTIVE — but a
+	// distinct kind, so logs and messages keep "never registered" and
+	// "registered but switched off" apart.
+	KindAccountInactive
 )
 
 // Error is the canonical domain error. Handlers receive it from the service
@@ -88,6 +99,11 @@ type Error struct {
 	Kind    Kind
 	Message string
 	Err     error
+	// Metadata carries structured, machine-readable context (e.g. the offending
+	// field name) that the transport boundary stamps onto ErrorDetail.metadata
+	// (ADR-019). It exists so callers stop baking such context into the
+	// non-authoritative Message string. Optional; nil when there is none.
+	Metadata map[string]string
 }
 
 // Error implements error.
@@ -104,24 +120,26 @@ func (e *Error) Unwrap() error { return e.Err }
 // kindStrings maps each Kind to its lowercase log token. Map dispatch
 // keeps Kind.String under the gocyclo cap as new families are added.
 var kindStrings = map[Kind]string{
-	KindInvalidRequest:              "invalid_request",
-	KindNotFound:                    "not_found",
-	KindSignatureInvalid:            "signature_invalid",
-	KindBillingDenied:               "billing_denied",
-	KindIdempotent:                  "idempotent",
-	KindInternal:                    "internal",
-	KindUnauthenticated:             "unauthenticated",
-	KindFailedPrecondition:          "failed_precondition",
-	KindPermissionDenied:            "permission_denied",
-	KindUnimplemented:               "unimplemented",
-	KindEntitlementMissing:          "entitlement_missing",
-	KindEntitlementMalformed:        "entitlement_malformed",
-	KindEntitlementExpired:          "entitlement_expired",
-	KindEntitlementWrongBuyer:       "entitlement_wrong_buyer",
-	KindSubscriptionLapsed:          "subscription_lapsed",
-	KindEntitlementNotGranted:       "entitlement_not_granted",
-	KindEntitlementStaleAttenuation: "entitlement_stale_attenuation",
-	KindUnavailable:                 "unavailable",
+	KindInvalidRequest:        "invalid_request",
+	KindNotFound:              "not_found",
+	KindSignatureInvalid:      "signature_invalid",
+	KindBillingDenied:         "billing_denied",
+	KindIdempotent:            "idempotent",
+	KindInternal:              "internal",
+	KindUnauthenticated:       "unauthenticated",
+	KindFailedPrecondition:    "failed_precondition",
+	KindPermissionDenied:      "permission_denied",
+	KindUnimplemented:         "unimplemented",
+	KindEntitlementMissing:    "entitlement_missing",
+	KindEntitlementMalformed:  "entitlement_malformed",
+	KindEntitlementExpired:    "entitlement_expired",
+	KindEntitlementWrongBuyer: "entitlement_wrong_buyer",
+	KindSubscriptionLapsed:    "subscription_lapsed",
+	KindEntitlementNotGranted: "entitlement_not_granted",
+	KindOfferExpired:          "offer_expired",
+	KindUnavailable:           "unavailable",
+	KindAccountNotRegistered:  "account_not_registered",
+	KindAccountInactive:       "account_inactive",
 }
 
 // String renders Kind for logging.
@@ -141,7 +159,7 @@ func (k Kind) ConnectCode() connect.Code {
 		return connect.CodeNotFound
 	case KindSignatureInvalid:
 		return connect.CodeUnauthenticated
-	case KindBillingDenied:
+	case KindBillingDenied, KindAccountNotRegistered, KindAccountInactive:
 		return connect.CodePermissionDenied
 	case KindIdempotent:
 		return connect.CodeAlreadyExists
@@ -155,6 +173,8 @@ func (k Kind) ConnectCode() connect.Code {
 		return connect.CodePermissionDenied
 	case KindUnimplemented:
 		return connect.CodeUnimplemented
+	case KindOfferExpired:
+		return connect.CodeUnauthenticated
 	case KindUnavailable:
 		return connect.CodeUnavailable
 	case KindEntitlementMissing,
@@ -162,8 +182,7 @@ func (k Kind) ConnectCode() connect.Code {
 		KindEntitlementExpired,
 		KindEntitlementWrongBuyer,
 		KindSubscriptionLapsed,
-		KindEntitlementNotGranted,
-		KindEntitlementStaleAttenuation:
+		KindEntitlementNotGranted:
 		return connect.CodeUnauthenticated
 	default:
 		return connect.CodeUnknown
@@ -178,6 +197,18 @@ func Newf(kind Kind, format string, args ...any) *Error {
 // Wrap wraps an existing cause with a domain error Kind.
 func Wrap(kind Kind, cause error, msg string) *Error {
 	return &Error{Kind: kind, Message: msg, Err: cause}
+}
+
+// WithField records the offending field name as structured Metadata so the
+// transport boundary can stamp it onto ErrorDetail.metadata["field"] (ADR-019),
+// rather than embedding it in the non-authoritative Message string. Returns the
+// receiver for fluent chaining off Newf/Wrap.
+func (e *Error) WithField(name string) *Error {
+	if e.Metadata == nil {
+		e.Metadata = make(map[string]string, 1)
+	}
+	e.Metadata["field"] = name
+	return e
 }
 
 // ToConnect converts any error into a connect.Error, preserving Kind mapping

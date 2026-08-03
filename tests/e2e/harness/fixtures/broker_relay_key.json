@@ -1,8 +1,0 @@
-{
-  "kid": "broker.broker-local.v1",
-  "kty": "OKP",
-  "crv": "Ed25519",
-  "alg": "EdDSA",
-  "private_key": "m7-erI0KLhYteqHVBNinKTz9p8-A3-Yw9is0gVMJFs4",
-  "public_key": "gCX76Qe6aRTjVWd2WIFaLtfTzBjA9EFFHUg3pz5AE9s"
-}

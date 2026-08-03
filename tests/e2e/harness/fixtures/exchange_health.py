@@ -10,15 +10,16 @@ fixture before each test to restore it.
 
 Ownership: this fixture is owned by the cleanup mode, not by
 individual tests. Tests declare ``stack_isolation("shared-clean-fixtures")``
-(the f6mq peer's marker contract) and the framework's per-test hook
-runs ``promote_drifted_exchange_health`` between tests. Tests do
+and the framework's per-test hook runs
+``promote_drifted_exchange_health`` between tests. Tests do
 NOT import or call this function directly.
 
 The Broker-side periodic health probe deliberately remains out of
 scope here — that's a config-flag-gated background goroutine the
-Broker may add later. ADR-008 D5 says "if it grows beyond a small
-probe, file a follow-up beads task and stop"; this module honours
-that boundary.
+Broker may add later. Per ADR-008 D5, cleanup belongs to the mode that
+declares it rather than to individual tests, so this module stays a
+small promote-on-drift helper; anything larger belongs in the fixture
+that owns the mode.
 """
 
 from __future__ import annotations

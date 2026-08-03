@@ -6,7 +6,7 @@
 --
 -- transaction_log.subscription_id records which subscription a transaction
 -- was billed against (null = per-request, non-null = subscription path with
--- billing.Authorize skipped). See design-demo-bootstrap.md §5.5, §7.5.
+-- billing.Authorize skipped).
 
 ALTER TABLE ramp.catalog
     ADD COLUMN subscription_id TEXT,      -- subscription-priced variant pointer; NULL means per-request only

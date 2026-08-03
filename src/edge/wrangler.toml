@@ -1,18 +1,80 @@
 name = "ramp-edge"
 main = "src/entries/cloudflare.ts"
-compatibility_date = "2025-01-15"
+compatibility_date = "2026-07-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Inject exchange URLs via `wrangler secret put` or the dashboard. The edge
-# resolves the Ed25519 delivery-URL verify key from the exchange's unified
-# /.well-known/ramp.json (public_keys[]); set EXCHANGE_MANIFEST_URL to it.
-# Optionally pre-provision the verify key(s) inline via RAMP_VERIFY_KEYS (a JSON
-# array of Ed25519 JWKs) to skip the fetch.
+# Workers Logs must be on: the operations runbook (README, "What to alert on")
+# reads the worker's structured edge.* records there — without this block the
+# records are not retained anywhere.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# Configure exchange URLs via [vars] (see the staging block below for a worked
+# example). The worker holds NO secrets — every value is public. The edge
+# resolves the Ed25519 delivery-URL verify key from the exchange's Web Bot Auth
+# directory (/.well-known/http-message-signatures-directory), matching the URL's
+# `kid` (RFC 7638 thumbprint); set EXCHANGE_WBA_URL to it. Optionally
+# pre-provision the verify key(s) inline via RAMP_VERIFY_KEYS (a JSON array of
+# Ed25519 JWKs) to skip the fetch.
 # [vars]
 # EXCHANGE_URL = "https://exchange.example.com"
-# EXCHANGE_MANIFEST_URL = "https://exchange.example.com/.well-known/ramp.json"
+# EXCHANGE_WBA_URL = "https://exchange.example.com/.well-known/http-message-signatures-directory"
 # RSL_BODY = "# RSL hint"
 # ACME_TOKENS_JSON = "{}"
 # RAMP_VERIFY_KEYS = "[]"
+# RAMP_ENFORCE_BINDING = "true"   # default; "false" downgrades to bearer addresses
 
 # KV for single-use URL enforcement is deferred post-v1.
+
+# ---------------------------------------------------------------------------
+# Staging environment for the publisher zone (deploy with: wrangler deploy --env
+# staging). One Worker on the article routes makes every access decision on
+# the SHARED article URL — humans and AI agents use the same URL, so there is
+# no CDN-native signed-URL check anywhere; the Worker is the only gate.
+#
+# The Worker holds NO secrets: every value below is public configuration. The
+# private Ed25519 signing key stays in the Exchange's key store and is never
+# given to Cloudflare. The Worker verifies with the Exchange's PUBLIC key,
+# fetched from EXCHANGE_WBA_URL at runtime (cached, rotation self-heals) or
+# pinned via RAMP_VERIFY_KEYS to skip the fetch.
+#
+# Exchange-side prerequisite: the publisher's tenant must be provisioned with
+# signing_scheme = 'ED25519' so delivery URLs carry the signature this Worker
+# verifies (see README.md, "Deploying for a publisher zone").
+# ---------------------------------------------------------------------------
+[env.staging]
+name = "ramp-edge-staging"
+# The worker must be reachable ONLY through the zone routes below. The
+# workers.dev hostname would bypass the zone (no zone features, and same-zone
+# origin forwarding cannot work there), so it stays off.
+workers_dev = false
+# Adjust patterns to the publisher's staging zone before deploying. The route
+# must cover the article paths AND /.well-known/* (discovery files).
+routes = [
+  { pattern = "staging.publisher.example/*", zone_name = "publisher.example" },
+]
+
+[env.staging.vars]
+EXCHANGE_URL = "https://exchange.example"
+EXCHANGE_WBA_URL = "https://exchange.example/.well-known/http-message-signatures-directory"
+PROVIDER = "www.publisher.example"
+EXCHANGES_JSON = '[{"domain":"exchange.example","endpoint":"https://exchange.example","supported_profiles":[]}]'
+# Proof-of-possession on agent-bound delivery addresses. "false" serves them as
+# bearer credentials instead. See CONFIGURATION.md §3.6.
+RAMP_ENFORCE_BINDING = "true"
+# Origin addressing — pick ONE of the two modes (the Worker refuses to run
+# with neither):
+#
+# Mode A (recommended when the zone's origin is already configured in
+# Cloudflare, e.g. a shared load balancer that routes by Host header):
+# forward to this zone's own origin. Cloudflare sends the subrequest straight
+# to the configured origin with the original Host — no origin address needed.
+SAME_ZONE_ORIGIN = "true"
+# Mode B: an explicit origin backend. Set per deployment if chosen. Must
+# NOT resolve back to the Worker's own route, or requests would loop.
+# ORIGIN_URL = "https://origin.publisher.example"
+# Optional hardening (uncomment to pin the Exchange's public verify keys and
+# skip the runtime directory fetch; the directory is still used as fallback
+# when an unknown key id appears, e.g. after rotation):
+# RAMP_VERIFY_KEYS = '[{"kty":"OKP","crv":"Ed25519","x":"<base64url public key>"}]'

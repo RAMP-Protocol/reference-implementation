@@ -1,12 +1,36 @@
 # Local full-stack E2E compose: brings up Postgres, Redis, Exchange, Broker,
-# Miniflare + Fastly + AWS edges, a mock publisher origin, a publisher-JWKS
-# host, and the MCP shim.
+# Miniflare + Fastly + AWS edges, a mock publisher origin, a publisher-JWKS host,
+# and the Identity service (Go MCP adapter) with its Zitadel + Vault + wildcard-DNS
+# supporting cast.
 #
 #   make e2e-up       # docker compose -f docker-compose.e2e.yml up -d --build
 #   make test-e2e     # up → pytest in `runner` service → down
 #   make e2e-down     # docker compose down -v
 #
-# See Wave 0 task agentic-content-access-flsp for scope.
+# See the Wave 0 compose-topology task for scope.
+
+# The wildcard-DNS sidecar every RAMP service resolves *.rampmcp.org through.
+# Anchored so the address has ONE owner: it was previously written out at each
+# consumer, and five copies of an IP is five places to miss when it moves.
+x-wildcard-dns: &wildcard-dns
+  - "172.30.0.53"
+
+# The identity service's OAuth issuer identifier. Anchored for the same reason as
+# the DNS address above: three services name it, and three copies is three places
+# to miss when it changes.
+x-identity-issuer: &identity-issuer "http://identity"
+
+# The bearer-token issuer and signing seed, as one unit. Both the identity service
+# (which MINTS and verifies bearers) and the runner (whose harness mints its own,
+# in tests/e2e/harness/test_mcp_endpoint.py) must agree on them exactly. Anchored
+# rather than repeated because the failure mode of a second spelling is silent: a
+# rotated seed on one side surfaces as an unexplained 401, not as a mismatch
+# anything reports.
+x-identity-auth: &identity-auth
+  IDENTITY_AUTH_ISSUER: *identity-issuer
+  # Deterministic token key so a bearer stays valid across a restart within a
+  # run (32-byte Ed25519 seed, base64). e2e-only, not a real secret.
+  IDENTITY_TOKEN_SIGNING_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 services:
   postgres:
@@ -15,6 +39,12 @@ services:
       POSTGRES_USER: ramp
       POSTGRES_PASSWORD: ramp
       POSTGRES_DB: ramp
+    volumes:
+      # Multi-exchange topology (ripdi): create exchange-b/c's separate catalog
+      # databases (ramp_b, ramp_c) at cluster init, before the socket opens for
+      # app connections. exchange-b/c gate on `condition: service_healthy`, so
+      # they never race a missing DB. `down -v` wipes the volume → re-runs init.
+      - ./deploy/storage/postgres/10-create-exchange-dbs.sql:/docker-entrypoint-initdb.d/10-create-exchange-dbs.sql:ro
     ports:
       # Ephemeral host port — discovered via `docker compose port postgres 5432`.
       # Lets two parallel worktree stacks coexist on a single Docker daemon
@@ -23,10 +53,15 @@ services:
         published: 0
         mode: host
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ramp -d ramp"]
+      # -h 127.0.0.1 forces a TCP check: during first-boot init (creating the
+      # extra databases) postgres listens only on the unix socket, and a
+      # socket-based pg_isready would report healthy while TCP 5432 is still
+      # closed — letting the exchanges start and hit connection-refused. Checking
+      # TCP keeps the container unhealthy until it actually accepts app connections.
+      test: ["CMD-SHELL", "pg_isready -U ramp -d ramp -h 127.0.0.1"]
       interval: 2s
       timeout: 3s
-      retries: 20
+      retries: 30
 
   redis:
     image: redis:7-alpine
@@ -41,6 +76,15 @@ services:
     image: nginx:alpine
     volumes:
       - ./tests/e2e/mock-publisher/content:/usr/share/nginx/html:ro
+      # Phase-2 demo content tree, served by PATH alongside the baseline tree.
+      # Mounted under its OWN docroot (/usr/share/nginx/demo) — NOT under the
+      # read-only baseline docroot, which the daemon cannot create child
+      # mountpoints in. deploy/publisher/nginx.conf routes the demo path
+      # prefixes (/articles, /lyrics, /tracks, /sfx) to this tree. The edge
+      # forwards the signed-URL path verbatim to ORIGIN_URL
+      # (http://publisher:80), so these mounts are what the canary fetch reads.
+      - ./deploy/content/demo:/usr/share/nginx/demo:ro
+      - ./deploy/publisher/nginx.conf:/etc/nginx/nginx.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/premium/article-42.html || exit 1"]
       interval: 2s
@@ -53,7 +97,7 @@ services:
   # /.well-known/ramp.json (§6.6 schema) so the
   # CatalogSignatureMiddleware self-signup path can resolve the
   # contributor's pubkey. The entrypoint reads the Ed25519 private key
-  # fixture under /keys and publishes the corresponding pubkey on every
+  # under /keys and publishes the corresponding pubkey on every
   # cold start.
   #
   # The service is reached via the `examplenews` network alias matching
@@ -66,12 +110,60 @@ services:
     environment:
       SIGNING_KEY_FILE: "/keys/examplenews-subscription-key.json"
       SIGNING_KID_OVERRIDE: "examplenews.sub.2026q2"
+      # Phase-2 demo: the rendered ramp.json also advertises the Exchange so the
+      # Broker's publisher-probe (which fetches this same /.well-known/ramp.json
+      # for the demo domains aliased below) can route a demo-resource resolve to
+      # exchange.e2e.local. Without exchanges[] the Broker refuses with
+      # NOT_IN_CATALOG even though the contributor is listed.
+      EXCHANGES_JSON: '[{"domain":"exchange:8081","endpoint":"http://exchange:8081","supported_profiles":["ramp-news-v1"],"ext":{"resource_owner_id":"demo-resource-owner"}}]'
     volumes:
       - ./deploy/publisher-keys:/keys:ro
     networks:
       default:
         aliases:
           - examplenews
+          # Phase-2 demo publisher domains were MOVED to the edges (Phase 2b):
+          # each demo domain now aliases to its publisher's edge runtime, which
+          # serves BOTH /.well-known/ramp.json (Gate 2 + Broker probe) AND the
+          # signed CONTENT on port 80. publisher-jwks keeps only its own
+          # `examplenews` alias for the subscription self-signup path.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # ───── 3rd-party catalog-contributor well-known host (fcrk7) ─────
+  # Plain-HTTP host aliased to `catalog-contributor-e2e` that serves THAT
+  # contributor's /.well-known/ramp.json with its Ed25519 signing key in
+  # public_keys[] and manifest domain == the host string. This is what the
+  # Exchange Gate-1 self-signup (agentreg.RegisterFromDirectory) fetches to learn
+  # the contributor's key — NO ramp.agents pre-seed. The music edge lists this
+  # contributor in CATALOG_CONTRIBUTORS_JSON (Gate-2 3rd-party branch); the
+  # philosophy/sfx edges list it too so the existing ingest/full-path tests that
+  # push to those publishers with the contributor key clear Gate-2 via the fetch
+  # path as well. Reuses the publisher-jwks image; the harness contributor key
+  # fixture (gen-e2e-keys.sh) is mounted read-only and its pubkey is published on
+  # every cold start.
+  catalog-contributor:
+    build:
+      context: deploy/publisher-jwks
+      dockerfile: Dockerfile
+    environment:
+      SIGNING_KEY_FILE: "/keys/catalog_contributor_key.json"
+      SIGNING_KID_OVERRIDE: "catalog-contributor-e2e"
+      # registry.go rejects a manifest whose domain != the fetched agent_id; the
+      # contributor's identity anchor is its own host string.
+      MANIFEST_DOMAIN_OVERRIDE: "catalog-contributor-e2e"
+      # A self-hosting contributor authorizes no third party of its own.
+      CATALOG_CONTRIBUTORS_JSON: "[]"
+    volumes:
+      - ./tests/e2e/harness/fixtures:/keys:ro
+    networks:
+      default:
+        aliases:
+          - catalog-contributor-e2e
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/healthz || exit 1"]
       interval: 3s
@@ -121,11 +213,24 @@ services:
       - |
         set -eu
         apk add --no-cache openssl >/dev/null
+        # exchange-a keys (unchanged names — exchange-a's identity is preserved).
         openssl genrsa -out /rsa-keys/rsa-private.pem 2048
         openssl rsa -in /rsa-keys/rsa-private.pem -pubout -out /rsa-keys/rsa-public.pem
         openssl genpkey -algorithm ED25519 -out /rsa-keys/ed25519-private.pem
-        chmod 0444 /rsa-keys/rsa-private.pem /rsa-keys/rsa-public.pem /rsa-keys/ed25519-private.pem
-        echo "rsa-keygen: wrote rsa-private.pem + rsa-public.pem + ed25519-private.pem"
+        # exchange-b / exchange-c keys (ripdi): distinct ed25519 offer keys +
+        # distinct RSA URL-signing keys per exchange, so each /.well-known/ramp.json
+        # serves a DISTINCT offer key and an offer signed by one exchange cannot be
+        # verified against another's manifest.
+        openssl genrsa -out /rsa-keys/rsa-b-private.pem 2048
+        openssl rsa -in /rsa-keys/rsa-b-private.pem -pubout -out /rsa-keys/rsa-b-public.pem
+        openssl genpkey -algorithm ED25519 -out /rsa-keys/ed25519-b-private.pem
+        openssl genrsa -out /rsa-keys/rsa-c-private.pem 2048
+        openssl rsa -in /rsa-keys/rsa-c-private.pem -pubout -out /rsa-keys/rsa-c-public.pem
+        openssl genpkey -algorithm ED25519 -out /rsa-keys/ed25519-c-private.pem
+        chmod 0444 /rsa-keys/rsa-private.pem /rsa-keys/rsa-public.pem /rsa-keys/ed25519-private.pem \
+          /rsa-keys/rsa-b-private.pem /rsa-keys/rsa-b-public.pem /rsa-keys/ed25519-b-private.pem \
+          /rsa-keys/rsa-c-private.pem /rsa-keys/rsa-c-public.pem /rsa-keys/ed25519-c-private.pem
+        echo "rsa-keygen: wrote rsa+ed25519 keypairs for exchange a/b/c"
     volumes:
       - rsa-keys:/rsa-keys
     restart: "no"
@@ -135,29 +240,57 @@ services:
     build:
       context: .
       dockerfile: src/exchange/Dockerfile
+    dns: *wildcard-dns
     environment:
       EXCHANGE_DSN: "postgres://ramp:ramp@postgres:5432/ramp?sslmode=disable"
+      # System-of-Record account registry. RAMP_SOR_ADAPTER
+      # defaults to "postgres", which requires a SEPARATE logical database
+      # (distinct from EXCHANGE_DSN): the Exchange opens a second pool and runs
+      # the SoR migrations at boot, but never CREATE DATABASEs — ramp_sor is
+      # pre-created by deploy/storage/postgres/10-create-exchange-dbs.sql at init.
+      EXCHANGE_SOR_DSN: "postgres://ramp:ramp@postgres:5432/ramp_sor?sslmode=disable"
       EXCHANGE_ADDR: ":8081"
-      EXCHANGE_DOMAIN: "exchange.e2e.local"
+      # Re-package: Offer.exchange (minted from EXCHANGE_DOMAIN) is the
+      # broker's routing key — it must be a host the broker can fetch
+      # /.well-known/ramp.json from in the compose network, so it is the
+      # service host:port (the well-known fetch URL carries no port). The manifest
+      # advertises EXCHANGE_PUBLIC_ORIGIN as the top-level endpoint; it MUST equal
+      # the broker's registered exchange endpoint (EXCHANGES_JSON) for the
+      # post-resolve SSRF equality gate.
+      EXCHANGE_DOMAIN: "exchange:8081"
+      EXCHANGE_PUBLIC_ORIGIN: "http://exchange:8081"
       # Inmemory billing adapter so the seeded agent-e2e balance is the
       # authoritative bound for AcceptOffer's billing gate. Defaults to
       # "free" elsewhere (always-approve); the e2e harness needs a real
       # deny path so the credit-less-buyer obligation surfaces.
       RAMP_BILLING_ADAPTER: "inmemory"
-      EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"},"lazy-agent-e2e":{"value":"100.00","currency":"USD"}}'
-      # Local-dev overrides for the manifest-fetch resolver (HTTPS is the
-      # default; compose network is HTTP-only).
-      RAMP_MANIFEST_FETCH_SCHEME: "http"
+      # agent-e2e (USD) funds the baseline obligation/full-stack suites; the
+      # Phase-2 demo catalog denominates terms in EUR/GBP, so a EUR-funded demo
+      # buyer (agent-demo-eur) is seeded for the demo proof (the in-memory
+      # adapter authorizes every term — incl. FREE — on a currency match, so the
+      # demo buyer's balance currency must match the demo terms). lazy-agent-e2e
+      # (USD) funds the v1.1 lazy-registration proof: the agent is absent from
+      # RAMP_KEYS_FILE/ramp.agents and resolves only via the per-agent well-known
+      # path (agent-jwks service), so its balance must be seeded here too.
+      EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"},"agent-demo-eur":{"value":"1000.00","currency":"EUR"},"lazy-agent-e2e":{"value":"100.00","currency":"USD"}}'
+      # Single scheme knob for the well-known / manifest-fetch resolver (HTTPS is
+      # the default; compose network is HTTP-only).
+      RAMP_WELLKNOWN_SCHEME: "http"
       # The SSRF guard on every outbound .well-known fetch (agent registration,
       # contributor-authz, broker revocation poll) blocks private/loopback hosts
       # by default; the compose network is private + http, so permit it here.
       # MUST stay unset in production.
-      RAMP_FETCH_INSECURE_ALLOW_PRIVATE: "1"
+      SKIP_SSRF: "true"
+      ALLOW_INSECURE: "true"
       # Activate revocation-aware key resolution: the Exchange polls the Broker's
       # well-known + invalidation_url so a Broker-revoked relay kid is rejected
       # even while it is still listed in the bootstrap keys file. Resolution
       # falls back to the static keys.json when the document is unreachable.
       EXCHANGE_BROKER_WELLKNOWN_URL: "http://broker:8082/.well-known/ramp.json"
+      # Poll the Broker's revocation channel frequently so the cross-container
+      # revocation e2e (test_revocation_channel) observes a freshly-published
+      # revocation within a bounded wait. Production uses a longer interval.
+      EXCHANGE_REVOCATION_POLL_INTERVAL: "1s"
       # EXCHANGE_CATALOG_URI_SCHEME overrides the https:// default that
       # entryFromProto materializes into stored catalog URIs. Compose-internal
       # traffic is http-only; production leaves this unset.
@@ -180,9 +313,13 @@ services:
       - ./deploy/broker:/keys:ro
       - rsa-keys:/rsa-keys:ro
     depends_on:
+      dns:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       publisher-jwks:
+        condition: service_healthy
+      catalog-contributor:
         condition: service_healthy
       rsa-keygen:
         condition: service_completed_successfully
@@ -195,10 +332,106 @@ services:
         published: 0
         mode: host
 
+  # ───── exchange-b (music) — SEPARATE catalog DB ramp_b (ripdi) ─────────────
+  # A copy of `exchange` (= exchange-a) with its OWN catalog database, OWN
+  # offer/URL signing keys, and OWN identity (EXCHANGE_DOMAIN/PUBLIC_ORIGIN). The
+  # music publisher's edge (fastly-edge) names exchange-b in its EXCHANGES_JSON,
+  # so the broker routes music offers here. Everything else (billing seed, httpsig
+  # key set, fetch overrides, broker-revocation poll) is identical to exchange-a.
+  exchange-b:
+    build:
+      context: .
+      dockerfile: src/exchange/Dockerfile
+    dns: *wildcard-dns
+    environment:
+      EXCHANGE_DSN: "postgres://ramp:ramp@postgres:5432/ramp_b?sslmode=disable"
+      # Own SoR registry DB (see exchange-a). ramp_sor_b is pre-created at init.
+      EXCHANGE_SOR_DSN: "postgres://ramp:ramp@postgres:5432/ramp_sor_b?sslmode=disable"
+      EXCHANGE_ADDR: ":8081"
+      EXCHANGE_DOMAIN: "exchange-b:8081"
+      EXCHANGE_PUBLIC_ORIGIN: "http://exchange-b:8081"
+      RAMP_BILLING_ADAPTER: "inmemory"
+      EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"},"agent-demo-eur":{"value":"1000.00","currency":"EUR"}}'
+      RAMP_WELLKNOWN_SCHEME: "http"
+      SKIP_SSRF: "true"
+      ALLOW_INSECURE: "true"
+      EXCHANGE_BROKER_WELLKNOWN_URL: "http://broker:8082/.well-known/ramp.json"
+      EXCHANGE_CATALOG_URI_SCHEME: "http"
+      RAMP_KEYS_FILE: "/keys/keys.json"
+      # Distinct ed25519 + RSA key MATERIAL (per exchange) so the well-known
+      # serves a distinct offer key. Key REF names are kept identical to
+      # exchange-a so the per-DB tenant rows (seeded with the same refs) resolve.
+      RAMP_RSA_PRIVATE_PEM_FILE: "/rsa-keys/rsa-b-private.pem"
+      RAMP_ED25519_PRIVATE_PEM_FILE: "/rsa-keys/ed25519-b-private.pem"
+    volumes:
+      - ./deploy/broker:/keys:ro
+      - rsa-keys:/rsa-keys:ro
+    depends_on:
+      dns:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      publisher-jwks:
+        condition: service_healthy
+      catalog-contributor:
+        condition: service_healthy
+      rsa-keygen:
+        condition: service_completed_successfully
+    ports:
+      - target: 8081
+        published: 0
+        mode: host
+
+  # ───── exchange-c (sfx) — SEPARATE catalog DB ramp_c (ripdi) ───────────────
+  # A copy of `exchange` with its OWN catalog database (ramp_c), OWN signing keys,
+  # and OWN identity. The sfx publisher's edge (aws-edge) names exchange-c in its
+  # EXCHANGES_JSON, so the broker routes sfx offers here.
+  exchange-c:
+    build:
+      context: .
+      dockerfile: src/exchange/Dockerfile
+    dns: *wildcard-dns
+    environment:
+      EXCHANGE_DSN: "postgres://ramp:ramp@postgres:5432/ramp_c?sslmode=disable"
+      # Own SoR registry DB (see exchange-a). ramp_sor_c is pre-created at init.
+      EXCHANGE_SOR_DSN: "postgres://ramp:ramp@postgres:5432/ramp_sor_c?sslmode=disable"
+      EXCHANGE_ADDR: ":8081"
+      EXCHANGE_DOMAIN: "exchange-c:8081"
+      EXCHANGE_PUBLIC_ORIGIN: "http://exchange-c:8081"
+      RAMP_BILLING_ADAPTER: "inmemory"
+      EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"},"agent-demo-eur":{"value":"1000.00","currency":"EUR"}}'
+      RAMP_WELLKNOWN_SCHEME: "http"
+      SKIP_SSRF: "true"
+      ALLOW_INSECURE: "true"
+      EXCHANGE_BROKER_WELLKNOWN_URL: "http://broker:8082/.well-known/ramp.json"
+      EXCHANGE_CATALOG_URI_SCHEME: "http"
+      RAMP_KEYS_FILE: "/keys/keys.json"
+      RAMP_RSA_PRIVATE_PEM_FILE: "/rsa-keys/rsa-c-private.pem"
+      RAMP_ED25519_PRIVATE_PEM_FILE: "/rsa-keys/ed25519-c-private.pem"
+    volumes:
+      - ./deploy/broker:/keys:ro
+      - rsa-keys:/rsa-keys:ro
+    depends_on:
+      dns:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      publisher-jwks:
+        condition: service_healthy
+      catalog-contributor:
+        condition: service_healthy
+      rsa-keygen:
+        condition: service_completed_successfully
+    ports:
+      - target: 8081
+        published: 0
+        mode: host
+
   broker:
     build:
       context: .
       dockerfile: src/broker/Dockerfile
+    dns: *wildcard-dns
     extra_hosts:
       # On Linux, Docker doesn't auto-wire this; make it explicit so the
       # Broker can probe edge URIs authored with host.docker.internal.
@@ -209,19 +442,33 @@ services:
       BROKER_ADDR: ":8082"
       BROKER_ID: "broker-e2e"
       BROKER_DOMAIN: "broker.e2e.local"
-      RAMP_PROBE_SCHEME: "http"
-      # Per-agent well-known resolver fetches an unknown agent's manifest; the
-      # compose network is HTTP-only (mirrors the Exchange's setting).
-      RAMP_MANIFEST_FETCH_SCHEME: "http"
+      # Single scheme knob for every broker well-known fetch: the publisher
+      # probe, the Offer.exchange endpoint resolver (that exchange's
+      # /.well-known/ramp.json), and the per-agent well-known key resolver
+      # (v1.1 lazy/just-in-time registration). The compose network is HTTP-only,
+      # so override the default https scheme.
+      RAMP_WELLKNOWN_SCHEME: "http"
       # The SSRF guard on the publisher-probe fetch blocks private/loopback hosts
       # by default; the compose publisher (and host.docker.internal probe target)
       # are internal http hosts, so permit it here. MUST stay unset in production.
-      RAMP_FETCH_INSECURE_ALLOW_PRIVATE: "1"
-      # Publish the revocation channel: the Broker manifest advertises this
-      # invalidation_url and serves a KeyInvalidationList at the route. No
-      # BROKER_INVALIDATION_FILE is mounted, so the served list is the empty
-      # (nothing-revoked) baseline; an operator revokes a kid by mounting a file.
-      BROKER_INVALIDATION_URL: "http://broker:8082/.well-known/ramp-invalidations.json"
+      SKIP_SSRF: "true"
+      ALLOW_INSECURE: "true"
+      # The Broker refuses to boot without a persistent identity key, because the
+      # key it publishes in its own WBA directory is cached by verifiers for 90
+      # days and a per-restart key invalidates every cached copy. The e2e stack
+      # is torn down between runs and nothing caches across it, so a throwaway
+      # key is correct here. MUST stay unset in production.
+      BROKER_ALLOW_EPHEMERAL_KEY: "true"
+      # Publish the revocation channel: after the WBA split the Broker's WBA
+      # directory advertises this URL as its revocation_url and serves a
+      # KeyRevocationList (keyed by RFC 7638 thumbprint) at that route
+      # (rampwellknown.RevocationPath).
+      BROKER_REVOCATION_URL: "http://broker:8082/.well-known/ramp-key-revocations.json"
+      # BROKER_REVOCATION_FILE points at a writable, host-mounted file the Broker
+      # re-reads on mtime change. Absent/empty → the nothing-revoked baseline; the
+      # cross-container revocation e2e writes a KeyRevocationList here to revoke a
+      # throwaway thumbprint and assert the Exchange then rejects it (401).
+      BROKER_REVOCATION_FILE: "/revocations/revocations.json"
       # Shared httpsig key set (read by Exchange + Broker).
       BROKER_KEYS_FILE: "/keys/keys.json"
       # Broker-relay signing key — without this the Broker ships unsigned
@@ -235,12 +482,23 @@ services:
     volumes:
       - ./deploy/broker:/keys:ro
       - ./tests/e2e/harness/fixtures/broker_relay_key.json:/relay/broker-key.json:ro
+      # Writable dir the revocation e2e writes revocations.json into; the Broker
+      # re-reads it on mtime change (see BROKER_REVOCATION_FILE above).
+      - ./tests/e2e/harness/revocations:/revocations
     depends_on:
+      dns:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       exchange:
+        condition: service_started
+      # Multi-exchange topology (ripdi): the broker resolves music offers to
+      # exchange-b and sfx offers to exchange-c, so both must be up before it.
+      exchange-b:
+        condition: service_started
+      exchange-c:
         condition: service_started
     ports:
       # Ephemeral host port — discovered via `docker compose port broker 8082`
@@ -253,18 +511,52 @@ services:
     build:
       context: src/edge
       dockerfile: Dockerfile.miniflare
+      # The edge consumes @ramp-protocol/sdk-l1 as a git dependency
+      # (git+https://…/protocol#<sha>); npm ci clones it during the image build,
+      # so no sibling build-context is mirrored in.
+    # WBA_KEYS_JSON for this publisher's self-publish key (no kid; named by
+    # thumbprint) is generated by scripts/gen-e2e-keys.sh into this env_file (the
+    # served JWK is derived from the same private fixture the demo ingest signs
+    # with, so they cannot drift). Served in the WBA directory's keys[] so the
+    # Exchange learns the key via the well-known fetch — no DB pre-seed (fcrk7).
+    env_file:
+      - ./deploy/edge-keys/edge.env
+    # Cloudflare edge listens on port 80 so the demo publisher domain alias
+    # (demo.ramp-protocol.org) resolves natively for BOTH the port-80
+    # /.well-known/ramp.json fetch (Exchange Gate 2 + Broker probe) and the
+    # port-80 signed-URL content fetch — no Host-override, no port rewrite.
+    # Root user so node can bind the privileged port inside the container.
+    user: "0:0"
     environment:
+      PORT: "80"
       EXCHANGE_URL: "http://exchange:8081"
-      EXCHANGE_MANIFEST_URL: "http://exchange:8081/.well-known/ramp.json"
+      # After the WBA split the exchange's offer-signing key lives in its WBA
+      # directory; the edge resolves the delivery-URL verify key by thumbprint
+      # from there, not from ramp.json.
+      EXCHANGE_WBA_URL: "http://exchange:8081/.well-known/http-message-signatures-directory"
       ORIGIN_URL: "http://publisher:80"
-      PROVIDER: "edge.e2e.local"
-      EXCHANGES_JSON: '[{"domain":"exchange.e2e.local","endpoint":"http://exchange:8081","supported_profiles":["ramp-news-v1"]}]'
-      # Authorized catalog pushers. The e2e harness seeds an ed25519 keypair
-      # for `catalog-contributor-e2e`, pre-registers it in ramp.agents, and
-      # uses it to sign PushResources RPCs — exercising the same production
-      # code path (no /admin/catalog/reload shortcut).
+      # Delivery-URL binding enforcement, stated explicitly rather than left to
+      # the default: this is the property the MCP end-to-end test exercises, and
+      # a test whose subject is implied by a default proves less than one whose
+      # subject is written down. A custodied registry agent satisfies the check
+      # because the identity service fetches on its behalf with the bound key.
+      RAMP_ENFORCE_BINDING: "true"
+      # PROVIDER is the manifest `domain` field; for the demo publisher this
+      # edge fronts the Stoa Press philosophy catalog.
+      PROVIDER: "demo.ramp-protocol.org"
+      EXCHANGES_JSON: '[{"domain":"exchange:8081","endpoint":"http://exchange:8081","supported_profiles":["ramp-news-v1"],"ext":{"resource_owner_id":"demo-resource-owner"}}]'
+      # Authorized catalog pushers (Gate-2 3rd-party branch). The harness signs
+      # PushResources as `catalog-contributor-e2e`; the Exchange learns that
+      # contributor's key ONLY by fetching its /.well-known/ramp.json from the
+      # catalog-contributor service (no ramp.agents pre-seed) — exercising the
+      # real well-known trust path (fcrk7), not an /admin/catalog/reload shortcut.
       CATALOG_CONTRIBUTORS_JSON: '[{"domain":"catalog-contributor-e2e","relationship":"harness"}]'
       RSL_BODY: "# e2e rsl"
+    networks:
+      default:
+        aliases:
+          # Stoa Press philosophy publisher → Cloudflare ed25519 edge.
+          - demo.ramp-protocol.org
     depends_on:
       exchange:
         condition: service_started
@@ -273,15 +565,15 @@ services:
     healthcheck:
       test:
         - "CMD-SHELL"
-        - 'node -e "require(''http'').get(''http://127.0.0.1:8787/.well-known/ramp.json'', r => process.exit(r.statusCode===200?0:1)).on(''error'', () => process.exit(1))"'
+        - 'node -e "require(''http'').get(''http://127.0.0.1:80/.well-known/ramp.json'', r => process.exit(r.statusCode===200?0:1)).on(''error'', () => process.exit(1))"'
       interval: 3s
       timeout: 3s
       retries: 20
       start_period: 3s
     ports:
-      # Ephemeral host port — discovered via `docker compose port edge 8787`
+      # Ephemeral host port — discovered via `docker compose port edge 80`
       # (h9gy: parallel-worktree-stack support).
-      - target: 8787
+      - target: 80
         published: 0
         mode: host
 
@@ -294,20 +586,45 @@ services:
       dockerfile: tests/e2e/fastly-edge/Dockerfile
       platforms:
         - linux/amd64
+      # Same git-dependency SDK source as the edge service (npm clones
+      # @ramp-protocol/sdk-l1 from git during the build; no sibling context).
+    # WBA_KEYS_JSON for the music publisher's self-publish key (no kid; named by
+    # thumbprint), generated by scripts/gen-e2e-keys.sh. The Fastly entrypoint
+    # hoists it into the ramp_edge config_store so the WASM worker serves it in
+    # the WBA directory's keys[] (fcrk7).
+    env_file:
+      - ./deploy/edge-keys/fastly-edge.env
     environment:
-      EXCHANGE_URL: "http://exchange:8081"
-      EXCHANGE_MANIFEST_URL: "http://exchange:8081/.well-known/ramp.json"
+      # Viceroy listens on port 80 so the music demo domain alias resolves
+      # natively for the port-80 manifest fetch + signed-URL content fetch.
+      FASTLY_SERVE_ADDR: "0.0.0.0:80"
+      # Multi-exchange topology (ripdi): the music publisher is fronted by
+      # exchange-b. Its ramp.json names exchange-b so the broker routes music
+      # offers there, and the music catalog is ingested into exchange-b's DB.
+      # After the WBA split the edge resolves the delivery-URL verify key by
+      # thumbprint from exchange-b's WBA directory, not from ramp.json.
+      EXCHANGE_URL: "http://exchange-b:8081"
+      EXCHANGE_WBA_URL: "http://exchange-b:8081/.well-known/http-message-signatures-directory"
       ORIGIN_URL: "http://publisher:80"
-      PROVIDER: "fastly-edge.e2e.local"
-      EXCHANGES_JSON: '[{"domain":"exchange.e2e.local","endpoint":"http://exchange:8081","supported_profiles":["ramp-news-v1"]}]'
-      # Authorized catalog pushers. The e2e harness seeds an ed25519 keypair
-      # for `catalog-contributor-e2e`, pre-registers it in ramp.agents, and
-      # uses it to sign PushResources RPCs — exercising the same production
-      # code path (no /admin/catalog/reload shortcut).
+      # Binding enforcement stated explicitly; see the cloudflare edge above.
+      RAMP_ENFORCE_BINDING: "true"
+      PROVIDER: "music.demo.ramp-protocol.org"
+      EXCHANGES_JSON: '[{"domain":"exchange-b:8081","endpoint":"http://exchange-b:8081","supported_profiles":["ramp-news-v1"],"ext":{"resource_owner_id":"demo-resource-owner"}}]'
+      # Authorized catalog pushers (Gate-2 3rd-party branch). The harness signs
+      # PushResources as `catalog-contributor-e2e`; the Exchange learns that
+      # contributor's key ONLY by fetching its /.well-known/ramp.json from the
+      # catalog-contributor service (no ramp.agents pre-seed) — exercising the
+      # real well-known trust path (fcrk7), not an /admin/catalog/reload shortcut.
       CATALOG_CONTRIBUTORS_JSON: '[{"domain":"catalog-contributor-e2e","relationship":"harness"}]'
       RSL_BODY: "# e2e rsl fastly"
+    networks:
+      default:
+        aliases:
+          # Harmonia Records music publisher → Fastly ed25519 edge.
+          - music.demo.ramp-protocol.org
     depends_on:
-      exchange:
+      # Music publisher fronts exchange-b (ripdi).
+      exchange-b:
         condition: service_started
       publisher:
         condition: service_healthy
@@ -318,15 +635,15 @@ services:
     healthcheck:
       test:
         - "CMD-SHELL"
-        - 'node -e "require(''http'').get(''http://127.0.0.1:7676/.well-known/ramp.json'', r => process.exit(r.statusCode===200?0:1)).on(''error'', () => process.exit(1))"'
+        - 'node -e "require(''http'').get(''http://127.0.0.1:80/.well-known/ramp.json'', r => process.exit(r.statusCode===200?0:1)).on(''error'', () => process.exit(1))"'
       interval: 3s
       timeout: 3s
       retries: 20
       start_period: 5s
     ports:
-      # Ephemeral host port — discovered via `docker compose port fastly-edge 7676`
+      # Ephemeral host port — discovered via `docker compose port fastly-edge 80`
       # (h9gy: parallel-worktree-stack support).
-      - target: 7676
+      - target: 80
         published: 0
         mode: host
 
@@ -338,26 +655,49 @@ services:
     build:
       context: .
       dockerfile: tests/e2e/aws-edge/Dockerfile
+    # WBA_KEYS_JSON for the sfx publisher's self-publish key (no kid; named by
+    # thumbprint), generated by scripts/gen-e2e-keys.sh. The raw-Node shim reads
+    # it from env and serves it in the WBA directory's keys[] (fcrk7).
+    env_file:
+      - ./deploy/edge-keys/aws-edge.env
+    # AWS CloudFront RSA edge shim listens on port 80 so the sfx demo domain
+    # alias resolves natively for the port-80 manifest + content fetches. Root
+    # user so node can bind the privileged port.
+    user: "0:0"
     environment:
-      EXCHANGE_URL: "http://exchange:8081"
+      # Multi-exchange topology (ripdi): the sfx publisher is fronted by
+      # exchange-c. Its ramp.json names exchange-c so the broker routes sfx
+      # offers there, and the sfx catalog is ingested into exchange-c's DB.
+      EXCHANGE_URL: "http://exchange-c:8081"
       ORIGIN_URL: "http://publisher:80"
-      PROVIDER: "aws-edge.e2e.local"
-      EXCHANGES_JSON: '[{"domain":"exchange.e2e.local","endpoint":"http://exchange:8081","supported_profiles":["ramp-news-v1"]}]'
-      # Authorized catalog pushers. The e2e harness seeds an ed25519 keypair
-      # for `catalog-contributor-e2e`, pre-registers it in ramp.agents, and
-      # uses it to sign PushResources RPCs — exercising the same production
-      # code path (no /admin/catalog/reload shortcut).
+      PROVIDER: "sfx.demo.ramp-protocol.org"
+      EXCHANGES_JSON: '[{"domain":"exchange-c:8081","endpoint":"http://exchange-c:8081","supported_profiles":["ramp-news-v1"],"ext":{"resource_owner_id":"demo-resource-owner"}}]'
+      # Authorized catalog pushers (Gate-2 3rd-party branch). The harness signs
+      # PushResources as `catalog-contributor-e2e`; the Exchange learns that
+      # contributor's key ONLY by fetching its /.well-known/ramp.json from the
+      # catalog-contributor service (no ramp.agents pre-seed) — exercising the
+      # real well-known trust path (fcrk7), not an /admin/catalog/reload shortcut.
       CATALOG_CONTRIBUTORS_JSON: '[{"domain":"catalog-contributor-e2e","relationship":"harness"}]'
-      PORT: "8788"
+      PORT: "80"
       # CloudFront RSA verify key, read from the file the rsa-keygen one-shot
       # writes into the shared volume — the matching public half of the Exchange's
       # RAMP_RSA_PRIVATE_PEM_FILE (trusted key group model; the cdn-keys.json
       # route is retired, D4). No longer committed to git.
-      RAMP_CF_PUBLIC_PEM_FILE: "/rsa-keys/rsa-public.pem"
+      # Multi-exchange topology (ripdi): the sfx publisher is fronted by
+      # exchange-c, which signs URLs with rsa-c-private.pem — so this shim must
+      # verify against rsa-c-public.pem (exchange-c's RSA public half), not
+      # exchange-a's.
+      RAMP_CF_PUBLIC_PEM_FILE: "/rsa-keys/rsa-c-public.pem"
     volumes:
       - rsa-keys:/rsa-keys:ro
+    networks:
+      default:
+        aliases:
+          # FoleyWorks SFX publisher → AWS CloudFront RSA edge.
+          - sfx.demo.ramp-protocol.org
     depends_on:
-      exchange:
+      # SFX publisher fronts exchange-c (ripdi).
+      exchange-c:
         condition: service_started
       publisher:
         condition: service_healthy
@@ -366,37 +706,183 @@ services:
     healthcheck:
       test:
         - "CMD-SHELL"
-        - 'node -e "require(''http'').get(''http://127.0.0.1:8788/.well-known/ramp.json'', r => process.exit(r.statusCode===200?0:1)).on(''error'', () => process.exit(1))"'
+        - 'node -e "require(''http'').get(''http://127.0.0.1:80/.well-known/ramp.json'', r => process.exit(r.statusCode===200?0:1)).on(''error'', () => process.exit(1))"'
       interval: 3s
       timeout: 3s
       retries: 20
       start_period: 3s
     ports:
-      # Ephemeral host port — discovered via `docker compose port aws-edge 8788`
+      # Ephemeral host port — discovered via `docker compose port aws-edge 80`
       # (h9gy: parallel-worktree-stack support).
-      - target: 8788
+      - target: 80
         published: 0
         mode: host
 
-  mcp:
-    build:
-      context: src/mcp
-      dockerfile: Dockerfile
+  # Wildcard DNS for the agent zone. Each agent gets a random subdomain
+  # (<slug>.rampmcp.org) that the Broker/Exchange must resolve to fetch the
+  # agent's WBA directory and verify its signature. The slug is random, so no
+  # static per-agent alias is possible; this resolves the whole zone to identity
+  # and forwards everything else to Docker's embedded DNS (127.0.0.11), which
+  # answers the compose service names and the demo-domain aliases. dnsmasq is
+  # installed at start from the alpine mirror (no bespoke image to pull/pin).
+  dns:
+    image: alpine:3.20
+    command:
+      - sh
+      - -c
+      - "apk add --no-cache dnsmasq >/dev/null 2>&1 && exec dnsmasq -k --log-facility=- --no-resolv --server=127.0.0.11 --address=/rampmcp.org/172.30.0.83"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      default:
+        ipv4_address: 172.30.0.53
+    # Ready once dnsmasq answers (the apk install adds a few seconds of startup);
+    # backends gate on this so they never start before their resolver is up.
+    healthcheck:
+      test: ["CMD-SHELL", "nslookup ready.rampmcp.org 127.0.0.1 >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+
+  # ───── Identity Service (registry / MCP adapter) ──────────────────
+  # The Go service that replaced the Python shim. It custodies each agent's key
+  # (identity-vault), provisions agents through real OIDC sign-up (zitadel), hosts
+  # each agent's WBA directory on its subdomain, and exposes the MCP endpoint the
+  # harness drives. See tests/e2e/harness/test_mcp_endpoint.py.
+  identity-vault:
+    image: hashicorp/vault:1.20
+    cap_add:
+      - IPC_LOCK
     environment:
-      RAMP_MCP_TRANSPORT: "http"
-      RAMP_MCP_HOST: "0.0.0.0"
-      RAMP_MCP_PORT: "8000"
-      BROKER_URL: "http://broker:8082"
-      RAMP_AGENT_ID: "agent-e2e"
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    # Dev mode auto-unseals and enables a KV v2 mount at `secret/`, which the
+    # identity KeyStore uses (IDENTITY_KV_MOUNT=secret). Not for production; the
+    # real deploy runs a sealed Vault with a real auth method.
+    command: ["server", "-dev"]
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  zitadel-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: zitadel
+      POSTGRES_PASSWORD: zitadel
+      POSTGRES_DB: zitadel
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zitadel -d zitadel"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # In-network OIDC provider. ExternalDomain=zitadel so the issuer is
+  # http://zitadel:8080 — resolvable by identity over the compose network (the dev
+  # stack in docker-compose.yml bakes localhost instead, for a laptop browser).
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:v3.4.9
+    command:
+      - start-from-init
+      - --masterkey
+      - MasterkeyNeedsToHave32Characters
+      - --tlsMode
+      - disabled
+      - --steps
+      - /etc/zitadel/init-steps.yaml
+    environment:
+      ZITADEL_EXTERNALDOMAIN: zitadel
+      ZITADEL_EXTERNALPORT: "8080"
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_PORT: "8080"
+      ZITADEL_TLS_ENABLED: "false"
+      ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
+      ZITADEL_DATABASE_POSTGRES_PORT: "5432"
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+    user: "0"
+    volumes:
+      - ./deploy/zitadel/init-steps.yaml:/etc/zitadel/init-steps.yaml:ro
+      - zitadel-bootstrap:/bootstrap
     depends_on:
-      broker:
-        condition: service_started
-    ports:
-      # Ephemeral host port — discovered via `docker compose port mcp 8000`
-      # (h9gy: parallel-worktree-stack support).
-      - target: 8000
-        published: 0
-        mode: host
+      zitadel-db:
+        condition: service_healthy
+
+  # One-shot: provisions the `ramp` project, the confidential `ramp-mcp` OIDC
+  # client with redirect URI http://identity/callback, and the alice login user;
+  # writes the minted client id/secret to the shared bootstrap volume, which
+  # identity reads via IDENTITY_OIDC_CLIENT_ID/SECRET_FILE.
+  zitadel-init:
+    image: curlimages/curl:8.11.1
+    entrypoint: ["sh", "/bootstrap.sh"]
+    user: "0"
+    environment:
+      ZITADEL_BASE_URL: http://zitadel:8080
+      ZITADEL_INSTANCE_HOST: zitadel
+      ZITADEL_ISSUER: http://zitadel:8080
+      IDENTITY_AUTH_ISSUER: *identity-issuer
+    volumes:
+      - ./scripts/zitadel-bootstrap.sh:/bootstrap.sh:ro
+      - zitadel-bootstrap:/bootstrap
+    depends_on:
+      - zitadel
+
+  identity:
+    build:
+      context: .
+      dockerfile: src/identity/Dockerfile
+    # Runs on :80 as root so the WBA directory it hosts is reachable at the
+    # agent's bare subdomain (http://<slug>.rampmcp.org, port 80) — the origin the
+    # Broker/Exchange resolve from the signed Signature-Agent header. The distroless
+    # nonroot default cannot bind a privileged port; e2e overrides it.
+    user: "0"
+    environment:
+      IDENTITY_ADDR: ":80"
+      IDENTITY_DSN: "postgres://ramp:ramp@postgres:5432/identity?sslmode=disable"
+      VAULT_ADDR: "http://identity-vault:8200"
+      VAULT_TOKEN: "root"
+      IDENTITY_KV_MOUNT: "secret"
+      IDENTITY_BASE_DOMAIN: "rampmcp.org"
+      IDENTITY_WELLKNOWN_SCHEME: "http"
+      IDENTITY_OIDC_ISSUER: "http://zitadel:8080"
+      IDENTITY_OIDC_CLIENT_ID_FILE: "/bootstrap/identity_client_id"
+      IDENTITY_OIDC_CLIENT_SECRET_FILE: "/bootstrap/identity_client_secret"
+      IDENTITY_OIDC_SCOPES: "openid profile email"
+      <<: *identity-auth
+      IDENTITY_MCP_BROKER_URL: "http://broker:8082"
+      IDENTITY_MCP_EXCHANGE_URL: "http://exchange:8081"
+      IDENTITY_MCP_WELLKNOWN_SCHEME: "http"
+      # The report leg fetches the offer's exchange well-known over the private
+      # compose network, so allow private targets (as the exchanges/broker do).
+      # The SSRF guard is SDK-owned and reads these two flags; the old
+      # RAMP_FETCH_INSECURE_ALLOW_PRIVATE knob left with the in-repo guard.
+      # Both MUST stay unset in production.
+      SKIP_SSRF: "true"
+      ALLOW_INSECURE: "true"
+    volumes:
+      - zitadel-bootstrap:/bootstrap:ro
+    # Static IP so the wildcard-DNS sidecar can point *.rampmcp.org here.
+    networks:
+      default:
+        ipv4_address: 172.30.0.83
+    # No healthcheck: distroless image ships only the /identity binary — no shell,
+    # no wget/curl (same as exchange/broker). Readiness is gated by the harness,
+    # which polls /healthz before driving the MCP endpoint.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      identity-vault:
+        condition: service_healthy
+      zitadel-init:
+        condition: service_completed_successfully
 
   runner:
     # Opt-in: `docker compose --profile test run --rm runner` executes the suite.
@@ -404,15 +890,21 @@ services:
     build:
       context: .
       dockerfile: tests/e2e/Dockerfile
+      # Both the harness and the shim it installs editable resolve
+      # ramp-protocol-sdk off-commit from git (subdirectory=sdk/python), so no
+      # sibling build-context is mirrored in.
     environment:
+      # The harness mints its own bearer for the MCP-endpoint test, so it needs the
+      # SAME issuer and seed the identity service verifies with.
+      <<: *identity-auth
       RAMP_E2E_REUSE_STACK: "1"
       RAMP_E2E_KEEP_UP: "1"
       RAMP_E2E_IN_NETWORK: "1"
       RAMP_E2E_COMPOSE_FILE: "/runner/docker-compose.e2e.yml"
-      # The in-process MCP shim (test_00_failure_07, test_mcp_ramp_fetch) signs
-      # /broker/v1/resolve with this key. kid == agent-e2e == the resolve
-      # agent_id, so the Broker's self-act gate (verified keyID == req.AgentID)
-      # admits it. The fixture ships in the runner image at /runner/harness.
+      # The harness signs RAMP calls as agent-e2e with this key: keyid's
+      # thumbprint resolves to the agent-e2e directory the seed registers, so the
+      # Broker/Exchange signature gate admits it. The fixture ships in the runner
+      # image at /runner/harness.
       RAMP_AGENT_KEY_FILE: "/runner/harness/fixtures/agent_e2e_key.json"
     volumes:
       - ./docker-compose.e2e.yml:/runner/docker-compose.e2e.yml:ro
@@ -423,11 +915,18 @@ services:
       - fixtures:/fixtures:rw
       # Docker socket bind: lets obligation tests drive container lifecycle
       # (restart, inspect, exec) via the docker-py SDK without depending on
-      # a docker CLI in the runner image. See diagnostic
-      # docs/diagnostics/8r0a-eimu-test-runner-no-docker-cli.md §4 (Shape A).
+      # a docker CLI in the runner image. Binding the socket rather than
+      # installing the CLI keeps the runner image small and avoids pinning a
+      # client version against whatever daemon the host happens to run.
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       exchange:
+        condition: service_started
+      # Multi-exchange topology (ripdi): the seed ingests the music/sfx catalogs
+      # into exchange-b/c's DBs, so the runner must wait for them too.
+      exchange-b:
+        condition: service_started
+      exchange-c:
         condition: service_started
       broker:
         condition: service_started
@@ -437,15 +936,29 @@ services:
         condition: service_healthy
       fastly-edge:
         condition: service_healthy
-      mcp:
-        condition: service_started
       agent-jwks:
         condition: service_healthy
+      identity:
+        condition: service_started
       postgres:
         condition: service_healthy
+
+# A fixed subnet so the wildcard-DNS sidecar and identity can hold static IPs.
+# NOTE: a fixed subnet means two e2e stacks on one Docker daemon collide here —
+# override RAMP_E2E_SUBNET / the static IPs for a parallel run. The ephemeral
+# host-port scheme (h9gy) is unaffected; only the internal subnet is pinned.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
 
 volumes:
   fixtures:
   # Ephemeral RSA keypair written by rsa-keygen at stack-up (never committed);
   # private half read by the Exchange, public half by the aws-edge shim.
   rsa-keys:
+  # Zitadel's Postgres data and the bootstrap volume the init one-shot writes the
+  # admin PAT + the minted OIDC client id/secret into (identity reads the latter).
+  zitadeldata:
+  zitadel-bootstrap:

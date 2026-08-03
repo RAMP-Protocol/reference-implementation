@@ -1,9 +1,19 @@
-import { decodeBase64Url, encodeBase64Url } from '../../src/verify.js';
+import { decodeBase64Url, encodeBase64Url } from '@ramp-protocol/sdk-l1/base64url';
+import { signatureBase } from '@ramp-protocol/sdk-l1/pop';
+import { thumbprint } from '@ramp-protocol/sdk-l1/thumbprint';
+import { canonicalMessage } from '@ramp-protocol/sdk-l1/verify';
 
 export interface TestKeypair {
   publicKey: CryptoKey;
   privateKey: CryptoKey;
   publicJwk: JsonWebKey & { kid: string };
+}
+
+// keyThumbprint returns the RFC 7638 thumbprint of a test keypair's public key —
+// the RFC 9421 keyid a request carries after the WBA split, and the value a
+// signed delivery URL's `kid` param now holds.
+export function keyThumbprint(kp: TestKeypair): Promise<string> {
+  return thumbprint(rawPublicKey(kp));
 }
 
 interface SubtleLike {
@@ -24,17 +34,33 @@ export function rawPublicKey(kp: TestKeypair): Uint8Array {
   return x;
 }
 
+// The exp-window convention every suite shares: a signed URL under test is
+// either comfortably inside its validity window or comfortably past it.
+// Living next to popHeaders so a change to the window is a single edit.
+export function futureExp(): number {
+  return Math.floor(Date.now() / 1000) + 300;
+}
+
+export function pastExp(secondsAgo = 60): number {
+  return Math.floor(Date.now() / 1000) - secondsAgo;
+}
+
 export interface GetSignOptions {
   keyid: string;
   created: number;
   expires: number;
+  // HTTP method the proof covers (RFC 9421 @method). Defaults to GET — the
+  // read case every suite drives; the signed-write forwarding test signs POST.
+  method?: string;
 }
 
-// signGetHeaders produces the RFC 9421 proof-of-possession headers for a GET of
-// fullUrl, signed by kp over the covered set ADR-013 D2 fixes (@method,
-// @target-uri). The signature base and Signature value MUST match the edge
-// verifier (src/pop.ts) and the Python agent signer (src/mcp httpsig.py): the
-// Signature byte string is STANDARD base64 inside `:...:`.
+// signGetHeaders produces the RFC 9421 proof-of-possession headers for a fetch
+// of fullUrl (GET unless opts.method says otherwise), signed by kp over the
+// covered set ADR-013 D2 fixes (@method,
+// @target-uri). The signature base comes from the SDK's signatureBase — the SAME
+// builder the verifier parses against — so the test signer cannot drift from the
+// verifier's byte contract. The Signature byte string is STANDARD base64 inside
+// `:...:` (matching the Python agent signer in src/mcp httpsig.py).
 export async function signGetHeaders(
   fullUrl: string,
   kp: TestKeypair,
@@ -43,7 +69,7 @@ export async function signGetHeaders(
   const rawParams =
     `("@method" "@target-uri");keyid="${opts.keyid}";` +
     `alg="ed25519";created=${opts.created};expires=${opts.expires}`;
-  const base = `"@method": GET\n"@target-uri": ${fullUrl}\n"@signature-params": ${rawParams}`;
+  const base = signatureBase(opts.method ?? 'GET', fullUrl, rawParams);
   const sig = new Uint8Array(
     await subtle().sign('Ed25519', kp.privateKey, new TextEncoder().encode(base)),
   );
@@ -54,6 +80,42 @@ export async function signGetHeaders(
     'Signature-Input': `sig1=${rawParams}`,
     Signature: `sig1=:${btoa(bin)}:`,
   };
+}
+
+// popHeaders wraps signGetHeaders with the proof window every suite uses:
+// created slightly in the past (tolerates clock skew), expiring shortly. The
+// skew convention lives here once, so a change to it is a single edit.
+export function popHeaders(
+  fullUrl: string,
+  kp: TestKeypair,
+  keyid: string,
+  method = 'GET',
+): Promise<Record<string, string>> {
+  const now = Math.floor(Date.now() / 1000);
+  return signGetHeaders(fullUrl, kp, { keyid, created: now - 5, expires: now + 300, method });
+}
+
+// boundUrl signs a delivery URL bound to an agent: agent_id is the agent
+// key's thumbprint, the URL itself is signed by the exchange key. Returns the
+// agentId too, since proof-of-possession tests need it as the keyid.
+export async function boundUrl(
+  origin: string,
+  exchangePrivateKey: CryptoKey,
+  agentKp: TestKeypair,
+  opts: { exp: number; kid: string; path?: string },
+): Promise<{ url: string; agentId: string }> {
+  const agentId = await keyThumbprint(agentKp);
+  const url = await signUrl(origin, exchangePrivateKey, { ...opts, agentId });
+  return { url, agentId };
+}
+
+// tamperSignature replaces the sig param with 64 zero bytes: valid length and
+// encoding, wrong bytes. The verifier resolves the key and fails on the
+// signature check itself — the signature_mismatch path, never a parse error.
+export function tamperSignature(url: string): string {
+  const tampered = new URL(url);
+  tampered.searchParams.set('sig', encodeBase64Url(new Uint8Array(64)));
+  return tampered.toString();
 }
 
 function subtle(): SubtleLike {
@@ -90,32 +152,40 @@ export async function signUrl(
   for (const [k, v] of Object.entries(opts.query ?? {})) {
     url.searchParams.set(k, v);
   }
-  const canonical = `GET\n${url.toString()}`;
+  // The SDK's canonicalMessage strips only `sig` (absent at this point), so it
+  // yields exactly the `GET\n<url>` bytes the signer must sign — signer and
+  // verifier share one source of the canonical form. It types its input as the
+  // opaque URL string; url.toString() is the no-op String() coercion the SDK
+  // applies internally, preserving byte-parity with the verifier.
   const sig = new Uint8Array(
-    await subtle().sign('Ed25519', privateKey, new TextEncoder().encode(canonical)),
+    await subtle().sign('Ed25519', privateKey, canonicalMessage(url.toString())),
   );
   url.searchParams.set('sig', encodeBase64Url(sig));
   return url.toString();
 }
 
-// Build a unified RAMP /.well-known/ramp.json document carrying the given keys
-// in public_keys[] — the shape the edge now fetches to resolve verify keys.
-// Each JWK is fleshed out with the full set of manifest fields (use/alg and a
-// wide not_before/not_after window) so it matches the production wire shape.
-export function manifestWithKeys(keys: Array<JsonWebKey & { kid: string }>): {
-  ver: string;
-  role: string;
-  domain: string;
-  public_keys: Array<
-    JsonWebKey & { kid: string; alg: string; use: string; not_before: string; not_after: string }
-  >;
+// Build a RAMP Web Bot Auth directory
+// (/.well-known/http-message-signatures-directory) carrying the given keys — the
+// shape the edge now fetches to resolve verify keys after the WBA split. Keys
+// carry NO kid (named by thumbprint); each is fleshed out with the full JWK
+// fields (use/alg and a wide not_before/not_after window) to match the
+// production wire shape (protojson of ramp.v1.WBAFile).
+export function wbaDirectoryWithKeys(keys: JsonWebKey[]): {
+  keys: Array<{
+    kty: string;
+    crv: string;
+    x: string;
+    alg: string;
+    use: string;
+    not_before: string;
+    not_after: string;
+  }>;
 } {
   return {
-    ver: '1.0',
-    role: 'ROLE_EXCHANGE',
-    domain: 'exchange.test',
-    public_keys: keys.map((k) => ({
-      ...k,
+    keys: keys.map((k) => ({
+      kty: k.kty ?? 'OKP',
+      crv: k.crv ?? 'Ed25519',
+      x: k.x ?? '',
       alg: 'EdDSA',
       use: 'sig',
       not_before: '2000-01-01T00:00:00Z',

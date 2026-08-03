@@ -26,12 +26,12 @@ const brokerIntermediaryHops int32 = 1
 // WellKnownManifest.max_intermediary_hops (set by the Exchange producer) and is
 // now enforced Exchange-side via httpsig.VerifyRequestOptions.MaxSignatures
 // (= max_intermediary_hops + 1, wired in the Exchange middleware), which rejects
-// an over-long signature chain with httpsig.ErrTooManyHops (RAMP-56).
+// an over-long signature chain with httpsig.ErrTooManyHops.
 func enforceHopBudget(maxHops *int32) error {
 	if maxHops != nil && brokerIntermediaryHops > *maxHops {
 		return broker.Newf(broker.KindInvalidArgument,
 			"max_hops=%d forbids the broker relay hop (chain needs at least %d intermediary)",
-			*maxHops, brokerIntermediaryHops)
+			*maxHops, brokerIntermediaryHops).WithField("max_hops")
 	}
 	return nil
 }

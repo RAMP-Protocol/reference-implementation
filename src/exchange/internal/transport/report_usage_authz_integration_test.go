@@ -26,7 +26,7 @@ func TestReportUsage_CrossTenantRejected(t *testing.T) {
 	_, agentBClient := h.addTenant(t, "tenantb", "agent-b")
 
 	_, err := agentBClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-cross",
+		Ver: "1.0", IdempotencyKey: "r-cross",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -45,7 +45,7 @@ func TestReportUsage_BrokerRelay_Allowed(t *testing.T) {
 	brokerClient := h.addCaller(t, "broker-trusted", "BROKER")
 
 	resp, err := brokerClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-broker-ok",
+		Ver: "1.0", IdempotencyKey: "r-broker-ok",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -53,8 +53,8 @@ func TestReportUsage_BrokerRelay_Allowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("broker relay (allowed): %v", err)
 	}
-	if !resp.Msg.GetAccepted() {
-		t.Errorf("broker relay accepted=false")
+	if resp.Msg.GetReportId() == "" {
+		t.Errorf("broker relay: accepted report missing report_id")
 	}
 	assertObligationState(t, h, txID, "RECEIVED", "VALIDATED")
 }
@@ -69,7 +69,7 @@ func TestReportUsage_BrokerRelay_Denied(t *testing.T) {
 	brokerClient := h.addCaller(t, "broker-untrusted", "BROKER")
 
 	_, err := brokerClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-broker-no",
+		Ver: "1.0", IdempotencyKey: "r-broker-no",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
@@ -82,6 +82,14 @@ func TestReportUsage_BrokerRelay_Denied(t *testing.T) {
 // for ExecuteTransaction: agent-B (signing with its own key) attempts to
 // execute a transaction naming requester.id="agent-test" (which belongs
 // to tenant A). Authz MUST reject with PermissionDenied.
+// TestExecuteTransaction_CrossTenantRejected pins the cross-identity guard under
+// the R4 contract: agent identity is proven by the BODY offer-acceptance
+// signature against the CLAIMED agent's REGISTERED key. A caller from another
+// tenant (agent-c) cannot forge an agent-test acceptance — it lacks agent-test's
+// private key — so a request claiming requester.id = agent-test but carrying an
+// acceptance signed by a foreign key is rejected SIGNATURE_INVALID, with no side
+// effect. (Pre-R4 this was a transport-keyid PermissionDenied "may not act"; R4
+// relocates identity from the transport sig to the body acceptance.)
 func TestExecuteTransaction_CrossTenantRejected(t *testing.T) {
 	h := newTestHarness(t)
 	seedCatalog(t, h)
@@ -90,13 +98,19 @@ func TestExecuteTransaction_CrossTenantRejected(t *testing.T) {
 
 	_, agentBClient := h.addTenant(t, "tenantc", "agent-c")
 
-	_, err := agentBClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", Id: "tx-cross",
-		OfferId:        stringPtr(offer.GetOfferId()),
-		OfferSignature: stringPtr(offer.GetSignature()),
-		// Falsely claim to be agent-test (tenant A's agent) while signing
-		// with agent-c's key (tenant C).
-		Requester: &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+	const txID = "tx-cross"
+	requester := &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT}
+	// Falsely claim to be agent-test while supplying an acceptance signed by a
+	// key that is NOT agent-test's registered key.
+	forged := mintWrongKeyAcceptanceFor(t, offer, requester, txID)
+	resp, err := agentBClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
+		Ver: "1.0", IdempotencyKey: txID,
+		Requester: requester,
+		Items:     []*rampv1.TransactionItem{{Offer: offer, AgentAcceptance: forged}},
 	}))
-	assertConnectError(t, err, connect.CodePermissionDenied, "may not act")
+	// The forged acceptance → KindSignatureInvalid, a denial-map kind → in-body
+	// per-item denial after the C4 collapse (Flag #1). Strength preserved:
+	// SIGNATURE_INVALID + no transaction.
+	assertItemDenied(t, resp, err, rampv1.DenialReason_DENIAL_REASON_SIGNATURE_INVALID)
+	assertNoTransaction(t, h, txID+":"+offer.GetOfferId())
 }

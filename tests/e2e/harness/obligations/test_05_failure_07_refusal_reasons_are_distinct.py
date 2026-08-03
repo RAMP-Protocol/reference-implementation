@@ -1,7 +1,6 @@
 """Obligation 05 — failure 07: refusal reasons are distinct per cause.
 
-Verbatim scenario (``docs/obligations/05-system-refuses-when-authority-is-bad.md``,
-third failure-mode bullet):
+Verbatim scenario (third failure-mode bullet):
 
 > The platform refuses but cannot explain why. This is a defect; the
 > refusal reason must be specific enough for a buyer operator to fix
@@ -224,11 +223,11 @@ def test_five_bad_signature_refusals_are_specific_and_distinct(
     compose_stack: StackURLs,
 ) -> None:
     """All five v1 bad-signature refusals are non-empty, non-generic, and distinct."""
-    body_obj = {"requester": {"uris": ["http://edge:8787/premium/distinct-defect-guard.html"]}}
+    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/distinct-defect-guard.html"]}
     body = json.dumps(body_obj, separators=(",", ":")).encode()
-    body_b_obj = {"requester": {"uris": ["http://edge:8787/premium/tampered.html"]}}
+    body_b_obj = {"requester": {}, "uris": ["http://edge:8787/premium/tampered.html"]}
     body_b = json.dumps(body_b_obj, separators=(",", ":")).encode()
-    replay_body_obj = {"requester": {"uris": ["http://edge:8787/premium/replay-distinct.html"]}}
+    replay_body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/replay-distinct.html"]}
     replay_body = json.dumps(replay_body_obj, separators=(",", ":")).encode()
     url = f"{compose_stack.exchange}{_DISCOVER_PATH}"
 

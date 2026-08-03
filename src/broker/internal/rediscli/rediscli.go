@@ -16,7 +16,7 @@ import (
 // returns (nil, nil) — the Broker operates in Redis-less fallback mode.
 func Setup(ctx context.Context, dsn string, logger *slog.Logger) (*redis.Client, error) {
 	if dsn == "" {
-		logger.Info("redis disabled: no REDIS_URL set")
+		logger.Info("broker.redis.disabled")
 		return nil, nil
 	}
 	opts, err := redis.ParseURL(dsn)
@@ -28,6 +28,6 @@ func Setup(ctx context.Context, dsn string, logger *slog.Logger) (*redis.Client,
 		_ = client.Close()
 		return nil, fmt.Errorf("redis ping: %w", pingErr)
 	}
-	logger.Info("redis ready", "addr", opts.Addr)
+	logger.Info("broker.redis.ready", "addr", opts.Addr)
 	return client, nil
 }

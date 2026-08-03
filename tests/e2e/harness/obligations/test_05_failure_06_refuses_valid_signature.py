@@ -1,7 +1,6 @@
 """Obligation 05 — failure 06: platform refuses a valid signature (DEFECT guard).
 
-Verbatim scenario (``docs/obligations/05-system-refuses-when-authority-is-bad.md``,
-second failure-mode bullet):
+Verbatim scenario (second failure-mode bullet):
 
 > The platform refuses a valid signature. This is a defect and must
 > be caught before release. The refusal reason told to the agent
@@ -126,7 +125,7 @@ def test_valid_signature_is_not_refused_at_signature_layer(
        field would be a defect, though the practical case is a 401
        whose body names the spurious httpsig failure.
     """
-    body_obj = {"requester": {"uris": ["http://edge:8787/premium/regression-guard-valid.html"]}}
+    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/regression-guard-valid.html"]}
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)

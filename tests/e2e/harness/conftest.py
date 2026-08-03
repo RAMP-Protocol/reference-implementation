@@ -9,17 +9,19 @@ and ``down -v`` after.
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import NamedTuple
-
 import httpx
 import pytest
 
 from ._compose import resolve_host_port
+
+# Re-export: the existing tests import StackURLs from conftest; its home is
+# stack_urls.py so non-pytest consumers (smoke_staging.py) can import it
+# without touching a pytest-convention file.
+from .stack_urls import StackURLs
 
 
 def _resolve_compose_file() -> Path:
@@ -38,17 +40,6 @@ COMPOSE_FILE = _resolve_compose_file()
 REPO_ROOT = COMPOSE_FILE.parent
 
 
-class StackURLs(NamedTuple):
-    """Host-side URLs for each compose service."""
-
-    exchange: str
-    broker: str
-    edge: str
-    aws_edge: str
-    fastly_edge: str
-    mcp: str
-
-
 def _resolve_stack_urls(compose_file: Path) -> StackURLs:
     """Resolve service URLs for the running stack.
 
@@ -58,22 +49,32 @@ def _resolve_stack_urls(compose_file: Path) -> StackURLs:
     auto-derives from the cwd, so two stacks brought up from different
     cwds (main tree + worktree) report distinct port sets.
     """
+    # The edges now listen on port 80 so the demo publisher-domain aliases
+    # resolve natively for both the manifest fetch and the signed-URL content
+    # fetch (Phase 2b). Service-DNS URLs target port 80; host runs discover the
+    # ephemeral host port mapped to container port 80.
     if os.environ.get("RAMP_E2E_IN_NETWORK") == "1":
         return StackURLs(
             exchange="http://exchange:8081",
+            exchange_b="http://exchange-b:8081",
+            exchange_c="http://exchange-c:8081",
             broker="http://broker:8082",
-            edge="http://edge:8787",
-            aws_edge="http://aws-edge:8788",
-            fastly_edge="http://fastly-edge:7676",
-            mcp="http://mcp:8000",
+            edge="http://edge:80",
+            aws_edge="http://aws-edge:80",
+            fastly_edge="http://fastly-edge:80",
+            identity="http://identity",
+            zitadel="http://zitadel:8080",
         )
     return StackURLs(
         exchange=f"http://127.0.0.1:{resolve_host_port(compose_file, 'exchange', 8081)}",
+        exchange_b=f"http://127.0.0.1:{resolve_host_port(compose_file, 'exchange-b', 8081)}",
+        exchange_c=f"http://127.0.0.1:{resolve_host_port(compose_file, 'exchange-c', 8081)}",
         broker=f"http://127.0.0.1:{resolve_host_port(compose_file, 'broker', 8082)}",
-        edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'edge', 8787)}",
-        aws_edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'aws-edge', 8788)}",
-        fastly_edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'fastly-edge', 7676)}",
-        mcp=f"http://127.0.0.1:{resolve_host_port(compose_file, 'mcp', 8000)}",
+        edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'edge', 80)}",
+        aws_edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'aws-edge', 80)}",
+        fastly_edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'fastly-edge', 80)}",
+        identity="",
+        zitadel="",
     )
 
 
@@ -92,11 +93,31 @@ def _wait_healthy(url: str, timeout_seconds: float = 90.0) -> None:
             if 200 <= resp.status_code < 300:
                 return
             last_err = f"{resp.status_code} {resp.text[:128]}"
-        except (httpx.HTTPError, OSError, socket.timeout) as exc:
+        except (httpx.HTTPError, OSError) as exc:
             last_err = str(exc)
         time.sleep(1.0)
     msg = f"{url} not healthy after {timeout_seconds}s (last: {last_err})"
     raise TimeoutError(msg)
+
+
+@pytest.fixture(scope="session")
+def seeded(compose_stack: StackURLs):
+    """Seed the demo catalog once per session and expose its resources.
+
+    Runs the production ``ramp-ingest`` binary over the three demo feeds
+    (one signed PushResources RPC per feed) after registering the demo tenants,
+    buyers, contributor, and broker exchange row. Shared session-wide so the
+    ingest runs once; every suite consumes the same demo-catalog resources.
+    """
+    from .seed import SeededFixture, seed_stack
+
+    fixture: SeededFixture = seed_stack(
+        str(COMPOSE_FILE),
+        compose_stack.exchange,
+        exchange_b_host_url=compose_stack.exchange_b,
+        exchange_c_host_url=compose_stack.exchange_c,
+    )
+    return fixture
 
 
 @pytest.fixture(scope="session")
@@ -111,6 +132,9 @@ def compose_stack() -> Iterator[StackURLs]:
     try:
         urls = _resolve_stack_urls(COMPOSE_FILE)
         _wait_healthy(f"{urls.exchange}/healthz")
+        # Multi-exchange topology: exchange-b/c must be reachable too.
+        _wait_healthy(f"{urls.exchange_b}/healthz")
+        _wait_healthy(f"{urls.exchange_c}/healthz")
         _wait_healthy(f"{urls.broker}/healthz")
         _wait_healthy(f"{urls.edge}/healthz")
         _wait_healthy(f"{urls.aws_edge}/healthz")
@@ -130,19 +154,19 @@ def compose_stack() -> Iterator[StackURLs]:
 # ---------------------------------------------------------------------------
 # ADR-008 D5 — `shared-clean-fixtures` cleanup chain registration.
 #
-# The peer executor (f6mq) owns the `stack_isolation` marker scaffolding
-# itself. This block registers the exchange-health cleanup function
-# onto the shared chain with the contract the team-lead pinned:
-# (function, autouse=False, ordering not required). The framework's
-# per-test hook reads the declared mode and dispatches the chain;
-# tests do NOT call ``promote_drifted_exchange_health`` directly.
+# The `stack_isolation` marker scaffolding — the marker registration,
+# the collection check and the autouse dispatch fixture — is defined
+# further down this same file. This block registers the exchange-health
+# cleanup function onto the shared chain under the agreed contract:
+# (function, autouse=False, ordering not required). The dispatch fixture
+# reads the declared mode and runs the chain; tests do NOT call
+# ``promote_drifted_exchange_health`` directly.
 #
-# Module-import-time append rather than a fresh re-bind so the peer
-# can land their own cleanup callables in the same list without
-# resolving a conftest.py overlap. ``SHARED_CLEAN_FIXTURES`` is a
-# tuple-of-callables list. It is consumed by the per-test hook the
-# stack_isolation marker installs; if that hook hasn't merged yet the
-# list is harmless (no test exercises it).
+# Module-import-time append rather than a fresh re-bind, so further
+# cleanup callables can be added to the same list without any of them
+# having to know about the others. ``SHARED_CLEAN_FIXTURES`` is a plain
+# list of zero-argument callables, consumed by the autouse dispatch
+# fixture below; a test in any other isolation mode never runs it.
 # ---------------------------------------------------------------------------
 from collections.abc import Callable  # noqa: E402
 
@@ -180,9 +204,9 @@ def cleanup_exchange_health() -> int:
 
 
 # Chain order is load-bearing: obligations FIRST so subsequent gates run
-# against a known baseline, then exchange-health, then anything peers
-# add later. Tests do NOT invoke these functions directly — the per-test
-# hook below reads the declared mode and dispatches the chain.
+# against a known baseline, then exchange-health, then anything added
+# later. Tests do NOT invoke these functions directly — the autouse
+# dispatch fixture below reads the declared mode and runs the chain.
 SHARED_CLEAN_FIXTURES: list[Callable[[], object]] = [
     cleanup_obligations,
     cleanup_exchange_health,

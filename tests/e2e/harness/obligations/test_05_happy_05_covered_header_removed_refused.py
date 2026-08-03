@@ -1,7 +1,6 @@
 """Obligation 05 — happy 05: a covered-header mismatch is refused.
 
-Verbatim scenario (``docs/obligations/05-system-refuses-when-authority-is-bad.md``,
-sixth-bullet covered-headers clause from the "What this is" enumeration):
+Verbatim scenario (sixth-bullet covered-headers clause from the "What this is" enumeration):
 
 > One or more of the covered headers the signature names is absent
 > or differs from the value the verifier sees.
@@ -160,7 +159,7 @@ def test_covered_header_mismatch_is_refused_with_specific_reason(
     2. The refusal reason names the covered-component mismatch
        (a token from the COVERED_MISMATCH bucket).
     """
-    body_obj = {"requester": {"uris": ["http://edge:8787/premium/covered-mismatch.html"]}}
+    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/covered-mismatch.html"]}
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)

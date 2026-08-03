@@ -1,0 +1,13 @@
+{
+  "name": "Footsteps on Gravel",
+  "slug": "footsteps-gravel",
+  "category": "foley/footsteps",
+  "duration_seconds": 12.6,
+  "sample_rate_hz": 96000,
+  "bit_depth": 24,
+  "channels": 1,
+  "loopable": false,
+  "format": "WAV",
+  "tags": ["footsteps", "gravel", "walking", "foley", "outdoor"],
+  "description": "A walking cycle of roughly sixteen footsteps on loose gravel at a steady pace, close-mic mono. Useful as a foley layer for outdoor scenes. Original foley recording metadata for demo purposes."
+}

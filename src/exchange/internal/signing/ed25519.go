@@ -2,21 +2,21 @@
 // Exchange offers and signed URLs. Ed25519 is the default scheme; RSA (for
 // AWS CloudFront signed URLs) lives alongside it and is selected per tenant.
 //
-// The offer signer operates on the canonical protobuf encoding of the Offer
-// with its signature fields cleared, so verifiers can recompute the payload
-// deterministically without server-side offer storage.
+// Offer signing delegates to the protocol SDK (helpers.SignOffer), whose
+// canonical payload covers the WHOLE Offer (expires_at included) with only the
+// signature fields cleared — the reference behavior every RAMP party shares.
+// The private key stays encapsulated in this package; the SDK never sees it
+// except through this signer.
 package signing
 
 import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
-	"errors"
 	"fmt"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
-	"google.golang.org/protobuf/proto"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 )
 
 // Ed25519Signer holds a single Ed25519 key pair and produces Offer signatures.
@@ -57,64 +57,21 @@ func (s *Ed25519Signer) PublicKeyB64URL() string {
 	return base64.RawURLEncoding.EncodeToString(s.public)
 }
 
-// SignatureAlgorithm returns the JWS alg value advertised on offers.
-const SignatureAlgorithm = "EdDSA"
+// SignatureAlgorithm is the JWS alg value advertised on offers. It mirrors
+// helpers.OfferSignatureAlgorithm; offers signed by this package carry it on
+// Offer.signature_algorithm (which the canonical payload clears before signing).
+const SignatureAlgorithm = helpers.OfferSignatureAlgorithm
 
-// SignOffer signs the canonical protobuf encoding of the Offer after clearing
-// any existing signature fields. The hex-encoded signature is returned.
+// SignOffer signs offer with the encapsulated private key and returns the
+// hex-encoded Ed25519 signature. It delegates to helpers.SignOffer so the
+// canonical payload — the WHOLE Offer with only the signature fields cleared,
+// expires_at INCLUDED — matches what every RAMP verifier (the SDK's
+// VerifyPresentedOffer at execute) recomputes. The private key never leaves this
+// package; the SDK receives it only via this call.
 func (s *Ed25519Signer) SignOffer(offer *rampv1.Offer) (string, error) {
-	payload, err := canonicalOfferPayload(offer)
+	sig, err := helpers.SignOffer(s.private, offer)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("sign offer: %w", err)
 	}
-	sig := ed25519.Sign(s.private, payload)
-	return hex.EncodeToString(sig), nil
-}
-
-// VerifyOffer verifies signatureHex against offer using pub.
-func VerifyOffer(offer *rampv1.Offer, signatureHex string, pub ed25519.PublicKey) error {
-	if len(pub) != ed25519.PublicKeySize {
-		return fmt.Errorf("ed25519: public key length = %d, want %d", len(pub), ed25519.PublicKeySize)
-	}
-	sig, err := hex.DecodeString(signatureHex)
-	if err != nil {
-		return fmt.Errorf("decode signature: %w", err)
-	}
-	payload, err := canonicalOfferPayload(offer)
-	if err != nil {
-		return err
-	}
-	if !ed25519.Verify(pub, payload, sig) {
-		return ErrSignatureInvalid
-	}
-	return nil
-}
-
-// ErrSignatureInvalid signals verification failure (wrong key or tampered payload).
-var ErrSignatureInvalid = errors.New("signing: offer signature invalid")
-
-// canonicalOfferPayload returns the deterministic byte sequence the signer
-// operates on. Protobuf marshalling is deterministic-enough for single-writer
-// signing when the signature fields are cleared; callers never compare bytes
-// across producers with different library versions.
-func canonicalOfferPayload(offer *rampv1.Offer) ([]byte, error) {
-	if offer == nil {
-		return nil, errors.New("signing: offer is nil")
-	}
-	clone, ok := proto.Clone(offer).(*rampv1.Offer)
-	if !ok {
-		return nil, errors.New("signing: offer clone type mismatch")
-	}
-	clone.Signature = ""
-	clone.SignatureAlgorithm = ""
-	// Expiry is bound to offer issuance time, not the offer's resource/pricing
-	// identity. Exchanges reissue offers with fresh expiries on every discovery
-	// call, so excluding it from the canonical payload lets stateless
-	// verification rebuild the same payload from the catalog alone.
-	clone.ExpiresAt = nil
-	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(clone)
-	if err != nil {
-		return nil, fmt.Errorf("marshal offer: %w", err)
-	}
-	return data, nil
+	return sig, nil
 }

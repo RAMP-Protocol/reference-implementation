@@ -1,12 +1,21 @@
 # ADR-012 — Edge Delivery-Log Contract
 
-**Status:** Accepted (2026-06-02)
+**Status:** Accepted (2026-06-02). **D2's key-distribution mechanism was not adopted by the
+protocol and D3 is unimplemented.** This ADR was written against a manifest that carried keys
+inline; the protocol has since moved identity keys out of the well-known manifest entirely.
+Keys are published in the Web Bot Auth directory (`WBAFile.keys`, served at
+`/.well-known/http-message-signatures-directory`), carry no `kid`, and are named by their
+RFC 7638 thumbprint — which is also the RFC 9421 `keyid`. `/.well-known/ramp.json` carries the
+commercial overlay only; a manifest that arrives carrying keys has them dropped as unknown
+fields. The domain-verification messages D3 builds on exist in the protocol but have no call
+site here. The delivery-log record contract (D1, D4, D5 onward) is unaffected and is what the
+Edge implements. Corrections are inline below; the reasoning is kept as a design record.
 
 ---
 
 ## Context
 
-The reconciliation procedure in ADR-011 requires three witnesses per transaction: the Exchange's signed-URL mint event, the Agent Usage Report, and a third witness that the Edge actually served bytes. The RAMP protocol defines the signed-URL shape, an optional `Offer.content_hash` qualified by `ResourceMutability`, and a `DomainVerificationRequest` flow for onboarding signing keys, but it does not define the third witness — there is no `DeliveryLog` or `FetchAcknowledgement` message in `ramp.proto`. The Edge is the only party that sees both the signed URL and the delivered bytes; this ADR pins the evidence the Edge must produce. The contract is scoped below the protocol layer so publishers who use CDN-native delivery can produce an equivalent witness without protocol churn.
+The reconciliation procedure in ADR-011 requires three witnesses per transaction: the Exchange's signed-URL mint event, the Agent Usage Report, and a third witness that the Edge actually served bytes. The RAMP protocol defines the signed-URL shape, an optional `ResourceIdentity.content_hash` qualified by `ResourceMutability`, reached as `Offer.identity.content_hash`, and a `DomainVerificationRequest` flow for onboarding signing keys, but it does not define the third witness — there is no `DeliveryLog` or `FetchAcknowledgement` message in `ramp.proto`. The Edge is the only party that sees both the signed URL and the delivered bytes; this ADR pins the evidence the Edge must produce. The contract is scoped below the protocol layer so publishers who use CDN-native delivery can produce an equivalent witness without protocol churn.
 
 ---
 
@@ -68,25 +77,27 @@ The Edge signs delivery records; the Exchange signs URLs. Two attestations, two 
 
 Sharing the key collapses both attestations into one self-referential signature, which is no stronger than an unsigned log.
 
-Edge keys are published in the publisher's [`WellKnownManifest.public_keys`](/Users/konst/projects/RAMP-Protocol/protocol/proto/ramp/v1/ramp.proto:1748) at `https://{publisher-domain}/.well-known/ramp.json` using the existing `JsonWebKey` shape (kty=OKP, crv=Ed25519, kid, not_before/not_after). The reconciler resolves `edge_signing_kid` against this manifest. Key rotation and revocation reuse the existing `invalidation_url` machinery (ADR-003, ADR-009). A publisher operating multiple PoPs lists one `kid` per node; `not_before`/`not_after` windows enable independent per-node rotation.
+Edge keys are published in the publisher's Web Bot Auth directory — `WBAFile.keys` at `https://{publisher-domain}/.well-known/http-message-signatures-directory` — using the `JsonWebKey` shape (kty=OKP, crv=Ed25519, not_before/not_after). Rotation and revocation use `WBAFile.revocation_url` and the `KeyRevocationList` it serves, polled on the 300s cadence ADR-003 and ADR-009 describe. A publisher operating multiple PoPs lists one key per node; the `not_before`/`not_after` window is half-open and enables independent per-node rotation.
+
+**Written against a manifest that no longer carries keys.** This paragraph originally placed them in a `WellKnownManifest.public_keys` field resolved by `kid`, with revocation through an `invalidation_url`. None of those three exists in the protocol: `/.well-known/ramp.json` is the commercial overlay only, keys carry no `kid` at all, and the record schema's `edge_signing_kid` has no protocol counterpart. The name a key is resolved by is its **RFC 7638 thumbprint**, which is the RFC 9421 `keyid` — so a record identifying its signing key must carry that thumbprint, not a `kid`. The two-keys decision above is unaffected; only the distribution channel and the identifier changed.
 
 ### D3 — Edge onboarding reuses the ACME HTTP-01 domain-verification flow
 
-Edge onboarding uses the protocol's existing [Provider Domain Verification flow](/Users/konst/projects/RAMP-Protocol/protocol/proto/ramp/v1/ramp.proto:2179) unchanged:
+Edge onboarding uses the protocol's existing Provider Domain Verification flow unchanged:
 
 1. Operator generates an Ed25519 keypair.
 2. Operator calls `RequestDomainVerification` with `domain={publisher-domain}`; Exchange returns a challenge token.
-3. Edge serves `/.well-known/ramp-verify/{token}` from its `acmeTokens` map ([`src/edge/src/app.ts:32-37`](/Users/konst/projects/agentic-content-access/src/edge/src/app.ts) already implements this).
+3. Edge serves `/.well-known/ramp-verify/{token}` from its `acmeTokens` map ([`src/edge/src/app.ts`](../../src/edge/src/app.ts) already implements this).
 4. Operator calls `ConfirmDomainVerification` with `domain`, `token`, `signing_key=<pubkey>`, `cdn_type="edge-ed25519"` (distinct from `cloudfront`/`akamai`/`fastly`/`hmac` URL-signing types).
-5. Exchange fetches the token from the publisher's domain; on success it registers the key under `WellKnownManifest.public_keys` with the kid in `DomainVerificationResult.key_id`.
+5. Exchange fetches the token from the publisher's domain; on success it records the key against the verified domain, returning its identifier in `DomainVerificationResult.key_id`.
 
-The trust anchor is the publisher's domain; each per-node Ed25519 key is a leaf in the manifest. No certificate path; validity is the JWK's `not_before`/`not_after`. N nodes means N ceremonies.
+**Unimplemented.** The domain-verification messages exist in the protocol but neither RPC has a call site here, and step 5 has no destination: the manifest has no key-bearing field, so where a verified key is recorded is undecided. The trust anchor is the publisher's domain; each per-node Ed25519 key is a leaf under it. No certificate path; validity is the JWK's `not_before`/`not_after`. N nodes means N ceremonies.
 
-### D4 — `Offer.content_hash` propagates opportunistically; reconciliation degrades gracefully
+### D4 — `ResourceIdentity.content_hash` propagates opportunistically; reconciliation degrades gracefully
 
-When `Offer.content_hash` is populated and `resource_mutability=RESOURCE_MUTABILITY_STATIC`: the Exchange embeds hash and method in the signed URL as `ch=<hexdigest>` and `chm=<method>` (covered by the URL HMAC). The Edge streams-hashes served bytes and populates `content_hash_observed`/`content_hash_method`. The reconciler compares announced vs observed and produces a per-transaction verdict; mismatch is disputable through the existing chain (`UsageReport → UsageReportResponse → DisputeRequest`).
+When `Offer.identity.content_hash` is populated and `resource_mutability=RESOURCE_MUTABILITY_STATIC`: the Exchange embeds hash and method in the signed URL as `ch=<hexdigest>` and `chm=<method>` (covered by the URL HMAC). The Edge streams-hashes served bytes and populates `content_hash_observed`/`content_hash_method`. The reconciler compares announced vs observed and produces a per-transaction verdict; mismatch is disputable through the existing chain (`UsageReport → UsageReportResponse → DisputeRequest`).
 
-When `Offer.content_hash` is absent or `resource_mutability=DYNAMIC`: no `ch` parameter; the Edge may still compute the hash for its own forensics but the reconciler does not compare. Witness collapses to "Edge served some bytes against `transaction_id`" — weaker than item-level integrity, stronger than no witness. `UsageReport.consumed_quantity` provides a non-cryptographic sanity check against `bytes_sent`.
+When `Offer.identity.content_hash` is absent or `resource_mutability=DYNAMIC`: no `ch` parameter; the Edge may still compute the hash for its own forensics but the reconciler does not compare. Witness collapses to "Edge served some bytes against `transaction_id`" — weaker than item-level integrity, stronger than no witness. `UsageReport.consumed_quantity` provides a non-cryptographic sanity check against `bytes_sent`.
 
 When `resource_mutability=LIVE`: `content_hash` is inapplicable; the record carries cumulative `bytes_sent` only. This is the documented limit of cryptographic reconciliation for streams. **LIVE record-shape decisions are deferred** to the first LIVE-streaming publisher integration — including whether to introduce a distinct `DELIVERY_OUTCOME_STREAM_OPENED` outcome (evidence that the stream opened but cumulative bytes never landed in a close record) and whether close records carry runtime-computed cumulative bytes. The current publisher use cases are text + images; introducing those record-shape values now would produce schema entries with no producer (Edge) and no consumer (reconciler + dispute path are themselves deferred).
 
@@ -139,8 +150,8 @@ This ADR does not add a `DeliveryLog` message to `ramp.proto`. The protocol's re
 
 - Three-way reconciliation has three witnesses. The third is a known schema, retention, signing key.
 - Stolen-URL detection is deterministic: `DELIVERY_OUTCOME_DENIED_BINDING` rate on a `transaction_id` flags real leakage, not a hypothesis.
-- `Offer.content_hash` becomes operationally valuable: D4 plumbs it from offer through URL through Edge to reconciler.
-- Edge onboarding reuses `DomainVerificationRequest`, `WellKnownManifest.public_keys`, and `invalidation_url` — no new RPC, manifest field, or key-distribution surface.
+- `ResourceIdentity.content_hash` becomes operationally valuable: D4 plumbs it from offer through URL through Edge to reconciler.
+- Edge onboarding reuses `DomainVerificationRequest` and the Web Bot Auth directory that already distributes identity keys — no new RPC and no new key-distribution surface. It does need somewhere to record a verified key, which the protocol does not yet provide.
 - CDN-native deployments are supported with documented evidence weakening.
 - v1 stays small: one append-only file, one polling endpoint, no chain, no multi-runtime adapter, no stream producer.
 
@@ -170,9 +181,9 @@ This ADR does not add a `DeliveryLog` message to `ramp.proto`. The protocol's re
 - ADR-009 — identity boundary; per-Edge Ed25519 key onboarding.
 - ADR-010 — publisher payout / inverse-posting policy.
 - ADR-011 — three-way reconciliation procedure.
-- [`ramp.proto`](/Users/konst/projects/RAMP-Protocol/protocol/proto/ramp/v1/ramp.proto) — `Offer.content_hash` (515), `ResourceMutability` (1082), `DomainVerificationRequest/Confirmation/Result` (2179+), `WellKnownManifest.public_keys` (1748), `JsonWebKey` (1697).
-- [`src/edge/src/app.ts`](/Users/konst/projects/agentic-content-access/src/edge/src/app.ts), [`src/edge/src/verify.ts`](/Users/konst/projects/agentic-content-access/src/edge/src/verify.ts) — current Edge implementation; `/.well-known/ramp-verify/:token` handler at app.ts:32-37 is the primitive D3 reuses.
-- [`src/exchange/internal/signing/signed_url.go`](/Users/konst/projects/agentic-content-access/src/exchange/internal/signing/signed_url.go) — URL signers; distinct from record signing per D2.
+- `ramp.proto` (module `github.com/RAMP-Protocol/protocol`) — `ResourceIdentity.content_hash` and `ResourceIdentity.resource_mutability` (reached through `Offer.identity`), `DomainVerificationRequest/Confirmation/Result`, and `WBAFile.keys` / `JsonWebKey` (the sole message carrying inline JWKs).
+- [`src/edge/src/app.ts`](../../src/edge/src/app.ts) — current Edge implementation; its `/.well-known/ramp-verify/:token` handler is the primitive D3 reuses. Signed-URL verification comes from `@ramp-protocol/sdk-l1/verify`, which the edge imports rather than implementing.
+- [`src/exchange/internal/signing/signed_url.go`](../../src/exchange/internal/signing/signed_url.go) — URL signers; distinct from record signing per D2.
 - Crosby & Wallach, "Efficient Data Structures for Tamper-Evident Logging", USENIX Security 2009 — Merkle-linked log reference.
 - Sigstore Rekor; Trillian-Tessera — transparency-log alternatives for the Merkle upgrade path.
 - AWS CloudFront standard logging; Cloudflare Logpush; Fastly streaming logs — D7 fallback field inventories.

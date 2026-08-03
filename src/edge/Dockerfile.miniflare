@@ -6,7 +6,14 @@
 #   docker build -f Dockerfile.miniflare -t ramp/edge-miniflare:dev .
 
 FROM node:22-slim AS builder
+# @ramp-protocol/sdk-l1 is a git dependency (git+https://…/protocol#<sha>),
+# resolved off-commit like the Go/pip pins — `npm ci` clones it, so no sibling
+# checkout is mirrored in and any shallow workdir works. The slim base ships no
+# git binary; install it for the clone.
 WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN npm ci --include=dev
 COPY . .

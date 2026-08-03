@@ -17,18 +17,20 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 )
 
-// TestPublisherOnboarding_HappyPath walks design-demo-bootstrap.md §7.1
+// TestPublisherOnboarding_HappyPath walks the onboarding happy path
 // end-to-end, exercising the RAMP-native bootstrap with no admin-plane
 // assistance:
 //
@@ -53,7 +55,7 @@ import (
 //  6. Agent calls DiscoverResources for the three URIs — three signed
 //     offers come back.
 //  7. Agent verifies each offer's Ed25519 signature against the offer key in
-//     /.well-known/ramp.json public_keys[].
+//     the Exchange's Web Bot Auth directory.
 //  8. Agent calls ExecuteTransaction; the returned retrieval_endpoint is a
 //     CloudFront canned-policy URL whose RSA-SHA1 signature verifies
 //     against the RSA key the fixture holds.
@@ -82,14 +84,15 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 	h.registerHost(publisherDomain, pubOrigin.server.URL)
 
 	// Step 4: signed push. Lazy self-signup runs implicitly; accepted = 3.
-	// EstimatedQuantity is set so the zero-estimate strict-reject branch
-	// of the validator (implementation plan Q2) does not fire when the
-	// e2e flow later reports ConsumedQuantity = 1.
-	est := int32(1)
+	// Each entry carries a priced term (pricing is term-derived, and an
+	// entry needs an eligible priced term to yield an offer). The term's
+	// Pricing.estimated_quantity is set so the zero-estimate strict-reject branch
+	// of the validator (implementation plan Q2) does not fire when the e2e flow
+	// later reports ConsumedQuantity = 1.
 	entries := []*rampv1.ResourceEntry{
-		{Domain: publisherDomain, Path: "/articles/one", EstimatedQuantity: &est},
-		{Domain: publisherDomain, Path: "/articles/two", EstimatedQuantity: &est},
-		{Domain: publisherDomain, Path: "/articles/three", EstimatedQuantity: &est},
+		{Domain: publisherDomain, Path: "/articles/one", Terms: []*rampv1.LicenseTerm{seedPricedTermEst(1)}},
+		{Domain: publisherDomain, Path: "/articles/two", Terms: []*rampv1.LicenseTerm{seedPricedTermEst(1)}},
+		{Domain: publisherDomain, Path: "/articles/three", Terms: []*rampv1.LicenseTerm{seedPricedTermEst(1)}},
 	}
 	pushResp, err := h.signedCat(publisherDomain, pubPriv).PushResources(h.ctx,
 		connect.NewRequest(&rampv1.PushResourcesRequest{
@@ -100,7 +103,7 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 	}
 	if got := pushResp.Msg.GetAccepted(); got != 3 {
 		// PushResourcesResponse no longer carries a per-entry Rejections
-		// slice (W4 of t3vk); surface the count split instead.
+		// slice (W4 of the proto-rename wave); surface the count split instead.
 		t.Fatalf("accepted = %d, want 3 (rejected=%d)",
 			got, pushResp.Msg.GetRejected())
 	}
@@ -116,6 +119,9 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 	}
 	h.publishAgentOrigin(t, agentID, agentPub)
 	registerAgentViaPublicEndpoint(t, h, agentID)
+	// Directory registration does not mint a billing_ref; a paid transaction needs
+	// one, so billing-register the agent through the public Register RPC.
+	h.registerForBilling(t, agentID, agentPub, agentPriv)
 
 	// Step 6: DiscoverResources for the three URIs.
 	uris := make([]string, len(entries))
@@ -123,11 +129,10 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 		uris[i] = "https://" + e.GetDomain() + e.GetPath()
 	}
 	discResp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver: "1.0", Id: "q-" + uuid.NewString(),
+		Ver: "1.0", Uris: uris,
 		Requester: &rampv1.Requester{
 			Id: agentID, Domain: agentID,
 			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-			Uris: uris,
 		},
 	}))
 	if err != nil {
@@ -144,32 +149,35 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 		if offer.GetSignatureAlgorithm() != "EdDSA" {
 			t.Fatalf("offer[%d] alg = %q, want EdDSA", i, offer.GetSignatureAlgorithm())
 		}
-		if err := signing.VerifyOffer(offer, offer.GetSignature(), jwksPub); err != nil {
+		if err := helpers.VerifyOffer(offer, offer.GetSignature(), jwksPub); err != nil {
 			t.Fatalf("offer[%d] signature verify: %v", i, err)
 		}
 	}
 
 	// Step 8: execute first offer → CloudFront signed URL.
-	// ADR-013 D5 requires multisig (agent + broker). Register the agent's pubkey
-	// in the httpsig resolver so the signature can be verified, then create a
-	// multisig client that signs with both the agent's key and the broker's key.
-	h.resolver.Put(agentID, agentPub)
-	multisigClient := newMultisigClient(h.baseRT, h.server.URL, agentID, agentPriv, h.discoverKeyID, h.discoverPriv)
+	// Items-only contract (C4 collapse) with body AgentAcceptance binding
+	// The agent key was learned via the well-known manifest fetch
+	// during onboarding/self-signup, so no manual resolver seeding or multisig
+	// transport client is needed here.
 	first := offers[0]
-	offerID, offerSig := first.GetOfferId(), first.GetSignature()
-	execResp, err := multisigClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", Id: "tx-" + uuid.NewString(),
-		OfferId:        &offerID,
-		OfferSignature: &offerSig,
-		Requester: &rampv1.Requester{
-			Id: agentID, Domain: agentID,
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
+	execTxID := "tx-" + uuid.NewString()
+	execReqr := &rampv1.Requester{Id: agentID, Domain: agentID, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT}
+	execResp, err := h.exchange.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
+		Ver: "1.0", IdempotencyKey: execTxID,
+		Requester: execReqr,
+		// R4: body acceptance signed by the registered agent key.
+		Items: []*rampv1.TransactionItem{
+			{Offer: first, AgentAcceptance: signAcceptanceFor(t, agentPriv, first, execReqr, execTxID)},
 		},
 	}))
 	if err != nil {
 		t.Fatalf("ExecuteTransaction: %v", err)
 	}
-	signedURL := extractSignedURL(t, execResp.Msg)
+	item := singleResultItem(t, execResp)
+	signedURL := item.GetRetrievalEndpoint()
+	if signedURL == "" {
+		t.Fatal("retrieval_endpoint missing from the single batch item")
+	}
 	rsaPub := exchangeCloudFrontKey(h.pushHarness)
 	if err := verifyCloudFrontCannedPolicy(signedURL, rsaPub); err != nil {
 		t.Fatalf("cloudfront signed url verify: %v", err)
@@ -177,16 +185,16 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 
 	// Step 9: report usage → accepted=true.
 	repResp, err := h.exchange.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-" + uuid.NewString(),
-		TransactionId: execResp.Msg.GetTransactionId(),
-		BillingId:     execResp.Msg.GetBillingId(),
+		Ver: "1.0", IdempotencyKey: "r-" + uuid.NewString(),
+		TransactionId: item.GetTransactionId(),
+		BillingId:     item.GetBillingId(),
 		Usage:         &rampv1.Usage{ConsumedQuantity: 1, Function: []string{"ai_input"}},
 	}))
 	if err != nil {
 		t.Fatalf("ReportUsage: %v", err)
 	}
-	if !repResp.Msg.GetAccepted() {
-		t.Fatalf("report accepted = false, reason=%q", repResp.Msg.GetRejectionReason())
+	if repResp.Msg.GetReportId() == "" {
+		t.Fatalf("accepted report missing report_id")
 	}
 
 	// Step 10 is provided automatically by the agentHarness's admin-guard
@@ -235,7 +243,7 @@ func insertCloudFrontTenant(t *testing.T, h *pushHarness, tenantID, domain strin
 func registerAgentViaPublicEndpoint(t *testing.T, h *agentHarness, agentID string) {
 	t.Helper()
 	body, err := json.Marshal(map[string]string{
-		"agent_id": agentID, "manifest_url": agentID,
+		"agent_id": agentID, "discovery_url": agentID,
 	})
 	if err != nil {
 		t.Fatalf("marshal register body: %v", err)
@@ -257,56 +265,36 @@ func registerAgentViaPublicEndpoint(t *testing.T, h *agentHarness, agentID strin
 	}
 }
 
-// extractSignedURL pulls the signed delivery URL from the transaction
-// response's canonical retrieval_endpoint field (TransactionResponse field 18,
-// the location ExchangeService.buildTxResponse sets) and asserts the legacy
-// ext["signed_url"] carrier is no longer populated.
-func extractSignedURL(t *testing.T, resp *rampv1.TransactionResponse) string {
-	t.Helper()
-	if ext := resp.GetExt(); ext != nil {
-		if _, ok := ext.GetFields()["signed_url"]; ok {
-			t.Fatalf(`legacy ext["signed_url"] must no longer be populated; keys=%v`, ext.GetFields())
-		}
-	}
-	s := resp.GetRetrievalEndpoint()
-	if s == "" {
-		t.Fatal("retrieval_endpoint missing from transaction response")
-	}
-	return s
-}
-
 // fetchExchangeOfferKey reads the Exchange's Ed25519 offer-signing key from its
-// /.well-known/ramp.json public_keys[] (kid "exchange-primary"). RAMP v1 folds
-// the offer key into the unified manifest; there is no separate jwks.json.
+// Web Bot Auth directory, where it is named by RFC 7638 thumbprint rather than by
+// a kid. There is no separate jwks.json, and the ramp.json overlay carries no keys.
 func fetchExchangeOfferKey(t *testing.T, h *pushHarness) ed25519.PublicKey {
 	t.Helper()
-	req, err := http.NewRequestWithContext(h.ctx, http.MethodGet, h.server.URL+rampwellknown.Path, nil)
+	// After the WBA split the offer key lives in the exchange's pure WBA directory
+	// (keyed by RFC 7638 thumbprint), not in the keyless ramp.json overlay.
+	req, err := http.NewRequestWithContext(h.ctx, http.MethodGet, h.server.URL+rampwellknown.WBAPath, nil)
 	if err != nil {
-		t.Fatalf("build ramp.json request: %v", err)
+		t.Fatalf("build WBA directory request: %v", err)
 	}
 	resp, err := h.server.Client().Do(req)
 	if err != nil {
-		t.Fatalf("GET ramp.json: %v", err)
+		t.Fatalf("GET WBA directory: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("ramp.json status = %d", resp.StatusCode)
+		t.Fatalf("WBA directory status = %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("read ramp.json: %v", err)
+		t.Fatalf("read WBA directory: %v", err)
 	}
-	m, err := rampwellknown.ParseManifest(body, rampwellknown.RoleExchange)
+	f, err := rampwellknown.ParseWBA(body)
 	if err != nil {
-		t.Fatalf("parse ramp.json: %v", err)
+		t.Fatalf("parse WBA directory: %v", err)
 	}
-	key, ok := rampwellknown.KeyByKid(m, "exchange-primary")
-	if !ok {
-		t.Fatalf("offer key absent from ramp.json public_keys")
-	}
-	pub, err := rampwellknown.PublicKey(key)
+	pub, err := resolvers.ActiveEd25519Key(f, time.Now())
 	if err != nil {
-		t.Fatalf("decode offer key: %v", err)
+		t.Fatalf("active offer key absent from WBA directory: %v", err)
 	}
 	return pub
 }

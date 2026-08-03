@@ -11,7 +11,7 @@ func TestMemoryService_CheckThenRecord(t *testing.T) {
 	s := budget.NewMemory(nil)
 	ctx := context.Background()
 
-	dec, err := s.Check(ctx, "lic-1", 1000)
+	dec, err := s.Check(ctx, "acct-1", 1000)
 	if err != nil {
 		t.Fatalf("Check: %v", err)
 	}
@@ -22,10 +22,10 @@ func TestMemoryService_CheckThenRecord(t *testing.T) {
 		t.Errorf("remaining = %d", dec.Remaining)
 	}
 
-	if err := s.Record(ctx, "lic-1", 600); err != nil {
+	if err := s.Record(ctx, "acct-1", 600); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	dec, err = s.Check(ctx, "lic-1", 1000)
+	dec, err = s.Check(ctx, "acct-1", 1000)
 	if err != nil {
 		t.Fatalf("Check 2: %v", err)
 	}
@@ -37,10 +37,10 @@ func TestMemoryService_CheckThenRecord(t *testing.T) {
 func TestMemoryService_Exhaustion(t *testing.T) {
 	s := budget.NewMemory(nil)
 	ctx := context.Background()
-	if err := s.Record(ctx, "lic-2", 1200); err != nil {
+	if err := s.Record(ctx, "acct-2", 1200); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	dec, err := s.Check(ctx, "lic-2", 1000)
+	dec, err := s.Check(ctx, "acct-2", 1000)
 	if err != nil {
 		t.Fatalf("Check: %v", err)
 	}

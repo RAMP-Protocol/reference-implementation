@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,9 +18,9 @@ import (
 
 	"golang.org/x/time/rate"
 
-	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
-	exchangedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/transport"
@@ -87,17 +86,13 @@ func (o *agentOrigin) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(status), status)
 		return
 	}
-	if r.URL.Path != "/.well-known/ramp.json" {
+	if r.URL.Path != rampwellknown.WBAPath {
 		http.NotFound(w, r)
 		return
 	}
-	doc, err := agentManifestFields(agentID, pub, from, until)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(doc)
+	_ = agentID
+	w.Header().Set("Content-Type", "application/jwk-set+json")
+	_, _ = w.Write(agentWBABytes(pub, from, until))
 }
 
 type registerFixedClock struct{ now time.Time }
@@ -107,18 +102,8 @@ func (c *registerFixedClock) Now() time.Time { return c.now }
 func setupRegisterFixture(t *testing.T, opts transport.AgentsRegisterOptions) *registerFixture {
 	t.Helper()
 	ctx := context.Background()
-	dsn := sharedb.StartPostgres(t, ctx)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	pool, err := sharedb.Setup(ctx, sharedb.SetupOptions{
-		DSN:             dsn,
-		Migrations:      exchangedb.Migrations,
-		MigrationsDir:   exchangedb.MigrationsDir,
-		MigrationsTable: exchangedb.MigrationsTable,
-	}, logger)
-	if err != nil {
-		t.Fatalf("db setup: %v", err)
-	}
-	t.Cleanup(pool.Close)
+	logger := testutil.DiscardLogger()
+	pool := acquireTestDB(t, ctx)
 	queries := sqlc.New(pool)
 
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
@@ -190,8 +175,8 @@ func decodeBody(t *testing.T, resp *http.Response) map[string]any {
 func TestAgentsRegister_HappyPathAndSignatureVerifies(t *testing.T) {
 	fx := setupRegisterFixture(t, transport.AgentsRegisterOptions{})
 	body, _ := json.Marshal(map[string]string{
-		"agent_id":     fx.agentID,
-		"manifest_url": fx.agentID,
+		"agent_id":      fx.agentID,
+		"discovery_url": fx.agentID,
 	})
 	resp := postRegister(t, fx, body)
 	if resp.StatusCode != http.StatusOK {
@@ -202,11 +187,12 @@ func TestAgentsRegister_HappyPathAndSignatureVerifies(t *testing.T) {
 		t.Fatalf("body = %v", out)
 	}
 
-	row, err := fx.queries.GetAgent(fx.ctx, fx.agentID)
+	// Production repository surface, not the raw sqlc Querier (Testing Doctrine pt9).
+	agent, err := repo.NewAgentRepo(fx.queries).ByID(fx.ctx, fx.agentID)
 	if err != nil {
-		t.Fatalf("GetAgent: %v", err)
+		t.Fatalf("AgentRepo.ByID: %v", err)
 	}
-	if !bytes.Equal(row.PublicKey, fx.agentPub) {
+	if !bytes.Equal(agent.PublicKey, fx.agentPub) {
 		t.Fatalf("stored pubkey does not match fixture agent pubkey")
 	}
 
@@ -273,7 +259,7 @@ func TestAgentsRegister_MissingFields(t *testing.T) {
 func TestAgentsRegister_BodyOverLimit(t *testing.T) {
 	fx := setupRegisterFixture(t, transport.AgentsRegisterOptions{MaxBodyBytes: 32})
 	// 64 bytes of filler > 32 byte cap.
-	body := []byte(`{"agent_id":"` + strings.Repeat("x", 64) + `","manifest_url":"y"}`)
+	body := []byte(`{"agent_id":"` + strings.Repeat("x", 64) + `","discovery_url":"y"}`)
 	resp := postRegister(t, fx, body)
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", resp.StatusCode)
@@ -284,8 +270,8 @@ func TestAgentsRegister_UpstreamFetchFailure(t *testing.T) {
 	fx := setupRegisterFixture(t, transport.AgentsRegisterOptions{})
 	fx.origin.setStatus(http.StatusNotFound)
 	body, _ := json.Marshal(map[string]string{
-		"agent_id":     fx.agentID,
-		"manifest_url": fx.agentID,
+		"agent_id":      fx.agentID,
+		"discovery_url": fx.agentID,
 	})
 	resp := postRegister(t, fx, body)
 	if resp.StatusCode != http.StatusBadGateway {
@@ -297,22 +283,12 @@ func TestAgentsRegister_UpstreamFetchFailure(t *testing.T) {
 	}
 }
 
-func TestAgentsRegister_AgentIDMismatch(t *testing.T) {
-	fx := setupRegisterFixture(t, transport.AgentsRegisterOptions{})
-	// Anchored host (manifest_url == agent_id), but the served manifest body
-	// self-asserts a different domain → the domain-binding check rejects it.
-	fx.rewriteMu.Lock()
-	fx.rewrite["wrong.agent.id"] = fx.origin.server.URL
-	fx.rewriteMu.Unlock()
-	body, _ := json.Marshal(map[string]string{
-		"agent_id":     "wrong.agent.id",
-		"manifest_url": "wrong.agent.id",
-	})
-	resp := postRegister(t, fx, body)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-}
+// NOTE: the former TestAgentsRegister_AgentIDMismatch is intentionally removed.
+// It exercised the manifest-body domain-binding check, which no longer exists
+// after the WBA split: a WBA directory carries only keys — no self-asserted
+// domain — so the fetch LOCATION is the sole anchor. The unanchored-host guard
+// (discovery_url host != agent_id) is still enforced by requireAnchoredHost and
+// covered by agentreg's TestRegistry_DiscoveryURLNotAnchored.
 
 func TestAgentsRegister_RateLimit(t *testing.T) {
 	// Burst=1 with a refill so slow the second call in the same window is
@@ -324,8 +300,8 @@ func TestAgentsRegister_RateLimit(t *testing.T) {
 		},
 	})
 	body, _ := json.Marshal(map[string]string{
-		"agent_id":     fx.agentID,
-		"manifest_url": fx.agentID,
+		"agent_id":      fx.agentID,
+		"discovery_url": fx.agentID,
 	})
 	resp1 := postRegister(t, fx, body)
 	if resp1.StatusCode != http.StatusOK {

@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/time/rate"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 )
@@ -84,8 +85,8 @@ func (h *AgentsRegisterHandler) RegisterRoutes(mux *http.ServeMux) {
 
 // registerRequest is the request body shape.
 type registerRequest struct {
-	AgentID     string `json:"agent_id"`
-	ManifestURL string `json:"manifest_url"`
+	AgentID      string `json:"agent_id"`
+	DiscoveryURL string `json:"discovery_url"`
 }
 
 type registerResponse struct {
@@ -115,7 +116,7 @@ func (h *AgentsRegisterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, errCode, errMsg)
 		return
 	}
-	if err := h.registry.RegisterFromManifest(r.Context(), req.AgentID, req.ManifestURL); err != nil {
+	if err := h.registry.RegisterFromDirectory(r.Context(), req.AgentID, req.DiscoveryURL); err != nil {
 		status, msg := classifyRegisterError(err)
 		reqctx.FromContext(r.Context()).WarnContext(r.Context(), "agents.register failed",
 			"agent_id", req.AgentID, "client_ip", clientIP,
@@ -154,13 +155,30 @@ func (h *AgentsRegisterHandler) decodeRequest(r *http.Request) (registerRequest,
 		return registerRequest{}, http.StatusBadRequest, "malformed json: " + err.Error()
 	}
 	req.AgentID = strings.TrimSpace(req.AgentID)
-	req.ManifestURL = strings.TrimSpace(req.ManifestURL)
+	req.DiscoveryURL = strings.TrimSpace(req.DiscoveryURL)
 	if req.AgentID == "" {
 		return registerRequest{}, http.StatusBadRequest, "agent_id required"
 	}
-	if req.ManifestURL == "" {
-		return registerRequest{}, http.StatusBadRequest, "manifest_url required"
+	if req.DiscoveryURL == "" {
+		return registerRequest{}, http.StatusBadRequest, "discovery_url required"
 	}
+	// Canonicalize here, at the edge, so req.AgentID IS the row agentreg will
+	// write. The handler echoes this field back as the registered identity and
+	// logs it; left raw, a caller that posted "https://a.example" was told it had
+	// registered "https://a.example" while the table held "a.example" — an answer
+	// naming a row that does not exist, and an operator search that finds nothing.
+	agentID, err := agentid.FromDirectory(req.AgentID)
+	if err != nil {
+		// Curated, like every other answer this endpoint gives — including
+		// classifyRegisterError's arm for the same fault class reached through the
+		// registry. Returning err.Error() here made one condition arrive in two
+		// shapes depending on which check caught it first, and leaked the internal
+		// wrapping to an unauthenticated caller. This branch can name the field
+		// outright, which the registry-side arm cannot: it knows only that one of
+		// the two submitted values is not a host.
+		return registerRequest{}, http.StatusBadRequest, "agent_id does not name a host"
+	}
+	req.AgentID = agentID
 	return req, 0, ""
 }
 
@@ -182,6 +200,12 @@ func (h *AgentsRegisterHandler) allow(ip string) bool {
 // upstream fetch failure (502).
 func classifyRegisterError(err error) (int, string) {
 	switch {
+	case errors.Is(err, agentreg.ErrNotAHost):
+		// Its own arm because the caller's repair is different: nothing was
+		// fetched and no two hosts disagree — one of the two submitted values is
+		// simply not a host. Answering "manifest is malformed" here sent the
+		// caller to inspect a document the Exchange never retrieved.
+		return http.StatusBadRequest, "agent_id or discovery_url does not name a host"
 	case errors.Is(err, agentreg.ErrAgentIDMismatch):
 		return http.StatusBadRequest, "manifest agent_id does not match request"
 	case errors.Is(err, agentreg.ErrMalformedManifest):

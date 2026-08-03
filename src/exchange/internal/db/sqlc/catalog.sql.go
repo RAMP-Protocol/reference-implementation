@@ -10,7 +10,7 @@ import (
 )
 
 const getCatalogEntry = `-- name: GetCatalogEntry :one
-SELECT resource_id, tenant_id, uri, uri_prefix, pricing, licensing_rules, delivery_method, created_at, updated_at FROM ramp.catalog WHERE resource_id = $1
+SELECT resource_id, tenant_id, uri, uri_prefix, pricing, delivery_method, created_at, updated_at, terms, metadata, resource_owner_id FROM ramp.catalog WHERE resource_id = $1
 `
 
 func (q *Queries) GetCatalogEntry(ctx context.Context, resourceID string) (RampCatalog, error) {
@@ -22,31 +22,35 @@ func (q *Queries) GetCatalogEntry(ctx context.Context, resourceID string) (RampC
 		&i.Uri,
 		&i.UriPrefix,
 		&i.Pricing,
-		&i.LicensingRules,
 		&i.DeliveryMethod,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Terms,
+		&i.Metadata,
+		&i.ResourceOwnerID,
 	)
 	return i, err
 }
 
 const insertCatalogEntry = `-- name: InsertCatalogEntry :one
 INSERT INTO ramp.catalog (
-    resource_id, tenant_id, uri, uri_prefix, pricing, licensing_rules,
-    delivery_method
+    resource_id, tenant_id, uri, uri_prefix, pricing, terms,
+    delivery_method, metadata, resource_owner_id
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING resource_id, tenant_id, uri, uri_prefix, pricing, licensing_rules, delivery_method, created_at, updated_at
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING resource_id, tenant_id, uri, uri_prefix, pricing, delivery_method, created_at, updated_at, terms, metadata, resource_owner_id
 `
 
 type InsertCatalogEntryParams struct {
-	ResourceID     string             `json:"resource_id"`
-	TenantID       string             `json:"tenant_id"`
-	Uri            string             `json:"uri"`
-	UriPrefix      string             `json:"uri_prefix"`
-	Pricing        []byte             `json:"pricing"`
-	LicensingRules []byte             `json:"licensing_rules"`
-	DeliveryMethod RampDeliveryMethod `json:"delivery_method"`
+	ResourceID      string             `json:"resource_id"`
+	TenantID        string             `json:"tenant_id"`
+	Uri             string             `json:"uri"`
+	UriPrefix       string             `json:"uri_prefix"`
+	Pricing         []byte             `json:"pricing"`
+	Terms           []byte             `json:"terms"`
+	DeliveryMethod  RampDeliveryMethod `json:"delivery_method"`
+	Metadata        []byte             `json:"metadata"`
+	ResourceOwnerID string             `json:"resource_owner_id"`
 }
 
 func (q *Queries) InsertCatalogEntry(ctx context.Context, arg InsertCatalogEntryParams) (RampCatalog, error) {
@@ -56,8 +60,10 @@ func (q *Queries) InsertCatalogEntry(ctx context.Context, arg InsertCatalogEntry
 		arg.Uri,
 		arg.UriPrefix,
 		arg.Pricing,
-		arg.LicensingRules,
+		arg.Terms,
 		arg.DeliveryMethod,
+		arg.Metadata,
+		arg.ResourceOwnerID,
 	)
 	var i RampCatalog
 	err := row.Scan(
@@ -66,16 +72,18 @@ func (q *Queries) InsertCatalogEntry(ctx context.Context, arg InsertCatalogEntry
 		&i.Uri,
 		&i.UriPrefix,
 		&i.Pricing,
-		&i.LicensingRules,
 		&i.DeliveryMethod,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Terms,
+		&i.Metadata,
+		&i.ResourceOwnerID,
 	)
 	return i, err
 }
 
 const listAllCatalog = `-- name: ListAllCatalog :many
-SELECT resource_id, tenant_id, uri, uri_prefix, pricing, licensing_rules, delivery_method, created_at, updated_at FROM ramp.catalog ORDER BY tenant_id, uri_prefix
+SELECT resource_id, tenant_id, uri, uri_prefix, pricing, delivery_method, created_at, updated_at, terms, metadata, resource_owner_id FROM ramp.catalog ORDER BY tenant_id, uri_prefix
 `
 
 func (q *Queries) ListAllCatalog(ctx context.Context) ([]RampCatalog, error) {
@@ -93,10 +101,12 @@ func (q *Queries) ListAllCatalog(ctx context.Context) ([]RampCatalog, error) {
 			&i.Uri,
 			&i.UriPrefix,
 			&i.Pricing,
-			&i.LicensingRules,
 			&i.DeliveryMethod,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Terms,
+			&i.Metadata,
+			&i.ResourceOwnerID,
 		); err != nil {
 			return nil, err
 		}
@@ -109,7 +119,7 @@ func (q *Queries) ListAllCatalog(ctx context.Context) ([]RampCatalog, error) {
 }
 
 const listCatalogByTenant = `-- name: ListCatalogByTenant :many
-SELECT resource_id, tenant_id, uri, uri_prefix, pricing, licensing_rules, delivery_method, created_at, updated_at FROM ramp.catalog WHERE tenant_id = $1 ORDER BY uri_prefix
+SELECT resource_id, tenant_id, uri, uri_prefix, pricing, delivery_method, created_at, updated_at, terms, metadata, resource_owner_id FROM ramp.catalog WHERE tenant_id = $1 ORDER BY uri_prefix
 `
 
 func (q *Queries) ListCatalogByTenant(ctx context.Context, tenantID string) ([]RampCatalog, error) {
@@ -127,10 +137,12 @@ func (q *Queries) ListCatalogByTenant(ctx context.Context, tenantID string) ([]R
 			&i.Uri,
 			&i.UriPrefix,
 			&i.Pricing,
-			&i.LicensingRules,
 			&i.DeliveryMethod,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Terms,
+			&i.Metadata,
+			&i.ResourceOwnerID,
 		); err != nil {
 			return nil, err
 		}
@@ -144,28 +156,32 @@ func (q *Queries) ListCatalogByTenant(ctx context.Context, tenantID string) ([]R
 
 const upsertCatalogEntry = `-- name: UpsertCatalogEntry :one
 INSERT INTO ramp.catalog (
-    resource_id, tenant_id, uri, uri_prefix, pricing, licensing_rules,
-    delivery_method
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
+    resource_id, tenant_id, uri, uri_prefix, pricing, terms,
+    delivery_method, metadata, resource_owner_id
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (resource_id) DO UPDATE
    SET tenant_id = EXCLUDED.tenant_id,
        uri = EXCLUDED.uri,
        uri_prefix = EXCLUDED.uri_prefix,
        pricing = EXCLUDED.pricing,
-       licensing_rules = EXCLUDED.licensing_rules,
+       terms = EXCLUDED.terms,
        delivery_method = EXCLUDED.delivery_method,
+       metadata = EXCLUDED.metadata,
+       resource_owner_id = EXCLUDED.resource_owner_id,
        updated_at = NOW()
-RETURNING resource_id, tenant_id, uri, uri_prefix, pricing, licensing_rules, delivery_method, created_at, updated_at
+RETURNING resource_id, tenant_id, uri, uri_prefix, pricing, delivery_method, created_at, updated_at, terms, metadata, resource_owner_id
 `
 
 type UpsertCatalogEntryParams struct {
-	ResourceID     string             `json:"resource_id"`
-	TenantID       string             `json:"tenant_id"`
-	Uri            string             `json:"uri"`
-	UriPrefix      string             `json:"uri_prefix"`
-	Pricing        []byte             `json:"pricing"`
-	LicensingRules []byte             `json:"licensing_rules"`
-	DeliveryMethod RampDeliveryMethod `json:"delivery_method"`
+	ResourceID      string             `json:"resource_id"`
+	TenantID        string             `json:"tenant_id"`
+	Uri             string             `json:"uri"`
+	UriPrefix       string             `json:"uri_prefix"`
+	Pricing         []byte             `json:"pricing"`
+	Terms           []byte             `json:"terms"`
+	DeliveryMethod  RampDeliveryMethod `json:"delivery_method"`
+	Metadata        []byte             `json:"metadata"`
+	ResourceOwnerID string             `json:"resource_owner_id"`
 }
 
 func (q *Queries) UpsertCatalogEntry(ctx context.Context, arg UpsertCatalogEntryParams) (RampCatalog, error) {
@@ -175,8 +191,10 @@ func (q *Queries) UpsertCatalogEntry(ctx context.Context, arg UpsertCatalogEntry
 		arg.Uri,
 		arg.UriPrefix,
 		arg.Pricing,
-		arg.LicensingRules,
+		arg.Terms,
 		arg.DeliveryMethod,
+		arg.Metadata,
+		arg.ResourceOwnerID,
 	)
 	var i RampCatalog
 	err := row.Scan(
@@ -185,10 +203,12 @@ func (q *Queries) UpsertCatalogEntry(ctx context.Context, arg UpsertCatalogEntry
 		&i.Uri,
 		&i.UriPrefix,
 		&i.Pricing,
-		&i.LicensingRules,
 		&i.DeliveryMethod,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Terms,
+		&i.Metadata,
+		&i.ResourceOwnerID,
 	)
 	return i, err
 }

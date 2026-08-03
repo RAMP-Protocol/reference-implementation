@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Generate a buyer's two Ed25519 keypairs — primary delegation signing key
 # (use=verify) and dedicated revocation-list signing key (use=revoke) — and
-# publish both pubkeys as a JWKS at the buyer's keys URL. Tracks ye6f-21 /
-# agentic-content-access-g32u; see ADR-003 §5c.
+# publish both pubkeys as a JWKS at the buyer's keys URL. Tracks the revocation-key work /
+# See ADR-003 §5c.
 #
 # Buyer JWKS hosting is intentionally flexible per ADR-003 §1 (opaque-URL
 # rule). Two layouts are supported via BUYER_HOSTING:

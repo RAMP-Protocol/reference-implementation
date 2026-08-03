@@ -3,6 +3,14 @@
     {
       "alg": "EdDSA",
       "crv": "Ed25519",
+      "kid": "agent-demo-eur",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "SG9Faublph_WMtO_RkqKxDw5sXvOq9cw1cBxR3_YbaI"
+    },
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
       "kid": "agent-demo.v1",
       "kty": "OKP",
       "use": "sig",
@@ -11,34 +19,10 @@
     {
       "alg": "EdDSA",
       "crv": "Ed25519",
-      "kid": "broker.broker-local.v1",
-      "kty": "OKP",
-      "use": "sig",
-      "x": "gCX76Qe6aRTjVWd2WIFaLtfTzBjA9EFFHUg3pz5AE9s"
-    },
-    {
-      "alg": "EdDSA",
-      "crv": "Ed25519",
-      "kid": "test-signer-e2e.v1",
-      "kty": "OKP",
-      "use": "sig",
-      "x": "-J62HVQUfS28zJEOqG_vu0nrc4D9Eo9S2UqiUQTSIUo"
-    },
-    {
-      "alg": "EdDSA",
-      "crv": "Ed25519",
-      "kid": "catalog-contributor-e2e",
-      "kty": "OKP",
-      "use": "sig",
-      "x": "QNQ6W8pIwTdPdDUITeKIeDnIClqYeOu99aS7jOTTn60"
-    },
-    {
-      "alg": "EdDSA",
-      "crv": "Ed25519",
       "kid": "agent-e2e",
       "kty": "OKP",
       "use": "sig",
-      "x": "5igeb3xWg3MbE3os0CzrTCyZyWuhkDShpZMBVc-ttkA"
+      "x": "T1v7aeiJ_3tBro3E5u4tHU3Cka67BDgdAUqkdjBp20A"
     },
     {
       "alg": "EdDSA",
@@ -46,7 +30,31 @@
       "kid": "agent-nobilling-e2e",
       "kty": "OKP",
       "use": "sig",
-      "x": "nzisHwOt_aXA79xAQH-xFEFKBtVPp4k57OVnl9msl3s"
+      "x": "UxNblBvdZwS6mPNXNFK-mlaRp39NPg6D9wQbNG1BO7g"
+    },
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "broker.broker-local.v1",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "58Z9xt-XHa3ZvQHvdX91IYgI8lkNE_fNdXNYDwYX0-c"
+    },
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "catalog-contributor-e2e",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "WcKd6X2MZBglTBbg7Z7GVjqS5lJOcVfZ-alTSEstWf8"
+    },
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "test-signer-e2e.v1",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "PlO2c8D9_skjnIEdgw6YYlTfcIzc3J5uJvkg7X9SW_0"
     }
   ]
 }

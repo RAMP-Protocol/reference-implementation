@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,11 +15,12 @@ import (
 	"testing"
 	"time"
 
-	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
+	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid/agentidtest"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
-	exchangedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
@@ -43,6 +43,7 @@ type fixtureOrigin struct {
 	mu      sync.Mutex
 	agentID string
 	keys    []fixtureKey
+	hits    int64 // WBA-directory fetches served (guarded by mu)
 }
 
 func newFixtureOrigin(t *testing.T, agentID string, keys []fixtureKey) *fixtureOrigin {
@@ -54,17 +55,27 @@ func newFixtureOrigin(t *testing.T, agentID string, keys []fixtureKey) *fixtureO
 }
 
 func (o *fixtureOrigin) handle(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/.well-known/ramp.json" {
+	// After the WBA split the registry discovers a caller's key from its WBA
+	// directory (the WBA file carries only keys — no role, no domain).
+	if r.URL.Path != rampwellknown.WBAPath {
 		http.NotFound(w, r)
 		return
 	}
 	o.mu.Lock()
-	agentID := o.agentID
+	o.hits++
 	keys := append([]fixtureKey(nil), o.keys...)
 	o.mu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(agentManifestJSON(agentID, keys))
+	w.Header().Set("Content-Type", "application/jwk-set+json")
+	_, _ = w.Write(agentWBAJSON(keys))
+}
+
+// hitCount returns how many WBA-directory fetches the origin has served, so a
+// debounce test can assert a burst of refreshes coalesced into a single fetch.
+func (o *fixtureOrigin) hitCount() int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.hits
 }
 
 func (o *fixtureOrigin) setKeys(agentID string, keys []fixtureKey) {
@@ -117,22 +128,14 @@ func (h *hostRewriter) RoundTrip(req *http.Request) (*http.Response, error) {
 	return http.DefaultTransport.RoundTrip(req)
 }
 
+func newTestQueries(t *testing.T) *sqlc.Queries {
+	t.Helper()
+	return sqlc.New(acquireTestDB(t, context.Background()))
+}
+
 func setupRegistry(t *testing.T, clock agentreg.Clock) (agentreg.Registry, *sqlc.Queries, *hostRewriter) {
 	t.Helper()
-	ctx := context.Background()
-	dsn := sharedb.StartPostgres(t, ctx)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	pool, err := sharedb.Setup(ctx, sharedb.SetupOptions{
-		DSN:             dsn,
-		Migrations:      exchangedb.Migrations,
-		MigrationsDir:   exchangedb.MigrationsDir,
-		MigrationsTable: exchangedb.MigrationsTable,
-	}, logger)
-	if err != nil {
-		t.Fatalf("db setup: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	q := sqlc.New(pool)
+	q := newTestQueries(t)
 	rw := newHostRewriter()
 	reg := agentreg.New(agentreg.Config{
 		Repo:  repo.NewAgentRepo(q),
@@ -140,6 +143,64 @@ func setupRegistry(t *testing.T, clock agentreg.Clock) (agentreg.Registry, *sqlc
 		Clock: clock,
 	})
 	return reg, q, rw
+}
+
+// TestRegistry_HonorsConfiguredSchemeAndPort proves Gate-1 self-signup builds
+// its well-known fetch URL from Config.Scheme/Port. The registry is given a
+// PLAIN http client (no host rewriter), so the ONLY way the fetch can reach the
+// loopback origin is if Scheme=http + the origin's port are threaded into the
+// fetch URL. With the default https:443 the fetch would fail to connect — this
+// is the exact gap that forced the e2e DB key pre-seed.
+func TestRegistry_HonorsConfiguredSchemeAndPort(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	q := newTestQueries(t)
+	ctx := t.Context()
+
+	pub := mustEd25519(t)
+	origin := newFixtureOrigin(t, "placeholder", []fixtureKey{{
+		kid: "k1", pub: pub,
+		validFrom:  now.Add(-time.Hour),
+		validUntil: now.Add(24 * time.Hour),
+	}})
+	originURL, err := url.Parse(origin.server.URL)
+	if err != nil {
+		t.Fatalf("parse origin url: %v", err)
+	}
+	// The agent_id IS the loopback host the origin listens on, so the
+	// identity-anchored fetch targets the origin directly.
+	agentID := originURL.Hostname() // "127.0.0.1"
+	origin.setKeys(agentID, []fixtureKey{{
+		kid: "k1", pub: pub,
+		validFrom:  now.Add(-time.Hour),
+		validUntil: now.Add(24 * time.Hour),
+	}})
+
+	reg := agentreg.New(agentreg.Config{
+		Repo:   repo.NewAgentRepo(q),
+		HTTP:   &http.Client{}, // no rewriter: only Scheme/Port can route this fetch
+		Clock:  &fixedClock{now: now},
+		Scheme: "http",
+		Port:   originURL.Port(),
+	})
+
+	if err := reg.RegisterFromDirectory(ctx, agentID, agentID); err != nil {
+		t.Fatalf("register over http (scheme/port not honored?): %v", err)
+	}
+	got, err := reg.LookupPublicKey(ctx, agentID)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if !pub.Equal(got) {
+		t.Fatal("lookup key mismatch")
+	}
+	row, err := q.GetAgent(ctx, agentID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	wantURL, _ := rampwellknown.WBAURL(agentID, "http", originURL.Port())
+	if !row.DiscoveryUrl.Valid || row.DiscoveryUrl.String != wantURL {
+		t.Fatalf("discovery_url = %+v, want %q (scheme/port must be reflected)", row.DiscoveryUrl, wantURL)
+	}
 }
 
 func TestRegistry_HappyPath(t *testing.T) {
@@ -156,7 +217,7 @@ func TestRegistry_HappyPath(t *testing.T) {
 	}})
 	rw.set(agentID, origin.server.URL)
 
-	if err := reg.RegisterFromManifest(ctx, agentID, agentID); err != nil {
+	if err := reg.RegisterFromDirectory(ctx, agentID, agentID); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	got, err := reg.LookupPublicKey(ctx, agentID)
@@ -171,15 +232,55 @@ func TestRegistry_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent: %v", err)
 	}
-	// The stored manifest_url is the identity-anchored discovery URL derived from
+	// The stored discovery_url is the identity-anchored discovery URL derived from
 	// agent_id, not whatever the caller passed.
-	wantURL, _ := rampwellknown.ManifestURL(agentID, "", "")
-	if !row.ManifestUrl.Valid || row.ManifestUrl.String != wantURL {
-		t.Fatalf("manifest_url = %+v, want %q", row.ManifestUrl, wantURL)
+	wantURL, _ := rampwellknown.WBAURL(agentID, "", "")
+	if !row.DiscoveryUrl.Valid || row.DiscoveryUrl.String != wantURL {
+		t.Fatalf("discovery_url = %+v, want %q", row.DiscoveryUrl, wantURL)
 	}
 }
 
-func TestRegistry_ManifestURLNotAnchored(t *testing.T) {
+// TestRegistry_DiscoveryURLNamingNoHostRefused covers the arm of the anchoring
+// check that the rest of the suite cannot reach. Every other call here passes
+// either identical arguments — which makes the agent_id arm fire first — or a
+// discovery_url that is a perfectly good host on the wrong domain, which is a
+// mismatch rather than a non-host.
+//
+// Without it, the discovery_url arm is proven only by a handler test that feeds
+// the sentinel to a stub registry: that shows the handler renders the sentinel,
+// not that the registry produces it. Revert this arm to ErrMalformedManifest and
+// the whole suite still passes, while the endpoint goes back to blaming a
+// manifest that was never fetched — the wrong diagnosis the split exists to end.
+func TestRegistry_DiscoveryURLNamingNoHostRefused(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	reg, q, _ := setupRegistry(t, &fixedClock{now: now})
+	ctx := t.Context()
+
+	const agentID = "agent.fixture.test"
+	for _, badURL := range []string{
+		`agent2="https://agent.fixture.test"`, // the sf-dictionary form
+		"//agent.fixture.test",                // authority parses empty
+		"https://",                            // scheme, no host
+	} {
+		t.Run(badURL, func(t *testing.T) {
+			err := reg.RegisterFromDirectory(ctx, agentID, badURL)
+			if !errors.Is(err, agentreg.ErrNotAHost) {
+				t.Fatalf("RegisterFromDirectory(%q, %q) = %v; want ErrNotAHost — nothing was "+
+					"fetched, so blaming the manifest would send the caller to inspect a "+
+					"document that was never retrieved", agentID, badURL, err)
+			}
+			if errors.Is(err, agentreg.ErrMalformedManifest) {
+				t.Errorf("refusal also matches ErrMalformedManifest; the split is what "+
+					"gives this fault its own diagnosis (err=%v)", err)
+			}
+			if _, err := q.GetAgent(ctx, agentID); err == nil {
+				t.Fatal("a refused registration must not have written a row")
+			}
+		})
+	}
+}
+
+func TestRegistry_DiscoveryURLNotAnchored(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	reg, q, rw := setupRegistry(t, &fixedClock{now: now})
 	ctx := t.Context()
@@ -194,44 +295,24 @@ func TestRegistry_ManifestURLNotAnchored(t *testing.T) {
 	}})
 	rw.set("attacker.example", origin.server.URL)
 
-	// Registering victimID against a manifest_url hosted by attacker.example must
+	// Registering victimID against a discovery_url hosted by attacker.example must
 	// be refused before any fetch — discovery is anchored to agent_id (ADR-009).
-	err := reg.RegisterFromManifest(ctx, victimID, "https://attacker.example/.well-known/ramp.json")
+	err := reg.RegisterFromDirectory(ctx, victimID, "https://attacker.example/.well-known/ramp.json")
 	if !errors.Is(err, agentreg.ErrAgentIDMismatch) {
-		t.Fatalf("want ErrAgentIDMismatch for unanchored manifest_url, got %v", err)
+		t.Fatalf("want ErrAgentIDMismatch for unanchored discovery_url, got %v", err)
 	}
 	if _, err := q.GetAgent(ctx, victimID); err == nil {
 		t.Fatal("victim agent must not be registered from an unanchored host")
 	}
 }
 
-func TestRegistry_AgentIDMismatch(t *testing.T) {
-	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	reg, q, rw := setupRegistry(t, &fixedClock{now: now})
-	ctx := t.Context()
-
-	pub := mustEd25519(t)
-	// The manifest is correctly anchored to agent.fixture.test's host, but its
-	// body self-asserts a different domain → the domain-binding check rejects it.
-	origin := newFixtureOrigin(t, "other.agent.test", []fixtureKey{{
-		kid: "k1", pub: pub,
-		validFrom:  now.Add(-time.Hour),
-		validUntil: now.Add(24 * time.Hour),
-	}})
-	rw.set("agent.fixture.test", origin.server.URL)
-
-	err := reg.RegisterFromManifest(ctx, "agent.fixture.test", "agent.fixture.test")
-	if !errors.Is(err, agentreg.ErrAgentIDMismatch) {
-		t.Fatalf("want ErrAgentIDMismatch, got %v", err)
-	}
-
-	if _, err := reg.LookupPublicKey(ctx, "agent.fixture.test"); !errors.Is(err, agentreg.ErrUnknown) {
-		t.Fatalf("expected ErrUnknown post-mismatch, got %v", err)
-	}
-	if _, err := q.GetAgent(ctx, "agent.fixture.test"); err == nil {
-		t.Fatalf("unexpected row for mismatched agent")
-	}
-}
+// NOTE: the former TestRegistry_AgentIDMismatch is intentionally removed. After
+// the WBA split the directory carries only keys — no self-asserted domain — so a
+// "manifest body claims a different domain" mismatch cannot occur. The fetch
+// LOCATION is the sole anchor: RegisterFromDirectory fetches the WBA directory
+// from agent_id's own well-known path (guarded by requireAnchoredHost, covered by
+// TestRegistry_DiscoveryURLNotAnchored), and pins whatever currently-valid key it
+// publishes there.
 
 func TestRegistry_MultipleKeysPicksCurrent(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
@@ -262,7 +343,7 @@ func TestRegistry_MultipleKeysPicksCurrent(t *testing.T) {
 	})
 	rw.set(agentID, origin.server.URL)
 
-	if err := reg.RegisterFromManifest(ctx, agentID, agentID); err != nil {
+	if err := reg.RegisterFromDirectory(ctx, agentID, agentID); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	got, err := reg.LookupPublicKey(ctx, agentID)
@@ -271,6 +352,209 @@ func TestRegistry_MultipleKeysPicksCurrent(t *testing.T) {
 	}
 	if !currentPub.Equal(got) {
 		t.Fatalf("wrong key selected; want current key")
+	}
+}
+
+// TestRegistry_RefreshDirectoryKey_RepinsRotatedKey proves the fix for the
+// key-rotation lockout: once an agent is registered, RefreshDirectoryKey
+// re-fetches its WBA directory and re-pins the currently-valid key, so a caller
+// that rotated its signing key is recognized without operator DB surgery.
+func TestRegistry_RefreshDirectoryKey_RepinsRotatedKey(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	reg, _, rw := setupRegistry(t, &fixedClock{now: now})
+	ctx := t.Context()
+
+	keyA := mustEd25519(t)
+	keyB := mustEd25519(t)
+	agentID := "agent.repin.test"
+	origin := newFixtureOrigin(t, agentID, []fixtureKey{{
+		kid: "a", pub: keyA,
+		validFrom:  now.Add(-time.Hour),
+		validUntil: now.Add(24 * time.Hour),
+	}})
+	rw.set(agentID, origin.server.URL)
+
+	if err := reg.RegisterFromDirectory(ctx, agentID, agentID); err != nil {
+		t.Fatalf("initial register: %v", err)
+	}
+	if got, _ := reg.LookupPublicKey(ctx, agentID); !keyA.Equal(got) {
+		t.Fatal("keyA must be pinned after initial registration")
+	}
+
+	// The agent rotates: its directory now publishes keyB instead of keyA.
+	origin.setKeys(agentID, []fixtureKey{{
+		kid: "b", pub: keyB,
+		validFrom:  now.Add(-time.Hour),
+		validUntil: now.Add(24 * time.Hour),
+	}})
+
+	if err := reg.RefreshDirectoryKey(ctx, agentID); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if got, _ := reg.LookupPublicKey(ctx, agentID); !keyB.Equal(got) {
+		t.Fatal("RefreshDirectoryKey must re-pin the rotated key keyB")
+	}
+}
+
+// TestRegistry_RefreshDirectoryKey_Debounced proves the re-fetch is bounded: a
+// burst of refreshes for one directory within the debounce window coalesces into
+// a single WBA-directory fetch, so a stream of key-mismatch requests cannot
+// amplify into a fetch storm against the directory host. The clock is fixed, so
+// every refresh falls inside the one-minute window.
+//
+// The burst deliberately uses a DIFFERENT SPELLING of the one directory each
+// time. The window is documented as one fetch per window per directory, and a
+// debounce keyed on the caller's text would make it one fetch per window per
+// SPELLING instead — one victim host, as many fetch budgets as the caller cares
+// to invent, which is no bound at all. One of the two production callers passes
+// an unverified caller_id straight off a catalog push, so the spellings really
+// are caller-chosen. Every entry below is the same directory to DNS.
+func TestRegistry_RefreshDirectoryKey_Debounced(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	q := newTestQueries(t)
+	rw := newHostRewriter()
+	reg := agentreg.New(agentreg.Config{
+		Repo:            repo.NewAgentRepo(q),
+		HTTP:            &http.Client{Transport: rw},
+		Clock:           &fixedClock{now: now},
+		RefreshDebounce: time.Minute,
+	})
+	ctx := t.Context()
+
+	keyA := mustEd25519(t)
+	agentID := "agent.debounce.test"
+	origin := newFixtureOrigin(t, agentID, []fixtureKey{{
+		kid: "a", pub: keyA,
+		validFrom:  now.Add(-time.Hour),
+		validUntil: now.Add(24 * time.Hour),
+	}})
+	rw.set(agentID, origin.server.URL)
+
+	if err := reg.RegisterFromDirectory(ctx, agentID, agentID); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	base := origin.hitCount()
+
+	spellings := []string{
+		agentID,
+		"https://" + agentID,          // scheme
+		"HTTPS://Agent.Debounce.Test", // scheme and case
+		agentID + ".",                 // trailing root dot
+		"https://" + agentID + ":443", // the port https already implies
+		"https://" + agentID + ":0443",
+	}
+	for _, spelling := range spellings {
+		if err := reg.RefreshDirectoryKey(ctx, spelling); err != nil {
+			t.Fatalf("refresh %q: %v", spelling, err)
+		}
+	}
+	if fetched := origin.hitCount() - base; fetched != 1 {
+		t.Fatalf("debounce: want exactly 1 directory fetch for %d refreshes of one directory, got %d — "+
+			"the anti-amplification bound is per-directory, not per-spelling", len(spellings), fetched)
+	}
+}
+
+// TestRegistry_StoresCanonicalIdentity pins what the agents table is keyed on. A
+// caller spells its own identity however it likes — a signed Signature-Agent
+// header on one path, an unverified caller_id on another — and keying the column
+// on that text gave one host a row per spelling, each with its own TOFU key pin
+// and, downstream, its own billing ref. Registration must therefore store the
+// canonical host, not what the caller typed.
+//
+// The spelling used here folds on every axis at once, because the axes were closed
+// one at a time and the bug stayed reachable through whichever remained.
+func TestRegistry_StoresCanonicalIdentity(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	reg, q, rw := setupRegistry(t, &fixedClock{now: now})
+	ctx := t.Context()
+
+	pub := mustEd25519(t)
+	const canonical = "agent.spelling.test"
+	const asSpelled = "https://Agent.Spelling.Test:0443"
+	origin := newFixtureOrigin(t, canonical, []fixtureKey{{
+		kid: "k1", pub: pub,
+		validFrom:  now.Add(-time.Hour),
+		validUntil: now.Add(24 * time.Hour),
+	}})
+	// Only the canonical host is routed to the origin, so a fetch URL rebuilt from
+	// the caller's spelling could not have been served at all.
+	rw.set(canonical, origin.server.URL)
+
+	if err := reg.RegisterFromDirectory(ctx, asSpelled, asSpelled); err != nil {
+		t.Fatalf("register %q: %v", asSpelled, err)
+	}
+
+	// Read back through the production repository interface, not raw sqlc — the
+	// documented tier-2 fallback, because the Exchange exposes no RPC that lists or
+	// reads an agent row. The assertion is on the returned Agent.ID, which is the
+	// COLUMN VALUE the row came back with rather than an echo of the argument;
+	// neither this surface nor the package's LookupPublicKey can be asked "is there
+	// a row under this exact string", since both canonicalize their own input by
+	// design (repo.AgentRepo owns that invariant now).
+	agents := repo.NewAgentRepo(q)
+	stored, err := agents.ByID(ctx, canonical)
+	if err != nil {
+		t.Fatalf("no row under the canonical host %q: %v", canonical, err)
+	}
+	if stored.ID != canonical {
+		t.Fatalf("stored agent_id = %q; want %q — a row keyed on the caller's spelling is a "+
+			"second key pin and a second billing ref", stored.ID, canonical)
+	}
+	if origin.hitCount() == 0 {
+		t.Fatal("the directory was never fetched from the canonical host")
+	}
+
+	// Every spelling of the one host resolves to the one registration.
+	for _, spelling := range []string{
+		canonical,
+		asSpelled,
+		"AGENT.SPELLING.TEST",
+		"http://agent.spelling.test",
+		"https://agent.spelling.test.",
+		"agent.spelling.test:443",
+	} {
+		got, err := reg.LookupPublicKey(ctx, spelling)
+		if err != nil {
+			t.Fatalf("LookupPublicKey(%q): %v — this spelling names the same agent", spelling, err)
+		}
+		if !pub.Equal(got) {
+			t.Errorf("LookupPublicKey(%q) returned a different key; one host must be one registration", spelling)
+		}
+	}
+}
+
+// TestRegistry_UnregistrableIdentityRefused is the negative path for the above: a
+// value that names no host must not become a storage key or a fetch target. It is
+// reported as ErrNotAHost — its own sentinel precisely so it is not confused with
+// ErrAgentIDMismatch, which means two hosts disagreed after a fetch that did
+// happen. IsCallerFault classifies it as a permanent caller fault, so every call
+// site maps it to the unauthenticated answer it already gives an unregistrable
+// identity.
+func TestRegistry_UnregistrableIdentityRefused(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	reg, q, _ := setupRegistry(t, &fixedClock{now: now})
+	ctx := t.Context()
+
+	// The shared corpus (internal/agentid/agentidtest): one list, so this layer and
+	// the rule that produces the refusal cannot drift apart.
+	for _, tc := range agentidtest.NonHostValues() {
+		bad := tc.Value
+		t.Run(tc.Name, func(t *testing.T) {
+			err := reg.RefreshDirectoryKey(ctx, bad)
+			if !errors.Is(err, agentreg.ErrNotAHost) {
+				t.Fatalf("RefreshDirectoryKey(%q) = %v; want ErrNotAHost", bad, err)
+			}
+			if !agentreg.IsCallerFault(err) {
+				t.Errorf("RefreshDirectoryKey(%q) is not classified a caller fault, so the "+
+					"call sites would answer it as a retryable outage", bad)
+			}
+			// The repository refuses the value outright, which is a stronger
+			// statement than "no row matched": the only writer of this column
+			// cannot be made to key a row on it.
+			if _, err := repo.NewAgentRepo(q).ByID(ctx, bad); !errors.Is(err, repo.ErrAgentIDNotAHost) {
+				t.Errorf("the agents repo accepted %q as a key (err=%v)", bad, err)
+			}
+		})
 	}
 }
 
@@ -288,7 +572,7 @@ func TestRegistry_UpsertIdempotentAndKeyReplace(t *testing.T) {
 	}})
 	rw.set(agentID, origin.server.URL)
 
-	if err := reg.RegisterFromManifest(ctx, agentID, agentID); err != nil {
+	if err := reg.RegisterFromDirectory(ctx, agentID, agentID); err != nil {
 		t.Fatalf("register1: %v", err)
 	}
 	row1, err := q.GetAgent(ctx, agentID)
@@ -296,7 +580,7 @@ func TestRegistry_UpsertIdempotentAndKeyReplace(t *testing.T) {
 		t.Fatalf("GetAgent1: %v", err)
 	}
 
-	if err := reg.RegisterFromManifest(ctx, agentID, agentID); err != nil {
+	if err := reg.RegisterFromDirectory(ctx, agentID, agentID); err != nil {
 		t.Fatalf("register2: %v", err)
 	}
 	row2, err := q.GetAgent(ctx, agentID)
@@ -317,7 +601,7 @@ func TestRegistry_UpsertIdempotentAndKeyReplace(t *testing.T) {
 		validFrom:  now.Add(-time.Hour),
 		validUntil: now.Add(24 * time.Hour),
 	}})
-	if err := reg.RegisterFromManifest(ctx, agentID, agentID); err != nil {
+	if err := reg.RegisterFromDirectory(ctx, agentID, agentID); err != nil {
 		t.Fatalf("register3: %v", err)
 	}
 	row3, err := q.GetAgent(ctx, agentID)
@@ -346,21 +630,22 @@ func TestRegistry_LookupUnknown(t *testing.T) {
 	}
 }
 
-// TestRegistry_NilHTTPClientDefaultsToGuardedClient pins the constructor's
-// fail-safe default: with no explicit HTTP client, agentreg.New must fall back
-// to the SSRF-guarded env client (like every sibling fetch constructor), never
-// http.DefaultClient. agents/register is an unauthenticated, caller-controlled
-// (agent_id + manifest_url) fetch path, so an unguarded default would let a
-// caller drive a fetch at a loopback/link-local/metadata target.
+// TestRegistry_GuardedClientRefusesLoopback pins that the injected SDK-guarded
+// client refuses a caller-steered internal target. agents/register is an
+// unauthenticated, caller-controlled (agent_id + discovery_url) fetch path, so
+// the composition root injects the SDK-owned guarded client
+// (resolvers.NewGuardedClientFromEnv) — never a fail-open http.DefaultClient.
 //
 // The guard refuses to dial a non-public address at connect time, so pointing a
-// registration at a loopback origin yields ErrBlockedTarget. With the unguarded
-// default the same dial would instead reach the origin (a TLS error, not a
-// block), so this assertion fails closed against a regression.
-func TestRegistry_NilHTTPClientDefaultsToGuardedClient(t *testing.T) {
-	// Force the production-safe guard posture regardless of the ambient
-	// compose/dev flag, so the loopback dial is refused deterministically.
-	t.Setenv(rampwellknown.EnvInsecureAllowPrivate, "0")
+// registration at a loopback origin fails the fetch (surfaced as ErrFetch) and
+// persists no agent row. With an unguarded client the same dial would instead
+// reach the origin, so this assertion fails closed against a regression.
+func TestRegistry_GuardedClientRefusesLoopback(t *testing.T) {
+	// Keep the address guard ON (SKIP_SSRF unset) but permit http (ALLOW_INSECURE),
+	// so the ONLY possible refuser is the dial-time ADDRESS guard — the loopback
+	// dial is refused deterministically, isolated from the scheme dimension.
+	t.Setenv("SKIP_SSRF", "")
+	t.Setenv("ALLOW_INSECURE", "true")
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	_, q, _ := setupRegistry(t, &fixedClock{now: now})
 	ctx := t.Context()
@@ -374,26 +659,30 @@ func TestRegistry_NilHTTPClientDefaultsToGuardedClient(t *testing.T) {
 	}
 	loopbackID := u.Host // 127.0.0.1:PORT
 
+	// The SSRF-guarded client is SDK-owned and injected by the composition root;
+	// construct it here exactly as production does.
+	guarded := resolvers.NewGuardedClientFromEnv()
 	reg := agentreg.New(agentreg.Config{
 		Repo:  repo.NewAgentRepo(q),
+		HTTP:  guarded,
 		Clock: &fixedClock{now: now},
 	})
-	err = reg.RegisterFromManifest(ctx, loopbackID, loopbackID)
-	if !errors.Is(err, rampwellknown.ErrBlockedTarget) {
-		t.Fatalf("nil HTTP client must default to the SSRF-guarded client and refuse "+
-			"a loopback target; got %v", err)
+	err = reg.RegisterFromDirectory(ctx, loopbackID, loopbackID)
+	if !errors.Is(err, rampwellknown.ErrFetch) {
+		t.Fatalf("the SDK-guarded client must refuse a loopback target (fetch failure); got %v", err)
 	}
 	if _, err := q.GetAgent(ctx, loopbackID); err == nil {
 		t.Fatal("a guard-blocked registration must not persist an agent row")
 	}
 }
 
-// newRawOrigin serves a fixed status + body at the well-known path, for failure
-// fixtures the JWKS-shaped fixtureOrigin cannot express (malformed body, 5xx).
+// newRawOrigin serves a fixed status + body at the WBA directory path, for
+// failure fixtures the JWK-set-shaped fixtureOrigin cannot express (malformed
+// body, 5xx).
 func newRawOrigin(t *testing.T, status int, body string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/.well-known/ramp.json" {
+		if r.URL.Path != rampwellknown.WBAPath {
 			http.NotFound(w, r)
 			return
 		}
@@ -419,7 +708,7 @@ func TestRegistry_NoValidKey(t *testing.T) {
 	}})
 	rw.set(agentID, origin.server.URL)
 
-	err := reg.RegisterFromManifest(ctx, agentID, agentID)
+	err := reg.RegisterFromDirectory(ctx, agentID, agentID)
 	if !errors.Is(err, agentreg.ErrNoValidKey) {
 		t.Fatalf("want ErrNoValidKey for an all-expired manifest, got %v", err)
 	}
@@ -436,7 +725,7 @@ func TestRegistry_MalformedManifest(t *testing.T) {
 	const agentID = "agent.fixture.test"
 	rw.set(agentID, newRawOrigin(t, http.StatusOK, "{not valid ramp json").URL)
 
-	err := reg.RegisterFromManifest(ctx, agentID, agentID)
+	err := reg.RegisterFromDirectory(ctx, agentID, agentID)
 	if !errors.Is(err, agentreg.ErrMalformedManifest) {
 		t.Fatalf("want ErrMalformedManifest for a schema-invalid body, got %v", err)
 	}
@@ -456,7 +745,7 @@ func TestRegistry_TransientFetchFailure(t *testing.T) {
 	// A 503 is a transient transport failure: it surfaces verbatim (ErrFetch) so
 	// the lazy-registration mapper classifies it Unavailable/retryable, not as a
 	// permanent caller fault (mapLazyRegisterError).
-	err := reg.RegisterFromManifest(ctx, agentID, agentID)
+	err := reg.RegisterFromDirectory(ctx, agentID, agentID)
 	if !errors.Is(err, rampwellknown.ErrFetch) {
 		t.Fatalf("want rampwellknown.ErrFetch for a 503, got %v", err)
 	}
@@ -477,14 +766,13 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// agentManifestJSON renders the unified ROLE_AGENT well-known manifest
-// (protojson, snake_case) whose domain anchors agentID and whose public_keys
-// carry the supplied Ed25519 keys. The shared rampwellknown producer helpers
-// guarantee the JWK shape matches what the consumer library accepts.
-func agentManifestJSON(agentID string, keys []fixtureKey) []byte {
+// agentWBAJSON renders a WBA directory (protojson, snake_case) carrying the
+// supplied Ed25519 keys. The shared rampwellknown producer helpers guarantee the
+// JWK shape matches what the consumer library accepts.
+func agentWBAJSON(keys []fixtureKey) []byte {
 	jwks := make([]*rampwellknown.Key, 0, len(keys))
 	for _, k := range keys {
-		jwks = append(jwks, rampwellknown.NewKey(k.kid, k.pub, k.validFrom, k.validUntil))
+		jwks = append(jwks, rampwellknown.NewKey(k.pub, k.validFrom, k.validUntil))
 	}
-	return testutil.MarshalManifest(testutil.Manifest(rampwellknown.RoleAgent, agentID, jwks...))
+	return testutil.MarshalWBA(testutil.WBAFile(jwks...))
 }

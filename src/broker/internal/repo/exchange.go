@@ -109,21 +109,21 @@ SELECT exchange_id, domain, endpoint, trust_level, healthy,
 }
 
 // UpsertFromBootstrap reconciles a bootstrap entry into the exchanges table.
+//
+// The endpoint is canonicalized on store (trailing "/" trimmed) so the single
+// stored form is what discovery advertises, what the agent signs its
+// @target-uri against, and what the relay's SSRF allowlist compares.
+// Without this, a trailing-slash endpoint would be admitted by the
+// allowlist but the reconstructed double-slash @target-uri would fail-closed in
+// sig1 verification, silently breaking such Exchanges over the relay.
 func (r *PgxExchangeRepo) UpsertFromBootstrap(ctx context.Context, m Exchange) (Exchange, error) {
 	profiles, err := json.Marshal(m.SupportedProfiles)
 	if err != nil {
 		return Exchange{}, fmt.Errorf("marshal supported_profiles: %w", err)
 	}
 	row, err := r.q.UpsertExchange(ctx, sqlc.UpsertExchangeParams{
-		ExchangeID: m.ID,
-		Domain:     m.Domain,
-		// Canonicalize on store (MED-01): strip any trailing slash so discovery
-		// always emits a single form. The agent signs `endpoint + Procedure`
-		// against exactly the value it receives in discovery; a trailing slash
-		// would make it sign a double-slash @target-uri the broker's sig1 verify
-		// (and the Exchange route) could never match. Normalizing here — the
-		// single source of truth — keeps the SSRF check, the signature base, the
-		// forwarded URL, and the Exchange's received path byte-identical.
+		ExchangeID:        m.ID,
+		Domain:            m.Domain,
 		Endpoint:          strings.TrimRight(m.Endpoint, "/"),
 		TrustLevel:        sqlc.BrokerTrustLevel(m.TrustLevel),
 		SupportedProfiles: profiles,

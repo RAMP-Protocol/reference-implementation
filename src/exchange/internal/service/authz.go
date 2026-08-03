@@ -15,12 +15,15 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"strings"
 
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
@@ -75,7 +78,7 @@ type Caller struct {
 // middleware (none today, but the code should not silently treat them as
 // any caller).
 func (s *ExchangeService) resolveCaller(ctx context.Context) (Caller, error) {
-	v := httpsig.FromContext(ctx)
+	v := helpers.FromContext(ctx)
 	if v == nil || v.KeyID == "" {
 		return Caller{}, exchange.Newf(exchange.KindUnauthenticated, "no verified caller in request context")
 	}
@@ -89,43 +92,70 @@ func (s *ExchangeService) resolveCaller(ctx context.Context) (Caller, error) {
 	return s.lookupCaller(ctx, v)
 }
 
-// classifySignatures separates verified signatures into agent and relay
-// based on keyid prefix. Returns first agent signature and first relay
-// signature (both may be nil).
-func classifySignatures(verified []httpsig.VerifiedRequest) (
-	agent *httpsig.VerifiedRequest,
-	relay *httpsig.VerifiedRequest,
-) {
-	for i := range verified {
-		v := &verified[i]
-		if strings.HasPrefix(v.KeyID, httpsig.BrokerKeyIDPrefix) {
-			if relay == nil {
-				relay = v
-			}
-		} else {
-			if agent == nil {
-				agent = v
-			}
-		}
-	}
-	return agent, relay
-}
-
 // lookupCaller resolves a verified signature to a Caller by looking up the
 // agent record and classifying the caller type. It is the single source of
-// truth for caller classification, shared by resolveCaller (single-sig) and
-// resolveMultisigCaller (multisig). Callers must guarantee s.agents != nil.
+// truth for caller classification on the single-sig caller-resolution path
+// (resolveCaller). Callers must guarantee s.agents != nil.
 //
-// The lookup runs through resolveAgentLazily, so an unknown keyID — arriving on
-// either the single-sig path or the multisig agent/relay slot — triggers the
+// The lookup runs through resolveAgentLazily, so an unknown keyID triggers the
 // ADR-009 D2 pull -> verify -> persist registration before classification.
+//
+// The signed Signature-Agent directory is normalized to its host before anything
+// keys on it, so one host is one agent no matter which scheme the caller spelled
+// (internal/agentid). Normalizing HERE, at the one place a verified signature
+// becomes a caller identity, is what keeps the stored row, the re-pin, and the
+// returned AgentID from ever holding three spellings of the same agent. A value
+// that names no host cannot be an identity and cannot be a fetch target, so it is
+// refused as an authentication failure rather than carried further.
 func (s *ExchangeService) lookupCaller(
 	ctx context.Context,
-	v *httpsig.VerifiedRequest,
+	v *helpers.VerifiedRequest,
 ) (Caller, error) {
-	agentRecord, err := s.resolveAgentLazily(ctx, v.KeyID)
+	// callerHost, not "directory". After FromDirectory this is the BARE canonical
+	// host ("a.example"), while "directory" in this codebase means the full origin
+	// the Signature-Agent header carries ("https://a.example") — what
+	// DirectoryFromHeader returns and what a fetch URL is built from. One word for
+	// two shapes, in adjacent code, is how an origin ends up passed where a host is
+	// expected. The prose below still says "directory" where it means the document
+	// and the party serving it, which is the sense that has not changed.
+	callerHost, err := agentid.FromDirectory(v.SignatureAgent)
+	if err != nil {
+		// Logged as raw_signature_agent, NOT caller_directory: every other site in
+		// this file stamps caller_directory with the normalized host, and an
+		// operator correlating on one attribute name must not be handed two
+		// different kinds of value under it.
+		reqctx.FromContext(ctx).WarnContext(ctx, "caller directory is not a usable identity",
+			"raw_signature_agent", v.SignatureAgent, "err", err)
+		return Caller{}, exchange.Newf(exchange.KindUnauthenticated,
+			"caller directory %q does not name a host", v.SignatureAgent)
+	}
+	agentRecord, err := s.resolveAgentLazily(ctx, callerHost)
 	if err != nil {
 		return Caller{}, err
+	}
+
+	// Bind the verified key to the claimed identity. The RFC 9421 keyid is only
+	// an RFC 7638 thumbprint (proof of key possession), and a resolver may verify
+	// a signature against any key it knows. Authorization keys on the
+	// Signature-Agent directory, so the directory MUST actually publish the key
+	// that produced this signature; otherwise a holder of any resolver-known key
+	// could set Signature-Agent to another registered directory and be authorized
+	// as it.
+	//
+	// For an ALREADY-registered directory resolveAgentLazily returns the pinned
+	// row without re-fetching, so a caller that rotated its directory key would
+	// mismatch the stale pin. On a mismatch, re-learn the directory's
+	// currently-valid key (bounded/debounced) and re-compare; only a key that
+	// still differs after a fresh pin is an impersonation attempt. Rejection is
+	// Unauthenticated (an authentication failure — the proven key is not published
+	// by the claimed directory), matching the catalog-push gate and not leaking
+	// whether the directory is a registered identity.
+	if !bytes.Equal(agentRecord.PublicKey, v.PublicKey) {
+		agentRecord = s.repinAndReload(ctx, callerHost, agentRecord)
+		if !bytes.Equal(agentRecord.PublicKey, v.PublicKey) {
+			return Caller{}, exchange.Newf(exchange.KindUnauthenticated,
+				"signing key is not published by caller directory %q", callerHost)
+		}
 	}
 
 	caller := Caller{
@@ -137,74 +167,35 @@ func (s *ExchangeService) lookupCaller(
 		caller.Kind = CallerBroker
 	default:
 		caller.Kind = CallerAgent
-		caller.AgentID = v.KeyID
+		caller.AgentID = callerHost
 	}
 	return caller, nil
 }
 
-// resolveMultisigCaller classifies each verified signature as agent or relay
-// BY KEYID PREFIX. Classification is order-independent: keyid starting with
-// "broker." = relay, else = agent. Returns agent (first non-broker keyid)
-// and optional relay (first broker keyid).
-func (s *ExchangeService) resolveMultisigCaller(
-	ctx context.Context,
-	verified []httpsig.VerifiedRequest,
-) (agent Caller, relay *Caller, err error) {
-	if s.agents == nil {
-		return Caller{}, nil, exchange.Newf(exchange.KindInternal,
-			"service has no agents repo wired")
+// repinAndReload attempts a bounded, debounced re-fetch + re-pin of directory's
+// currently-valid key and returns the reloaded agent row so lookupCaller can
+// re-compare the proven key against the freshly pinned one. A re-pin failure
+// (registry unwired, unreachable directory, transient fetch error) is NOT fatal
+// here: it is logged and the prior row is returned, so the caller re-compares
+// against the best key available and denies on mismatch. This keeps an
+// impersonation attempt against an unreachable victim directory a clean
+// Unauthenticated rather than an amplifying, retryable Unavailable.
+func (s *ExchangeService) repinAndReload(ctx context.Context, callerHost string, current repo.Agent) repo.Agent {
+	if s.agentReg == nil {
+		return current
 	}
-
-	agentVerified, relayVerified := classifySignatures(verified)
-
-	if agentVerified == nil {
-		return Caller{}, nil, exchange.Newf(exchange.KindUnauthenticated,
-			"no agent signature in multisig request")
+	if err := s.agentReg.RefreshDirectoryKey(ctx, callerHost); err != nil {
+		reqctx.FromContext(ctx).WarnContext(ctx, "caller key re-pin failed",
+			"caller_directory", callerHost, "err", err)
+		return current
 	}
-
-	agent, err = s.lookupCaller(ctx, agentVerified)
+	reloaded, err := s.agents.ByID(ctx, callerHost)
 	if err != nil {
-		return Caller{}, nil, err
+		reqctx.FromContext(ctx).WarnContext(ctx, "caller reload after re-pin failed",
+			"caller_directory", callerHost, "err", err)
+		return current
 	}
-	// The agent slot must resolve to a genuine agent. classifySignatures routes
-	// by keyID prefix, but the DB requester_type is authoritative: a BROKER
-	// whose keyID lacks the "broker." prefix would otherwise occupy the agent
-	// slot and have the delivery URL bound to its key instead of the agent's
-	// (ADR-013). Symmetric to the relay-slot check below.
-	if agent.Kind != CallerAgent {
-		return Caller{}, nil, exchange.Newf(exchange.KindUnauthenticated,
-			"agent keyID %q has requester_type other than an agent role", agentVerified.KeyID)
-	}
-
-	if relayVerified != nil {
-		relayCaller, err := s.lookupCaller(ctx, relayVerified)
-		if err != nil {
-			return Caller{}, nil, err
-		}
-		if relayCaller.Kind != CallerBroker {
-			return Caller{}, nil, exchange.Newf(exchange.KindUnauthenticated,
-				"relay keyID %q has requester_type other than BROKER", relayVerified.KeyID)
-		}
-		relay = &relayCaller
-	}
-
-	return agent, relay, nil
-}
-
-// authorizeRelay enforces the broker-relay opt-in for the relay caller and
-// audits a rejection. A nil relay (single-agent multisig) is a no-op. Routes
-// through authorizeForAgent so the relay gate and its message stay in one place.
-func (s *ExchangeService) authorizeRelay(
-	ctx context.Context, relay *Caller, agentID string, tenant repo.Tenant,
-) *exchange.Error {
-	if relay == nil {
-		return nil
-	}
-	authzErr := authorizeForAgent(*relay, agentID, tenant.AllowBrokerRelay)
-	if authzErr != nil {
-		s.logOutcome(ctx, "execute_transaction", "REJECTED_AUTHZ", *relay, &tenant, agentID, "", authzErr)
-	}
-	return authzErr
+	return reloaded
 }
 
 // resolveAgentLazily looks the keyID up in the agents repo and, on a miss,
@@ -212,35 +203,43 @@ func (s *ExchangeService) authorizeRelay(
 // The agent's identity anchors discovery: the manifest is fetched from the
 // keyID's own domain and the registry refuses a key the manifest does not
 // publish, so a forged keyID cannot self-register.
-func (s *ExchangeService) resolveAgentLazily(ctx context.Context, keyID string) (repo.Agent, error) {
-	agent, err := s.agents.ByID(ctx, keyID)
+func (s *ExchangeService) resolveAgentLazily(ctx context.Context, callerHost string) (repo.Agent, error) {
+	agent, err := s.agents.ByID(ctx, callerHost)
 	if err == nil {
 		return agent, nil
+	}
+	if errors.Is(err, agentid.ErrNotAHost) {
+		// A caller fault, not a server one. The repo refuses a value that cannot key
+		// its column, and that is exactly the caller this gate exists to catch — so
+		// it must not arrive as a 500. Classified here beside ErrAgentNotFound
+		// because this is where repo errors become domain kinds.
+		return repo.Agent{}, exchange.Newf(exchange.KindUnauthenticated,
+			"caller directory %q does not name a host", callerHost)
 	}
 	if !errors.Is(err, repo.ErrAgentNotFound) {
 		return repo.Agent{}, exchange.Wrap(exchange.KindInternal, err, "lookup caller")
 	}
 	if s.agentReg == nil {
 		return repo.Agent{}, exchange.Newf(exchange.KindUnauthenticated,
-			"caller keyID %q not registered as an agent or broker", keyID)
+			"caller directory %q not registered as an agent or broker", callerHost)
 	}
-	// keyID IS the agent's domain anchor (ADR-009 D3/D4): pull its own
-	// manifest, verify the key is published there, persist. manifestURL ==
-	// keyID so agentreg's host-anchoring guard is satisfied.
-	if regErr := s.agentReg.RegisterFromManifest(ctx, keyID, keyID); regErr != nil {
-		s.logger.WarnContext(ctx, "lazy agent registration failed",
-			"caller_keyid", keyID, "err", regErr)
-		return repo.Agent{}, mapLazyRegisterError(keyID, regErr)
+	// The Signature-Agent directory IS the agent's discovery anchor: fetch its
+	// own WBA file, pin the currently-valid key, persist. directoryURL ==
+	// directory so agentreg's host-anchoring guard is satisfied.
+	if regErr := s.agentReg.RegisterFromDirectory(ctx, callerHost, callerHost); regErr != nil {
+		reqctx.FromContext(ctx).WarnContext(ctx, "lazy agent registration failed",
+			"caller_directory", callerHost, "err", regErr)
+		return repo.Agent{}, mapLazyRegisterError(callerHost, regErr)
 	}
-	agent, err = s.agents.ByID(ctx, keyID)
+	agent, err = s.agents.ByID(ctx, callerHost)
 	if err != nil {
 		if errors.Is(err, repo.ErrAgentNotFound) {
 			return repo.Agent{}, exchange.Newf(exchange.KindUnauthenticated,
-				"caller keyID %q not registered after lazy registration", keyID)
+				"caller directory %q not registered after lazy registration", callerHost)
 		}
 		return repo.Agent{}, exchange.Wrap(exchange.KindInternal, err, "lookup caller after registration")
 	}
-	s.logger.InfoContext(ctx, "lazy agent registration ok", "caller_keyid", keyID)
+	reqctx.FromContext(ctx).InfoContext(ctx, "lazy agent registration ok", "caller_directory", callerHost)
 	return agent, nil
 }
 
@@ -279,72 +278,4 @@ func authorizeForAgent(caller Caller, agentID string, allowBrokerRelay bool) *ex
 	default:
 		return exchange.Newf(exchange.KindUnauthenticated, "unclassified caller")
 	}
-}
-
-// resolveCallerAndBinding detects whether the request is single-sig or
-// multisig and returns the authorized caller and agent binding. For multisig
-// requests (agent + broker), authorizes the broker relay and binds to the
-// AGENT's key. For single-sig requests, binds to the caller's key.
-func (s *ExchangeService) resolveCallerAndBinding(
-	ctx context.Context, agentID string, tenant repo.Tenant,
-) (Caller, agentBinding, error) {
-	allSigs := httpsig.AllSignaturesFromContext(ctx)
-
-	if len(allSigs) > 1 {
-		// Multisig path: agent + broker relay
-		agent, relay, err := s.resolveMultisigCaller(ctx, allSigs)
-		if err != nil {
-			return Caller{}, agentBinding{}, err
-		}
-		// Authorize the relay (if present) through the canonical gate so the
-		// rule and its message live in one place and the rejection is audited
-		// like every other authz outcome (EE-03).
-		if authzErr := s.authorizeRelay(ctx, relay, agentID, tenant); authzErr != nil {
-			return Caller{}, agentBinding{}, authzErr
-		}
-		// CRITICAL: Authorize and bind to AGENT (not broker)
-		if authzErr := authorizeForAgent(agent, agentID, tenant.AllowBrokerRelay); authzErr != nil {
-			return s.rejectExecuteAuthz(ctx, agent, &tenant, agentID, authzErr)
-		}
-		binding, err := agentBindingFor(agent)
-		if err != nil {
-			return Caller{}, agentBinding{}, err
-		}
-		return agent, binding, nil
-	}
-
-	// Single-sig path
-	caller, err := s.resolveCaller(ctx)
-	if err != nil {
-		return Caller{}, agentBinding{}, err
-	}
-	// A broker may not be the sole signer on the delivery-URL binding path: the
-	// multisig dispatch above gates on signature COUNT, so a lone broker sig
-	// reaches here and would otherwise bind the URL to the broker's own key.
-	// There is no agent identity to bind to (ADR-013); a broker must relay WITH
-	// an agent signature (the multisig path). report_usage's own broker-relay
-	// path is unaffected — it does not route through resolveCallerAndBinding.
-	if caller.Kind == CallerBroker {
-		authzErr := exchange.Newf(exchange.KindPermissionDenied,
-			"broker %q may not act as sole signer; an agent co-signature is required", caller.KeyID)
-		return s.rejectExecuteAuthz(ctx, caller, &tenant, agentID, authzErr)
-	}
-	if authzErr := authorizeForAgent(caller, agentID, tenant.AllowBrokerRelay); authzErr != nil {
-		return s.rejectExecuteAuthz(ctx, caller, &tenant, agentID, authzErr)
-	}
-	binding, err := agentBindingFor(caller)
-	if err != nil {
-		return Caller{}, agentBinding{}, err
-	}
-	return caller, binding, nil
-}
-
-// rejectExecuteAuthz audits a REJECTED_AUTHZ outcome for the execute-transaction
-// path and returns the zero caller/binding with err, so resolveCallerAndBinding's
-// authz-failure sites stay a single line.
-func (s *ExchangeService) rejectExecuteAuthz(
-	ctx context.Context, caller Caller, tenant *repo.Tenant, agentID string, err *exchange.Error,
-) (Caller, agentBinding, error) {
-	s.logOutcome(ctx, "execute_transaction", "REJECTED_AUTHZ", caller, tenant, agentID, "", err)
-	return Caller{}, agentBinding{}, err
 }

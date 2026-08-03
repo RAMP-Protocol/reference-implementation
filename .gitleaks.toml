@@ -1,7 +1,7 @@
 # Gitleaks configuration for the public reference implementation.
 #
 # Extends the default ruleset (real secrets still fail the scan) and allowlists
-# two categories so the secret-scan gate stays meaningful instead of drowning
+# three categories so the secret-scan gate stays meaningful instead of drowning
 # in false positives:
 #
 #   1. Build/test artifacts — virtualenvs, node_modules, bytecode. These are
@@ -10,11 +10,20 @@
 #      scanner walks the filesystem, so it would otherwise flag example keys
 #      embedded in third-party libraries (authlib, pyjwt, cryptography, …).
 #
-#   2. Throwaway demo / e2e / conformance key material. Public keys, test
-#      seeds, and a CloudFront key-pair id (a public identifier). These sign
-#      nothing in production — they exist so the e2e stack and cross-language
-#      conformance tests run out-of-the-box. The real production signing key
-#      is never committed.
+#   2. Throwaway demo / e2e / conformance / terraform-test key material. Public
+#      keys, test seeds, key-shaped test fixtures, and a CloudFront key-pair id
+#      (a public identifier). These sign nothing in production — they exist so
+#      the e2e stack, the cross-language conformance tests and the terraform
+#      module suites run out-of-the-box. The real production signing key is
+#      never committed.
+#
+#   3. Documentation of key FORMATS, matched by content rather than by path or
+#      line number. Operator docs necessarily show what a PEM header looks like
+#      and what a startup log line contains; those strings are not key material.
+#      See the `regexes` block below for the exact cases and why each is
+#      safe. Content-matching keeps the exemption stable across edits without
+#      exempting a whole file — a real key pasted into one of those same
+#      documents is still caught.
 #
 # A genuine private key added anywhere outside these paths still fails the gate.
 
@@ -22,7 +31,46 @@
 useDefault = true
 
 [allowlist]
-description = "Build/test artifacts (never published) + throwaway demo key material (no production secrets)."
+description = "Build/test artifacts (never published) + throwaway demo key material + documented key FORMATS (no production secrets)."
+
+# Reviewed false positives, matched against the finding's MATCH text so the
+# exemption survives edits that move the line. Each is a documentation string
+# that describes the shape of key material without containing any.
+#
+#   1. `x509.MarshalPKCS8PrivateKey` — a Go stdlib symbol in a comment in
+#      internal/pemkeys/pemkeys.go explaining why the PEM block is labelled
+#      "PRIVATE KEY". A function name, flagged only for its entropy.
+#   2. A truncated `keyid` in a sample startup log line in broker/DEPLOYMENT.md.
+#      A key id is a PUBLIC thumbprint, and this one is elided with a literal
+#      "..." — requiring that ellipsis is what keeps the exemption from covering
+#      a real value.
+#
+# BOTH ARE ANCHORED TO A SINGLE LINE, and that is what makes them safe. The
+# default private-key rule is
+#
+#     -----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY( BLOCK)?-----[\s\S-]*KEY( BLOCK)?----
+#
+# whose body is GREEDY: one match runs from the first PEM header in a file to the
+# LAST "KEY----" anywhere below it. An unanchored exemption is tested against
+# that whole multi-line match text, so it suppresses everything between the two
+# anchors — including a real key pasted in between. Measured: a genuine Ed25519
+# key placed after a quoted header and a mention of the Go symbol above scanned
+# clean under the unanchored form.
+#
+# `^[^\n]*...[^\n]*$` cannot match text containing a newline, so the exemption
+# applies to a one-line finding and never to a span. `regexTarget = "line"` does
+# NOT achieve this — measured, it still masks. Verified in five states: both
+# false positives stay suppressed, the three operator docs stay clean, and a real
+# key in either masking arrangement is caught.
+#
+# Keep any new exemption anchored the same way. An exemption that can match
+# across lines is an exemption over an arbitrary region of the file.
+regexTarget = "match"
+regexes = [
+  '''^[^\n]*x509\.MarshalPKCS8PrivateKey[^\n]*$''',
+  '''^[^\n]*keyid":"[A-Za-z0-9_/+=-]{8,}\.\.\."[^\n]*$''',
+]
+
 paths = [
   # Build/test artifacts — gitignored, never published.
   '''(^|/)\.venv/''',
@@ -36,4 +84,15 @@ paths = [
   '''(^|/)testdata/[^/]*\.json$''',
   '''(^|/)tests/e2e/harness/seed\.py$''',
   '''(^|/)scripts/mint-signed-url\.py$''',
+  # Terraform module test fixtures. The compose-stack suite feeds the module
+  # PEM-shaped and password-shaped values so it can assert what the rendered
+  # cloud-init does and does not contain, and its provider mocks mean the suite
+  # reaches no cloud account and needs no credentials. A path exemption rather
+  # than a content one, because the alternative is not available here: the
+  # private-key match in that file runs from the first header on line 29 to the
+  # last "KEY-----" on line 216, and the rule above is that an exemption must be
+  # anchored to a single line. Scoped to this one module on purpose — another
+  # module's suite growing a key-shaped fixture should fail the gate and be
+  # added here deliberately.
+  '''(^|/)deploy/terraform/modules/compose-stack/tests/[^/]*\.tftest\.hcl$''',
 ]

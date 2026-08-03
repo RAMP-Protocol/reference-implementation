@@ -44,13 +44,18 @@ func TestCache_GetAndAuthorizes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if !rampwellknown.AuthorizesContributor(m, "pub.example") {
+	// This package cannot import the identity rule (internal/agentid is built on
+	// it), so what it can assert is the predicate's own logic — self, listed,
+	// stranger — under a rule that folds nothing. The folding behaviour is pinned
+	// where the real rule lives, in the Exchange's contributor tests.
+	verbatim := rampwellknown.Identity(func(s string) (string, error) { return s, nil })
+	if !rampwellknown.AuthorizesContributor(m, "pub.example", verbatim) {
 		t.Error("publisher domain should authorize itself")
 	}
-	if !rampwellknown.AuthorizesContributor(m, "verifier.example") {
+	if !rampwellknown.AuthorizesContributor(m, "verifier.example", verbatim) {
 		t.Error("listed contributor should be authorized")
 	}
-	if rampwellknown.AuthorizesContributor(m, "stranger.example") {
+	if rampwellknown.AuthorizesContributor(m, "stranger.example", verbatim) {
 		t.Error("unlisted caller must not be authorized")
 	}
 }
@@ -60,9 +65,8 @@ func TestCache_RoleAssert(t *testing.T) {
 	// The negative-cache path (404 → ErrNoManifest), including stickiness and
 	// expiry, is covered by cache_behaviors_test.go's
 	// TestCache_NegativeCacheStickyThenExpires.
-	_, key := testutil.NewSigningKey("k", anchor.Add(-time.Hour), anchor.Add(time.Hour))
 	origin := testutil.NewOrigin(testutil.MarshalManifest(
-		testutil.Manifest(rampwellknown.RoleAgent, "a.example", key),
+		testutil.Manifest(rampwellknown.RoleAgent, "a.example"),
 	))
 	defer origin.Close()
 	c := newPublisherCache(clock.NewDeterministic(anchor))

@@ -7,6 +7,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"errors"
+	"log/slog"
+	"math/big"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,6 +37,11 @@ type recordingAdapter struct {
 	refundCalls   []refundCall
 	// failRecord, when non-nil, is returned by Record instead of forwarding.
 	failRecord error
+	// beforeRecord, when non-nil, runs at the start of Record (before forwarding to
+	// the inner adapter). Used to mutate external state — e.g. a fee override —
+	// between Authorize and settlement, to prove the settled rate was frozen at
+	// Authorize and is not re-resolved at Record.
+	beforeRecord func()
 }
 
 type recordCall struct {
@@ -58,6 +66,10 @@ func newRecordingAdapter(inner billing.Adapter) *recordingAdapter {
 	return &recordingAdapter{inner: inner}
 }
 
+func (r *recordingAdapter) EnsureAgentAccount(ctx context.Context, billingRef string) error {
+	return r.inner.EnsureAgentAccount(ctx, billingRef)
+}
+
 func (r *recordingAdapter) Authorize(ctx context.Context, req billing.AuthorizeRequest) (billing.AuthorizeResult, error) {
 	r.mu.Lock()
 	r.authorizeKeys = append(r.authorizeKeys, req.IdempotencyKey)
@@ -69,7 +81,11 @@ func (r *recordingAdapter) Record(ctx context.Context, billingID string, qty int
 	r.mu.Lock()
 	r.recordCalls = append(r.recordCalls, recordCall{BillingID: billingID, Qty: qty, Key: key})
 	fail := r.failRecord
+	hook := r.beforeRecord
 	r.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if fail != nil {
 		return fail
 	}
@@ -154,9 +170,11 @@ func newRecordingHarness(t *testing.T) (*testHarness, *recordingAdapter) {
 // recording pair; callers must not set opts.inner / opts.server.
 func newRecordingHarnessWith(t *testing.T, opts harnessOptions) (*testHarness, *recordingAdapter) {
 	t.Helper()
+	// Seed under the billing_ref the harness registers the caller under, not the
+	// agent id: the charge path keys the ledger account on the ref.
 	inner := billing.NewInMemoryAdapter(billing.InMemoryOptions{
 		Balances: map[string]billing.Amount{
-			"agent-test": mustBillingAmount(t, "10.00", "USD"),
+			defaultCallerBillingRef: mustBillingAmount(t, "10.00", "USD"),
 		},
 	})
 	rec := newRecordingAdapter(inner)
@@ -190,10 +208,21 @@ func (failKeyStore) RSA(string) (*rsa.PrivateKey, error) {
 // TestExecuteTransaction_RecordsOnExecute asserts that billing.Record is called
 // exactly once during ExecuteTransaction, with the estimated quantity from the
 // offer, and that the balance is debited accordingly. The pre-task-05 design
-// (docs/design/design-exchange.md §ExecuteTransaction:555-569) is restored:
+// (the ExecuteTransaction ordering contract) is restored:
 // money commitment happens at Execute, not at ReportUsage.
 func TestExecuteTransaction_RecordsOnExecute(t *testing.T) {
 	h, rec := newRecordingHarness(t)
+
+	// Read the ref-keyed balance BEFORE the transaction so the assertion below can
+	// prove the charge decreased THIS account by exactly the settled amount — the
+	// account the agent registered under (AC 1). A charge that landed on
+	// the old agent-id-keyed account would leave h.billingRef's balance untouched
+	// and fail the decrease check.
+	before, err := h.billing.GetBalance(h.ctx, h.billingRef)
+	if err != nil {
+		t.Fatalf("GetBalance before: %v", err)
+	}
+
 	_, billingID := executeTransactionFor(t, h, 100)
 
 	if n := rec.recordCallCount(); n != 1 {
@@ -210,14 +239,17 @@ func TestExecuteTransaction_RecordsOnExecute(t *testing.T) {
 		t.Errorf("Record qty = %d, want 100 (estimated)", call.Qty)
 	}
 
-	// 10.00 - 0.05 * 100 = 5.00 (default fixture unit cost is 0.05/USD).
-	bal, err := h.billing.GetBalance(h.ctx, "agent-test")
+	// The ref-keyed account decreased by 0.05 × 100 = 5.00 (default fixture unit
+	// cost is 0.05/USD): settlement landed on h.billingRef, and 10.00 − 5.00 = 5.00.
+	bal, err := h.billing.GetBalance(h.ctx, h.billingRef)
 	if err != nil {
-		t.Fatalf("GetBalance: %v", err)
+		t.Fatalf("GetBalance after: %v", err)
 	}
-	want, _ := billing.NewAmount("5.00", "USD")
-	if bal.Value.Cmp(want.Value) != 0 {
-		t.Errorf("balance after Execute = %s; want 5.00", bal.Value.FloatString(4))
+	charge, _ := billing.NewAmount("5.00", "USD")
+	wantAfter := new(big.Rat).Sub(before.Value, charge.Value)
+	if bal.Value.Cmp(wantAfter) != 0 {
+		t.Errorf("ref-keyed balance after Execute = %s; want %s (decreased by 5.00)",
+			bal.Value.FloatString(4), wantAfter.FloatString(4))
 	}
 
 	// Release must NOT be called on the success path.
@@ -227,7 +259,7 @@ func TestExecuteTransaction_RecordsOnExecute(t *testing.T) {
 }
 
 // TestExecuteTransaction_RecordFailureLogsButSucceeds verifies the best-effort
-// stance documented in design-exchange.md:564 ("Log but don't fail —
+// documented stance ("Log but don't fail —
 // transaction is already committed."). A Record failure must not fail the
 // request; the agent still gets the signed URL.
 func TestExecuteTransaction_RecordFailureLogsButSucceeds(t *testing.T) {
@@ -252,7 +284,7 @@ func TestExecuteTransaction_RecordFailureLogsButSucceeds(t *testing.T) {
 }
 
 // TestReportUsage_DoesNotCallBilling asserts that ReportUsage never invokes
-// the billing adapter (per design-exchange.md §ReportUsage:765-810). Money
+// the billing adapter, per the ReportUsage contract. Money
 // commitment was at Execute; the report is a pure audit write.
 func TestReportUsage_DoesNotCallBilling(t *testing.T) {
 	h, rec := newRecordingHarness(t)
@@ -265,7 +297,7 @@ func TestReportUsage_DoesNotCallBilling(t *testing.T) {
 	rec.mu.Unlock()
 
 	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", Id: "r-audit",
+		Ver: "1.0", IdempotencyKey: "r-audit",
 		TransactionId: txID,
 		BillingId:     billingID,
 		Usage:         &rampv1.Usage{ConsumedQuantity: 80},
@@ -310,11 +342,11 @@ func TestReportUsage_ConcurrentSecondGetsFailedPrecondition(t *testing.T) {
 		go func(reportID string) {
 			defer wg.Done()
 			_, e := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-				Ver:           "1.0",
-				Id:            reportID,
-				TransactionId: txID,
-				BillingId:     billingID,
-				Usage:         &rampv1.Usage{ConsumedQuantity: 100},
+				Ver:            "1.0",
+				IdempotencyKey: reportID,
+				TransactionId:  txID,
+				BillingId:      billingID,
+				Usage:          &rampv1.Usage{ConsumedQuantity: 100},
 			}))
 			if e == nil {
 				okCount.Add(1)
@@ -361,7 +393,7 @@ func TestExecuteTransaction_ZeroEstimateChargesOneUnit(t *testing.T) {
 	}
 	// Default fixture unit cost is 0.05/USD; the zero estimate clamps to 1
 	// unit at Authorize, so the settled charge is 0.05: 10.00 - 0.05 = 9.95.
-	bal, err := h.billing.GetBalance(h.ctx, "agent-test")
+	bal, err := h.billing.GetBalance(h.ctx, h.billingRef)
 	if err != nil {
 		t.Fatalf("GetBalance: %v", err)
 	}
@@ -372,15 +404,49 @@ func TestExecuteTransaction_ZeroEstimateChargesOneUnit(t *testing.T) {
 	}
 }
 
+// assertBillingLifecycle asserts the three billing-lifecycle observations a
+// free/paid execute test cares about: whether Authorize ran, and the Record and
+// Release call counts. Extracted so the free-path suite states the trio once
+// instead of hand-writing the same three checks per test.
+func assertBillingLifecycle(t *testing.T, rec *recordingAdapter, wantAuthorized bool, wantRecord, wantRelease int) {
+	t.Helper()
+	if _, ok := rec.lastAuthorizeKey(); ok != wantAuthorized {
+		t.Errorf("Authorize called = %v, want %v", ok, wantAuthorized)
+	}
+	if n := rec.recordCallCount(); n != wantRecord {
+		t.Errorf("Record called %d time(s); want %d", n, wantRecord)
+	}
+	if n := rec.releaseCallCount(); n != wantRelease {
+		t.Errorf("Release called %d time(s); want %d", n, wantRelease)
+	}
+}
+
+// assertNoBillingHold asserts the billing adapter saw no reservation at all —
+// Authorize was never called and nothing was recorded — proving a paid item was
+// denied BEFORE any money was reserved. caseLabel names the denied case in the
+// failure message. The canonical check for every deny-before-Authorize test
+// (unregistered agent, deactivated account, SoR-unknown account).
+func assertNoBillingHold(t *testing.T, rec *recordingAdapter, caseLabel string) {
+	t.Helper()
+	if key, ok := rec.lastAuthorizeKey(); ok {
+		t.Errorf("Authorize was called (key=%q) for %s; want no hold taken", key, caseLabel)
+	}
+	if n := rec.recordCallCount(); n != 0 {
+		t.Errorf("Record called %d time(s) for %s; want 0", n, caseLabel)
+	}
+}
+
 // assertReleasedOnExecuteFailure drives a single ExecuteTransaction against the
 // recording harness, expects it to fail on the named hot-path step, and asserts
 // the post-Authorize reservation was released exactly once, Record was never
-// reached, and the balance is restored to the 10 USD seed. Shared by the two
-// release-on-failure tests.
-func assertReleasedOnExecuteFailure(t *testing.T, h *testHarness, rec *recordingAdapter, step string) {
+// reached, and the balance is restored to the 10 USD seed. Shared by the
+// release-on-failure tests. Returns the ExecuteTransaction error so callers can
+// additionally assert its connect.Code and message.
+func assertReleasedOnExecuteFailure(t *testing.T, h *testHarness, rec *recordingAdapter, step string) error {
 	t.Helper()
 	offer := pushDiscoverOffer(t, h, 100)
-	if _, err := executeOfferRaw(t, h, offer); err == nil {
+	_, execErr := executeOfferRaw(t, h, offer)
+	if execErr == nil {
 		t.Fatalf("expected ExecuteTransaction to fail on %s", step)
 	}
 	if n := rec.releaseCallCount(); n != 1 {
@@ -398,7 +464,7 @@ func assertReleasedOnExecuteFailure(t *testing.T, h *testHarness, rec *recording
 	if !ok || rel.Key == "" || rel.Key != authKey {
 		t.Errorf("Release key = %q, want non-empty and == Authorize key %q", rel.Key, authKey)
 	}
-	bal, err := h.billing.GetBalance(h.ctx, "agent-test")
+	bal, err := h.billing.GetBalance(h.ctx, h.billingRef)
 	if err != nil {
 		t.Fatalf("GetBalance: %v", err)
 	}
@@ -407,6 +473,7 @@ func assertReleasedOnExecuteFailure(t *testing.T, h *testHarness, rec *recording
 		t.Errorf("balance after released %s failure = %s; want 10.00 (reservation released)",
 			step, bal.Value.FloatString(4))
 	}
+	return execErr
 }
 
 // TestExecuteTransaction_ReleaseOnPersistFailure forces persistTransaction to
@@ -417,10 +484,45 @@ func TestExecuteTransaction_ReleaseOnPersistFailure(t *testing.T) {
 }
 
 // TestExecuteTransaction_ReleaseOnURLSignFailure forces mintSignedURL to fail
-// (injected failing keystore) and asserts the reservation is released
+// (injected failing keystore) and asserts the reservation is released. A broken
+// keystore is a server fault, so the wire code stays Internal — the control for
+// the deferred-RSA FailedPrecondition classification below.
 func TestExecuteTransaction_ReleaseOnURLSignFailure(t *testing.T) {
 	h, rec := newRecordingHarnessWith(t, harnessOptions{keystore: failKeyStore{}})
-	assertReleasedOnExecuteFailure(t, h, rec, "URL signing")
+	err := assertReleasedOnExecuteFailure(t, h, rec, "URL signing")
+	if code := connect.CodeOf(err); code != connect.CodeInternal {
+		t.Errorf("broken-keystore code = %v, want %v", code, connect.CodeInternal)
+	}
+}
+
+// TestExecuteTransaction_DeferredRSAKeyFailedPrecondition drives
+// ExecuteTransaction for a tenant on the AWS_CLOUDFRONT_RSA scheme against an
+// Exchange running without an RSA key — the deferred refusal provider
+// registered at the production ref, exactly the shape installRSAKey wires. The
+// refusal is operator-fixable configuration, not a server fault: the wire
+// carries CodeFailedPrecondition with a sanitized message (the env-var guidance
+// goes to the server log, where the operator reads it), and the billing
+// reservation is released.
+func TestExecuteTransaction_DeferredRSAKeyFailedPrecondition(t *testing.T) {
+	buf := &safeBuffer{}
+	h, rec := newRecordingHarnessWith(t, harnessOptions{
+		deferredRSATenant: true,
+		logger:            slog.New(slog.NewJSONHandler(buf, nil)),
+	})
+	err := assertReleasedOnExecuteFailure(t, h, rec, "deferred RSA refusal")
+	if code := connect.CodeOf(err); code != connect.CodeFailedPrecondition {
+		t.Errorf("deferred-RSA code = %v, want %v", code, connect.CodeFailedPrecondition)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "delivery URL signing is not provisioned") {
+		t.Errorf("caller message = %q, want the sanitized not-provisioned text", msg)
+	}
+	if strings.Contains(msg, "RAMP_RSA_PRIVATE_PEM") {
+		t.Errorf("caller message leaks operator env-var guidance: %q", msg)
+	}
+	if logs := buf.String(); !strings.Contains(logs, "RAMP_RSA_PRIVATE_PEM") {
+		t.Errorf("server log does not name RAMP_RSA_PRIVATE_PEM for the operator:\n%s", logs)
+	}
 }
 
 // TestExecuteTransaction_ThreadsIdempotencyKeyOnSuccess asserts the billing

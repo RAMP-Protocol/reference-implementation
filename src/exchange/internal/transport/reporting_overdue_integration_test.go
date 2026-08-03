@@ -25,7 +25,9 @@ func TestExecuteTransaction_ReportingOverdue_Denied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed execute: %v", err)
 	}
-	h.backdateObligationDeadline(t, seed.Msg.GetTransactionId())
+	// Items-only (C4 collapse): the transaction id lives on the single result
+	// item, not the removed top-level field.
+	h.backdateObligationDeadline(t, singleResultItem(t, seed).GetTransactionId())
 
 	_, err = executeOfferRawWithID(t, h, pushDiscoverOffer(t, h, 1), "tx-gated")
 	assertConnectError(t, err, connect.CodeFailedPrecondition, "reporting overdue")
@@ -44,10 +46,12 @@ func TestExecuteTransaction_ReportingOverdue_Denied(t *testing.T) {
 	}
 
 	// The gate runs before resolveBilling, so the denied tx reserves no funds.
-	// The only Authorize must be the seed; if "tx-gated" authorized, a reorder
-	// past billing has leaked a hold.
-	if key, _ := rec.lastAuthorizeKey(); key != "tx-seed" {
-		t.Errorf("gated tx reserved funds: last Authorize key = %q, want %q", key, "tx-seed")
+	// The only Authorize must be the seed's; if "tx-gated" authorized, a reorder
+	// past billing has leaked a hold. Items-only billing keys on the DERIVED
+	// per-item key (idempotency_key:offer_id), so the seed's Authorize key is
+	// prefixed "tx-seed:" — assert the last Authorize is the seed's, not "tx-gated".
+	if key, _ := rec.lastAuthorizeKey(); !strings.HasPrefix(key, "tx-seed") {
+		t.Errorf("gated tx reserved funds: last Authorize key = %q, want prefix %q", key, "tx-seed")
 	}
 }
 
@@ -64,13 +68,13 @@ func TestExecuteTransaction_NoOverdue_Proceeds(t *testing.T) {
 	}
 	// Discriminator: the first tx must leave a *live* PENDING obligation. If it
 	// did not, the second execute would trivially pass and prove nothing.
-	assertObligationPending(t, h, first.Msg.GetTransactionId())
+	assertObligationPending(t, h, singleResultItem(t, first).GetTransactionId())
 
 	resp, err := executeOfferRawWithID(t, h, pushDiscoverOffer(t, h, 1), "tx-2")
 	if err != nil {
 		t.Fatalf("second execute denied unexpectedly: %v", err)
 	}
-	if resp.Msg.GetTransactionId() == "" {
+	if singleResultItem(t, resp).GetTransactionId() == "" {
 		t.Fatalf("second execute returned empty transaction id")
 	}
 }

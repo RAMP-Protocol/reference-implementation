@@ -5,7 +5,6 @@
 - `docs/architecture/adr-002-entitlement-biscuit-model.md` — protocol-level TTL constants (≤10m attenuation, contract `valid_until`) are values; this ADR pins how those values are consulted at runtime so test-time and production-time read from the same port.
 - `docs/architecture/adr-004-protocol-layers.md` — "refusal is the product" demands a refusal vocabulary; this ADR makes the vocabulary structured and enumerable.
 **Companion documents:**
-- `CLAUDE.md` Testing Doctrine — this ADR formalises the structural commitments that doctrine assumes.
 - `docs/architecture/adr-005-biscuit-transport-canonical-binding.md` — Gate F's clock-dependence is one of D1's beneficiaries.
 - `docs/architecture/adr-006-broker-intermediation.md` — D2's structured-vocabulary discipline mirrors ADR-006's `authorized_intermediaries` discipline applied to a different surface.
 
@@ -63,7 +62,7 @@ Tests that document a contract the production system has not yet implemented use
 
 **Rationale**: A contract that exists in the test suite but cannot fail-noisily is a contract that is being silently postponed. Strict mode makes the postponement visible at exactly the moment production catches up — the test flips from xfail to failure (because it's now expected to fail strictly but it passes), forcing the marker to be removed and the test to become a real regression guard. The lenient form was originally intended as a transition state for the window between "test landed encoding the contract" and "production caught up," but every variant of "transition state" is an attractor for forgotten obligations: strict mode IS the transition state, because the build breaks the moment the transition is complete and the marker must be removed. There is no scenario in which lenient mode produces signal a strict marker plus an open issue-tracker entry doesn't produce more cleanly.
 
-**Operational complement**: when a strict-mode flip surfaces as a regression against a previously-green build, route it through the regression-diagnostic-predecessor pattern (`.claude/rules/workflows/regression-diagnostic-predecessor.md`) — its taxonomy distinguishes shipped bugs from exposed latent bugs (the dominant case under D3) and prevents panic-reverts of the marker change.
+**Operational complement**: when a strict-mode flip surfaces as a regression against a previously-green build, route it through a diagnostic-first investigation before any fix — a taxonomy that distinguishes shipped bugs from exposed latent bugs (the dominant case under D3) and prevents panic-reverts of the marker change.
 
 ### D4 — Concurrent task executions run in isolated working copies
 
@@ -77,7 +76,7 @@ When two or more tasks execute concurrently against the same repository — whet
 
 **Merge before teardown**: the orchestration primitive that returns concurrent tasks MUST merge each worktree's commits to the main tree BEFORE invoking any teardown call. Teardown without a prior merge is a protocol violation: the worktree's history — including the executor's outputs — is unrecoverable once the directory is removed.
 
-**Executor outputs land in commits before handoff**: an executor that produces output the team-lead will read after handoff (a diagnostic file, a generated artifact, a beads-task body, anything the next phase consumes) MUST commit that output inside its worktree before signaling completion. The team-lead's merge step then carries it to the main tree. Outputs left uncommitted at handoff are indistinguishable from outputs that never existed.
+**Executor outputs land in commits before handoff**: an executor that produces output the team-lead will read after handoff (a diagnostic file, a generated artifact, a task description, anything the next phase consumes) MUST commit that output inside its worktree before signaling completion. The team-lead's merge step then carries it to the main tree. Outputs left uncommitted at handoff are indistinguishable from outputs that never existed.
 
 **Rationale**: Project-wide tooling (formatters, linters, code generators, dependency-graph builders) is a real and load-bearing part of the build. A "don't touch the same files" honour system fails the moment such tooling runs from inside a concurrent task: its writes are nominally outside the caller's scope but functionally affect every peer. Worktree isolation makes the property structural: a task literally cannot see or affect peers' in-progress edits. The durability constraints above are the dual property — isolation that keeps peers from seeing each other's edits is the same mechanism that makes uncommitted edits invisible to the team-lead at teardown, and the discipline that closes the gap is to commit before signaling and merge before tearing down.
 
@@ -133,4 +132,3 @@ Each test declares its stack-isolation requirement explicitly. Three modes:
 - ADR-004 — protocol layers ("refusal is the product"; D2 makes the refusal vocabulary structured and enforceable).
 - ADR-005 — biscuit transport carriage and canonical-form binding (every gate Gate F composes with consults time, and benefits from D1).
 - ADR-006 — broker intermediation (D2's structured-vocabulary discipline is the same shape as ADR-006's `authorized_intermediaries` discipline applied to a different surface).
-- `CLAUDE.md` Testing Doctrine — this ADR formalises the structural commitments that doctrine assumes.

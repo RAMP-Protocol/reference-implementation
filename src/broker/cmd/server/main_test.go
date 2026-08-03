@@ -9,13 +9,16 @@ import (
 	"testing"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/resolve"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/signing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport"
 )
 
 // TestBrokerMux_RequestIDCoversWellKnownRoutes asserts the root request-id wrap
-// applied in run() covers the public well-known + invalidation routes — not just
+// applied in run() covers the public well-known + revocation routes — not just
 // /broker/v1/resolve — so every route echoes/sets X-Request-ID, matching the
 // Exchange's root-level wrap (LT4). Previously only the resolve route was
 // wrapped, leaving these two routes without request-id correlation.
@@ -31,17 +34,18 @@ func TestBrokerMux_RequestIDCoversWellKnownRoutes(t *testing.T) {
 	}
 	logger := testutil.DiscardLogger()
 	mux := buildBrokerMux(brokerMuxDeps{
-		resolveDeps: transport.Deps{},
+		// These tests exercise non-resolve routes, so an empty resolveDeps suffices.
+		resolveDeps: resolve.Deps{},
 		signer:      signer,
 		brokerID:    "broker-1",
 		agentKeys:   transport.NewKeyRegistry(),
 	})
-	// Mirror run(): request-id outermost, wrapping the httpsig-wrapped mux. The
-	// well-known routes are public (brokerSigRequestPredicate), so httpsig passes
-	// them through unverified.
-	handler := transport.RequestIDMiddleware(logger, wrapWithHTTPSig(mux, transport.NewKeyRegistry(), nil, nil))
+	// Mirror run(): WrapPublicSurface wraps the whole mux (request-id outermost +
+	// URL normalization). The well-known routes are public (not under the
+	// BrokerService connectserver gate), so they pass through and return 200.
+	handler := transport.WrapPublicSurface(logger, mux, runhttp.PublicSurfaceOptions{})
 
-	for _, path := range []string{rampwellknown.Path, rampwellknown.InvalidationPath} {
+	for _, path := range []string{rampwellknown.Path, rampwellknown.RevocationPath} {
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, http.NoBody)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -61,4 +65,83 @@ func TestBrokerMux_RequestIDCoversWellKnownRoutes(t *testing.T) {
 	if got := rec.Header().Get("X-Request-ID"); got != "corr-123" {
 		t.Errorf("X-Request-ID = %q, want corr-123 (echoed)", got)
 	}
+}
+
+// TestBrokerMux_BespokeResolveRouteGone pins the ADR-019 contract
+// cleanup: the bespoke POST /broker/v1/resolve route no longer exists on the
+// production mux. The ONLY agent surface is the Connect endpoint
+// ramp.v1.BrokerService/Resolve (registered in the same buildBrokerMux), so a
+// GET *and* a POST to the old path must both return 404 from the mux.
+//
+// This is a behavioral assertion through the production mux (buildBrokerMux),
+// not a structural source scan: the mux is the outermost surface that owns
+// routing, so a request that finds no registered pattern returns 404. It drives
+// the real server via httptest. On HEAD the route IS registered
+// (main.go:222 mux.Handle("POST /broker/v1/resolve", resolve)), so a POST is
+// matched (returns 200/non-404) and a GET to a path with only a POST handler
+// returns 405 Method Not Allowed — NOT 404. After the route is deleted, both
+// verbs fall through to the mux default → 404. FAILS on HEAD, PASSES after
+// removal.
+func TestBrokerMux_BespokeResolveRouteGone(t *testing.T) {
+	t.Parallel()
+	_, relayPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("relay keygen: %v", err)
+	}
+	signer, err := signing.NewCoSigner("broker.example", "broker-1", relayPriv, nil)
+	if err != nil {
+		t.Fatalf("cosigner: %v", err)
+	}
+	logger := testutil.DiscardLogger()
+	mux := buildBrokerMux(brokerMuxDeps{
+		// These tests exercise non-resolve routes, so an empty resolveDeps suffices.
+		resolveDeps: resolve.Deps{},
+		signer:      signer,
+		brokerID:    "broker-1",
+		agentKeys:   transport.NewKeyRegistry(),
+	})
+	// Mirror run(): WrapPublicSurface wraps the whole mux (request-id + URL
+	// normalization), matching how production routes every route.
+	handler := transport.WrapPublicSurface(logger, mux, runhttp.PublicSurfaceOptions{})
+
+	const bespokePath = "/broker/v1/resolve"
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		req := httptest.NewRequestWithContext(context.Background(), method, bespokePath, http.NoBody)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s: status = %d, want 404 (bespoke route must be gone; only the Connect endpoint exists)",
+				method, bespokePath, rec.Code)
+		}
+	}
+}
+
+// bootstrapRegistry must tolerate an unset BROKER_REGISTRY_FILE. It seeds
+// nothing in that case — no Exchange is registered until the operator supplies
+// a file — and, critically, it must not reach the YAML decoder: a zero-byte
+// document decodes to io.EOF, which would abort the boot of every Broker that
+// has not configured a registry file yet.
+func TestBootstrapRegistry_NoFileSeedsNothingAndDoesNotError(t *testing.T) {
+	t.Setenv("BROKER_REGISTRY_FILE", "")
+
+	repoStub := &countingExchangeRepo{}
+	if err := bootstrapRegistry(context.Background(), repoStub, testutil.DiscardLogger()); err != nil {
+		t.Fatalf("bootstrapRegistry with no file: %v", err)
+	}
+	if repoStub.upserts != 0 {
+		t.Errorf("expected zero seeded exchanges, got %d", repoStub.upserts)
+	}
+}
+
+// countingExchangeRepo records how many rows bootstrapRegistry tried to seed.
+type countingExchangeRepo struct {
+	repo.ExchangeRepo
+	upserts int
+}
+
+func (c *countingExchangeRepo) UpsertFromBootstrap(
+	_ context.Context, m repo.Exchange,
+) (repo.Exchange, error) {
+	c.upserts++
+	return m, nil
 }

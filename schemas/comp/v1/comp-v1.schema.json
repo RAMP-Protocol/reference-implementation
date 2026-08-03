@@ -1,0 +1,640 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ramp-protocol.org/schemas/comp/v1/comp-v1.schema.json",
+  "title": "CoMP V1 \u2014 Content Monetization Protocols (supply + request)",
+  "description": "JSON Schema (Draft 2020-12) for canonical CoMP V1, derived from IABTechLab/CoMP@main CoMP-1.0.md (commit 08c0181a). CoMP V1 ships as a Markdown spec with no upstream machine-readable schema; this fills that gap. A CoMP document carries a request-side aisystem and/or a supply-side package. Every canonical object forbids unknown keys (additionalProperties:false); non-CoMP extensions live under a nested open ext object.",
+  "type": "object",
+  "minProperties": 1,
+  "additionalProperties": false,
+  "properties": {
+    "aisystem": {
+      "$ref": "#/$defs/AISystem"
+    },
+    "package": {
+      "$ref": "#/$defs/Package"
+    },
+    "ext": {
+      "type": "object",
+      "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+    }
+  },
+  "$defs": {
+    "AISystem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "aisysuse"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "ua": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "aisysuse": {
+          "$ref": "#/$defs/AISystemUse"
+        },
+        "ext": {
+          "type": "object",
+          "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+        }
+      }
+    },
+    "AISystemUse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lid",
+        "aiauth"
+      ],
+      "properties": {
+        "lid": {
+          "type": "string"
+        },
+        "aiauth": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "uri": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "scope": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ]
+        },
+        "function": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "enum": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        },
+        "subfn": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "enum": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        },
+        "resdis": {
+          "type": "integer"
+        },
+        "ext": {
+          "type": "object",
+          "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+        }
+      }
+    },
+    "Package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "seller": {
+          "type": "string"
+        },
+        "packager": {
+          "type": "string"
+        },
+        "licenseurl": {
+          "type": "string"
+        },
+        "citation": {
+          "type": "integer"
+        },
+        "reporturl": {
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "retrieval": {
+          "$ref": "#/$defs/Retrieval"
+        },
+        "ext": {
+          "type": "object",
+          "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+        }
+      }
+    },
+    "Scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ]
+        },
+        "ause": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ]
+        },
+        "pricetype": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "pricetier": {
+          "type": "integer"
+        },
+        "unitprice": {
+          "type": "number"
+        },
+        "cur": {
+          "type": "string"
+        },
+        "country": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "licensedur": {
+          "type": "integer"
+        },
+        "max": {
+          "type": "integer"
+        },
+        "ctype": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "enum": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          }
+        },
+        "text": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Text"
+          }
+        },
+        "video": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Video"
+          }
+        },
+        "image": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Image"
+          }
+        },
+        "audio": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Audio"
+          }
+        },
+        "ext": {
+          "type": "object",
+          "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+        }
+      }
+    },
+    "Retrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auth": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "type": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "enum": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          }
+        },
+        "ext": {
+          "type": "object",
+          "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+        }
+      }
+    },
+    "Text": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "string or array of strings (canonical examples use both)"
+        },
+        "cattax": {
+          "type": "integer"
+        },
+        "cat": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "language": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "pubdate": {
+          "type": "string"
+        },
+        "published": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "update": {
+          "type": "string"
+        },
+        "author": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sourcetype": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "provenance": {
+          "type": "integer"
+        },
+        "provent": {
+          "type": "string"
+        },
+        "ext": {
+          "type": "object",
+          "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+        },
+        "wordcount": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "Video": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "string or array of strings (canonical examples use both)"
+        },
+        "cattax": {
+          "type": "integer"
+        },
+        "cat": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "language": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "pubdate": {
+          "type": "string"
+        },
+        "published": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "update": {
+          "type": "string"
+        },
+        "author": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sourcetype": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "provenance": {
+          "type": "integer"
+        },
+        "provent": {
+          "type": "string"
+        },
+        "ext": {
+          "type": "object",
+          "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+        },
+        "dur": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "clip": {
+          "type": "integer"
+        },
+        "wordcount": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "transcript": {
+          "type": "integer"
+        }
+      }
+    },
+    "Image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "string or array of strings (canonical examples use both)"
+        },
+        "cattax": {
+          "type": "integer"
+        },
+        "cat": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "language": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "pubdate": {
+          "type": "string"
+        },
+        "published": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "update": {
+          "type": "string"
+        },
+        "author": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sourcetype": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "provenance": {
+          "type": "integer"
+        },
+        "provent": {
+          "type": "string"
+        },
+        "ext": {
+          "type": "object",
+          "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+        }
+      }
+    },
+    "Audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "string or array of strings (canonical examples use both)"
+        },
+        "cattax": {
+          "type": "integer"
+        },
+        "cat": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "language": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "pubdate": {
+          "type": "string"
+        },
+        "published": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "update": {
+          "type": "string"
+        },
+        "author": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sourcetype": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "provenance": {
+          "type": "integer"
+        },
+        "provent": {
+          "type": "string"
+        },
+        "ext": {
+          "type": "object",
+          "description": "Open extension object; non-CoMP (e.g. RAMP) keys live here."
+        },
+        "dur": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "wordcount": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "transcript": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}
