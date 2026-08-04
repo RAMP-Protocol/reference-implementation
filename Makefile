@@ -2,6 +2,7 @@
 .PHONY: go-fmt go-fmt-check go-lint go-typecheck go-test test-integration test-zitadel test-e2e-collect
 .PHONY: db-up db-down db-logs dev-keys adr-001-check adr-008-d3-check sdk-pin-check
 .PHONY: stale-proto-names-check published-refs-check published-secrets-check test-terraform
+.PHONY: image-version-check
 .PHONY: zitadel-up zitadel-creds zitadel-logs zitadel-down
 .PHONY: edge-%
 .PHONY: test-e2e e2e-keys e2e-up e2e-down e2e-logs e2e-demo
@@ -33,7 +34,7 @@ help:
 	@echo ""
 	@echo "Per-subproject: make edge-<target> (e.g. edge-lint, edge-test)"
 
-quality: fmt lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3-check sdk-pin-check stale-proto-names-check published-refs-check published-secrets-check
+quality: fmt lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3-check sdk-pin-check stale-proto-names-check published-refs-check published-secrets-check image-version-check
 	@echo "All quality gates passed!"
 
 # CI variant of `quality`: formatting is CHECKED, never written. CI must not
@@ -41,7 +42,7 @@ quality: fmt lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3
 # silently auto-fixing them. (Go + edge formatting is also enforced by their
 # linters; tests/e2e Python formatting is enforced ONLY here.) Local
 # `make quality` keeps auto-formatting via `fmt`.
-quality-ci: fmt-check lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3-check sdk-pin-check stale-proto-names-check published-refs-check published-secrets-check
+quality-ci: fmt-check lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3-check sdk-pin-check stale-proto-names-check published-refs-check published-secrets-check image-version-check
 	@echo "All quality gates passed (CI, check-only fmt)!"
 
 file-length:
@@ -89,6 +90,13 @@ published-refs-check:
 # to the commit that would cause it. Needs gitleaks — `make install-tools`.
 published-secrets-check:
 	@scripts/check-published-secrets.sh
+
+# Keeps the published image version declared once per deployment document and
+# identical across the three. A release edits one line per document; a partial
+# edit would otherwise leave a document naming a tag nobody published, which
+# reads as correct right up to the "not found".
+image-version-check:
+	@scripts/check-image-version.sh
 
 fmt: go-fmt
 	@$(MAKE) -C src/edge fmt

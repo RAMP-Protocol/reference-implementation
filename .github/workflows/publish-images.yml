@@ -1,0 +1,146 @@
+# Builds the three RAMP service images and publishes them to the GitHub
+# Container Registry.
+#
+# WHAT STARTS IT. A tag whose name begins with "v", pushed to this repository,
+# or a manual run from the Actions tab. Publishing source and publishing images
+# are deliberately separate acts: a source snapshot on its own builds nothing,
+# so a documentation-only update never reissues the images.
+#
+# A manual run must select a TAG as its ref, not a branch. The version comes from
+# the tag and there is nowhere else to get it; a branch produces no version at
+# all, and the first step below stops the run rather than letting it fail later
+# with something less obvious.
+#
+# AUTHENTICATION. The per-run GITHUB_TOKEN and nothing else. No personal access
+# token is created, stored or rotated for this workflow.
+#
+# TAGS. Exactly one per build: the version from the git tag with the leading "v"
+# removed. There is no "latest" and no moving major or minor pointer, so a
+# published tag names one build for ever. Production should pin by digest
+# (@sha256:...), which every image carries whether or not it is tagged.
+#
+# ARCHITECTURE. linux/amd64 only. The Broker and the Identity service are pure
+# Go and would need no more than the extra platform here, but the Exchange links
+# a C library for the ledger client, so an x86 runner cannot build its arm64
+# variant. Adding ARM means an arm64 runner and a manifest merge.
+#
+# Third-party actions are pinned by commit rather than by tag, because whoever
+# owns an action can repoint its tags at any time.
+
+name: Publish container images
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # One publish per ref at a time, and never cancel a run that is under way. A
+  # half-finished release leaves some of the three images published and some
+  # not, which is worse than a slow queue.
+  group: publish-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    strategy:
+      # The three build independently. One failure must not hide the other two
+      # results, which is exactly what you need when a release breaks.
+      fail-fast: false
+      matrix:
+        include:
+          - service: exchange
+            dockerfile: src/exchange/Dockerfile
+          - service: broker
+            dockerfile: src/broker/Dockerfile
+          - service: identity
+            dockerfile: src/identity/Dockerfile
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Sign in to the registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive the image tag
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          # Lower case throughout: the registry refuses a mixed-case name.
+          images: ghcr.io/ramp-protocol/${{ matrix.service }}
+          # This list REPLACES the action's default rules. Keep it to the single
+          # entry: a default rule would publish tags that move.
+          tags: |
+            type=semver,pattern={{version}}
+          # Needed as well. The "latest" flavour defaults to "auto", which adds
+          # a latest tag on its own as soon as the ref is a version tag.
+          flavor: |
+            latest=false
+
+      - name: Refuse a run that has no version to publish
+        # A manual run can select any ref. On a branch the semver rule above
+        # matches nothing, so the tag list comes out empty. Without this step the
+        # build compiles all the way through and then fails inside the push, and
+        # the message it fails with does not say "you picked a branch".
+        #
+        # The ref reaches the script through the environment, never through an
+        # expression. GitHub substitutes an expression into the script TEXT
+        # before bash reads it, so at that point a ref name is command text.
+        # A ref name may hold $, backticks, parentheses, ; & and |. git does
+        # reject some characters — spaces, backslashes, control characters, and
+        # the revision syntax it needs for itself, : ? * [ ~ ^ — but not one of
+        # those omissions closes this hole. The job holds a token with
+        # packages: write for all three images.
+        #
+        # The message names no version. The tag is the only source of one, so an
+        # example here would be a second place to edit at release time, and the
+        # last one anybody would think to check.
+        if: steps.meta.outputs.tags == ''
+        env:
+          TRIGGER_REF: ${{ github.ref }}
+        run: |
+          echo "::error::No version tag was derived from ${TRIGGER_REF}. The version comes from the tag name and nowhere else: run this workflow against a tag whose name is the version to publish, with a leading v."
+          exit 1
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          # The repository root, because every service Dockerfile also copies
+          # the shared internal/ tree.
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # Only the two labels that cannot be known until the build runs. The
+          # rest — source, licenses, title, description — are baked into each
+          # Dockerfile, and passing the metadata action's full label set here
+          # would overwrite the per-service title and description with this
+          # repository's own name for all three images. There is no created
+          # label because the image config already records a creation time.
+          labels: |
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Off on purpose. With provenance on, the pushed tag resolves to an
+          # image index carrying an extra attestation entry, which is a
+          # multi-platform manifest in everything but name. One platform is
+          # published, so the tag should resolve straight to that one image.
+          provenance: false
+          # Without a cache every run recompiles Go from cold, several minutes
+          # per service. The scope keeps the three from evicting each other.
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

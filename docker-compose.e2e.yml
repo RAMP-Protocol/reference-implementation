@@ -919,6 +919,13 @@ services:
       # installing the CLI keeps the runner image small and avoids pinning a
       # client version against whatever daemon the host happens to run.
       - /var/run/docker.sock:/var/run/docker.sock
+      # The revocation e2e writes revocations.json through the harness tree, and
+      # the broker service above reads THE SAME host directory at /revocations
+      # (BROKER_REVOCATION_FILE). The mount is what makes the write cross the
+      # container boundary. Without it the path resolves inside the runner
+      # image's own layer — the directory is there, because COPY brought
+      # .gitkeep in, so the write succeeds and the Broker never sees a byte.
+      - ./tests/e2e/harness/revocations:/runner/harness/revocations
     depends_on:
       exchange:
         condition: service_started

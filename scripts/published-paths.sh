@@ -30,6 +30,7 @@ ALLOW_DIRS=(
   deploy
   schemas
   docs/architecture
+  .github
 )
 # schemas/ is load-bearing, not documentation: src/exchange/internal/comptest/schema_test.go
 # reads schemas/comp/v1/comp-v1.schema.json and carries NO build tag, so its absence fails
@@ -38,6 +39,17 @@ ALLOW_DIRS=(
 # docs/architecture is the ONLY docs/ path published, by owner decision. Cross-references
 # from published files into the rest of docs/ are cleaned in the citing file rather than
 # resolved by widening this list.
+#
+# .github holds the workflow that builds and publishes the service container images. It
+# has to be authored HERE rather than on the public repository, because the publish
+# rebuilds the public tree from this list and deletes everything it does not reproduce —
+# a workflow created directly on GitHub would survive exactly until the next publish.
+#
+# CAUTION, and it applies to every entry here: an ALLOW_DIRS entry copies the WHOLE
+# subtree. Anything added under .github/ later reaches the public repository on the next
+# publish with no further decision. ALLOW_SCRIPTS below is per-file and this array is not,
+# so if .github/ ever needs to hold something that must stay private, the granularity has
+# to be built first.
 
 # --- Root-level build/config files (required to build/test) ---
 ALLOW_ROOT_FILES=(
@@ -71,6 +83,9 @@ ALLOW_SCRIPTS=(
   # Scans the same derived set for secrets, so a key reaching a published path
   # fails the branch rather than the publish. Ships for the same reason.
   scripts/check-published-secrets.sh
+  # Keeps the three deployment documents agreeing on one published image version.
+  # Those documents ship, so the check on them has to ship with them.
+  scripts/check-image-version.sh
 
   # Local stack + e2e bootstrap. The e2e key material is generated at bootstrap
   # (it is gitignored, never committed), so without these the published stack has

@@ -26,12 +26,14 @@ scanned an empty tree.
 Unlike its sibling guards, the subject here is a shell script rather than Python
 source, so there is no pure detector function to feed inline snippets to. The
 cases build synthetic trees under ``tmp_path`` and run the real script against
-them through ``RAMP_PUBLISHED_REFS_ROOT`` — the seam exists for exactly this, and
+them through its ``--root`` argument — the seam exists for exactly this, and
 testing the shipped artifact rather than a reimplementation of it is the point.
+An argument rather than an environment variable, because a variable that selects
+what a gate reads can redirect it in production too.
 
-Pure subprocess work: no stack, no Docker, no database. ``stack_isolation
-("isolated")`` makes the autouse cleanup dispatch a no-op, which would otherwise
-resolve a live Postgres DSN this test has no use for.
+Pure subprocess work: no stack, no Docker, no database. The marks come from
+``guard_harness.guard_marks``, whose docstring says why the isolation one is
+there.
 """
 
 from __future__ import annotations
@@ -39,9 +41,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from .conftest import REPO_ROOT
+from .guard_harness import guard_marks, run_gate
 from .published_paths import shared_array as _shared_array
 
 # REPO_ROOT rather than a parents[N] walk: inside the runner container the
@@ -50,18 +51,10 @@ from .published_paths import shared_array as _shared_array
 # tier rather than this one module.
 _GATE = REPO_ROOT / "scripts" / "check-published-refs.sh"
 
-# `isolated` makes the autouse cleanup dispatch a no-op — it would otherwise
-# resolve a live Postgres DSN this module has no use for. The skip covers the
-# container leg: scripts/ is not COPYed into the runner image and not
-# bind-mounted, so there is nothing to drive there. The host `test-fast` target
-# runs this module on every commit, so the skip costs no coverage.
-pytestmark = [
-    pytest.mark.stack_isolation("isolated"),
-    pytest.mark.skipif(
-        not _GATE.is_file(),
-        reason="scripts/ is absent from the e2e runner image; this guard runs on the host",
-    ),
-]
+# The skip covers the container leg: scripts/ is not COPYed into the runner image
+# and not bind-mounted, so there is nothing to drive there. The host `test-fast`
+# target runs this module on every commit, so the skip costs no coverage.
+pytestmark = guard_marks(skip_when=not _GATE.is_file())
 
 # One reference of each kind the gate exists to reject. All are resolvable in
 # this repository and unresolvable in the published one, which is the whole
@@ -123,19 +116,8 @@ def _build_tree(root: Path) -> None:
 
 
 def _run_gate(root: Path) -> subprocess.CompletedProcess[str]:
-    """Run the shipped gate against ``root``.
-
-    The root is passed as an argument, never through the environment: an ambient
-    variable that selects the tree a gate reads can redirect it in production
-    too, and this gate runs as the last check before an irreversible publish.
-    """
-    return subprocess.run(
-        ["bash", str(root / "scripts" / "check-published-refs.sh"), "--root", str(root)],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
+    """This gate's parameters. The mechanics are shared, and only these differ."""
+    return run_gate(root, _GATE.name)
 
 
 def test_gate_passes_on_a_clean_tree(tmp_path: Path) -> None:

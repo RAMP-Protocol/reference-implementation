@@ -76,19 +76,45 @@ before you set anything up:
 
 ## 3. Build or pull the image
 
-The image is published to Docker Hub. To build it yourself:
+The image is published to the GitHub Container Registry. Set the version once —
+this is the only place this document names one, and every command below reuses
+it:
+
+```bash
+VERSION=1.0.0-rc.1
+docker pull ghcr.io/ramp-protocol/identity:$VERSION
+```
+
+There is no `latest` tag, so the version is never optional. A bare
+`docker pull ghcr.io/ramp-protocol/identity` fails rather than fetching something
+recent.
+
+In production, deploy the digest rather than the tag. A tag is a pointer, and
+whoever holds write access to the registry can move it; a digest names the
+content itself and cannot be repointed. Read the digest, then deploy that:
+
+```bash
+docker buildx imagetools inspect ghcr.io/ramp-protocol/identity:$VERSION
+docker pull ghcr.io/ramp-protocol/identity@sha256:<the digest that printed>
+```
+
+To build it yourself instead. The tag is `dev` on purpose: a local build is not
+the published artifact, and giving it the release tag invites someone to push it.
 
 ```bash
 # Run this from the REPOSITORY ROOT, not from src/identity.
 # The build needs the shared internal/ directory as well as src/identity/.
-docker build -f src/identity/Dockerfile -t ramp/identity:1.0 .
-# Expect: "naming to docker.io/ramp/identity:1.0 done"
+docker build -f src/identity/Dockerfile -t ghcr.io/ramp-protocol/identity:dev .
 ```
 
 Facts about the image:
 
-- **amd64 by default.** Pass `--platform` if you need another architecture; nothing
-  in the binary is architecture-specific.
+- **The published image is amd64 only.** No ARM variant is published, so
+  `--platform` selects nothing on it. That is a publishing decision, not a limit
+  of the code: nothing in this binary is architecture-specific, so you can build
+  an ARM image yourself if you need one. On an Apple Silicon laptop the published
+  image runs under emulation, which is fine for looking at it and wrong for
+  measuring it.
 - It is a *distroless* image (no shell, no package manager) and runs as an
   unprivileged user, **uid 65532**. Any secret file you mount must be readable by that
   uid.
@@ -267,7 +293,8 @@ minimal Docker Compose service:
 ```yaml
 services:
   identity:
-    image: ramp/identity:1.0
+    # A digest, not a tag — §3 explains why production pins the content itself.
+    image: ghcr.io/ramp-protocol/identity@sha256:<the digest from §3>
     restart: unless-stopped
     ports:
       - "8083:8083"

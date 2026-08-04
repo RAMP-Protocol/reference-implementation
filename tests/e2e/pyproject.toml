@@ -35,6 +35,12 @@ dependencies = [
     # (test_mcp_endpoint.py drives the Go adapter over the MCP protocol).
     "fastmcp>=2.0",
     "pyjwt>=2.9",
+    # Parses .github/workflows/*.yml for the workflow-script guard
+    # (test_guards_workflow_scripts.py). It is already installed as a transitive
+    # dependency of fastmcp, which is exactly why it is named here: a guard that
+    # rides on another package's dependency tree stops running the day that tree
+    # changes, and nothing would say so.
+    "pyyaml>=6.0",
     # L1 protocol-mechanics helpers (thumbprint, RFC 9421 sign, JCS acceptance,
     # base64url) — the harness's former hand-rolled copies now import these.
     "ramp-protocol-sdk",

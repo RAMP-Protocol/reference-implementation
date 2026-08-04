@@ -34,9 +34,9 @@ The fixture builds a real git repository rather than a plain directory, because
 it: an empty file is a zero-rule config, and a zero-rule config makes every case
 below pass.
 
-Pure subprocess work: no stack, no Docker, no database. ``stack_isolation
-("isolated")`` makes the autouse cleanup dispatch a no-op, which would otherwise
-resolve a live Postgres DSN this test has no use for.
+Pure subprocess work: no stack, no Docker, no database. The marks come from
+``guard_harness.guard_marks``, whose docstring says why the isolation one is
+there.
 """
 
 from __future__ import annotations
@@ -47,14 +47,18 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.hazmat.primitives.serialization import (
-    Encoding,
-    NoEncryption,
-    PrivateFormat,
-)
 
 from .conftest import REPO_ROOT
+from .guard_harness import (
+    GITLEAKS_ABSENT,
+    SECRET_SCAN_CONFIG,
+    commit_all,
+    guard_marks,
+    init_scratch_repo,
+    private_key_pem,
+    run_gate,
+    run_git,
+)
 from .published_paths import shared_array
 
 # REPO_ROOT rather than a parents[N] walk: inside the runner container the
@@ -63,10 +67,9 @@ from .published_paths import shared_array
 # tier rather than this one module.
 _GATE = REPO_ROOT / "scripts" / "check-published-secrets.sh"
 
-# The one root file whose CONTENT this gate depends on. gitleaks resolves
-# <source>/.gitleaks.toml in place of its defaults, so an empty copy is a
-# zero-rule config and the scan becomes a no-op that passes everything.
-_SCANNER_CONFIG = ".gitleaks.toml"
+# This gate is the slow one: gitleaks reads every file in the tree, where the
+# sibling gates are greps. The shared default is sized for those.
+_SCAN_TIMEOUT = 300
 
 # The exempted path, and a sibling that is not exempted. Both are inside the
 # published set; the only difference between them is the allowlist entry, which
@@ -74,33 +77,7 @@ _SCANNER_CONFIG = ".gitleaks.toml"
 _EXEMPT_FIXTURE = "deploy/terraform/modules/compose-stack/tests/planted.tftest.hcl"
 _UNEXEMPT_SIBLING = "deploy/terraform/modules/aws-vm/tests/planted.tftest.hcl"
 
-pytestmark = [
-    pytest.mark.stack_isolation("isolated"),
-    pytest.mark.skipif(
-        not _GATE.is_file(),
-        reason="scripts/ is absent from the e2e runner image; this guard runs on the host",
-    ),
-    pytest.mark.skipif(
-        shutil.which("gitleaks") is None,
-        reason="gitleaks is not installed; the gate refuses to run without it",
-    ),
-]
-
-
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, timeout=60)
-
-
-def _private_key_pem() -> bytes:
-    """A real, freshly generated Ed25519 private key.
-
-    Generated rather than pasted as a constant: a committed literal key is the
-    thing this whole gate exists to keep out of the tree, and the guard's own
-    fixture is not exempt from that.
-    """
-    return ed25519.Ed25519PrivateKey.generate().private_bytes(
-        Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
-    )
+pytestmark = [*guard_marks(skip_when=not _GATE.is_file()), GITLEAKS_ABSENT]
 
 
 def _build_repo(root: Path) -> None:
@@ -111,17 +88,14 @@ def _build_repo(root: Path) -> None:
     rather than as nothing to scan — that is the behaviour the missing-root case
     asserts.
     """
-    root.mkdir(parents=True, exist_ok=True)
-    _git(root, "init", "-q", "-b", "main")
-    _git(root, "config", "user.email", "guard@example.invalid")
-    _git(root, "config", "user.name", "published secrets guard")
+    init_scratch_repo(root, branch="main", committer="published secrets guard")
 
     for directory in shared_array("ALLOW_DIRS"):
         (root / directory).mkdir(parents=True, exist_ok=True)
         (root / directory / ".keep").write_text("")
 
     for name in shared_array("ALLOW_ROOT_FILES"):
-        if name == _SCANNER_CONFIG:
+        if name == SECRET_SCAN_CONFIG:
             (root / name).write_bytes((REPO_ROOT / name).read_bytes())
         else:
             # The ignore files must stay EMPTY. This fixture commits planted key
@@ -147,36 +121,26 @@ def _build_repo(root: Path) -> None:
     (root / "docs" / "design").mkdir(parents=True, exist_ok=True)
     (root / "docs" / "design" / "note.md").write_text("# not a published doc\n")
 
-    _git(root, "add", "-A")
-    _git(root, "commit", "-qm", "baseline")
+    commit_all(root, "baseline")
 
 
 def _run_gate(root: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    """Run the shipped gate against ``root``.
+    """This gate's parameters. The mechanics are shared, and only these differ.
 
-    The root is passed as an argument, never through the environment: an ambient
-    variable that selects the tree a gate reads can redirect it in production
-    too. ``env`` exists only to place a broken scanner on PATH — it selects which
-    gitleaks binary runs, never which tree is read.
+    ``env`` is one of them: it exists only to place a broken scanner on PATH, and
+    it selects which gitleaks binary runs, never which tree is read.
     """
-    return subprocess.run(
-        ["bash", str(root / "scripts" / "check-published-secrets.sh"), "--root", str(root)],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=300,
-        env=env,
-    )
+    return run_gate(root, _GATE.name, env=env, timeout=_SCAN_TIMEOUT)
 
 
 def _plant(root: Path, relative: str, *, commit: bool) -> None:
     """Write a real private key at ``relative`` and optionally commit it."""
     target = root / relative
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(_private_key_pem())
+    target.write_bytes(private_key_pem())
     if commit:
-        _git(root, "add", "-f", relative)
-        _git(root, "commit", "-qm", f"plant {relative}")
+        run_git(root, "add", "-f", relative)
+        run_git(root, "commit", "-qm", f"plant {relative}")
 
 
 @pytest.fixture
@@ -288,7 +252,7 @@ def test_an_uncommitted_key_in_a_tracked_file_is_rejected(published_repo: Path) 
     one moment the finding is still cheap to fix.
     """
     tracked = published_repo / "src" / ".keep"
-    tracked.write_bytes(_private_key_pem())
+    tracked.write_bytes(private_key_pem())
 
     proc = _run_gate(published_repo)
 
@@ -325,7 +289,7 @@ def test_a_missing_search_root_fails_loudly(published_repo: Path) -> None:
     it scanned nothing and reported PASS. Here the same shape would mean an
     entire published directory stopped being scanned for secrets.
     """
-    _git(published_repo, "mv", "src", "src_moved")
+    run_git(published_repo, "mv", "src", "src_moved")
 
     proc = _run_gate(published_repo)
 
@@ -350,7 +314,7 @@ def test_an_untracked_scanner_config_is_refused(published_repo: Path) -> None:
     The assertion names a phrase unique to this check for the same reason —
     matching on the file name alone would pass on the missing-root message.
     """
-    _git(published_repo, "rm", "-q", "--cached", _SCANNER_CONFIG)
+    run_git(published_repo, "rm", "-q", "--cached", SECRET_SCAN_CONFIG)
 
     proc = _run_gate(published_repo)
 
@@ -373,7 +337,7 @@ def test_a_tree_with_no_tracked_files_is_refused(tmp_path: Path) -> None:
     _build_repo(root)
     # Unstage everything while leaving the working tree exactly as it was, so the
     # roots still exist and only the tracked set is empty.
-    _git(root, "rm", "-rq", "--cached", ".")
+    run_git(root, "rm", "-rq", "--cached", ".")
 
     proc = _run_gate(root)
 

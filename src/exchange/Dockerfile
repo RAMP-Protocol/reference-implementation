@@ -1,8 +1,9 @@
-# Multi-stage build for the Exchange service. Distroless runtime keeps the
-# final image under 20 MB with no shell, package manager, or extra users.
+# Multi-stage build for the Exchange service. The distroless runtime carries no
+# shell, no package manager and no extra users. It is the largest of the three
+# service images, because the TigerBeetle client below needs glibc.
 #
 # Build from repository root:
-#   docker build -f src/exchange/Dockerfile -t ramp/exchange:dev .
+#   docker build -f src/exchange/Dockerfile -t ghcr.io/ramp-protocol/exchange:dev .
 
 FROM golang:1.26-bookworm AS builder
 WORKDIR /build
@@ -14,9 +15,9 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends gcc \
  && rm -rf /var/lib/apt/lists/*
 
-# proto/ was deleted in 9a1b245 — the protocol is now consumed as a
-# published Go module (github.com/RAMP-Protocol/protocol). The legacy
-# `COPY proto/ ./proto/` line broke the build under this stale Dockerfile.
+# There is no in-tree proto/ directory to copy. The protocol is consumed as the
+# published Go module github.com/RAMP-Protocol/protocol, pinned in the root
+# go.mod, so `go mod download` below is what fetches it.
 # Root go module + deps.
 COPY go.mod go.sum ./
 RUN go mod download
@@ -36,6 +37,16 @@ RUN GOARCH=${TARGETARCH:-amd64} \
 
 FROM gcr.io/distroless/base-debian12:nonroot
 COPY --from=builder /out/exchange /exchange
+
+# image.source is what links the published package to its repository on GitHub,
+# which is in turn what allows the package to be made public. Version and
+# revision are deliberately absent: neither is knowable until a build runs, so
+# the publishing workflow stamps those two as --label flags instead.
+LABEL org.opencontainers.image.source="https://github.com/RAMP-Protocol/reference-implementation" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.title="RAMP Exchange" \
+      org.opencontainers.image.description="RAMP Exchange service: offers, transactions and signed content URLs"
+
 USER nonroot:nonroot
 EXPOSE 8081
 ENTRYPOINT ["/exchange"]

@@ -61,11 +61,23 @@ typecheck:
 # signature rejections much later. Add a new file here only if it needs nothing
 # brought up.
 #
-# The two published-* guard modules earn their place for a different reason than
-# the rest: they watch gates that `make quality` itself relies on. Running them
-# in a later tier would mean a green quality run could keep asserting a property
-# no longer being checked.
+# The published-* and image-version guard modules earn their place for a
+# different reason than the rest: they watch gates that `make quality` itself
+# relies on. Running them in a later tier would mean a green quality run could
+# keep asserting a property no longer being checked.
+#
+# The two publish-guard suites were one module until their combined length passed
+# the cap on a test file. Both belong in this tier for the same reason, so a split
+# that moved either one out would quietly halve the coverage this tier gives the
+# publish tool.
+#
+# The workflow-script guard belongs here for a third reason: it is the only test
+# that reads the real publishing workflow, and nothing else in this repository
+# parses that file at all — there is no actionlint, no yamllint and no yq. Run it
+# in a later tier and a green `make quality` would say nothing about the shell
+# that publishes the images.
 test-fast:
 	uv run pytest -q harness/test_rampsig.py harness/test_acceptance.py \
 		harness/test_guards_published_refs.py harness/test_guards_published_secrets.py \
-		harness/test_guards_publish_gates.py
+		harness/test_guards_publish_gates.py harness/test_guards_publish_worktree.py \
+		harness/test_guards_image_version.py harness/test_guards_workflow_scripts.py

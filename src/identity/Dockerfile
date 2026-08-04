@@ -3,7 +3,7 @@
 # library.
 #
 # Build from repository root:
-#   docker build -f src/identity/Dockerfile -t ramp/identity:dev .
+#   docker build -f src/identity/Dockerfile -t ghcr.io/ramp-protocol/identity:dev .
 
 FROM golang:1.26-bookworm AS builder
 WORKDIR /build
@@ -24,6 +24,16 @@ RUN GOARCH=${TARGETARCH:-amd64} \
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /out/identity /identity
+
+# image.source is what links the published package to its repository on GitHub,
+# which is in turn what allows the package to be made public. Version and
+# revision are deliberately absent: neither is knowable until a build runs, so
+# the publishing workflow stamps those two as --label flags instead.
+LABEL org.opencontainers.image.source="https://github.com/RAMP-Protocol/reference-implementation" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.title="RAMP Identity" \
+      org.opencontainers.image.description="RAMP Identity service: agent key registry and MCP adapter"
+
 USER nonroot:nonroot
 EXPOSE 8083
 ENTRYPOINT ["/identity"]

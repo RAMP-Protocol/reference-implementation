@@ -310,3 +310,23 @@ def _stack_isolation_dispatch(request: pytest.FixtureRequest) -> Iterator[None]:
         for cleanup in SHARED_CLEAN_FIXTURES:
             cleanup()
     yield
+
+
+@pytest.fixture
+def publish_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A source repo, a bare stand-in for the public remote, and a worktree path.
+
+    Shared by the two publish guard suites. It sits here rather than in
+    ``publish_harness`` so both can request it by name without re-exporting a
+    fixture, which pytest reads as a redefinition.
+    """
+    # Imported inside the body on purpose: publish_harness reads REPO_ROOT from
+    # this module, so importing it at the top would be circular.
+    from .publish_harness import make_public_remote, make_source_repo
+
+    source = tmp_path / "source"
+    bare = tmp_path / "public.git"
+    worktree = tmp_path / "worktree"
+    make_source_repo(source)
+    make_public_remote(bare, source)
+    return source, bare, worktree

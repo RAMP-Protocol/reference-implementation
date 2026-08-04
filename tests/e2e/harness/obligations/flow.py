@@ -1,15 +1,16 @@
 """Shared discover -> accept flow for the obligation happy-path tests.
 
-De-duplicates the DiscoverResources + ExecuteTransaction request bodies and the
-"first offer / assert signature" extraction that the standard USD/``sign_post``
-happy-path obligation tests repeat near-verbatim.
+De-duplicates the ExecuteTransaction request body and the "first offer / assert
+signature" extraction that the standard USD/``sign_post`` happy-path obligation
+tests repeat near-verbatim. The DiscoverResources body itself is built by
+``harness.discovery.discover_body``, which every caller in the suite shares.
 
 Scope note (premise correction): the requester's self-declared facets
 (``domain`` / ``userType`` / ``geography``) are KEPT on the DiscoverResources
 path. Per ADR-014 the Exchange does scope-only *projection* (it does not filter
 terms by these facets), but the facets are still legitimately carried on the
 wire to the Exchange — only the Broker-resolve canonical ``DiscoveryRequest`` dropped
-them. So this shared builder preserves them.
+them. So this flow passes them through to the shared builder.
 
 Bespoke flows that do NOT use this helper, by design: the obligation-04 public-
 resource tests (EUR agent, their own ``_post_signed_json`` + per-response
@@ -29,10 +30,10 @@ from typing import Any, cast
 import httpx
 
 from ramp_sdk.core import sign_offer_acceptance_jcs
+from ..discovery import DISCOVER_PATH, discover_body
 from ..httpsig_signer import load_keypair
 from ..signing import AGENT_E2E_KEY_PATH, sign_post
 
-_DISCOVER_PATH = "/ramp.v1.ExchangeService/DiscoverResources"
 _EXECUTE_PATH = "/ramp.v1.ExchangeService/ExecuteTransaction"
 
 
@@ -54,21 +55,14 @@ def discover_first_offer(
     requester. The requester facets are carried as-is (Exchange-path facets).
     """
     resp = sign_post(
-        f"{exchange_url}{_DISCOVER_PATH}",
-        body={
-            "id": f"q-{uuid.uuid4().hex}",
-            "requester": {
-                "id": agent_id,
-                "domain": domain,
-                # The pinned proto requires Requester.type != UNSPECIFIED on
-                # EVERY message carrying a Requester (enum not_in:[0]),
-                # ResourceQuery included — not just ExecuteTransaction.
-                "type": "REQUESTER_TYPE_AGENT",
-                "user_type": user_type,
-                "geography": geography,
-            },
-            "uris": [uri],
-        },
+        f"{exchange_url}{DISCOVER_PATH}",
+        body=discover_body(
+            uris=[uri],
+            agent_id=agent_id,
+            domain=domain,
+            user_type=user_type,
+            geography=geography,
+        ),
         key_path=key_path,
     )
     assert resp.status_code == httpx.codes.OK, (

@@ -63,6 +63,7 @@ from .catalog_push import (
     push_catalog,
 )
 from .conftest import StackURLs
+from .discovery import DISCOVER_PATH, discover_body
 from .httpsig_signer import generate_random_keypair, sign_request
 from .seed import (
     CONTRIBUTOR_KEY_PATH,
@@ -79,7 +80,6 @@ from .signing import sign_post
 
 pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 
-_DISCOVER_PATH = "/ramp.v1.ExchangeService/DiscoverResources"
 _PUSH_PROCEDURE = "/ramp.v1.CatalogService/PushResources"
 
 # Tenant ids (server derives the owning tenant from the entry domain, but the
@@ -102,12 +102,8 @@ def _discover(exchange_url: str, uri: str) -> httpx.Response:
     music→exchange-b, sfx→exchange-c).
     """
     return sign_post(
-        f"{exchange_url}{_DISCOVER_PATH}",
-        body={
-            "id": f"q-{uuid.uuid4().hex}",
-            "requester": {"id": USD_AGENT_ID, "type": "REQUESTER_TYPE_AGENT"},
-            "uris": [uri],
-        },
+        f"{exchange_url}{DISCOVER_PATH}",
+        body=discover_body(uris=[uri], agent_id=USD_AGENT_ID),
         key_path=USD_AGENT_KEY_PATH,
     )
 

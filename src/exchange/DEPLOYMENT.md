@@ -63,21 +63,45 @@ that is your plan, sort it out before deploying.
 
 ## 3. Build or pull the image
 
-To build it yourself:
+The image is published to the GitHub Container Registry. Set the version once —
+this is the only place this document names one, and every command below reuses
+it:
+
+```bash
+VERSION=1.0.0-rc.1
+docker pull ghcr.io/ramp-protocol/exchange:$VERSION
+```
+
+There is no `latest` tag, so the version is never optional. A bare
+`docker pull ghcr.io/ramp-protocol/exchange` fails rather than fetching
+something recent.
+
+In production, deploy the digest rather than the tag. A tag is a pointer, and
+whoever holds write access to the registry can move it; a digest names the
+content itself and cannot be repointed. Read the digest, then deploy that:
+
+```bash
+docker buildx imagetools inspect ghcr.io/ramp-protocol/exchange:$VERSION
+docker pull ghcr.io/ramp-protocol/exchange@sha256:<the digest that printed>
+```
+
+To build it yourself instead. The tag is `dev` on purpose: a local build is not
+the published artifact, and giving it the release tag invites someone to push it.
 
 ```bash
 # Run this from the REPOSITORY ROOT, not from src/exchange.
 # The build needs the shared internal/ directory as well as src/exchange/.
-docker build -f src/exchange/Dockerfile -t ramp/exchange:1.0 .
-# Expect: "naming to docker.io/ramp/exchange:1.0 done"
+docker build -f src/exchange/Dockerfile -t ghcr.io/ramp-protocol/exchange:dev .
 ```
 
 Facts about the image:
 
-- **amd64 only.** There is no ARM build and no multi-architecture image. The
-  build links a native library for the TigerBeetle ledger client, which needs a C
-  toolchain and cannot build for a different processor type, so the image is built
-  for the native architecture only. Build it on an amd64 machine.
+- **The published image is amd64 only.** There is no ARM build and no
+  multi-architecture image. The build links a native library for the TigerBeetle
+  ledger client, which needs a C toolchain and cannot build for a different
+  processor type, so build it on an amd64 machine if you build it yourself. On an
+  Apple Silicon laptop the published image runs under emulation. That is fine for
+  looking at it and wrong for measuring it.
 - It is a *distroless* image (no shell, no package manager) and runs as an
   unprivileged user, **uid 65532**. Any key or configuration file you mount must
   be readable by that uid.
@@ -229,7 +253,8 @@ and mount the key files. A minimal Docker Compose service:
 ```yaml
 services:
   exchange:
-    image: ramp/exchange:1.0
+    # A digest, not a tag — §3 explains why production pins the content itself.
+    image: ghcr.io/ramp-protocol/exchange@sha256:<the digest from §3>
     restart: unless-stopped
     ports:
       - "8081:8081"                     # public listener only — see §7
