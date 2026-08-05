@@ -1,11 +1,15 @@
 package server_test
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -201,5 +205,111 @@ func TestWBAHandler_ServeAndRebuild(t *testing.T) {
 	}
 	if _, ok := rampwellknown.KeyByThumbprint(rebuilt, testutil.MustThumbprintKey(t, b1)); ok {
 		t.Fatal("Rebuild still serves the old key b1 after rotation")
+	}
+}
+
+// lockedKeys is a KeySource safe to rotate while RunRefresher reads it from
+// another goroutine.
+type lockedKeys struct {
+	mu   sync.Mutex
+	keys []*rampwellknown.Key
+}
+
+func (m *lockedKeys) Keys() []*rampwellknown.Key {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.keys
+}
+
+func (m *lockedKeys) set(keys ...*rampwellknown.Key) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.keys = keys
+}
+
+// recordCounter is a slog.Handler that only counts records, so the test can
+// wait until the refresher has attempted (and failed) at least one rebuild.
+type recordCounter struct{ n atomic.Int64 }
+
+func (c *recordCounter) Enabled(context.Context, slog.Level) bool  { return true }
+func (c *recordCounter) Handle(context.Context, slog.Record) error { c.n.Add(1); return nil }
+func (c *recordCounter) WithAttrs([]slog.Attr) slog.Handler        { return c }
+func (c *recordCounter) WithGroup(string) slog.Handler             { return c }
+
+// TestRunRefresher_FailedRebuildKeepsServingOldDocument pins the refresher's
+// failure behavior: when a rebuild fails (here: the KeySource rotates to an
+// empty list, which the WBA schema rejects), the previously served bytes stay
+// up and the loop keeps running — it logs a warning per failed attempt and
+// recovers on its own once the source is healthy again. The surface never
+// goes dark because one rebuild attempt failed.
+func TestRunRefresher_FailedRebuildKeepsServingOldDocument(t *testing.T) {
+	t.Parallel()
+	_, good := testutil.NewSigningKey("keep-serving", anchor.Add(-time.Hour), anchor.Add(time.Hour))
+	src := &lockedKeys{keys: []*rampwellknown.Key{good}}
+	wba, err := server.NewWBAHandler(server.WBAConfig{Keys: src})
+	if err != nil {
+		t.Fatalf("NewWBAHandler: %v", err)
+	}
+	manifest, err := server.NewHandler(server.Config{Role: rampwellknown.RoleBroker, Domain: "broker.example"})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	h := server.Handlers{Manifest: manifest, WBA: wba}
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	servedKeys := func() *rampwellknown.WBAFile {
+		resp, err := http.Get(srv.URL + rampwellknown.WBAPath) //nolint:noctx // test client
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		f, err := rampwellknown.ParseWBA(body)
+		if err != nil {
+			t.Fatalf("served WBA directory invalid: %v", err)
+		}
+		return f
+	}
+	goodTP := testutil.MustThumbprintKey(t, good)
+	if _, ok := rampwellknown.KeyByThumbprint(servedKeys(), goodTP); !ok {
+		t.Fatal("initial document missing its key")
+	}
+
+	// Break the source: an empty key list fails BuildWBA's schema validation,
+	// so every rebuild attempt from here on errors.
+	src.set()
+	counter := &recordCounter{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.RunRefresher(ctx, time.Millisecond, slog.New(counter))
+
+	deadline := time.Now().Add(5 * time.Second)
+	for counter.n.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("refresher never logged a failed rebuild")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, ok := rampwellknown.KeyByThumbprint(servedKeys(), goodTP); !ok {
+		t.Fatal("failed rebuilds must keep the previously served document up, but the key is gone")
+	}
+
+	// Heal the source: the loop must still be running and pick the new key up
+	// without intervention — a failure is a skipped tick, not an exit.
+	_, healed := testutil.NewSigningKey("healed", anchor.Add(-time.Hour), anchor.Add(time.Hour))
+	src.set(healed)
+	healedTP := testutil.MustThumbprintKey(t, healed)
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := rampwellknown.KeyByThumbprint(servedKeys(), healedTP); ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("refresher never recovered after the source turned healthy again")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

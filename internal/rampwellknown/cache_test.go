@@ -9,6 +9,7 @@ import (
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
@@ -44,18 +45,20 @@ func TestCache_GetAndAuthorizes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	// This package cannot import the identity rule (internal/agentid is built on
-	// it), so what it can assert is the predicate's own logic — self, listed,
-	// stranger — under a rule that folds nothing. The folding behaviour is pinned
-	// where the real rule lives, in the Exchange's contributor tests.
-	verbatim := rampwellknown.Identity(func(s string) (string, error) { return s, nil })
-	if !rampwellknown.AuthorizesContributor(m, "pub.example", verbatim) {
+	// agentid.FromDirectory is the rule the Exchange passes in production. The
+	// package under test cannot import it — internal/agentid is built on this
+	// package, so the dependency would close a cycle — but this file is an
+	// external test package, which Go compiles separately and which may import
+	// anything that imports rampwellknown. Asserting under the production rule is
+	// what makes self, listed and stranger say something about the deployment
+	// rather than about string equality.
+	if !rampwellknown.AuthorizesContributor(m, "pub.example", agentid.FromDirectory) {
 		t.Error("publisher domain should authorize itself")
 	}
-	if !rampwellknown.AuthorizesContributor(m, "verifier.example", verbatim) {
+	if !rampwellknown.AuthorizesContributor(m, "verifier.example", agentid.FromDirectory) {
 		t.Error("listed contributor should be authorized")
 	}
-	if rampwellknown.AuthorizesContributor(m, "stranger.example", verbatim) {
+	if rampwellknown.AuthorizesContributor(m, "stranger.example", agentid.FromDirectory) {
 		t.Error("unlisted caller must not be authorized")
 	}
 }

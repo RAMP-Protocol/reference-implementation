@@ -141,7 +141,7 @@ func TestRoundTrip_RAMPTargetKeepsRAMPProfile(t *testing.T) {
 	_ = resp.Body.Close()
 
 	got := (*seen)[0]
-	resolver := httpsig.NewStaticResolver(map[string]ed25519.PublicKey{thumbprintOf(t, pub): pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{thumbprintOf(t, pub): pub})
 	verified, err := httpsig.VerifyRequest(got, resolver)
 	if err != nil {
 		t.Fatalf("RAMP verify: %v", err)
@@ -210,7 +210,7 @@ func TestRoundTrip_AppendSignerUsesTheResolvedKey(t *testing.T) {
 	send(t, http.MethodPost, srv.URL+rampTarget, body, staticSource(key), WithAppendSigner())
 
 	got := (*seen)[0]
-	resolver := httpsig.NewStaticResolver(map[string]ed25519.PublicKey{thumbprintOf(t, pub): pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{thumbprintOf(t, pub): pub})
 	verified, err := httpsig.VerifyRequest(got, resolver)
 	if err != nil {
 		t.Fatalf("append-signed request did not verify: %v", err)
@@ -255,7 +255,7 @@ func TestRoundTrip_ChainsOverAnIncomingSignature(t *testing.T) {
 
 	got := (*seen)[0]
 	relayKeyID := thumbprintOf(t, relayPub)
-	resolver := httpsig.NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		agentKeyID: agentPub,
 		relayKeyID: relayPub,
 	})

@@ -17,4 +17,6 @@ COPY tests/e2e/mock-publisher/content /usr/share/nginx/html
 
 # Demo publisher trees (stoa-press, harmonia-records, foleyworks) under their
 # own docroot, reached via the /articles, /lyrics, /tracks, /sfx prefixes.
+# The same tree carries index.html, the human-facing landing page nginx
+# serves at the site root.
 COPY deploy/content/demo /usr/share/nginx/demo

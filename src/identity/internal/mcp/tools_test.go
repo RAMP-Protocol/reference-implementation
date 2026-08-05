@@ -126,7 +126,8 @@ func TestDiscover_ReturnsOffersVerbatimAndNamesTheRequester(t *testing.T) {
 	f.broker.resolveResp = &rampv1.DiscoveryResponse{
 		Ver: rampproto.Ver,
 		OfferGroups: []*rampv1.OfferGroup{{
-			Uri: "https://pub.example/a",
+			Uri:             "https://pub.example/a",
+			DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_SEARCH.Enum(),
 			Offers: []*rampv1.Offer{{
 				OfferId:   "offer-1",
 				Exchange:  "exchange.example",
@@ -146,6 +147,16 @@ func TestDiscover_ReturnsOffersVerbatimAndNamesTheRequester(t *testing.T) {
 	group := out.OfferGroups[0]
 	if group.URI != "https://pub.example/a" {
 		t.Errorf("group uri = %q, want the requested URL", group.URI)
+	}
+	// How the URL was found is carried through to the agent, not dropped and not
+	// replaced in the projection. The fixture Broker reports SEARCH — a value
+	// this adapter has no way to produce on its own — so the assertion names its
+	// source: an adapter that substituted its own answer, or that mapped every
+	// method onto EXCHANGE, fails here. Expecting EXCHANGE against an EXCHANGE
+	// fixture would pass either way.
+	wantMethod := rampv1.DiscoveryMethod_DISCOVERY_METHOD_SEARCH
+	if group.DiscoveryMethod != wantMethod.String() {
+		t.Errorf("discovery_method = %q, want %q", group.DiscoveryMethod, wantMethod)
 	}
 	if len(group.Offers) != 1 {
 		t.Fatalf("got %d offers, want 1", len(group.Offers))
@@ -201,6 +212,14 @@ func TestDiscover_EmptyGroupCarriesItsReason(t *testing.T) {
 	if got := out.OfferGroups[0].AbsenceReason; got != absence.String() {
 		t.Errorf("absence_reason = %q, want %q", got, absence)
 	}
+	// This fixture omits the discovery method — our Broker always sets one — so
+	// the case covers the projection's rule for an upstream that sends none: it
+	// reports nothing rather than the UNSPECIFIED placeholder, the same rule the
+	// absence reason follows. Rendering the zero enum as a string would hand the
+	// agent a value that looks like an answer.
+	if got := out.OfferGroups[0].DiscoveryMethod; got != "" {
+		t.Errorf("discovery_method = %q, want empty for an unset method", got)
+	}
 }
 
 // TestDiscover_BatchOfURIsKeepsOneGroupPerURI covers the obligation a multi-URI
@@ -226,18 +245,30 @@ func TestDiscover_BatchOfURIsKeepsOneGroupPerURI(t *testing.T) {
 		Ver: rampproto.Ver,
 		OfferGroups: []*rampv1.OfferGroup{
 			{
-				Uri: uris[0],
+				// The caller named these URLs, so a real Broker reports EXCHANGE
+				// on every group of this response. Nothing here asserts the
+				// method; it is set so the fixture does not describe a shape the
+				// Broker cannot send.
+				Uri:             uris[0],
+				DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE.Enum(),
 				Offers: []*rampv1.Offer{
 					{OfferId: "offer-a1", Exchange: "exchange.example", Signature: "sig-a1"},
 					{OfferId: "offer-a2", Exchange: "exchange.example", Signature: "sig-a2"},
 				},
 			},
 			{
-				Uri:    uris[1],
-				Offers: []*rampv1.Offer{{OfferId: "offer-b1", Exchange: "other.example", Signature: "sig-b1"}},
+				Uri:             uris[1],
+				DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE.Enum(),
+				Offers:          []*rampv1.Offer{{OfferId: "offer-b1", Exchange: "other.example", Signature: "sig-b1"}},
 			},
 			// Present but empty, with a typed reason — never silently dropped.
-			{Uri: uris[2], AbsenceReason: &absence},
+			// It carries the method too: the Broker states one on the absence
+			// groups it synthesises, the same as on the groups that carry offers.
+			{
+				Uri:             uris[2],
+				AbsenceReason:   &absence,
+				DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE.Enum(),
+			},
 		},
 	}
 	a := f.provision(t, "dev-one", acmeDetails)
@@ -483,8 +514,9 @@ func TestEveryTool_ReturnsTheCorrelationID(t *testing.T) {
 	f.broker.resolveResp = &rampv1.DiscoveryResponse{
 		Ver: rampproto.Ver,
 		OfferGroups: []*rampv1.OfferGroup{{
-			Uri:    "https://pub.example/a",
-			Offers: []*rampv1.Offer{{OfferId: "offer-1", Exchange: "exchange.example", Signature: "sig-1"}},
+			Uri:             "https://pub.example/a",
+			DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE.Enum(),
+			Offers:          []*rampv1.Offer{{OfferId: "offer-1", Exchange: "exchange.example", Signature: "sig-1"}},
 		}},
 	}
 	f.issuer.reportResp = &rampv1.UsageReportResponse{Ver: rampproto.Ver, ReportId: "rep-1"}
@@ -536,9 +568,10 @@ type discoverResult struct {
 		URI string `json:"uri"`
 		// Licensed is part of the wire contract deliberately (see offerGroup),
 		// so the mirror carries it rather than re-deriving it from len(offers).
-		Licensed      bool             `json:"licensed"`
-		Offers        []map[string]any `json:"offers"`
-		AbsenceReason string           `json:"absence_reason"`
+		Licensed        bool             `json:"licensed"`
+		Offers          []map[string]any `json:"offers"`
+		AbsenceReason   string           `json:"absence_reason"`
+		DiscoveryMethod string           `json:"discovery_method"`
 	} `json:"offer_groups"`
 	AbsenceReason string `json:"absence_reason"`
 	RequestID     string `json:"request_id"`

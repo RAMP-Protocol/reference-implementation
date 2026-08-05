@@ -1,13 +1,22 @@
-"""Shared Ed25519 key-materialization core for the repo's key-gen scripts.
+"""Shared Ed25519 key material helpers for the repo's key-gen scripts.
 
-Both ``scripts/gen-e2e-keys.sh`` and ``scripts/gen-examplenews-publisher-key.sh``
-embed a ``python3`` heredoc that mints an Ed25519 seed (and, for e2e, its public
-half) and b64url-encodes raw bytes. That core used to live in two byte-identical
-copies; it lives here once. Each script keeps its own JSON shape, file layout,
-and side effects (chmod, registry publish, env-file emission).
+The key-gen scripts (``scripts/gen-e2e-keys.sh``,
+``scripts/gen-examplenews-publisher-key.sh``,
+``scripts/gen-buyer-delegation-key.sh``, and
+``deploy/terraform/scripts/gen-staging-keys.sh``) embed ``python3`` heredocs
+that mint Ed25519 keypairs and, for the identity scripts, emit public Web Bot
+Auth directory entries. The keypair mint and the WBA entry shape each used to
+live in several byte-identical copies; they live here once. Each script keeps
+its own JSON file shape, file layout, and side effects (chmod, env-file
+emission).
 
-The heredocs consume this module by inserting ``scripts/lib`` onto ``sys.path``
-(passed as the first heredoc argv) and importing the two helpers below.
+``deploy/publisher-jwks/entrypoint.sh`` consumes this module too: its image is
+built from the repo root so the Dockerfile copies this file to
+``/opt/ramp/lib``, and the entrypoint heredoc imports the same window and
+entry helpers the scripts use — no shell-side copy to keep in sync.
+
+The heredocs consume this module by inserting its directory onto ``sys.path``
+(passed as a heredoc argv) and importing the helpers below.
 
 Runnable as a CLI for ad-hoc use / verification::
 
@@ -19,6 +28,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
@@ -45,6 +57,88 @@ def generate_seed_pub_b64() -> tuple[str, str]:
     seed = priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
     pub = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     return b64u(seed), b64u(pub)
+
+
+def wba_validity_window(lifetime_days: int, skew_hours: int = 1) -> tuple[str, str]:
+    """Return ``(not_before, not_after)`` RFC 3339 strings for a WBA entry.
+
+    ``not_before`` is backdated by ``skew_hours`` so a verifier whose clock
+    runs slightly behind the generating machine never rejects a
+    freshly-published key; ``not_after`` is ``lifetime_days`` ahead. The
+    caller chooses the lifetime — it is a policy decision, not a default.
+    """
+    now = datetime.now(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return (
+        (now - timedelta(hours=skew_hours)).strftime(fmt),
+        (now + timedelta(days=lifetime_days)).strftime(fmt),
+    )
+
+
+def wba_directory_key(pub_b64: str, not_before: str, not_after: str) -> dict:
+    """Return one WBA directory ``keys[]`` entry for an Ed25519 public key.
+
+    The seven members are all required by the canonical directory schema
+    (``internal/rampwellknown/schema/ramp-wba-directory.json``); a document
+    missing one serves fine and then fails every signed request with an error
+    that points at the signature, so the entry is built here once instead of
+    hand-written per script. Entries carry no ``kid`` — verifiers name a key
+    by its RFC 7638 thumbprint.
+    """
+    return {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "use": "sig",
+        "alg": "EdDSA",
+        "x": pub_b64,
+        "not_before": not_before,
+        "not_after": not_after,
+    }
+
+
+def materialize_keypair(path, kid: str, mode: int = 0o600) -> str:
+    """Idempotently ensure an Ed25519 keypair fixture at ``path``; return its
+    public key (b64url).
+
+    An existing file is REUSED, never rotated — re-running a key-gen script
+    must not swap a live identity's key out from under the containers or
+    documents derived from it. On reuse the ``issuer`` member is backfilled
+    in place when absent: the jwks entrypoint requires it for the manifest
+    domain and refuses to guess from the kid (whose first dot would truncate
+    a dotted identity). New files carry
+    ``{kid, issuer, kty, crv, alg, private_key, public_key}`` with
+    ``issuer == kid``.
+
+    ``mode`` is applied on both paths. The default 0o600 suits operator-held
+    keys; the e2e script passes 0o644 because its fixtures are mounted
+    read-only into distroless/nonroot containers across a UID boundary.
+    """
+    fixture = Path(path)
+    if fixture.exists():
+        spec = json.loads(fixture.read_text())
+        pub_b64 = spec["public_key"]
+        if "issuer" not in spec:
+            spec["issuer"] = kid
+            fixture.write_text(json.dumps(spec, indent=2) + "\n")
+    else:
+        seed_b64, pub_b64 = generate_seed_pub_b64()
+        fixture.write_text(
+            json.dumps(
+                {
+                    "kid": kid,
+                    "issuer": kid,
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "alg": "EdDSA",
+                    "private_key": seed_b64,
+                    "public_key": pub_b64,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+    os.chmod(fixture, mode)
+    return pub_b64
 
 
 def _main() -> None:

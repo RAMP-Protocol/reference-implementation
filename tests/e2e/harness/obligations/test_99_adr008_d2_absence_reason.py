@@ -121,8 +121,8 @@ def test_unknown_uri_discover_resources_sets_not_in_catalog_enum(
     # Post-1rnxh: the Exchange's global httpsig middleware verifies every
     # /ramp.v1.ExchangeService/* request unconditionally. The signed-post
     # helper stamps an RFC 9421 signature with the test signer kid
-    # (test-signer-e2e.v1) which is pre-registered in the static resolver
-    # via deploy/broker/keys.json.
+    # (test-signer-e2e.v1), whose key the Exchange resolves from the
+    # test-signer-e2e.v1-jwks well-known host.
     body = {
         "requester": {
             "id": _AGENT_ID,

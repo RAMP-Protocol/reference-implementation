@@ -109,14 +109,11 @@ services:
       # plain-HTTP socket scheme. Safe here ONLY because the service is not
       # directly reachable — Caddy owns the public ports.
       RAMP_TRUST_PROXY_HEADERS: "true"
-      # Revocation authority — the Exchange refuses to boot without it. On
-      # first boot this crash-loops until DNS + Caddy certs + the Broker are
-      # live (a few minutes); restart: unless-stopped rides it out.
+      # Revocation authority — the Exchange refuses to boot when this is
+      # unset, but never fetches it at boot. While DNS + Caddy certs + the
+      # Broker come up on first boot (a few minutes) the running Exchange
+      # rejects signed requests with 401 and recovers on its own.
       EXCHANGE_BROKER_WELLKNOWN_URL: "https://${broker_hostname}/.well-known/ramp.json"
-      # Env name is fixed by the Exchange binary. The Broker mounts the SAME
-      # keys.json under BROKER_KEYS_FILE — the differing prefixes are
-      # service-mandated, do not "unify" one to match the other.
-      RAMP_KEYS_FILE: "/keys/keys.json"
       RAMP_ED25519_PRIVATE_PEM_FILE: "/keys/ed25519-private.pem"
 %{ if rsa_enabled }
       # Only AWS_CLOUDFRONT_RSA tenants use this. Omitting it is a supported
@@ -130,9 +127,10 @@ services:
       # identity.
       - /opt/ramp/keys/exchange:/keys:ro
     # The image is distroless (no shell/curl), so the probe is the service
-    # binary itself (`exchange healthcheck` GETs the local /healthz). During
-    # the documented first-boot crash-loop the container reports unhealthy —
-    # that is the honest status; restart: unless-stopped rides it out.
+    # binary itself (`exchange healthcheck` GETs the local /healthz). While
+    # the service is still coming up on first boot the container reports
+    # unhealthy — that is the honest status; restart: unless-stopped waits
+    # it out.
     healthcheck:
       test: ["CMD", "/exchange", "healthcheck"]
       interval: 5s
@@ -162,10 +160,6 @@ services:
       # X-Forwarded-Proto and owns the public ports, so verification runs
       # against the https URL the agent signed.
       RAMP_TRUST_PROXY_HEADERS: "true"
-      # Env name is fixed by the Broker binary. The Exchange mounts the SAME
-      # keys.json under RAMP_KEYS_FILE — the differing prefixes are
-      # service-mandated, do not "unify" one to match the other.
-      BROKER_KEYS_FILE: "/keys/keys.json"
       BROKER_RELAY_KEY_FILE: "/keys/broker-relay-key.json"
       # The Broker's IDENTITY key — NOT the relay key above. Its public half is
       # published in the Broker's WBA directory with a 90-day validity window,
@@ -302,9 +296,8 @@ services:
       IDENTITY_AUTH_ISSUER: "https://${identity_hostname}"
       IDENTITY_OIDC_ISSUER: "https://${zitadel_hostname}"
       # Minted by the identity bootstrap script into the shared volume. Until
-      # it has run, this container crash-loops on the missing files — the same
-      # documented first-boot behaviour as the Exchange, and restart:
-      # unless-stopped picks it up once the files appear.
+      # it has run, this container crash-loops on the missing files;
+      # restart: unless-stopped picks it up once the files appear.
       IDENTITY_OIDC_CLIENT_ID_FILE: "/bootstrap/identity_client_id"
       IDENTITY_OIDC_CLIENT_SECRET_FILE: "/bootstrap/identity_client_secret"
       IDENTITY_OIDC_SCOPES: "openid profile email"
@@ -360,6 +353,11 @@ services:
       - "443:443"
     volumes:
       - /opt/ramp/Caddyfile:/etc/caddy/Caddyfile:ro
+%{ if wba_enabled ~}
+      # Static Web Bot Auth key directories written by cloud-init; the
+      # Caddyfile's per-hostname site blocks serve them with file_server.
+      - /opt/ramp/wba:/srv/wba:ro
+%{ endif ~}
       - caddydata:/data
       - caddyconfig:/config
     depends_on:

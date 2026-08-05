@@ -25,9 +25,8 @@ Notes:
   Let's Encrypt certificates. If you cycle often, set `acme_staging = true`
   to avoid production rate limits (5 duplicate certificates per week).
 - **Keys**: `keys/` and the local state files are NOT removed by destroy.
-  Keep them if you plan to re-apply (same identities, no re-seeding of
-  keys.json); shred them (`rm -rf keys/ terraform.tfstate*`) to retire the
-  environment completely.
+  Keep them if you plan to re-apply (same identities); shred them
+  (`rm -rf keys/ terraform.tfstate*`) to retire the environment completely.
 - **Images**: pushed images stay in the registry; delete them there if
   needed.
 

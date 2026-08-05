@@ -112,25 +112,18 @@ func TestComp_ProfileGatedPricingProjection(t *testing.T) {
 // The plain discoverOffers helper sets no profiles; this one declares the CoMP
 // profile so the Exchange is asked to project it.
 //
+// scopes are the requester's entitlement scopes. Callers pass none when the term
+// under test carries none (seedPricedTerm), and pass one when the term is
+// scope-gated so licenseterm.Select keeps it.
+//
 // SHARED helper: used by the slice-1, slice-3, and slice-4 scenarios across the
 // comp_*_integration_test.go files; it stays in this base file so those siblings
 // reuse one definition (Go would reject a redeclaration).
-func discoverCompOffer(t *testing.T, h *pushHarness, uri string) *rampv1.Offer {
+func discoverCompOffer(t *testing.T, h *pushHarness, uri string, scopes ...string) *rampv1.Offer {
 	t.Helper()
-	resp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:               "1.0",
-		Uris:              []string{uri},
-		SupportedProfiles: []string{"ramp-comp-v1"},
-		Requester: &rampv1.Requester{
-			Id:     "agent-discover",
-			Domain: "agent.example",
-			Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
-	if err != nil {
-		t.Fatalf("discover (comp profile) %s: %v", uri, err)
-	}
-	offers := resp.Msg.GetOffers()
+	spec := requesterWithScopes("agent-discover", scopes...)
+	spec.profiles = []string{"ramp-comp-v1"}
+	offers := discoverOffersAs(t, h, uri, spec)
 	if len(offers) != 1 {
 		t.Fatalf("discover (comp profile) %s: got %d offers, want 1", uri, len(offers))
 	}

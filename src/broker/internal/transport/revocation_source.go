@@ -24,8 +24,8 @@ const emptyRevocationDoc = `{"as_of":"1970-01-01T00:00:00Z"}`
 // freshness is tracked by mtime rather than an explicit Rebuild: the steady-state
 // hot path does a cheap os.Stat instead of a full os.ReadFile + schema
 // validation per request, while an operator editing the file still takes effect
-// without a restart (the admin plane was removed; a re-read file mirrors the
-// BROKER_KEYS_FILE operator-provisioning pattern).
+// without a restart (the admin plane was removed; an operator-owned re-read
+// file is the provisioning surface).
 //
 // The operator owns as_of monotonicity (ADR-003 Consequences): each published
 // snapshot MUST carry an as_of strictly newer than the last, or the consumer's

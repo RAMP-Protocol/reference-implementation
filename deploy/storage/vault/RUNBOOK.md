@@ -4,12 +4,12 @@ Operated by the Exchange Operator, on infrastructure you provide. Written for yo
 DevOps engineer running the key store for the RAMP platform: you do not need to read
 the source code, and words that may be new are explained the first time they appear.
 
-**Escalation.** If §3 does not resolve it, contact Postindustria at
-`<support channel — fill in before handover>`. Send the `request_id` of a failing
-request together with the matching log lines from the Identity Service. Postindustria
+**Escalation.** If §3 does not resolve it, contact Postindustria over the
+existing communication channel. Send the `request_id` of a failing request
+together with the matching log lines from the Identity Service. Postindustria
 has no access to your infrastructure, so that correlation ID is the only way the
-request can be traced. Vault's own operation is a HashiCorp product question, not a
-RAMP one.
+request can be traced. Vault's own operation is a HashiCorp product question, not
+a RAMP one.
 
 > This runbook assumes Vault is already running and the Identity Service is pointed at
 > it. For setting it up, the policy and first-boot verification, see

@@ -76,11 +76,12 @@ func (p *Pool) For(endpoint string) rampv1connect.ExchangeServiceClient {
 	// The Connect protocol (the connect-go default — deliberately NOT
 	// connect.WithGRPC()): the relay crosses real proxies/LBs on a plain
 	// HTTP/1.1 client, and gRPC depends on HTTP trailers, which are reliable
-	// in-process (the WithGRPC integration tests and the ingest CLI run
-	// against local servers) but not across intermediaries; Connect has no
-	// trailer dependency. This is also the protocol the full e2e stack
-	// proves, and it keeps the pool single-protocol with the byte-verbatim
-	// Connect-JSON raw relay (DiscoverResourcesRaw).
+	// in-process (where the WithGRPC integration tests run) but not across
+	// intermediaries; Connect has no trailer dependency. The ingest CLI made
+	// the same switch for the same reason after its gRPC push died at a TLS
+	// proxy's HTTP/1.1 upstream hop. This is also the protocol the full e2e
+	// stack proves, and it keeps the pool single-protocol with the
+	// byte-verbatim Connect-JSON raw relay (DiscoverResourcesRaw).
 	c = rampv1connect.NewExchangeServiceClient(p.http, endpoint)
 	p.clients[endpoint] = c
 	return c

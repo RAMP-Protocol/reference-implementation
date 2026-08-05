@@ -4,11 +4,11 @@
 // bootstrap layer is not exercised here; the Docker-based real-runtime
 // harness lives at tests/e2e/aws-edge/ (repo root).
 import { handle } from 'hono/lambda-edge';
-import type { CloudFrontEdgeEvent, CloudFrontRequest } from 'hono/lambda-edge';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../../src/app.js';
-import type { AppDeps } from '../../src/types.js';
+import { type AppDeps, WBA_PATH } from '../../src/types.js';
+import { makeViewerRequestEvent as makeEvent } from '../helpers/cloudfront.js';
 import {
   type TestKeypair,
   futureExp,
@@ -67,36 +67,6 @@ beforeEach(() => {
   originRequests = [];
 });
 
-function makeEvent(urlStr: string, headers: Record<string, string> = {}): CloudFrontEdgeEvent {
-  const url = new URL(urlStr);
-  const cfHeaders: CloudFrontRequest['headers'] = {};
-  cfHeaders.host = [{ key: 'Host', value: url.host }];
-  for (const [k, v] of Object.entries(headers)) {
-    cfHeaders[k.toLowerCase()] = [{ key: k, value: v }];
-  }
-  return {
-    Records: [
-      {
-        cf: {
-          config: {
-            distributionDomainName: 'test.cloudfront.net',
-            distributionId: 'EXAMPLE',
-            eventType: 'viewer-request',
-            requestId: 'req-1',
-          },
-          request: {
-            clientIp: '127.0.0.1',
-            method: 'GET',
-            uri: url.pathname,
-            querystring: url.search.slice(1),
-            headers: cfHeaders,
-          },
-        },
-      },
-    ],
-  };
-}
-
 describe('AWS Lambda@Edge handler', () => {
   it('serves /healthz', async () => {
     const result = await lambdaHandler(makeEvent(`${PUB_ORIGIN}/healthz`));
@@ -110,6 +80,16 @@ describe('AWS Lambda@Edge handler', () => {
     const body = JSON.parse(result.body ?? '') as { role: string; domain: string };
     expect(body.role).toBe('ROLE_PUBLISHER');
     expect(body.domain).toBe('pub.example.com');
+  });
+
+  it('answers 404 on the key directory when the publisher issues no keys', async () => {
+    // The deps above carry no `wba`, which is the CloudFront-native posture: the
+    // verify key is provisioned out of band and the publisher publishes no
+    // signing key of its own. Four operator documents tell people that this 404
+    // is correct and not an incident, so the status is load-bearing on every
+    // runtime, not only on the two that already covered it.
+    const result = await lambdaHandler(makeEvent(`${PUB_ORIGIN}${WBA_PATH}`));
+    expect(result.status).toBe('404');
   });
 
   it('passes through valid signed URL and serves the origin body', async () => {

@@ -49,7 +49,7 @@ func buildProbeMux(t *testing.T, d muxDeps) http.Handler {
 	}
 	d.agentRegistry = noopRegistry{}
 	d.offerSigner = offerSigner
-	mux, err := buildMux(d)
+	mux, _, err := buildMux(d)
 	if err != nil {
 		t.Fatalf("build mux: %v", err)
 	}

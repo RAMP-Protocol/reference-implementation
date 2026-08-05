@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
@@ -53,7 +55,7 @@ func TestWBASplit_RejectsPreSignatureAgentSignature(t *testing.T) {
 	req.Header.Set("Signature-Input", oldFixSigInput)
 	req.Header.Set("Signature", oldFixSignature)
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		oldFixAgentKID:  agentPub,
 		oldFixBrokerKID: brokerPub,
 	})

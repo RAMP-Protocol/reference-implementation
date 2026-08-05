@@ -59,6 +59,11 @@ curl https://<your-hostname>/.well-known/ramp.json
 
 You should see your publisher manifest (your domain + the exchange entries).
 
+Compare it field by field against the reference copy in
+[../../publisher-wellknown/](../../publisher-wellknown/), which also covers the second
+discovery document (your Web Bot Auth key directory) and the payee id that has to
+be inside `exchanges_json` before your content can be sold.
+
 ## Inputs you will actually set
 
 | Variable | What it is |

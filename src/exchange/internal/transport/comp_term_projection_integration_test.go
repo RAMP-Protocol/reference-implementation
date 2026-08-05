@@ -140,7 +140,7 @@ func TestComp_TermProjection(t *testing.T) {
 	// requester declares the entitlement scope the term carries so licenseterm.
 	// Select keeps it (entitlement scopes are the only discovery eligibility
 	// filter — restriction axes do not exclude terms; ADR-014).
-	compOffer := discoverCompOfferScoped(t, h, uri, "entitlement:full")
+	compOffer := discoverCompOffer(t, h, uri, "entitlement:full")
 	assertCompTermProjection(t, compOffer, term)
 	assertCompUnmappableOmitted(t, compOffer)
 
@@ -157,34 +157,6 @@ func TestComp_TermProjection(t *testing.T) {
 func assertTransactParityScoped(t *testing.T, h *pushHarness, o *rampv1.Offer, scope string) {
 	t.Helper()
 	parityTransact(t, h, o, []string{scope})
-}
-
-// discoverCompOfferScoped discovers uri WITH SupportedProfiles=["ramp-comp-v1"]
-// AND a requester carrying the given entitlement scope, asserting exactly one
-// offer. It mirrors discoverCompOffer but covers the term's entitlement scope so
-// licenseterm.Select keeps a scope-bearing term (the slice-1 helper uses no
-// scopes because seedPricedTerm carries none).
-func discoverCompOfferScoped(t *testing.T, h *pushHarness, uri, scope string) *rampv1.Offer {
-	t.Helper()
-	resp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:               "1.0",
-		Uris:              []string{uri},
-		SupportedProfiles: []string{"ramp-comp-v1"},
-		Requester: &rampv1.Requester{
-			Id:     "agent-discover",
-			Domain: "agent.example",
-			Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-			Scopes: []string{scope},
-		},
-	}))
-	if err != nil {
-		t.Fatalf("discover (comp profile, scoped) %s: %v", uri, err)
-	}
-	offers := resp.Msg.GetOffers()
-	if len(offers) != 1 {
-		t.Fatalf("discover (comp profile, scoped) %s: got %d offers, want 1", uri, len(offers))
-	}
-	return offers[0]
 }
 
 // assertCompTermProjection verifies property (1): the mappable crosswalk landed

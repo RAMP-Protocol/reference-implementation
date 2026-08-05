@@ -27,14 +27,15 @@ Agent ──► Broker ──► Exchange ──► (signed link) ──► CDN 
 The Broker is **not** on the download path. It never holds an agent's private key,
 never creates a download link, and never sees the content.
 
-**One dependency to know about before you start.** The Exchange refuses to start
-until it can read a document published by the Broker (it treats the Broker as the
-final word on which keys have been withdrawn). So on a first deployment the
-Exchange will start, fail and restart over and over — a *crash-loop* — for a few
-minutes, until DNS resolves, certificates are issued and the Broker is answering.
-**This is expected and fixes itself** — deploy both with a restart policy such as
-`restart: unless-stopped` and let them keep retrying. Do not treat the early
-Exchange restarts as a fault.
+**One dependency to know about before you start.** The Exchange treats the Broker
+as the final word on which keys have been withdrawn. The Exchange refuses to start
+only when its `EXCHANGE_BROKER_WELLKNOWN_URL` setting is empty — it does not fetch
+the Broker's document at boot. If the Broker is down, or DNS and certificates are
+not ready yet, the Exchange still starts normally; it then rejects every signed
+request with `401` and logs `exchange.httpsig.broker_wellknown_unavailable`,
+because it cannot prove a key has not been withdrawn. **So bring the Broker up
+first** — until the Broker answers, the Exchange authenticates nobody, even though
+both processes look healthy.
 
 ---
 
@@ -63,7 +64,7 @@ this is the only place this document names one, and every command below reuses
 it:
 
 ```bash
-VERSION=1.0.0-rc.1
+VERSION=1.0.0-rc.2
 docker pull ghcr.io/ramp-protocol/broker:$VERSION
 ```
 
@@ -148,7 +149,7 @@ interchangeable.
 
 | Keypair | What it does | Set via |
 |---|---|---|
-| **Identity key** | The Broker's public identity. Its public half is published at `https://<your-broker>/.well-known/http-message-signatures-directory` and cached by other parties for up to 90 days. | `BROKER_ED25519_SEED` |
+| **Identity key** | The Broker's public identity. Its public half is published at `https://<your-broker>/.well-known/http-message-signatures-directory` with a 90-day validity window; other parties fetch it from there and re-fetch on their own cache schedule (once an hour by default). | `BROKER_ED25519_SEED` |
 | **Relay key** | Signs the Broker's outbound calls to the Exchange, so the Exchange knows the request really came from your Broker. | `BROKER_RELAY_KEY_FILE` |
 
 ### Generate the identity key
@@ -169,20 +170,19 @@ Store that string in your secret manager and supply it as `BROKER_ED25519_SEED`.
 
 ```bash
 BROKER_RELAY_KID=broker.example.v1 scripts/gen-broker-relay-key.sh
-# Expect: "wrote deploy/broker/keys.json and deploy/broker/broker-key.json
-#          (kid=broker.example.v1)"
+# Expect: "wrote <absolute path to>/deploy/broker/broker-key.json (kid=broker.example.v1)"
+# The script prints the full path it resolved from the repository root.
 ```
 
-This writes two files:
+This writes one file:
 
 - `deploy/broker/broker-key.json` — the **private** key. Mount it into the Broker
   container and point `BROKER_RELAY_KEY_FILE` at it. Treat it as a secret.
-- `deploy/broker/keys.json` — the **public** key, added to the shared list of keys
-  the Exchange trusts. The Exchange operator must load this same file, otherwise it
-  will reject your Broker's calls with `401`.
 
-> The copies of these files already in the repository are **test fixtures with
-> published private keys**. Generate your own; do not deploy the committed ones.
+There is nothing to hand to the Exchange operator: the Broker publishes the
+relay **public** key in its own directory
+(`/.well-known/http-message-signatures-directory`) at start-up, and the
+Exchange resolves it from there via `EXCHANGE_BROKER_WELLKNOWN_URL`.
 
 ---
 
@@ -205,7 +205,6 @@ services:
       BROKER_ID: "broker-01"
       BROKER_DOMAIN: "broker.example"
       BROKER_ED25519_SEED: "${BROKER_ED25519_SEED}"
-      BROKER_KEYS_FILE: "/keys/keys.json"
       BROKER_RELAY_KEY_FILE: "/keys/broker-key.json"
       BROKER_REGISTRY_FILE: "/config/exchanges.yaml"
       BROKER_REVOCATION_URL: "https://broker.example/.well-known/ramp-key-revocations.json"
@@ -224,7 +223,6 @@ docker compose logs broker | head -20
 #   {"level":"INFO","msg":"migrations applied","version":3,"dirty":false, ...}
 #   {"level":"INFO","msg":"broker.redis.ready","addr":"..."}
 #   {"level":"INFO","msg":"broker.relay.signing","keyid":"0yN6xRMmYrgA78Ue3aR4..."}
-#   {"level":"INFO","msg":"broker.registry.loaded","path":"/keys/keys.json","count":N}
 #   {"level":"INFO","msg":"broker listening","addr":":8082"}
 #
 # The "keyid" is not the name you chose in BROKER_RELAY_KID — it is the key's
@@ -234,7 +232,7 @@ docker compose logs broker | head -20
 ```
 
 If you see `broker.redis.disabled`, `broker.relay.key_absent` or
-`broker.registry.absent` instead, a setting is missing — see
+`broker.registry.no_bootstrap` instead, a setting is missing — see
 [`CONFIGURATION.md`](CONFIGURATION.md) §3 for what each one costs.
 
 ---
@@ -372,9 +370,10 @@ Stopping the Broker stops agents using the platform: they can no longer discover
 offers or make purchases. It does **not** affect visitors reading the publisher's
 site, and it does not invalidate download links already issued.
 
-Note that a stopped Broker will also prevent the **Exchange** from starting, because
-the Exchange requires the Broker's published documents at boot (§1). Bring the
-Broker back before restarting the Exchange.
+Note that while the Broker is stopped, the **Exchange** stops authenticating: it
+stays up, but it rejects every signed request with `401` because it cannot reach
+the Broker's published withdrawn-keys document (§1). Bring the Broker back and the
+Exchange recovers on its own, without a restart.
 
 ---
 

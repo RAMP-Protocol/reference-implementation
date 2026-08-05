@@ -48,15 +48,13 @@ called out in §3 and §5.
 | `REDIS_URL` | Optional, **set it** | Redis connection string, used to remember which signed requests have already been seen. Leave it unset and each process remembers on its own — see the warning below. Username, password and TLS all travel inside the URL; there is no separate variable for them. | `rediss://:PASSWORD@cache.internal:6379/0` |
 | `BROKER_ID` | Optional | A short name for this Broker, used in the documents it publishes. Default `broker-local`. | `broker-01` |
 | `BROKER_DOMAIN` | Optional | The public hostname of this Broker. It is written into the documents the Broker publishes and into the signatures it makes, so it must match the name callers actually use. Default `broker.local`. | `broker.example` |
-| `BROKER_KEYS_FILE` | Optional | Path to a JSON file of **public** keys the Broker accepts signatures from (agents, and its own relay key). Default `deploy/broker/keys.json`. | `/keys/keys.json` |
 | `BROKER_RELAY_KEY_FILE` | Optional, **set it** | Path to the **private** key the Broker signs its outbound calls to the Exchange with. Default `deploy/broker/broker-key.json`. Without it those calls go out unsigned and the Exchange answers `401`. | `/relay/broker-key.json` |
 | `BROKER_ED25519_SEED` | **Required** (or the file below) | The Broker's own signing key, as 32 raw bytes in base64url. This is the identity the Broker publishes to the world. The Broker will not start without it — see below. | `<43-character base64url string>` |
 | `BROKER_ED25519_KEY_FILE` | Alternative to the seed | The same key supplied as a PEM file. Only read when `BROKER_ED25519_SEED` is empty. Note the format problem in §3. | `/keys/cosign.pem` |
 | `BROKER_REVOCATION_URL` | Optional, **set it** | The public web address where the Broker publishes its list of withdrawn keys. The Exchange polls this. If unset, the Broker does not advertise it and the Exchange has nothing to poll. | `https://broker.example/.well-known/ramp-key-revocations.json` |
 | `BROKER_REVOCATION_FILE` | Optional | Path to the file whose contents are served at the address above. If unset or missing, the Broker serves an empty "nothing has ever been withdrawn" answer, dated 1 January 1970, forever. The file is re-read when it changes — no restart needed. | `/revocations/revocations.json` |
 | `BROKER_REGISTRY_FILE` | Optional, **set it** | Path to a YAML file listing the Exchanges this Broker routes to. Nothing else fills that list, so with this unset the Broker starts with no Exchanges and every discovery returns nothing. | `/config/exchanges.yaml` |
-| `EXA_API_KEY` | Optional — **leave unset** | Reserved for free-text search discovery through a third-party provider. That is not implemented, so the setting does nothing and there is **no reason to obtain a key**. Requests that name a URL directly work without it. | *(leave unset)* |
-| `BROKER_AGENT_WELLKNOWN_RESOLUTION` | Optional | Whether the Broker may look up an unknown agent's public key from that agent's own website. Default on. Turning it off means any agent not already listed in `BROKER_KEYS_FILE` gets `401`. | `true` |
+| `EXA_API_KEY` | Optional | The key for the EXA search service. It is used only for requests that carry a free-text query and no URLs: EXA turns the query into candidate publisher domains. With it unset, every such request fails at once with `no domains for query`. Requests that name a URL directly never use it. Even with a key, the free-text path returns no offers yet — see [`RUNBOOK.md`](RUNBOOK.md) §6. | *(unset unless you serve free-text queries)* |
 | `RAMP_WELLKNOWN_SCHEME` | Optional | Which protocol the Broker uses when fetching other parties' public documents. Default `https`. **Must stay `https` in production.** | `https` |
 | `RAMP_WELLKNOWN_PORT` | Optional | Appends a port when fetching those documents. Only needed inside a local test network. Leave unset. | *(leave unset)* |
 | `SKIP_SSRF` | Optional — **leave unset** | Setting this to `true` removes the guard that stops the Broker being tricked into calling internal addresses. Development only. | *(leave unset)* |
@@ -79,7 +77,9 @@ instance must point at **the same** Redis. Do not give each instance its own.
 ### The identity key is mandatory
 
 The Broker publishes its own public key in a directory that other parties fetch and
-cache for up to 90 days. A key that changed on every restart would leave everybody
+cache. Each published key carries a 90-day validity window, and consumers such as
+the Exchange re-fetch the directory on their own schedule — once an hour by
+default. A key that changed on every restart would leave everybody
 holding one that no longer verifies — so the Broker **refuses to start** when neither
 `BROKER_ED25519_SEED` nor `BROKER_ED25519_KEY_FILE` is set, rather than creating one
 for you:
@@ -97,15 +97,18 @@ requirement in place. **Never set it in production**; see §5.
 
 ## 3. The file settings, and what happens when one is missing
 
-Five settings point at files. Four of them fail quietly, which makes them the
+Four settings point at files. Two of them fail quietly, which makes them the
 most common source of "it deployed fine but nothing works".
+
+There is no key file for verification: the Broker learns an agent's public key
+by fetching the directory named by the request's signed `Signature-Agent`
+header. An agent that does not publish its key gets `401`.
 
 | Setting | If the file is missing | If the file is present but broken |
 |---|---|---|
-| `BROKER_KEYS_FILE` | Warning `broker.registry.absent`, Broker starts with an empty key list — every signed request is rejected. | Unreadable or not valid JSON: the Broker **refuses to start**. A single malformed key inside a valid file is skipped, not fatal. |
 | `BROKER_RELAY_KEY_FILE` | Warning `broker.relay.key_absent`, Broker starts, **outbound calls to the Exchange are unsigned** and get `401`. | The Broker **refuses to start**. |
 | `BROKER_ED25519_KEY_FILE` | The Broker **refuses to start** unless `BROKER_ED25519_SEED` is set instead (see §2). | The Broker **refuses to start**. |
-| `BROKER_REGISTRY_FILE` | No Exchange is registered, so every discovery returns nothing. Logged once at start-up as `broker.registry.no_bootstrap`. | The Broker **refuses to start**. |
+| `BROKER_REGISTRY_FILE` | The Broker **refuses to start** — the open error appears in `broker.exit`. The quiet case is leaving the variable **unset**: then no Exchange is registered, every discovery returns nothing, and the only signal is one `broker.registry.no_bootstrap` warning at start-up. | The Broker **refuses to start**. |
 | `BROKER_REVOCATION_FILE` | Serves an empty list dated `1970-01-01T00:00:00Z` forever — the Exchange concludes no key has ever been withdrawn. | Returns HTTP `500` on that one route; the rest of the Broker keeps working. The log line `broker.revocation.unavailable` carries the validation error. |
 
 The withdrawn-keys file is the one file you edit while the Broker is running — it is
@@ -197,7 +200,6 @@ carried into production:
 | `SKIP_SSRF: "true"` | Test services live on private addresses the guard blocks. | Removes the protection against the Broker being steered into your internal network. |
 | `ALLOW_INSECURE: "true"` | Same reason. | Same consequence. |
 | `sslmode=disable` in the DSN | The database is on the same private bridge. | Database traffic, including credentials, in the clear. |
-| `deploy/broker/keys.json` | A committed test fixture. | Its matching private keys are public in this repository. Generate your own. |
 | `BROKER_ALLOW_EPHEMERAL_KEY: "true"` | Tests are torn down between runs, so nothing caches the Broker's identity. | Every restart changes the identity the Broker publishes, and everyone who cached it is left holding a key that no longer verifies. |
 
 ---
@@ -212,7 +214,6 @@ BROKER_ADDR=:8082
 REDIS_URL=rediss://:<password>@<redis-host>:6379/0
 BROKER_ID=broker-01
 BROKER_DOMAIN=broker.example
-BROKER_KEYS_FILE=/keys/keys.json
 BROKER_RELAY_KEY_FILE=/keys/broker-key.json
 BROKER_ED25519_SEED=<fill in — see DEPLOYMENT.md §5>
 BROKER_REGISTRY_FILE=/config/exchanges.yaml

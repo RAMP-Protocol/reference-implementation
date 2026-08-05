@@ -153,6 +153,7 @@ locals {
     default_tenant_domain      = var.default_tenant_domain
     exa_api_key                = var.exa_api_key
     rsa_enabled                = var.rsa_private_pem != null
+    wba_enabled                = length(var.static_wba_directories) > 0
   })
 
   caddyfile = templatefile("${path.module}/templates/Caddyfile.tftpl", {
@@ -163,6 +164,13 @@ locals {
     origin_hostname   = var.origin_hostname
     acme_email        = var.acme_email
     acme_staging      = var.acme_staging
+    # Only the hostnames reach the Caddyfile — and they are the interpolated
+    # half, so the variable validates BOTH halves at plan time: every document
+    # against the JWK Set schema, and every hostname against the DNS-shape
+    # regex. The documents themselves are written to /opt/ramp/wba by
+    # cloud-init (base64-encoded in transit) and served as files, so no
+    # document byte is ever interpolated into proxy configuration.
+    static_wba_hostnames = keys(var.static_wba_directories)
   })
 
   init_sql = templatefile("${path.module}/templates/exchange-dbs.sql.tftpl", {
@@ -178,11 +186,11 @@ locals {
     caddyfile               = local.caddyfile
     init_sql                = local.init_sql
     zitadel_init_steps      = local.zitadel_init_steps
-    keys_json               = var.keys_json
     ed25519_private_pem     = var.ed25519_private_pem
     rsa_private_pem         = var.rsa_private_pem
     broker_relay_key_json   = var.broker_relay_key_json
     broker_identity_key_pem = var.broker_identity_key_pem
+    static_wba_directories  = var.static_wba_directories
     registry_server         = var.registry_server
     registry_username       = var.registry_username
     registry_password       = var.registry_password

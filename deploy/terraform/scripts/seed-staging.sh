@@ -25,9 +25,12 @@
 #                      PUBLISHER_DOMAIN=client-news.example.com \
 #                      deploy/terraform/scripts/seed-staging.sh
 #   FEED             default deploy/fixtures/demo/philosophy.jsonl
-#   AGENT_ID / CONTRIBUTOR_ID / BROKER_RELAY_KID — identity defaults come
-#   from lib/staging-env.sh (single home, shared with gen-staging-keys.sh
-#   and smoke.sh so the ids can never drift apart).
+#   AGENT_ID / CONTRIBUTOR_ID / BROKER_RELAY_KID — identity ids come from
+#   lib/staging-env.sh, which reads the smoke ids from the generated key
+#   files' kids (shared with gen-staging-keys.sh and smoke.sh so the ids can
+#   never drift apart). This script additionally proves the ids equal the
+#   hostnames the stack serves the key directories at, before seeding rows
+#   under them.
 #
 # Usage:
 #   deploy/terraform/scripts/seed-staging.sh
@@ -51,6 +54,12 @@ command -v uv >/dev/null 2>&1 || { echo "missing: uv" >&2; exit 2; }
 # VM — it carries -i <key> when ssh_private_key_path is set in tfvars. Split
 # it into words for exec (none of its parts can contain spaces).
 read -r -a SSH_CMD <<< "$(tf_out ssh_command)"
+
+# The rows seeded below are keyed by the smoke ids, and the services verify
+# those identities' signatures by fetching https://<id>/.well-known/... — so
+# an id that is not the hostname the stack serves is a guaranteed 401 later.
+# Refuse to seed it.
+require_ids_match_stack
 # The tenant domain and the Exchange's EXCHANGE_DEFAULT_TENANT must be the
 # same string, and the stack is the one place that derives it (its
 # default_tenant_domain output). Reading it back here keeps the two tools

@@ -84,6 +84,15 @@ module "ramp_edge" {
 
 Full descriptions live in `variables.tf`.
 
+`provider_domain`, `exchanges_json`, `catalog_contributors_json`, `wba_keys_json`
+and `wba_revocation_url` are the five inputs that decide what the worker
+publishes at `/.well-known/ramp.json` and
+`/.well-known/http-message-signatures-directory`. `provider_domain` is easy to
+overlook: it becomes the `domain` field of `ramp.json`, which is the first thing
+the Exchange compares a catalog pusher against. A filled-in copy of both
+documents, with each field traced back to the input that produced it, is in
+[../../../publisher-wellknown/](../../../publisher-wellknown/).
+
 ## Zone protections (read before production)
 
 Cloudflare zone protections (WAF managed rules, Bot Fight Mode, security

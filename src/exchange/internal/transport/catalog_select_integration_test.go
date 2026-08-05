@@ -12,8 +12,10 @@ import (
 )
 
 // This file owns the SHARED arrange/observe helpers the licensing integration
-// suite builds on (pushTerms, selectPricing, userTypeTerm, discoverOffersAs,
-// discoverTermsAs, requesterWithExt, labels). The requester-attribute Select
+// suite builds on (pushTerms, selectPricing, userTypeTerm, discoverAs,
+// discoverOffersAs, discoverTermsAs, requesterWithExt, labels). discoverAs is
+// the RPC entry point: the offer-shaped and group-shaped helpers all read their
+// result off it. The requester-attribute Select
 // scenarios that once lived here were removed with ADR-014's 2026-06-15
 // amendment: the Exchange no longer excludes a term by the requester's
 // self-declared user_type / geography / intended_use, so those exclusion
@@ -71,22 +73,39 @@ func userTypeTerm(label, userType string) *rampv1.LicenseTerm {
 	}
 }
 
-// discoverOffersAs reads the offers DiscoverResources projects for uri to the
-// given requester. Every projection assertion drives the FULL application chain
-// through this public RPC, never by calling licenseterm.Select with hand-built
-// structs.
-func discoverOffersAs(t *testing.T, h *pushHarness, uri string, spec requesterSpec) []*rampv1.Offer {
+// discoverAs runs DiscoverResources for uri as the given requester and returns
+// the whole response. It is the RPC entry point for the licensing helper family:
+// discoverOffersAs and discoverTermsAs here, discoverOffers and
+// discoverOfferCount in the term-validation file, and discoverCompOffer for the
+// profile-aware CoMP reads, which set spec.profiles rather than rebuilding the
+// query. The group-shaped reads call it directly. None of them reaches past the
+// public surface.
+//
+// Its signature bounds what can route through it: one uri, and a failed test on
+// any error. A caller that discovers a batch, or that asserts on the error
+// itself, issues its own request — this helper makes no claim about those.
+func discoverAs(t *testing.T, h *pushHarness, uri string, spec requesterSpec) *rampv1.ResourceResponse {
 	t.Helper()
 	resp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
 		Ver:                    "1.0",
 		Uris:                   []string{uri},
 		Requester:              spec.requester,
 		AcceptableRestrictions: spec.restrictions,
+		SupportedProfiles:      spec.profiles,
 	}))
 	if err != nil {
 		t.Fatalf("discover %s: %v", uri, err)
 	}
-	return resp.Msg.GetOffers()
+	return resp.Msg
+}
+
+// discoverOffersAs reads the offers DiscoverResources projects for uri to the
+// given requester. Every projection assertion drives the FULL application chain
+// through this public RPC, never by calling licenseterm.Select with hand-built
+// structs.
+func discoverOffersAs(t *testing.T, h *pushHarness, uri string, spec requesterSpec) []*rampv1.Offer {
+	t.Helper()
+	return discoverAs(t, h, uri, spec).GetOffers()
 }
 
 // discoverTermsAs returns the terms on the single offer DiscoverResources
@@ -111,6 +130,10 @@ func discoverTermsAs(t *testing.T, h *pushHarness, uri string, spec requesterSpe
 type requesterSpec struct {
 	requester    *rampv1.Requester
 	restrictions []*rampv1.AcceptableRestriction
+	// profiles are the ResourceQuery.supported_profiles the caller advertises.
+	// Nil for the plain licensing suites; the CoMP helpers set "ramp-comp-v1" so
+	// the Exchange is asked to project that profile.
+	profiles []string
 }
 
 // requesterWithExt builds an identity requester plus the advisory

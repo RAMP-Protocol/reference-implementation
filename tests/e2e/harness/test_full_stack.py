@@ -19,14 +19,13 @@ ramp.transaction_log backs every successful resolve.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import httpx
 
 from .broker_client import execute_first_offer
 from .conftest import StackURLs
-from .edge_fetch import fetch_signed
+from .edge_fetch import fetch_signed, tamper_query_param
 from .resolve_carriers import first_item_of, licensed_of, retrieval_endpoint_of
 from .seed import DemoResource, SeededFixture
 from .signing import build_pop_headers
@@ -49,17 +48,6 @@ def _fetch(
     if key_path is not None and "agent_id=" in signed_url:
         headers = build_pop_headers(url=signed_url, key_path=key_path)
     return httpx.get(signed_url, headers=headers, follow_redirects=True, timeout=timeout)
-
-
-def _tamper_sig(signed_url: str, param: str = "sig") -> str:
-    """Flip a base64url byte in the middle of the ``param`` query value."""
-    m = re.search(rf"{param}=([^&]+)", signed_url)
-    assert m, f"no {param}= in {signed_url}"
-    val = m.group(1)
-    mid = len(val) // 2
-    replacement = "B" if val[mid] != "B" else "C"
-    tampered = val[:mid] + replacement + val[mid + 1 :]
-    return signed_url.replace(f"{param}={val}", f"{param}={tampered}")
 
 
 def _delivered_url(resp: httpx.Response) -> str:
@@ -208,7 +196,7 @@ def test_tampered_signature_is_rejected(
     """Mutating the ed25519 signature flips the Cloudflare edge verify to 403."""
     res = seeded.cloudflare
     resp = _deliver_demo(compose_stack, res)
-    tampered = _tamper_sig(_delivered_url(resp))
+    tampered = tamper_query_param(_delivered_url(resp))
     bad = _fetch(tampered)
     assert bad.status_code == httpx.codes.FORBIDDEN, bad.text
 
@@ -254,7 +242,7 @@ def test_aws_tampered_signature_is_rejected(
     """Mutating a byte inside the CloudFront Signature flips the AWS shim verifier to 403."""
     res = seeded.aws
     resp = _deliver_demo(compose_stack, res)
-    tampered = _tamper_sig(_delivered_url(resp), param="Signature")
+    tampered = tamper_query_param(_delivered_url(resp), param="Signature")
     bad = _fetch(tampered)
     assert bad.status_code == httpx.codes.FORBIDDEN, bad.text
 
@@ -303,7 +291,7 @@ def test_fastly_tampered_signature_is_rejected(
     """Mutating the sig param trips Fastly Compute's ed25519 verify."""
     res = seeded.fastly
     resp = _deliver_demo(compose_stack, res)
-    tampered = _tamper_sig(_delivered_url(resp))
+    tampered = tamper_query_param(_delivered_url(resp))
     bad = _fetch(tampered)
     assert bad.status_code == httpx.codes.FORBIDDEN, bad.text
 

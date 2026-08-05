@@ -26,11 +26,18 @@ really came from that agent.
 **It acts on their behalf.** The agent connects to `/mcp` and calls one of five tools
 (`ramp_register`, `ramp_status`, `ramp_discover`, `ramp_execute`, `ramp_report`). Each
 call is turned into a proper RAMP request, signed with **that agent's** key, and sent
-to the Broker or an Exchange.
+to the Broker or an Exchange. For a purchase, the service goes one step further: it
+follows the delivery link the Exchange answered with, fetches the licensed content
+from the publisher's delivery edge — proving to that edge that it holds the agent's
+key — and returns the content inside the tool result. The key never leaves this
+service, so the agent could not make that proof itself.
 
 ```
 Agent ──► Identity (/mcp) ──► Broker ──► Exchange ──► (signed link) ──► CDN ──► Origin
-              │
+              │                                                          │
+              │      ◄─── fetches the licensed content ──────────────────┘
+              │           with the agent's key, and returns
+              │           it to the agent
               └── Vault (agent keys) · PostgreSQL · your OIDC provider
 ```
 
@@ -81,7 +88,7 @@ this is the only place this document names one, and every command below reuses
 it:
 
 ```bash
-VERSION=1.0.0-rc.1
+VERSION=1.0.0-rc.2
 docker pull ghcr.io/ramp-protocol/identity:$VERSION
 ```
 
@@ -120,8 +127,11 @@ Facts about the image:
   uid.
 - It publishes **port 8083**, matching the `IDENTITY_ADDR` default. If you change
   `IDENTITY_ADDR`, change the published port to match.
-- **There is no health check inside the image**, because there is no shell or `curl`
-  to run one with. Probe `/healthz` from outside.
+- **The image defines no health check of its own**, and there is no shell or `curl`
+  inside it to write one with. The binary is its own probe instead: running
+  `/identity healthcheck` calls the local `/healthz` and exits with the result, so a
+  container health check can exec the service binary itself. Or probe `/healthz`
+  from outside.
 - **The emergency revocation tool is not in the image.** It is a second binary and
   the image contains only the server. See [`RUNBOOK.md`](RUNBOOK.md) §4.2 — set this
   up before you need it, not during an incident.
@@ -337,10 +347,15 @@ If it exited instead, the `identity.exit` line names the cause:
 | `sign-up config: developer sign-up requires` | One of the four OIDC values is missing. |
 | `sign-up config: oidc upstream: oidcup: discover` | The OIDC provider did not answer. Check the address and that it is reachable from this container. |
 | `sign-up config: IDENTITY_SESSION_KEY must decode to` | The key is not 32 bytes of standard base64 (§7). |
+| `keystore:` | The Vault client could not be built — usually a `VAULT_ADDR` that is not a valid address at all. |
 | `mcp config: both IDENTITY_MCP_` | One or both peer addresses are missing. |
+| `mcp config: IDENTITY_MCP_MAX_` | One of the two content byte caps is not a positive whole number. |
+| `build server:` | The server could not be assembled from the settings — for example a per-item content cap larger than the per-call cap. The rest of the message names the exact cause. |
 
-Note that a **wrong Vault address is not on that list** — it does not stop start-up.
-Check C in §10 is what catches it.
+Note that a **wrong-but-well-formed Vault address is not on that list** — only a
+`VAULT_ADDR` the client cannot even parse stops start-up (the `keystore:` row). An
+address that parses but points nowhere, a missing token, or a sealed Vault all let
+the service start normally. Check C in §10 is what catches those.
 
 ---
 
@@ -439,14 +454,19 @@ docker compose stop identity      # pause; the database and Vault keep their con
 docker compose down               # remove containers; named volumes survive
 ```
 
-Stopping the Identity Service takes the agent-facing path down: agents cannot make new
-requests, and no developer can sign up. It does **not** affect visitors reading the
-publisher's site, and it does not invalidate delivery links already issued.
+Stopping the Identity Service takes the agent-facing path down: agents cannot make
+new requests, no developer can sign up, and no licensed content is delivered —
+content is fetched by this service on the agent's behalf, so that stops with it. It
+does **not** affect visitors reading the publisher's site, and it does not
+invalidate delivery links already issued — though a link bound to an agent's key is
+only usable through this service, so it waits until the service is back.
 
 **It also takes down every agent's published key**, because those documents are served
-by this process. The Broker and the Exchange cache them for a few minutes, so a short
-restart is invisible, but a long outage eventually makes agent requests fail
-verification everywhere.
+by this process. The Broker and the Exchange cache a fetched key directory for up to
+an hour, so a short restart is invisible for agents they have seen recently — but an
+agent they have not seen, or one presenting a newly rotated key, fails verification
+immediately, and a long outage eventually makes agent requests fail verification
+everywhere.
 
 Removing the database or the Vault contents is a different matter — the keys in Vault
 cannot be recovered, and every agent would have to be created again.

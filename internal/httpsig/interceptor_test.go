@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
@@ -39,7 +41,7 @@ func TestMiddleware_AcceptsSigned(t *testing.T) {
 		t.Fatalf("gen: %v", err)
 	}
 	now := signNow()
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
 	var seenKeyID string
@@ -81,7 +83,7 @@ func TestMiddleware_RejectsUnsignedWith401(t *testing.T) {
 		t.Fatalf("gen: %v", err)
 	}
 	now := signNow()
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
 	calls := 0
@@ -112,7 +114,7 @@ func TestMiddleware_RejectsReplay(t *testing.T) {
 		t.Fatalf("gen: %v", err)
 	}
 	now := signNow()
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
 	h := Middleware(resolver, replay, InterceptorOptions{
@@ -162,7 +164,7 @@ func TestMiddleware_MultisigReplayDoesNotBurnOtherSignatures(t *testing.T) {
 		t.Fatalf("gen pub2: %v", err)
 	}
 	now := signNow()
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{"key1": pub1, "key2": pub2})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{"key1": pub1, "key2": pub2})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
 	bodyStr := `{"q":"x"}`
@@ -227,7 +229,7 @@ func TestMiddleware_SkipsNonRampPaths(t *testing.T) {
 		t.Fatalf("gen: %v", err)
 	}
 	now := signNow()
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	replay := NewMemoryReplayStore(func() time.Time { return now })
 
 	called := false
@@ -258,7 +260,7 @@ func TestMiddleware_MultisigStoresAllSignatures(t *testing.T) {
 		t.Fatalf("gen pub2: %v", err)
 	}
 	now := signNow()
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		"key1": pub1,
 		"key2": pub2,
 	})

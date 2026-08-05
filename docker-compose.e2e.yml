@@ -32,6 +32,33 @@ x-identity-auth: &identity-auth
   # run (32-byte Ed25519 seed, base64). e2e-only, not a real secret.
   IDENTITY_TOKEN_SIGNING_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
+# One agent well-known host (universal well-known key discovery). Every agent
+# jwks service below is this block plus exactly two per-identity values: the
+# key-file mount (bound at the fixed /keys/signing-key.json path the anchored
+# SIGNING_KEY_FILE names) and the network alias (== the identity's kid, which
+# the harness sends as the covered Signature-Agent header). Each host mounts
+# ONLY its own key file — never the whole fixtures directory — so a wrong
+# mount fails at container start instead of serving another identity's key
+# while healthy (the ghost negative control depends on its key being served
+# NOWHERE, so a mixed-up mount here would hollow that test out silently).
+x-jwks-host: &jwks-host
+  build:
+    # Repo-root context (the same shape the service images use) so the
+    # Dockerfile can copy scripts/lib/ed25519_keys.py — the entrypoint renders
+    # its WBA directory through the same shared helpers the key-gen scripts
+    # use, instead of a shell-side copy kept in sync by hand.
+    context: .
+    dockerfile: deploy/publisher-jwks/Dockerfile
+  environment:
+    SIGNING_KEY_FILE: "/keys/signing-key.json"
+    MANIFEST_ROLE: "ROLE_AGENT"
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/healthz || exit 1"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+    start_period: 5s
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -104,9 +131,10 @@ services:
   # the contributor fixture's domain, so URL templating
   # (http://examplenews/.well-known/ramp.json) lands on this service.
   publisher-jwks:
-    build:
-      context: deploy/publisher-jwks
-      dockerfile: Dockerfile
+    <<: *jwks-host
+    # The whole environment map is restated (a YAML merge key replaces nested
+    # maps, it does not deep-merge): this host serves a ROLE_PUBLISHER manifest
+    # (the anchor's ROLE_AGENT must not apply) with its own key path and kid.
     environment:
       SIGNING_KEY_FILE: "/keys/examplenews-subscription-key.json"
       SIGNING_KID_OVERRIDE: "examplenews.sub.2026q2"
@@ -117,7 +145,12 @@ services:
       # NOT_IN_CATALOG even though the contributor is listed.
       EXCHANGES_JSON: '[{"domain":"exchange:8081","endpoint":"http://exchange:8081","supported_profiles":["ramp-news-v1"],"ext":{"resource_owner_id":"demo-resource-owner"}}]'
     volumes:
-      - ./deploy/publisher-keys:/keys:ro
+      # ONLY the one key file this host uses — never the whole directory,
+      # per the anchor's rule above: deploy/publisher-keys also collects
+      # gen-contributor-key.sh and gen-buyer-delegation-key.sh output, and a
+      # directory mount would carry every one of those private keys into a
+      # container whose job is serving public documents over HTTP.
+      - ./deploy/publisher-keys/examplenews-subscription-key.json:/keys/examplenews-subscription-key.json:ro
     networks:
       default:
         aliases:
@@ -127,14 +160,8 @@ services:
           # serves BOTH /.well-known/ramp.json (Gate 2 + Broker probe) AND the
           # signed CONTENT on port 80. publisher-jwks keeps only its own
           # `examplenews` alias for the subscription self-signup path.
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/healthz || exit 1"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-      start_period: 5s
 
-  # ───── 3rd-party catalog-contributor well-known host (fcrk7) ─────
+  # ───── 3rd-party catalog-contributor well-known host ─────
   # Plain-HTTP host aliased to `catalog-contributor-e2e` that serves THAT
   # contributor's /.well-known/ramp.json with its Ed25519 signing key in
   # public_keys[] and manifest domain == the host string. This is what the
@@ -146,56 +173,115 @@ services:
   # path as well. Reuses the publisher-jwks image; the harness contributor key
   # fixture (gen-e2e-keys.sh) is mounted read-only and its pubkey is published on
   # every cold start.
-  catalog-contributor:
-    build:
-      context: deploy/publisher-jwks
-      dockerfile: Dockerfile
+  catalog-contributor-e2e-jwks:
+    <<: *jwks-host
+    # The whole environment map is restated (a YAML merge key replaces nested
+    # maps, it does not deep-merge): this host is a ROLE_PUBLISHER manifest
+    # (the anchor's ROLE_AGENT must not apply) with contributor extras.
     environment:
-      SIGNING_KEY_FILE: "/keys/catalog_contributor_key.json"
+      SIGNING_KEY_FILE: "/keys/signing-key.json"
       SIGNING_KID_OVERRIDE: "catalog-contributor-e2e"
-      # registry.go rejects a manifest whose domain != the fetched agent_id; the
-      # contributor's identity anchor is its own host string.
+      # A belt, not a load-bearing check: registration anchors the
+      # contributor's identity to the host its directory is fetched from and
+      # never reads the served manifest's domain — pinning the domain here
+      # just keeps the published document consistent with that host string.
       MANIFEST_DOMAIN_OVERRIDE: "catalog-contributor-e2e"
       # A self-hosting contributor authorizes no third party of its own.
       CATALOG_CONTRIBUTORS_JSON: "[]"
     volumes:
-      - ./tests/e2e/harness/fixtures:/keys:ro
+      - ./tests/e2e/harness/fixtures/catalog_contributor_key.json:/keys/signing-key.json:ro
     networks:
       default:
         aliases:
           - catalog-contributor-e2e
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/healthz || exit 1"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-      start_period: 5s
 
-  # ───── Agent well-known host (lazy-registration e2e) ─────
-  # Serves the fresh agent's ROLE_AGENT /.well-known/ramp.json on the
-  # `lazy-agent-e2e` network alias (== the agent's keyID/domain). The agent is
-  # deliberately ABSENT from RAMP_KEYS_FILE and ramp.agents, so the Exchange's
-  # and Broker's per-agent well-known resolvers (ADR-009 D2) are the only way its
-  # transport signature verifies — and a transaction lazily registers it.
-  agent-jwks:
-    build:
-      context: deploy/publisher-jwks
-      dockerfile: Dockerfile
-    environment:
-      SIGNING_KEY_FILE: "/keys/agent_lazy_e2e_key.json"
-      MANIFEST_ROLE: "ROLE_AGENT"
+  # ───── Agent well-known hosts (universal well-known key discovery) ─────
+  # There is no static key file: EVERY signing identity publishes its own keys
+  # at its well-known address, and the Exchange and Broker learn a key only by
+  # fetching the signer's directory (the same path production uses). One host
+  # per identity; the network alias equals the identity's kid, which the
+  # harness sends as the covered Signature-Agent header, and the service name
+  # is that same kid plus "-jwks" — so a kid in a rejection log maps to its
+  # service in `docker compose ps` without a lookup table.
+  #
+  # None of these hosts needs MANIFEST_DOMAIN_OVERRIDE (unlike the
+  # catalog-contributor-e2e-jwks above, which pins it as an explicit belt):
+  # nothing on any path these hosts serve reads a manifest's `domain`. The
+  # httpsig key-resolution path fetches only the WBA directory (a JWK set
+  # matched by thumbprint), and lazy registration fetches that SAME directory
+  # — its identity check (agentreg's ErrAgentIDMismatch) compares the
+  # discovery URL's host against the agent id, never manifest content. The
+  # manifest these hosts do serve gets its domain from the key fixture's
+  # required `issuer` (stamped with the full kid by scripts/gen-e2e-keys.sh),
+  # so it equals the host's alias anyway, dotted kids (test-signer-e2e.v1)
+  # included.
+  #
+  # lazy-agent-e2e-jwks (lazy-registration e2e): serves the fresh agent's ROLE_AGENT
+  # /.well-known/ramp.json on the `lazy-agent-e2e` alias (== the agent's
+  # keyID/domain). The agent is deliberately ABSENT from ramp.agents, so a
+  # transaction lazily registers it after its key resolves (ADR-009 D2).
+  lazy-agent-e2e-jwks:
+    <<: *jwks-host
     volumes:
-      - ./tests/e2e/harness/fixtures:/keys:ro
+      - ./tests/e2e/harness/fixtures/agent_lazy_e2e_key.json:/keys/signing-key.json:ro
     networks:
       default:
         aliases:
           - lazy-agent-e2e
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/healthz || exit 1"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-      start_period: 5s
+
+  # The baseline funded buyer the harness signs most agent-direct calls as.
+  agent-e2e-jwks:
+    <<: *jwks-host
+    volumes:
+      - ./tests/e2e/harness/fixtures/agent_e2e_key.json:/keys/signing-key.json:ro
+    networks:
+      default:
+        aliases:
+          - agent-e2e
+
+  # The deliberately-unfunded buyer for the billing deny-path obligations.
+  agent-nobilling-e2e-jwks:
+    <<: *jwks-host
+    volumes:
+      - ./tests/e2e/harness/fixtures/agent_nobilling_e2e_key.json:/keys/signing-key.json:ro
+    networks:
+      default:
+        aliases:
+          - agent-nobilling-e2e
+
+  # The EUR-funded Phase-2 demo buyer.
+  agent-demo-eur-jwks:
+    <<: *jwks-host
+    volumes:
+      - ./tests/e2e/harness/fixtures/agent_demo_eur_key.json:/keys/signing-key.json:ro
+    networks:
+      default:
+        aliases:
+          - agent-demo-eur
+
+  # The generic harness test signer (build_signed_headers' default identity).
+  test-signer-e2e.v1-jwks:
+    <<: *jwks-host
+    volumes:
+      - ./tests/e2e/harness/fixtures/test_signer_key.json:/keys/signing-key.json:ro
+    networks:
+      default:
+        aliases:
+          - test-signer-e2e.v1
+
+  # The throwaway identity the cross-container revocation e2e revokes: its key
+  # resolves here (per-agent well-known) until the test publishes a revocation
+  # through the Broker's channel, after which the Exchange rejects the
+  # thumbprint even though this host still serves the key — revocation
+  # overrides a still-published key.
+  revocation-throwaway-e2e-jwks:
+    <<: *jwks-host
+    volumes:
+      - ./tests/e2e/harness/fixtures/revocation_throwaway_key.json:/keys/signing-key.json:ro
+    networks:
+      default:
+        aliases:
+          - revocation-throwaway-e2e
 
   # One-shot: generate ephemeral signing keys into a shared volume at stack-up so
   # nothing is committed to git. Mints (a) the AWS_CLOUDFRONT_RSA tenant RSA pair —
@@ -270,8 +356,8 @@ services:
       # adapter authorizes every term — incl. FREE — on a currency match, so the
       # demo buyer's balance currency must match the demo terms). lazy-agent-e2e
       # (USD) funds the v1.1 lazy-registration proof: the agent is absent from
-      # RAMP_KEYS_FILE/ramp.agents and resolves only via the per-agent well-known
-      # path (agent-jwks service), so its balance must be seeded here too.
+      # ramp.agents and a transaction registers it lazily after its key resolves
+      # via the per-agent well-known path, so its balance must be seeded here too.
       EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"},"agent-demo-eur":{"value":"1000.00","currency":"EUR"},"lazy-agent-e2e":{"value":"100.00","currency":"USD"}}'
       # Single scheme knob for the well-known / manifest-fetch resolver (HTTPS is
       # the default; compose network is HTTP-only).
@@ -282,10 +368,11 @@ services:
       # MUST stay unset in production.
       SKIP_SSRF: "true"
       ALLOW_INSECURE: "true"
-      # Activate revocation-aware key resolution: the Exchange polls the Broker's
-      # well-known + invalidation_url so a Broker-revoked relay kid is rejected
-      # even while it is still listed in the bootstrap keys file. Resolution
-      # falls back to the static keys.json when the document is unreachable.
+      # Revocation-aware key resolution: the Exchange polls the Broker's
+      # well-known + invalidation_url so a Broker-revoked kid is rejected, and
+      # resolves the Broker relay key from the same directory. The Broker's
+      # directory is the revocation authority; when it is unreachable the
+      # Exchange fails closed (rejects) rather than trusting any other source.
       EXCHANGE_BROKER_WELLKNOWN_URL: "http://broker:8082/.well-known/ramp.json"
       # Poll the Broker's revocation channel frequently so the cross-container
       # revocation e2e (test_revocation_channel) observes a freshly-published
@@ -295,8 +382,6 @@ services:
       # entryFromProto materializes into stored catalog URIs. Compose-internal
       # traffic is http-only; production leaves this unset.
       EXCHANGE_CATALOG_URI_SCHEME: "http"
-      # RAMP_KEYS_FILE (shared httpsig key set, read by Exchange + Broker).
-      RAMP_KEYS_FILE: "/keys/keys.json"
       # RSA private key for the AWS_CLOUDFRONT_RSA tenant scheme, read from a file
       # the rsa-keygen one-shot writes into a shared volume at stack-up (the key
       # is no longer committed to git). The aws-edge CloudFront shim reads the
@@ -310,7 +395,6 @@ services:
       # stack. Production wires RAMP_ED25519_PRIVATE_PEM from Secrets Manager.
       RAMP_ED25519_PRIVATE_PEM_FILE: "/rsa-keys/ed25519-private.pem"
     volumes:
-      - ./deploy/broker:/keys:ro
       - rsa-keys:/rsa-keys:ro
     depends_on:
       dns:
@@ -319,7 +403,7 @@ services:
         condition: service_healthy
       publisher-jwks:
         condition: service_healthy
-      catalog-contributor:
+      catalog-contributor-e2e-jwks:
         condition: service_healthy
       rsa-keygen:
         condition: service_completed_successfully
@@ -357,14 +441,12 @@ services:
       ALLOW_INSECURE: "true"
       EXCHANGE_BROKER_WELLKNOWN_URL: "http://broker:8082/.well-known/ramp.json"
       EXCHANGE_CATALOG_URI_SCHEME: "http"
-      RAMP_KEYS_FILE: "/keys/keys.json"
       # Distinct ed25519 + RSA key MATERIAL (per exchange) so the well-known
       # serves a distinct offer key. Key REF names are kept identical to
       # exchange-a so the per-DB tenant rows (seeded with the same refs) resolve.
       RAMP_RSA_PRIVATE_PEM_FILE: "/rsa-keys/rsa-b-private.pem"
       RAMP_ED25519_PRIVATE_PEM_FILE: "/rsa-keys/ed25519-b-private.pem"
     volumes:
-      - ./deploy/broker:/keys:ro
       - rsa-keys:/rsa-keys:ro
     depends_on:
       dns:
@@ -373,7 +455,7 @@ services:
         condition: service_healthy
       publisher-jwks:
         condition: service_healthy
-      catalog-contributor:
+      catalog-contributor-e2e-jwks:
         condition: service_healthy
       rsa-keygen:
         condition: service_completed_successfully
@@ -405,11 +487,9 @@ services:
       ALLOW_INSECURE: "true"
       EXCHANGE_BROKER_WELLKNOWN_URL: "http://broker:8082/.well-known/ramp.json"
       EXCHANGE_CATALOG_URI_SCHEME: "http"
-      RAMP_KEYS_FILE: "/keys/keys.json"
       RAMP_RSA_PRIVATE_PEM_FILE: "/rsa-keys/rsa-c-private.pem"
       RAMP_ED25519_PRIVATE_PEM_FILE: "/rsa-keys/ed25519-c-private.pem"
     volumes:
-      - ./deploy/broker:/keys:ro
       - rsa-keys:/rsa-keys:ro
     depends_on:
       dns:
@@ -418,7 +498,7 @@ services:
         condition: service_healthy
       publisher-jwks:
         condition: service_healthy
-      catalog-contributor:
+      catalog-contributor-e2e-jwks:
         condition: service_healthy
       rsa-keygen:
         condition: service_completed_successfully
@@ -469,18 +549,15 @@ services:
       # cross-container revocation e2e writes a KeyRevocationList here to revoke a
       # throwaway thumbprint and assert the Exchange then rejects it (401).
       BROKER_REVOCATION_FILE: "/revocations/revocations.json"
-      # Shared httpsig key set (read by Exchange + Broker).
-      BROKER_KEYS_FILE: "/keys/keys.json"
       # Broker-relay signing key — without this the Broker ships unsigned
       # Exchange calls and the Exchange's httpsig middleware rejects them.
-      # The keypair is a committed harness fixture (deploy/broker/broker-key.json
-      # is gitignored as private material, so it would be absent on a fresh
-      # checkout/CI); its pubkey is pinned in deploy/broker/keys.json under kid
-      # broker.broker-local.v1 so the Exchange verifies the relay signature.
+      # The keypair is a generated harness fixture (gen-e2e-keys.sh; gitignored
+      # as private material). The Broker publishes the relay pubkey in its OWN
+      # WBA directory at boot, which is where the Exchange's broker well-known
+      # resolver learns it — no pre-shared key file anywhere.
       BROKER_RELAY_KEY_FILE: "/relay/broker-key.json"
       # EXA_API_KEY deliberately empty — pytest drives with direct URIs.
     volumes:
-      - ./deploy/broker:/keys:ro
       - ./tests/e2e/harness/fixtures/broker_relay_key.json:/relay/broker-key.json:ro
       # Writable dir the revocation e2e writes revocations.json into; the Broker
       # re-reads it on mtime change (see BROKER_REVOCATION_FILE above).
@@ -718,6 +795,76 @@ services:
         published: 0
         mode: host
 
+  # ───── Lambda@Edge (AWS Lambda runtime emulator) ─────────────────────
+  # The REAL src/edge worker running inside the AWS Lambda runtime image, as the
+  # Lambda@Edge bundle a deployment would upload: built by
+  # src/edge/scripts/build-lambda-edge.mjs with the per-deployment config baked
+  # in (Lambda@Edge has no environment variables, which is why nothing is
+  # configured here — see tests/e2e/lambda-edge/write-configs.mjs).
+  #
+  # This is NOT the aws-edge service above. That one is a hand-written
+  # CloudFront-RSA verifier stand-in covering a different signature chain and it
+  # never executes src/edge code; this one is the Ed25519 worker itself on the
+  # third runtime it ships for.
+  #
+  # Reached ONLY through the Lambda invoke endpoint
+  # (POST /2015-03-31/functions/function/invocations, port 8080), so it takes no
+  # publisher-domain network alias: ordinary HTTP is not a thing this runtime
+  # speaks. The harness builds CloudFront viewer-request events and reads the
+  # returned JSON — a pass-through comes back as the request object, a denial as
+  # a generated response.
+  #
+  # No ORIGIN_URL is baked, which is the CloudFront-native posture: CloudFront
+  # owns the origin fetch and the function hands an authorized request back to
+  # it. EXCHANGE_WBA_URL points at exchange-a, so delivery-URL verify keys are
+  # resolved by fetching that directory over this network, the same way
+  # production resolves them.
+  lambda-edge:
+    build:
+      context: .
+      dockerfile: tests/e2e/lambda-edge/Dockerfile
+    depends_on:
+      exchange:
+        condition: service_started
+    # The emulator exposes only the invoke route, so readiness is an actual
+    # function invocation (a viewer-request event for /healthz) rather than a
+    # GET. The image ships node but no curl.
+    healthcheck:
+      test: ["CMD", "node", "/opt/healthcheck.mjs"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    ports:
+      # Ephemeral host port — discovered via
+      # `docker compose port lambda-edge 8080`.
+      - target: 8080
+        published: 0
+        mode: host
+
+  # The same image, running the bundle built WITHOUT a publisher signing key.
+  # The WBA directory route has two answers — the JWK Set above, 404 here — and a
+  # Lambda container serves exactly one baked bundle, so covering both postures
+  # takes two containers. Everything else about the two configs is identical.
+  lambda-edge-no-wba:
+    build:
+      context: .
+      dockerfile: tests/e2e/lambda-edge/Dockerfile
+    command: ["no-wba.handler"]
+    depends_on:
+      exchange:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "/opt/healthcheck.mjs"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    ports:
+      - target: 8080
+        published: 0
+        mode: host
+
   # Wildcard DNS for the agent zone. Each agent gets a random subdomain
   # (<slug>.rampmcp.org) that the Broker/Exchange must resolve to fetch the
   # agent's WBA directory and verify its signature. The slug is random, so no
@@ -906,13 +1053,21 @@ services:
       # Broker/Exchange signature gate admits it. The fixture ships in the runner
       # image at /runner/harness.
       RAMP_AGENT_KEY_FILE: "/runner/harness/fixtures/agent_e2e_key.json"
+      # exchange-a's Ed25519 delivery-URL signing key, the private half of the
+      # key it publishes in its WBA directory. The Lambda@Edge suite signs its
+      # own delivery URLs with it because that runtime cannot be handed one the
+      # Exchange minted: CloudFront terminates TLS, so the Lambda adapter always
+      # rebuilds the request URL as https, while this compose network is
+      # http-only and the signature covers the scheme. The verify side stays the
+      # production path — the edge resolves the key by thumbprint from the
+      # Exchange's directory over the network.
+      RAMP_EXCHANGE_ED25519_PEM_FILE: "/rsa-keys/ed25519-private.pem"
     volumes:
+      # Read-only, for the signing key named above. Written by the rsa-keygen
+      # one-shot at stack-up; the aws-edge shim consumes the public half of the
+      # sibling RSA pair from the same volume.
+      - rsa-keys:/rsa-keys:ro
       - ./docker-compose.e2e.yml:/runner/docker-compose.e2e.yml:ro
-      # fixtures is :rw on the runner so seed_stack can write the
-      # catalog-contributor keypair (catalog_push.generate_contributor_key)
-      # to the shared volume the first time it runs. Subsequent runs reuse
-      # it. Other services that consume the volume keep it :ro.
-      - fixtures:/fixtures:rw
       # Docker socket bind: lets obligation tests drive container lifecycle
       # (restart, inspect, exec) via the docker-py SDK without depending on
       # a docker CLI in the runner image. Binding the socket rather than
@@ -943,7 +1098,21 @@ services:
         condition: service_healthy
       fastly-edge:
         condition: service_healthy
-      agent-jwks:
+      lambda-edge:
+        condition: service_healthy
+      lambda-edge-no-wba:
+        condition: service_healthy
+      lazy-agent-e2e-jwks:
+        condition: service_healthy
+      agent-e2e-jwks:
+        condition: service_healthy
+      agent-nobilling-e2e-jwks:
+        condition: service_healthy
+      agent-demo-eur-jwks:
+        condition: service_healthy
+      test-signer-e2e.v1-jwks:
+        condition: service_healthy
+      revocation-throwaway-e2e-jwks:
         condition: service_healthy
       identity:
         condition: service_started
@@ -961,7 +1130,6 @@ networks:
         - subnet: 172.30.0.0/16
 
 volumes:
-  fixtures:
   # Ephemeral RSA keypair written by rsa-keygen at stack-up (never committed);
   # private half read by the Exchange, public half by the aws-edge shim.
   rsa-keys:

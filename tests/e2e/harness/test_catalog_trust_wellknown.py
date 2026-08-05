@@ -19,7 +19,7 @@ Both Gate-2 trust branches are exercised through the SAME well-known fetch gate:
 * **Shape B — 3rd-party contributor** (``caller_id`` in the publisher's
   ``catalog_contributors[]``): the ``catalog-contributor-e2e`` identity pushes to
   the music publisher. Gate-1 fetches the contributor's OWN well-known host
-  (the ``catalog-contributor`` compose service); Gate-2 passes on the
+  (the ``catalog-contributor-e2e-jwks`` compose service); Gate-2 passes on the
   ``contributors`` branch because the music edge lists that contributor.
 
 Assertion hierarchy (well-known trust lock)
@@ -224,8 +224,9 @@ def test_third_party_contributor_push_accepted_via_wellknown(
     """A 3rd-party contributor pushes to the music publisher (Gate-2 contributors branch).
 
     ``catalog-contributor-e2e`` signs a push to ``music.demo.ramp-protocol.org``.
-    Gate-1 fetches the contributor's OWN well-known host (the catalog-contributor
-    compose service) to learn its key; Gate-2 passes because the music edge lists
+    Gate-1 fetches the contributor's OWN well-known host (the
+    catalog-contributor-e2e-jwks compose service) to learn its key; Gate-2 passes
+    because the music edge lists
     that contributor in CATALOG_CONTRIBUTORS_JSON. Neither leg uses a DB pre-seed.
     """
     _assert_push_accepted_and_discoverable(

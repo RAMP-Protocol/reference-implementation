@@ -1,0 +1,13 @@
+{
+  "name": "Typewriter Keystroke",
+  "slug": "typewriter-keystroke",
+  "category": "foley/office",
+  "duration_seconds": 0.4,
+  "sample_rate_hz": 96000,
+  "bit_depth": 24,
+  "channels": 1,
+  "loopable": false,
+  "format": "WAV",
+  "tags": ["typewriter", "keystroke", "mechanical", "office", "foley"],
+  "description": "Single crisp strike of a mechanical typewriter key, with the type bar hitting the platen and a short spring return. Close-mic mono capture with minimal room tone. Original foley recording metadata for demo purposes."
+}

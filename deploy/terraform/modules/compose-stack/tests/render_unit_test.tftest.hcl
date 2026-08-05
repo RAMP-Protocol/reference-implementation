@@ -28,7 +28,6 @@ variables {
   # recognizably fake.
   ed25519_private_pem     = "-----BEGIN PRIVATE KEY-----\ndGVzdA==\n-----END PRIVATE KEY-----\n"
   rsa_private_pem         = "-----BEGIN RSA PRIVATE KEY-----\ndGVzdA==\n-----END RSA PRIVATE KEY-----\n"
-  keys_json               = "{\"keys\":[]}"
   broker_relay_key_json   = "{\"kid\":\"broker.test.v1\"}"
   broker_identity_key_pem = "-----BEGIN ED25519 PRIVATE KEY-----\nZmFrZSBicm9rZXIgaWRlbnRpdHkgZml4dHVyZTogZXhhY3RseSBzaXh0eS1mb3VyIGJ5dGVzIGZvciB0ZnRlcw==\n-----END ED25519 PRIVATE KEY-----\n"
 }
@@ -440,6 +439,120 @@ run "acme_production_by_default" {
   assert {
     condition     = !strcontains(output.user_data, "acme-staging-v02")
     error_message = "acme_staging defaults off -> no staging CA in the Caddyfile"
+  }
+}
+
+run "static_wba_directories_render_caddy_site_blocks" {
+  command = apply
+
+  variables {
+    # Multi-line and containing a backtick-adjacent shape on purpose: the
+    # document must reach the VM byte-for-byte through cloud-init's b64
+    # channel, never through Caddyfile or shell quoting. Schema-conforming —
+    # the variable validation refuses anything less (see the rejection runs
+    # below).
+    static_wba_directories = {
+      "smoke-agent.staging.example" = "{\n  \"keys\": [\n    {\"kty\": \"OKP\", \"crv\": \"Ed25519\", \"use\": \"sig\", \"alg\": \"EdDSA\",\n     \"x\": \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ\",\n     \"not_before\": \"2026-08-04T00:00:00Z\", \"not_after\": \"2026-11-02T00:00:00Z\"}\n  ]\n}\n"
+    }
+  }
+
+  assert {
+    condition     = strcontains(output.user_data, "smoke-agent.staging.example {")
+    error_message = "each static_wba_directories hostname must get its own Caddy site block"
+  }
+  assert {
+    # The document lands as a base64-delivered file for Caddy's file_server —
+    # NOT interpolated into the Caddyfile, where a legal JSON backtick would
+    # end the quoted token and the rest would parse as proxy configuration.
+    condition     = strcontains(output.user_data, "path: /opt/ramp/wba/smoke-agent.staging.example.json")
+    error_message = "each document must be written to /opt/ramp/wba/<hostname>.json by cloud-init"
+  }
+  assert {
+    condition     = strcontains(output.user_data, base64encode("{\n  \"keys\": [\n    {\"kty\": \"OKP\", \"crv\": \"Ed25519\", \"use\": \"sig\", \"alg\": \"EdDSA\",\n     \"x\": \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ\",\n     \"not_before\": \"2026-08-04T00:00:00Z\", \"not_after\": \"2026-11-02T00:00:00Z\"}\n  ]\n}\n"))
+    error_message = "the document must reach the VM byte-for-byte (base64-encoded in cloud-init)"
+  }
+  assert {
+    condition     = strcontains(output.user_data, "file_server") && !strcontains(output.user_data, "respond `")
+    error_message = "the directory must be served from the written file, never from an interpolated respond body"
+  }
+  assert {
+    condition     = strcontains(output.user_data, "application/jwk-set+json")
+    error_message = "the directory must be served with the JWK Set media type"
+  }
+  assert {
+    condition     = strcontains(output.compose_yaml, "- /opt/ramp/wba:/srv/wba:ro")
+    error_message = "the Caddy container must mount the written directory read-only"
+  }
+}
+
+run "wba_directory_missing_schema_member_is_rejected" {
+  command = plan
+
+  variables {
+    # `use` is omitted. Without the variable validation this document deploys
+    # cleanly, serves 200, and fails the first signed request with an error
+    # that points at the signature — the validation moves that failure to
+    # `terraform plan`.
+    static_wba_directories = {
+      "smoke-agent.staging.example" = "{\"keys\":[{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"alg\":\"EdDSA\",\"x\":\"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ\",\"not_before\":\"2026-08-04T00:00:00Z\",\"not_after\":\"2026-11-02T00:00:00Z\"}]}"
+    }
+  }
+
+  expect_failures = [
+    var.static_wba_directories,
+  ]
+}
+
+run "wba_directory_padded_x_is_rejected" {
+  command = plan
+
+  variables {
+    # A padded (44-character, trailing "=") x: standard base64 instead of the
+    # unpadded base64url the schema requires. Same failure mode as a missing
+    # member — verifiers cannot match the key.
+    static_wba_directories = {
+      "smoke-agent.staging.example" = "{\"keys\":[{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"use\":\"sig\",\"alg\":\"EdDSA\",\"x\":\"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP=\",\"not_before\":\"2026-08-04T00:00:00Z\",\"not_after\":\"2026-11-02T00:00:00Z\"}]}"
+    }
+  }
+
+  expect_failures = [
+    var.static_wba_directories,
+  ]
+}
+
+run "wba_directory_malformed_hostname_key_is_rejected" {
+  command = plan
+
+  variables {
+    # The KEY is the half that reaches rendered configuration verbatim (Caddy
+    # site block, rewrite target, cloud-init write_files path) — here it
+    # carries a Caddyfile brace and a path separator. The document is
+    # schema-conforming on purpose: only the hostname validation can reject
+    # this input.
+    static_wba_directories = {
+      "bad host {\nrespond `owned`\n} ignore/../../etc" = "{\"keys\":[{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"use\":\"sig\",\"alg\":\"EdDSA\",\"x\":\"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ\",\"not_before\":\"2026-08-04T00:00:00Z\",\"not_after\":\"2026-11-02T00:00:00Z\"}]}"
+    }
+  }
+
+  expect_failures = [
+    var.static_wba_directories,
+  ]
+}
+
+run "no_static_wba_directories_by_default" {
+  command = apply
+
+  assert {
+    # application/jwk-set+json is written only by the static-directory site
+    # block, so its absence proves the block is not rendered. The path string
+    # alone would not discriminate — the compose file names other well-known
+    # URLs.
+    condition     = !strcontains(output.user_data, "application/jwk-set+json")
+    error_message = "with no static_wba_directories the Caddyfile must carry no directory site block"
+  }
+  assert {
+    condition     = !strcontains(output.compose_yaml, "/srv/wba")
+    error_message = "with no static_wba_directories the Caddy container must not mount the directory volume"
   }
 }
 

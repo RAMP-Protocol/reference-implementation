@@ -93,7 +93,7 @@ type Response struct {
 // URL was absent (the exchange returned NOT_IN_CATALOG, or the URL routed to no
 // exchange at all) — an empty Offers slice plus the per-URL AbsenceReason.
 // toDiscoveryResponse maps it to a wire rampv1.OfferGroup with Uri +
-// DiscoveryMethod(EXCHANGE) + per-group AbsenceReason set.
+// DiscoveryMethod + per-group AbsenceReason set.
 type OfferGroup struct {
 	URI string
 	// Offers is the ranked (winner-first) set of already-signed Offers for this
@@ -104,6 +104,10 @@ type OfferGroup struct {
 	// returned NOT_IN_CATALOG, or the URL routed to no exchange). UNSPECIFIED when
 	// the group carries offers.
 	AbsenceReason rampv1.OfferAbsenceReason
+	// DiscoveryMethod is how the Broker found this URL. stampMethod sets it on
+	// every group of a response, from the discovery strategy that ran; nothing
+	// between there and the wire alters it.
+	DiscoveryMethod rampv1.DiscoveryMethod
 	// cands is the pre-finalisation accumulator: the raw candidates collected for
 	// this URL before Dedup+Rank. finalize() folds it into Offers. It is internal
 	// to the discovery assembly and never read after finalize().

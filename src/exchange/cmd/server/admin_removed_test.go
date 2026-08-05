@@ -64,7 +64,7 @@ func TestAdminRoutesReturn404(t *testing.T) {
 	if err != nil {
 		t.Fatalf("offer signer: %v", err)
 	}
-	mux, err := buildMux(muxDeps{
+	mux, _, err := buildMux(muxDeps{
 		pool:          nil, // healthzHandler tolerates nil
 		exchange:      nil, // Connect-Go handlers register against nil; never invoked here
 		catalog:       nil,
@@ -129,7 +129,7 @@ func TestAdminRoutesReturn404(t *testing.T) {
 // buildMux didn't silently drop a route that the rest of the surface still
 // needs.
 func TestHealthzStillRegistered(t *testing.T) {
-	mux, err := buildMux(muxDeps{
+	mux, _, err := buildMux(muxDeps{
 		pool:          nil,
 		agentRegistry: noopRegistry{},
 		offerSigner:   mustSigner(t),

@@ -5,9 +5,9 @@
 #
 # Key material is split into per-service directories so each container is
 # given ONLY its own keys: a compromise of one service must not hand over
-# another service's signing identity. keys.json (the shared PUBLIC-key
-# registry) is written into both consumers' directories; only private keys
-# are single-home.
+# another service's signing identity. Every key file here is a private key
+# for the service that mounts it — public keys are never pre-shared; each
+# participant publishes its own at its well-known address.
 #
 # Files land 0600 root, then a runcmd below re-owns them root:65532 and
 # opens files 0640 / directories 0750 before compose starts: the services
@@ -42,10 +42,6 @@ write_files:
     permissions: "0600"
     content: |
       ${indent(6, zitadel_init_steps)}
-  - path: /opt/ramp/keys/exchange/keys.json
-    permissions: "0600"
-    content: |
-      ${indent(6, keys_json)}
   - path: /opt/ramp/keys/exchange/ed25519-private.pem
     permissions: "0600"
     content: |
@@ -56,10 +52,6 @@ write_files:
     content: |
       ${indent(6, rsa_private_pem)}
 %{ endif }
-  - path: /opt/ramp/keys/broker/keys.json
-    permissions: "0600"
-    content: |
-      ${indent(6, keys_json)}
   - path: /opt/ramp/keys/broker/broker-relay-key.json
     permissions: "0600"
     content: |
@@ -68,6 +60,16 @@ write_files:
     permissions: "0600"
     content: |
       ${indent(6, broker_identity_key_pem)}
+%{ for wba_hostname, wba_document in static_wba_directories }
+  # Public JWK Set (public keys only, never private material) served verbatim
+  # by Caddy at this hostname's well-known path. Base64-delivered so any byte
+  # of the document is safe inside this YAML and inside the file — the
+  # document never passes through shell or proxy-config quoting.
+  - path: /opt/ramp/wba/${wba_hostname}.json
+    permissions: "0644"
+    encoding: b64
+    content: ${base64encode(wba_document)}
+%{ endfor }
 %{ if registry_server != null }
   # Base64-delivered so the secret is never interpolated into a shell
   # command line — any byte in the token is safe. Root-only, removed after

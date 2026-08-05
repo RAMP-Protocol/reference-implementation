@@ -194,7 +194,7 @@ def test_contributor_identity_is_served_via_wellknown(compose_stack: StackURLs) 
 
     The well-known-trust rule removed the ramp.agents pre-seed: the Exchange learns the
     ``catalog-contributor-e2e`` key ONLY by fetching that contributor's own
-    discovery documents (the ``catalog-contributor`` compose host). This guard
+    discovery documents (the ``catalog-contributor-e2e-jwks`` compose host). This guard
     fetches them through the real host and asserts (a) the keyless overlay
     manifest's ``domain`` equals the contributor's agent_id (matched by
     caller_id), and (b) the key served in the contributor's WBA directory (x)

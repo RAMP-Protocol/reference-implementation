@@ -19,7 +19,7 @@ The Exchange is a single Go binary in a container. It needs:
 | PostgreSQL — **two separate databases** | **Yes** | The first holds the catalog, the transaction log, the evidence store and the audit log (`EXCHANGE_DSN`). The second holds the account registry (`EXCHANGE_SOR_DSN`). The binary exits if either connection string is unset. Both must exist before the Exchange starts — see §2.1. |
 | An Ed25519 private key | **Yes** | Signs offers and signed delivery URLs. The binary exits without one. |
 | An RSA private key | Only for AWS CloudFront publishers | Signs AWS CloudFront delivery URLs. An all-Ed25519 deployment boots and runs without one; a CloudFront publisher's requests are refused until it is added — see §2.2. |
-| A reachable Broker | **Yes, at boot and at runtime** | The Broker publishes the list of withdrawn keys. The Exchange refuses to start without an address for it, and rejects signed requests while it is unreachable. |
+| The Broker's address | **Yes** | The Broker publishes the list of withdrawn keys. The Exchange refuses to start without an address for it (`EXCHANGE_BROKER_WELLKNOWN_URL`). The boot never waits on reaching the Broker: while the Broker cannot be fetched, the Exchange runs but rejects signed requests — see §2.3. |
 | Redis | Strongly recommended | Stops the same signed request being replayed. Without it the Exchange still runs, but the protection is per-process (see §2.1). |
 | TigerBeetle | Only for `tigerbeetle` billing | The money ledger. Not needed for the default `free` adapter. |
 
@@ -31,7 +31,9 @@ Three things are worth knowing up front because operators often look for them an
 they do not exist:
 
 - **There are no command-line flags.** Configuration is 100% environment
-  variables, and there is no configuration file.
+  variables, and there is no configuration file. The binary does accept one
+  subcommand: `exchange healthcheck` probes its own `/healthz` and exits,
+  so a container health check can run the service binary itself.
 - **There is no `LOG_LEVEL`.** The Exchange always writes structured JSON logs at
   `INFO` level to standard output. ("Structured" means each log line is
   machine-readable data, not free text.) `DEBUG` lines are never emitted.
@@ -45,11 +47,12 @@ Two parsing rules apply throughout and are worth stating once:
 - **An empty string counts as unset.** `EXCHANGE_DOMAIN=""` gives you the default
   `exchange.ramp.local`, not an empty domain. There is no way to set a setting to
   the empty string on purpose.
-- **The on/off settings are a denylist, not an allowlist.** `0`, `false`, `no`
-  and `off` (any case) mean off; **anything else non-empty means on**. So a typo
-  like `EXCHANGE_AGENT_WELLKNOWN_RESOLUTION=flase` silently means *on*.
-  `SKIP_SSRF` and `ALLOW_INSECURE` are the two exceptions and use the opposite,
-  stricter rule — see §2.4.
+- **The on/off settings are strict.** A switch is on only for exactly `true`
+  (any case) or `1`; **any other value means off**. So a typo like
+  `RAMP_TRUST_PROXY_HEADERS=flase` silently means *off* — after setting a
+  switch, confirm the behaviour changed rather than assuming. This one rule
+  covers every on/off setting the Exchange reads, `SKIP_SSRF` and
+  `ALLOW_INSECURE` included — see §2.4.
 
 ---
 
@@ -167,24 +170,33 @@ missing:
 Callers sign their requests using a scheme called HTTP Message Signatures
 (RFC 9421). These settings control which keys the Exchange will accept.
 
+There is no key file. The Exchange learns every verification key over the
+network, from the key owner's own published documents:
+
+1. **The Broker's directory first** (`EXCHANGE_BROKER_WELLKNOWN_URL`). It
+   carries the Broker's relay key and the withdrawn-key list, and its verdict
+   on a withdrawn or expired key is final.
+2. **The signer's own directory second.** For any other key, the Exchange
+   fetches the directory named by the request's signed `Signature-Agent`
+   header and looks the key up there. A signer that does not publish its key
+   gets `401`.
+
 | Name | Required? | What it is | Example |
 |---|---|---|---|
-| `EXCHANGE_BROKER_WELLKNOWN_URL` | **Required** | The address of the Broker's published document. The Exchange consults the Broker's withdrawn-key list *before* its own key file on every verification. Boot fails without it — see below. | `https://broker.example/.well-known/ramp.json` |
-| `RAMP_KEYS_FILE` | Optional, **set it** | Path to a JSON file of **public** keys the Exchange accepts signatures from. Default `deploy/broker/keys.json` — a **relative** path, resolved against the process working directory, which is `/` in the container. Loading zero keys is a boot failure. | `/keys/keys.json` |
+| `EXCHANGE_BROKER_WELLKNOWN_URL` | **Required** | The address of the Broker's published document. The Exchange consults the Broker's withdrawn-key list *first* on every verification, and resolves the Broker's own relay key from the same document. Boot fails without it — see below. | `https://broker.example/.well-known/ramp.json` |
 | `EXCHANGE_REVOCATION_POLL_INTERVAL` | Optional | How often to re-read the Broker's withdrawn-key list. Unset leaves the built-in interval in place. A malformed value silently falls back (§3). | `5m` |
 | `EXCHANGE_DIRECTORY_TTL` | Optional | How long a fetched key directory is cached. Unset leaves the built-in TTL in place. A malformed value silently falls back (§3). | `10m` |
-| `EXCHANGE_AGENT_WELLKNOWN_RESOLUTION` | Optional | Whether the Exchange may look up an unknown agent's public key from that agent's own website. Default on. Turning it off means any agent not already in `RAMP_KEYS_FILE` or the database gets `401`. | `true` |
 
 #### `EXCHANGE_BROKER_WELLKNOWN_URL` is mandatory, by design
 
 Without an address for the Broker, the Exchange has nothing to check the
 withdrawn-key list against: a key that had been withdrawn would keep working for
-as long as `RAMP_KEYS_FILE` still listed it. Rather than warn and boot anyway, the
-Exchange refuses to start:
+as long as the signer's own directory still published it. Rather than warn and
+boot anyway, the Exchange refuses to start:
 
 ```
 EXCHANGE_BROKER_WELLKNOWN_URL is required: refusing to boot without a revocation
-authority ahead of the static bootstrap key file (a revoked key would otherwise
+authority ahead of the per-agent well-known path (a revoked key would otherwise
 keep verifying)
 ```
 
@@ -192,26 +204,6 @@ The same principle applies at runtime: if the Broker's document cannot be
 fetched, signed requests are **rejected**, not let through. The Exchange logs
 `exchange.httpsig.broker_wellknown_unavailable` and refuses the request rather
 than risk accepting a withdrawn key. See [`RUNBOOK.md`](RUNBOOK.md) §2.3.
-
-#### `RAMP_KEYS_FILE` — a relative default and two failure shapes
-
-The default value `deploy/broker/keys.json` is relative. Inside the container the
-working directory is `/`, so it resolves to `/deploy/broker/keys.json`, which
-does not exist there. **Always set an absolute path.**
-
-The file is a JWKS (a JSON Web Key Set — a `{"keys": [...]}` document of Ed25519
-public keys). Two different failures behave very differently:
-
-- **Individual malformed entries are silently skipped.** A wrong key type, an
-  undecodable key value, an unparseable validity window — the entry is dropped
-  with no log line, and the callers holding that key start getting `401`.
-- **Loading zero keys is fatal.** An empty file, a missing file, or a file where
-  every entry was skipped stops the Exchange booting with `httpsig: no keys
-  loaded (empty or malformed JWKS)`.
-
-The Exchange and the Broker read the same shared file under different variable
-names (`RAMP_KEYS_FILE` here, `BROKER_KEYS_FILE` there). Update both, or the two
-services disagree about who is trusted.
 
 ### 2.4 Public documents and outbound fetches
 
@@ -222,11 +214,11 @@ services disagree about who is trusted.
 | `SKIP_SSRF` | Optional — **leave unset** | Setting this removes the guard that stops the Exchange being tricked into calling internal addresses. Development only. | *(leave unset)* |
 | `ALLOW_INSECURE` | Optional — **leave unset** | Setting this allows plain unencrypted `http` for those same calls. Development only. | *(leave unset)* |
 
-`SKIP_SSRF` and `ALLOW_INSECURE` are parsed **strictly**: they are on only for
-exactly `true` (any case) or `1`. Every other value — including `yes`, `on`, and
-a typo like `ture` — leaves the guard in place. This is deliberately the opposite
-of the rule in §1: a typo must leave a safety guard in place, while a feature
-switch whose safe state is *on* may stay on.
+`SKIP_SSRF` and `ALLOW_INSECURE` follow the same strict rule as every other
+on/off setting (§1): they are on only for exactly `true` (any case) or `1`.
+Every other value — including `yes`, `on`, and a typo like `ture` — leaves the
+guard in place. For these two switches the rule matters most: each one removes
+a protection, so a typo must leave the protection on.
 
 ### 2.5 Billing
 
@@ -297,7 +289,7 @@ registration is refused, so no agent can buy anything.
 
 ## 3. Settings that take a default silently when malformed
 
-Most bad values stop the boot and name themselves. Four do not — they fall back
+Most bad values stop the boot and name themselves. Three do not — they fall back
 to a default with **no log line**, so the Exchange runs with settings you did not
 choose and nothing tells you.
 
@@ -306,7 +298,6 @@ choose and nothing tells you.
 | `EXCHANGE_MAX_INTERMEDIARY_HOPS` | Falls back to `4`. Non-numeric, negative, or above 1048576 all qualify. | The value is published to Brokers as the number of relay hops you accept. |
 | `EXCHANGE_REVOCATION_POLL_INTERVAL` | Falls back to the built-in interval. A negative duration also qualifies. | You may believe you are polling the withdrawn-key list every minute when you are not. |
 | `EXCHANGE_DIRECTORY_TTL` | Falls back to the built-in TTL. | A rotated key may be picked up later than you planned. |
-| Entries inside `RAMP_KEYS_FILE` | The individual entry is skipped. | The caller holding that key gets `401` with no clue why (§2.3). |
 
 After changing any of these, confirm the value took effect rather than assuming:
 the poll interval is echoed in the `exchange.httpsig.wellknown_enabled` boot line,
@@ -369,7 +360,6 @@ carried into production:
 | `ALLOW_INSECURE: "true"` | Same reason. | Same consequence. |
 | `EXCHANGE_CATALOG_URI_SCHEME: "http"` | Compose traffic is http-only. | Every catalog URL would be stored as plaintext `http`. |
 | `sslmode=disable` in the DSN | The database is on the same private bridge. | Database traffic, including credentials, in the clear. |
-| `deploy/broker/keys.json` | A test file committed to this repository. | Its matching private keys are public in this repository. Generate your own. |
 | `RAMP_BILLING_ADAPTER: "inmemory"` | The test suite needs a deny path without a real ledger. | Balances live in process memory and vanish on restart. Nothing is ever settled. |
 
 ---
@@ -388,7 +378,6 @@ EXCHANGE_DOMAIN=exchange.example
 EXCHANGE_PUBLIC_ORIGIN=https://exchange.example
 EXCHANGE_DEFAULT_TENANT=www.publisher.example
 REDIS_URL=rediss://:<password>@<redis-host>:6379/0
-RAMP_KEYS_FILE=/keys/keys.json
 RAMP_ED25519_PRIVATE_PEM_FILE=/keys/ed25519-private.pem
 RAMP_RSA_PRIVATE_PEM_FILE=/keys/rsa-private.pem
 EXCHANGE_BROKER_WELLKNOWN_URL=https://broker.example/.well-known/ramp.json

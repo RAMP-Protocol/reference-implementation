@@ -71,3 +71,24 @@ ${origin_hostname} {
 	reverse_proxy publisher:80
 }
 %{ endif ~}
+%{ for wba_hostname in static_wba_hostnames }
+# Static Web Bot Auth key directory: the public keys of a signer whose private
+# key deliberately never reaches this VM (an operator-held identity, e.g. the
+# smoke signer). The Exchange and Broker verify that signer's requests by
+# fetching this one path. The document is served from a file cloud-init wrote
+# — never interpolated into this Caddyfile, so no byte of a document can ever
+# parse as proxy configuration.
+${wba_hostname} {
+	handle /.well-known/http-message-signatures-directory {
+		root * /srv/wba
+		rewrite * /${wba_hostname}.json
+		header Content-Type application/jwk-set+json
+		file_server
+	}
+	# Everything else — the overlay manifest included — is 404 on purpose:
+	# the smoke identities are pre-seeded on the services and nothing on any
+	# verification or seeding path fetches their manifest, so the key
+	# directory above is the entire surface a verifier needs.
+	respond 404
+}
+%{ endfor ~}

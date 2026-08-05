@@ -2,11 +2,11 @@
 
 Operated by the Exchange Operator.
 
-**Escalation.** If §3 does not resolve it, contact Postindustria at
-`<support channel — fill in before handover>`. Send the `request_id` of a failing
-request together with the matching log lines from the Identity Service, the Broker and
-the Exchange. Postindustria has no access to your infrastructure, so that correlation
-ID is the only way the request can be traced.
+**Escalation.** If §3 does not resolve it, contact Postindustria over the
+existing communication channel. Send the `request_id` of a failing request
+together with the matching log lines from the Identity Service, the Broker and
+the Exchange. Postindustria has no access to your infrastructure, so that
+correlation ID is the only way the request can be traced.
 
 > This runbook assumes the Identity Service is already deployed. For installation,
 > configuration values, applying or destroying the stack, and deploy-time
@@ -31,9 +31,12 @@ agent registered in it — buy content, spend money, and file usage reports in t
 agent's name. Treat the Vault backups with the same care as the live system
 ([`deploy/storage/vault/RUNBOOK.md`](../../deploy/storage/vault/RUNBOOK.md) §5).
 
-**It is not on the delivery path.** It never sees the licensed content. If it is down,
-agents cannot discover or buy — but the publisher's site is unaffected and delivery
-links already issued keep working.
+**It is on the delivery path for its agents.** When an agent buys content, the
+service does not stop at forwarding the purchase: it follows the delivery link the
+Exchange answered with, fetches the licensed content from the publisher's edge —
+proving it holds the agent's key — and returns the content inside the tool result.
+If it is down, agents cannot discover, buy, or receive content. The publisher's site
+is unaffected either way.
 
 **One replica only.** See §4.1 before you run more than one.
 
@@ -92,10 +95,12 @@ end. It arrives or is created as the `X-Request-ID` header and is passed outboun
 | `identity.directory.unavailable` | WARN | Vault or the database is not answering. The caller got `503`. **The first sign of a Vault outage.** |
 | `identity.signup.ephemeral_session_key` | WARN | `IDENTITY_SESSION_KEY` is unset. Sign-ups in progress break on every restart. |
 | `identity.signup.ephemeral_token_key` | WARN | `IDENTITY_TOKEN_SIGNING_KEY` is unset. **Every agent is signed out on every restart.** |
+| `identity.mcp.delivery_failed` | WARN | The agent's purchase went through, but this service could not fetch one of the bought items from the publisher's edge. **The Exchange has already charged for it.** The line names the `subdomain`, the `offer_id` and the reason; the agent was handed the same failure with the delivery link intact, so it can try again. |
 | `identity.oauthserver.*` (outage) | WARN | A backend was unavailable during sign-up; the caller got `503`. |
 | `identity.mcp.register` / `.status` / `.discover` / `.execute` / `.report` | INFO | One agent tool call. One line per call, naming the agent. |
+| `identity.oauthserver.register.ok` / `.signin.ok` / `.registration.complete` / `.consent.approved` | INFO | One sign-up step completed. Together these are the audit record of who signed up and which agent software registered itself. |
 | `identity.rotation.rotated` / `.pruned` | INFO | A key was replaced, or a retired one erased. Routine. |
-| `identity.revoke` | INFO | A key was revoked. Carries `subdomain`, `thumbprint` and `as_of` — **this is the audit record**, and the only one. |
+| `identity.revoke` | INFO | A key was revoked. Carries `subdomain`, `thumbprint` and `as_of` — **this is the audit record of the revocation**. |
 | `identity listening` | INFO | Start-up finished. |
 
 ### 2.3 Alerts
@@ -130,10 +135,10 @@ into whatever monitoring you already run.
 | Will not start after an outage | The OIDC provider is contacted at boot and the service exits if it cannot reach it | Bring the provider back, then start this service. A running service does not need it; a starting one does. |
 | Sign-in fails at the provider, nothing in these logs | The redirect address on file does not match `IDENTITY_AUTH_ISSUER` + `/callback` exactly | [`deploy/zitadel/RUNBOOK.md`](../../deploy/zitadel/RUNBOOK.md) §3. The failure happens before the request ever reaches here, which is why the logs are silent. |
 | Sign-ups fail halfway through, only sometimes | `IDENTITY_SESSION_KEY` unset and the service restarted mid-flow | Set the key ([`DEPLOYMENT.md`](DEPLOYMENT.md) §7). |
-| **A revoked key still verifies** | Revocation is published in a document other parties cache | Wait out `IDENTITY_DIRECTORY_TTL` (default 5 minutes). This is expected, not a fault — §4.2. |
-| Agent calls fail with a signature error at the Broker | Its published key was fetched before a rotation, or clocks disagree | Compare the agent's directory (§3.2) with what the Broker holds; check time sync on both hosts. |
+| **A revoked key still verifies** | Two delays add up: this service republishes the revocation within `IDENTITY_DIRECTORY_TTL` (default 5 minutes), and the Broker and the Exchange each notice on their own revocation refresh (about every 5 minutes; their library's default, not set here) | Wait roughly ten minutes end to end. This is expected, not a fault — §4.2. |
+| Agent calls fail with a signature error at the Broker | The agent's directory does not serve the key it signed with, or clocks disagree | Read the agent's directory (§3.2) and check the signing key is in it; check time sync on both hosts. The Broker keeps no key list of its own — it fetches this directory on demand, and re-fetches when it meets a key fingerprint it does not know, so a rotation normally corrects itself. |
 | An agent's purchases are refused | Its account is inactive or was never created | Have it call `ramp_status`; the answer says which. Activation is §4.2. |
-| **A delivery URL worked for someone who should not have it** | For an agent whose key this service holds, the delivery URL is a bearer credential — whoever holds it can fetch the content, until it expires | Working as designed today — §6. Reduce exposure by keeping URL lifetimes short. |
+| **A delivery URL worked for someone who should not have it** | The edge that served it accepts the URL on its own, without asking for proof of the agent's key | The Exchange binds each delivery URL to the agent's key, and this service proves possession of that key when it fetches. An edge that checks the binding refuses the bare URL; one that does not still accepts it until it expires — §6. Keep URL lifetimes short on such edges. |
 | Rotation stopped entirely, no per-agent errors | The `identity.rotation.list_subdomains_failed` line names a Vault problem | §3.2, then Vault's runbook. |
 | Two instances are running | Not supported — §4.1 | Scale back to one. |
 
@@ -218,9 +223,11 @@ psql "$IDENTITY_DSN" -c "SELECT version, dirty FROM public.schema_migrations_ide
   provider dead, and with both RAMP peers unreachable.
 - **Vault is never checked at start-up**, so a Vault misconfiguration always looks like
   a healthy service, and always shows up later as `503`s.
-- **A revocation is not instant.** It takes effect within `IDENTITY_DIRECTORY_TTL`,
-  because the document carrying it is cached. Plan incident response around minutes,
-  not seconds.
+- **A revocation is not instant.** This service republishes the document carrying it
+  within `IDENTITY_DIRECTORY_TTL` (default 5 minutes), and each verifier then
+  notices on its own revocation refresh — about every 5 minutes for the Broker and
+  the Exchange, a default this service does not control. Plan incident response
+  around roughly ten minutes, not seconds.
 - **The emergency revocation tool is not in the container image.** Have a way to run
   it ready before you need it — §4.2.
 - **Changing `IDENTITY_BASE_DOMAIN` leaves every agent already created with an address
@@ -243,8 +250,9 @@ psql "$IDENTITY_DSN" -c "SELECT version, dirty FROM public.schema_migrations_ide
 **Restart.** Takes a few seconds. It costs nothing *as long as* both keys from
 [`DEPLOYMENT.md`](DEPLOYMENT.md) §7 are set — without `IDENTITY_TOKEN_SIGNING_KEY`, a
 restart signs out every agent. While the process is down, every agent's published key
-is unreachable; the Broker and the Exchange cache them for a few minutes, so a quick
-restart is invisible and a long outage is not.
+is unreachable; the Broker and the Exchange cache a fetched key directory for up to
+an hour, so a quick restart is invisible for agents they already know, and a long
+outage is not.
 
 **Everything needs a restart.** There is no live reload for any setting.
 
@@ -307,9 +315,15 @@ from a checkout, with the same database and Vault settings the service uses:
 
 ```bash
 IDENTITY_DSN="postgres://..." VAULT_ADDR="https://vault.internal:8200" VAULT_TOKEN="<token>" \
+IDENTITY_KV_MOUNT="ramp-agents" \
   go run ./src/identity/cmd/operator revoke <subdomain> <thumbprint>
 # Expect: revoked <subdomain> <thumbprint>
 ```
+
+`IDENTITY_KV_MOUNT` (and `IDENTITY_KV_PREFIX`, if you changed it) must match what
+the service runs with — the values from [`CONFIGURATION.md`](CONFIGURATION.md) §7.
+Left unset, the tool looks in Vault's default `secret` mount, finds nothing there,
+and reports the key as unknown.
 
 The thumbprint is the key's fingerprint, taken from the agent's published directory
 (§3.2), not a name you chose.
@@ -319,10 +333,12 @@ from Vault. **The order matters** — if Vault is the thing that is broken, the
 revocation is still recorded and still takes effect, and the erase is retried by
 re-running the same command. It is safe to run twice.
 
-> **It takes effect within `IDENTITY_DIRECTORY_TTL`, not immediately.** The command
-> writes the durable record; the running service picks it up when it next rebuilds that
-> agent's documents, and other parties see it when their own cache expires. With the
-> default that is five minutes. Confirm:
+> **It does not take effect immediately.** The command writes the durable record;
+> the running service picks it up when it next rebuilds that agent's documents,
+> within `IDENTITY_DIRECTORY_TTL` (default 5 minutes). The Broker and the Exchange
+> then notice on their own revocation refresh — about every 5 minutes, a default of
+> the library they verify with, not a setting of this service. Plan around roughly
+> ten minutes end to end. Confirm:
 >
 > ```bash
 > curl -s "https://<subdomain>/.well-known/ramp-key-revocations.json"
@@ -332,8 +348,9 @@ re-running the same command. It is safe to run twice.
 A revocation is permanent. The agent gets a working key again through the normal
 rotation, or by signing up again.
 
-**Removing an agent's access to the endpoint.** Revoking a key stops the agent signing
-RAMP requests. To also stop it reaching `/mcp`, remove its registered client:
+**Removing an agent's access to the endpoint.** Revoking a key stops the agent
+signing RAMP requests — that is the step that actually contains an incident. To also
+stop its software signing in again, remove its registered client:
 
 ```sql
 DELETE FROM identity.oauth_client WHERE client_id = '<client-id>';
@@ -342,6 +359,13 @@ DELETE FROM identity.oauth_client WHERE client_id = '<client-id>';
 List them first with the query in §3.2. Agent software registers itself when it first
 connects, so unfamiliar entries are normal — check `client_name` and `created_at`
 before deleting.
+
+> **Deleting the client does not cut off `/mcp` at once.** An access token is
+> checked on its own — signature, issuer, audience, expiry — with no lookup against
+> this table, so a token issued before the delete keeps working until it expires
+> (one hour from issue, by default). The delete stops the software obtaining the
+> next token. If the agent must lose everything now, revoke its key first: `/mcp`
+> may still answer for up to an hour, but nothing it signs verifies anywhere.
 
 ### 4.3 Upgrade and rollback
 
@@ -410,10 +434,10 @@ Three things to plan for rather than react to:
 - **There is no metrics endpoint.** Alerting is on log events.
 - **There is no admin API.** Agent and account state is read and changed with SQL.
 - **The emergency revocation tool is not in the container image.**
-- **A delivery URL is a bearer credential for these agents.** The design intends a
-  delivery URL to be usable only by the agent that bought it, proven with the key it
-  signed the purchase with. This service holds that key and never releases it, so an
-  agent cannot present it at the CDN — which means edges serving these agents accept
-  the URL on its own, and anyone who obtains one can fetch the content until it
-  expires. Keep delivery URL lifetimes short. Single-use delivery URLs are not
-  implemented yet.
+- **Whether a delivery URL works on its own depends on the edge.** The Exchange
+  binds each URL to the key that signed the purchase. That key stays in this
+  service, which is why the fetch happens here: the service presents proof of the
+  key when it retrieves the content. An edge that checks the binding refuses the
+  bare URL, so obtaining one is not enough there. An edge that does not check it
+  still accepts the URL alone until it expires — keep URL lifetimes short with such
+  edges. Single-use delivery URLs are not implemented yet.

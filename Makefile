@@ -279,13 +279,13 @@ test-e2e: e2e-up
 # Generate every signing key the E2E stack needs BEFORE `docker compose up`, so
 # a fresh checkout needs zero manual keygen (no private material is
 # committed). Mints:
-#   * the five e2e identities (contributor/agent/agent-nobilling/broker-relay/
-#     test-signer) — private fixtures under tests/e2e/harness/fixtures/ + pubkeys
-#     merged into deploy/broker/keys.json (scripts/gen-e2e-keys.sh). The
-#     broker-relay private fixture this mints is the one the broker container
-#     mounts (BROKER_RELAY_KEY_FILE), so its pubkey is the registry's source of
-#     truth — gen-broker-relay-key.sh is NOT run here, to avoid overwriting the
-#     registry entry with a key the broker does not actually sign with.
+#   * the e2e identities (contributor/agents/broker-relay/test-signer/…) —
+#     private fixtures under tests/e2e/harness/fixtures/
+#     (scripts/gen-e2e-keys.sh). There is no shared key registry file: each
+#     identity's pubkey is served only by that identity's own well-known host
+#     in docker-compose.e2e.yml. The broker-relay private fixture this mints is
+#     the one the broker container mounts (BROKER_RELAY_KEY_FILE); the broker
+#     publishes its pubkey in its own WBA directory at boot.
 #   * the demo subscription-publisher key the publisher-jwks service signs
 #     /.well-known/ramp.json with (scripts/gen-examplenews-publisher-key.sh).
 # Idempotent: safe to re-run before every `make e2e-up`.

@@ -2,12 +2,12 @@
 
 Operated by the Publisher.
 
-**Escalation.** If §3 does not resolve it, contact Postindustria at
-`<support channel — fill in before handover>`. Send the `request_id` of a failing
-request together with the matching Workers Logs records and, where the Exchange is
-involved, its log lines for the same `request_id`. Postindustria has no access to
-your Cloudflare account, so that correlation ID is the only way a request can be
-traced across the two services.
+**Escalation.** If §3 does not resolve it, contact Postindustria over the
+existing communication channel. Send the `request_id` of a failing request
+together with the matching Workers Logs records and, where the Exchange is
+involved, its log lines for the same `request_id`. Postindustria has no access
+to your Cloudflare account, so that correlation ID is the only way a request can
+be traced across the two services.
 
 > This runbook assumes the Worker is already deployed. For installation,
 > configuration values and deploy-time verification, see
@@ -143,7 +143,7 @@ Only a sudden change in the `edge.deny.signature` rate is worth attention.
 |---|---|---|
 | **A sudden wave of `403` responses** | Two different causes share this response code. Separate them first — see below how to distinguish them. | Read the `edge.deny.*` event name. |
 | Clock skew, or an address presented too late | A signed address carries an expiry (`exp`). A caller whose clock is slow, or that waits too long before using the address, presents an expired one. | Look for `edge.deny.signature` with `reason=expired`. Check the caller's clock; the Worker cannot extend the expiry time. |
-| The key directory is unreachable | Signed requests cannot be verified, so they are refused with a `503` rather than let through. | `edge.keys.load_failed` names the cause. **It fixes itself within the one-hour cache lifetime** once the directory answers again — that lifetime is fixed and no setting shortens it. Escalate to the Exchange operator. |
+| The key directory is unreachable | Signed requests cannot be verified, so they are refused with a `503` rather than let through. | `edge.keys.load_failed` names the cause. **It fixes itself as soon as the directory answers again** — a failed load is not cached, so the next signed request simply retries the fetch. Escalate to the Exchange operator to get the directory back up. |
 | Visitors get `502` | The origin is down, or its address is wrong. | `edge.origin.fetch_failed` carries the message. If `ORIGIN_URL` is in use, confirm it does **not** resolve back to the Worker's own route — that loops until Cloudflare cuts it off. |
 | **Every** request fails after a deploy | Neither origin mode is set, so the Worker fails with an error before it can serve anything. | The error message names both variables. [`CONFIGURATION.md`](CONFIGURATION.md) §3.1. |
 | Search crawlers are blocked | Cloudflare's WAF managed rules and bot products run **before** the Worker; a blocked crawler never reaches it. | Check Security Events for the crawler, add a skip rule. [`DEPLOYMENT.md`](DEPLOYMENT.md) §7. |
@@ -158,10 +158,15 @@ edge.deny.bot         → an unpaid AI bot. NORMAL. Rising volume means more
                         crawlers are finding the site, not that anything broke.
 
 edge.deny.signature   → paying agents are being refused. Check `reason`:
-                          expired  → clock skew, or a stale address (above)
-                          anything else → key mismatch. Compare the `kid` in
-                          the record against the key ids the Exchange publishes
-                          (§3.2). Usually a rotation in progress.
+                          expired → clock skew, or a stale address (above)
+                          signature_mismatch → key mismatch. Compare the `kid`
+                          in the record against the key ids the Exchange
+                          publishes (§3.2). Usually a rotation in progress.
+                          missing_sig, missing_exp, bad_sig_encoding,
+                          bad_exp_encoding, bad_agent_encoding → the address
+                          itself is malformed — a parameter is empty, damaged,
+                          or lost (for example the address was cut when copied).
+                          The caller needs a fresh address from the Exchange.
 ```
 
 **A third cause: `edge.deny.binding`.** That record reports a caller failing to
@@ -169,15 +174,30 @@ prove it holds the key its address was issued to — the check
 `RAMP_ENFORCE_BINDING` governs, on by default. Read its `reason`:
 
 ```
-missing_agent_key   → the caller presented no key at all. An agent fetching its
-                      own address directly cannot pass this check when the key is
-                      held by a registry; the registry is meant to fetch on
-                      its behalf.
-keyid_mismatch      → the caller proved a key, but not the one this address names.
-thumbprint_mismatch → the key presented does not hash to the id it claims.
-pop_expired         → the proof itself expired. Clock skew, or a caller reusing an
-                      old proof.
-pop_sig_invalid     → the signature over the request did not verify.
+missing_agent_key     → the caller presented no key at all. An agent fetching its
+                        own address directly cannot pass this check when the key
+                        is held by a registry; the registry is meant to fetch on
+                        its behalf.
+bad_agent_key         → a key was presented but it is not a valid Ed25519 public
+                        key (wrong encoding or wrong length).
+malformed_sig_input   → the request carries no readable Signature-Input header —
+                        the caller did not sign the request, or its signing
+                        library is broken.
+unsupported_alg       → the signature names an algorithm other than Ed25519.
+bad_covered_components→ the signature does not cover exactly the request method
+                        and the full URL, which is what this check requires.
+missing_sig           → a Signature-Input header is present but the Signature
+                        header with the actual signature bytes is missing or
+                        unreadable.
+keyid_mismatch        → the caller proved a key, but not the one this address names.
+thumbprint_mismatch   → the key presented does not hash to the id it claims.
+pop_missing_created   → the proof carries no `created` timestamp.
+pop_future_created    → the proof's `created` timestamp is more than 5 minutes in
+                        the future — the caller's clock is wrong.
+pop_missing_exp       → the proof carries no `expires` timestamp.
+pop_expired           → the proof itself expired. Clock skew, or a caller reusing
+                        an old proof.
+pop_sig_invalid       → the signature over the request did not verify.
 ```
 
 A wave of `missing_agent_key` records right after a deploy usually means this
@@ -221,13 +241,14 @@ curl -s -o /dev/null -w 'paying agent     %{http_code}\n' \
 
 ```bash
 curl -s https://<host>/.well-known/ramp.json
-# Expect: "role":"ROLE_PUBLISHER", the publisher's domain, and an exchanges
-#         entry carrying "ext":{"resource_owner_id":"…"}.
-
 curl -s https://<host>/.well-known/http-message-signatures-directory
-# Expect: a JWK Set of the publisher's OWN keys — or 404, which is legitimate
-#         when the publisher issues none.
 ```
+
+What each answer should look like — including why a `404` on the second is
+legitimate, and why the served key value has to be compared against
+`WBA_KEYS_JSON` rather than judged from the status and content type — is in
+[`../../deploy/publisher-wellknown/`](../../deploy/publisher-wellknown/),
+alongside a reference copy of both documents.
 
 **Confirm which keys are in use.** The Worker checks signatures against the
 Exchange's directory, not its own:
@@ -266,10 +287,17 @@ there is a sign that the Worker has not picked up a rotation yet — §4.2.
 **Deploy a code change.** Rebuild and deploy; nothing else is needed.
 
 ```bash
-cd src/edge && npm ci && npx wrangler deploy --env production
-# Expect: "Uploaded ramp-edge (N sec)", "Deployed ramp-edge triggers (N sec)",
-#         the route list, and a new "Current Version ID".
+cd src/edge && npm ci && npx wrangler deploy --env staging
+# Expect: "Uploaded ramp-edge-staging (N sec)", "Deployed ramp-edge-staging
+#         triggers (N sec)", the route list, and a new "Current Version ID".
 ```
+
+The checked-in `wrangler.toml` defines only the `[env.staging]` block. A
+production deployment first adds a matching `[env.production]` block — routes,
+vars, and a `name` (without an explicit `name`, wrangler derives
+`ramp-edge-production`) — and then deploys with `--env production`. The
+uploaded name in the output is always the environment's worker name, never the
+bare top-level `ramp-edge`.
 
 **Change configuration only.** Variables are not code. Edit the environment
 block's vars in `wrangler.toml` and deploy the same way — the bundle is unchanged
@@ -281,7 +309,9 @@ authoritative configuration.
 **Update the bot patterns.** `BOT_UA_ALLOW_JSON` and `BOT_UA_DENY_JSON` replace
 the built-in lists rather than extending them, so include again the entries you
 want to keep ([`CONFIGURATION.md`](CONFIGURATION.md) §3.3). An invalid pattern
-intentionally fails the deploy. Verify afterwards with the four-path reproduction in §3.2.
+does not fail the deploy: the lists are read on the first request, so
+`wrangler deploy` succeeds and the Worker then answers `500` to every request.
+Verify afterwards with the four-path reproduction in §3.2.
 
 **Cache purge.** Purging the zone cache is a Cloudflare operation and affects only
 origin responses. It does not touch the Worker, which caches nothing except the
@@ -308,20 +338,28 @@ curl -sI https://<host>/ | grep -i '^server:'
    the Worker; `/.well-known/http-message-signatures-directory` is served only
    when `WBA_KEYS_JSON` is set and returns `404` otherwise, which is legitimate.
    **All discovery documents are generated at request time from the environment
-   variables — there are no static files to upload or keep in sync.**
+   variables — there are no static files to upload or keep in sync.** A filled-in
+   copy of each, with the procedure for the publisher's signing key, is in
+   [`../../deploy/publisher-wellknown/`](../../deploy/publisher-wellknown/).
 4. **Zone protections that must not conflict with the Worker**
    ([`DEPLOYMENT.md`](DEPLOYMENT.md) §7).
 
 Then run the verification in [`DEPLOYMENT.md`](DEPLOYMENT.md) §8.
 
-**When the Exchange rotates its keys — the Edge-side steps.** Normally **nothing to
-do, and no redeploy**: the Worker fetches the Exchange's public keys from its
-directory and re-fetches when it meets a key id it does not know, so a rotation
-fixes itself.
+**When the Exchange rotates its keys — the Edge-side steps.** Normally **nothing
+to do, and no redeploy** — but the two key modes pick a rotation up differently:
 
-A redeploy is needed in exactly one case: when `RAMP_VERIFY_KEYS` is set, pinning
-the keys. Then add the new key to that variable (keeping the old one until the
-Exchange stops using it) and deploy as in §4.1.
+- **Default (keys fetched from the directory).** The Worker caches the fetched
+  key set for one hour and does **not** re-fetch early for an unknown key id.
+  Until the cache expires, addresses signed with the new key are refused with
+  `signature_mismatch`. The rotation heals on its own within at most one hour;
+  if that is too long, publish a new version (§4.1) — fresh isolates start with
+  an empty cache and fetch immediately.
+- **Pinned (`RAMP_VERIFY_KEYS` set).** A key id that is not in the pinned set
+  triggers one immediate directory fetch, so a rotation heals right away, with
+  no waiting. Still update the pinned list afterwards — add the new key
+  (keeping the old one until the Exchange stops using it) and deploy as in
+  §4.1 — so verification returns to running without a network fetch.
 
 Verify either way with a fresh signed address from the Exchange:
 
@@ -333,10 +371,10 @@ curl -s "$EXCHANGE_WBA_URL"
 # Expect: a "keys" array containing the new key.
 ```
 
-If signatures keep failing after the directory shows the new key, the Worker is
-still inside the one-hour cache lifetime — [`CONFIGURATION.md`](CONFIGURATION.md)
-§4. Wait for the cache to expire, or publish a new version to start fresh
-isolates.
+If signatures keep failing after the directory shows the new key, the Worker
+is still inside the one-hour cache lifetime described above —
+[`CONFIGURATION.md`](CONFIGURATION.md) §4. Wait for the cache to expire, or
+publish a new version to start fresh isolates.
 
 ### 4.3 Upgrade and rollback
 
@@ -367,10 +405,17 @@ under an unchanged bundle. Change it as part of a code change, never alone.
 | Action | Effect | Consequence |
 |---|---|---|
 | **Remove the route** | Traffic bypasses the Worker entirely and goes straight to the origin. | The site works normally for everyone — including AI bots, who now read for free. No gate, no negotiation, no revenue. |
-| **Empty the deny list** (`BOT_UA_DENY_JSON = "[]"`) | The Worker still runs; the bot gate matches nothing. | Bots pass free, but signed addresses are still verified and the discovery documents still serve. Reversible with one deploy. |
+| **Neutralize the deny list** (`BOT_UA_DENY_JSON = '["(?!)"]'`) | The Worker still runs; the deny patterns match no User-Agent (`(?!)` is a valid pattern that never matches anything). | Pattern-based bot denials stop. Signed addresses are still verified and the discovery documents still serve. Reversible with one deploy. Two denials remain even so: callers that Cloudflare itself has verified as AI crawlers, and callers sending no User-Agent at all — both are refused before the pattern lists are consulted. |
+
+**Never set the deny list to an empty array.** `BOT_UA_DENY_JSON = "[]"` fails
+the shape check (a list must have at least 1 entry —
+[`CONFIGURATION.md`](CONFIGURATION.md) §3.3), and a shape failure makes the
+Worker fail on **every** request. What was meant as "switch the gate off"
+becomes a full outage of the site. The never-matching pattern above is the safe
+way to make the list match nothing.
 
 Removing the route is the stronger action and the right one if the Worker itself
-is causing an outage. Emptying the deny list is right when the gate is
+is causing an outage. Neutralizing the deny list is right when the gate is
 misclassifying legitimate traffic and you need the rest of the Worker intact.
 
 ---

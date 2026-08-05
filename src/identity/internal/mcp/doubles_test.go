@@ -17,6 +17,8 @@ import (
 	"github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 	"google.golang.org/protobuf/encoding/protojson"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
 	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 )
@@ -367,11 +369,12 @@ func (p *rampPeer) Resolve(
 // newTrustStore is the key directory the peers verify against: thumbprint →
 // public key, seeded from custody as agents are provisioned.
 //
-// It is httpsig.StaticResolver, the resolver the library already ships for
-// exactly this ("intended for test seeding and dynamic registration paths") and
-// which the broker suites already use. A hand-rolled equivalent here would also
-// have dropped its validity-window check, so this suite could not express a
-// key-window negative without re-adding that logic a third time.
-func newTrustStore() *httpsig.StaticResolver {
-	return httpsig.NewStaticResolver(nil)
+// It is the SDK's helpers.StaticKeyResolver — the in-memory map double the
+// SDK ships "for preloaded key sets and tests", with Put for dynamic
+// registration — the same double the broker suites use. It carries no
+// validity-window logic, so a key-window negative cannot be expressed through
+// this trust store; window enforcement is covered where it lives, in the
+// well-known resolver suites.
+func newTrustStore() *helpers.StaticKeyResolver {
+	return helpers.NewStaticKeyResolver(nil)
 }

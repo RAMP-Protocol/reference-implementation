@@ -14,6 +14,10 @@ locals {
   zitadel_fqdn   = "${var.zitadel_subdomain}.${var.domain}"
   origin_fqdn    = "${var.origin_subdomain}.${var.domain}"
   publisher_fqdn = "${var.publisher_subdomain}.${var.domain}"
+  # The smoke identities: each hostname IS the identity's id (its kid, its
+  # ramp.agents row, and the host its public key directory is served at).
+  smoke_agent_fqdn         = "${var.smoke_agent_subdomain}.${var.domain}"
+  catalog_contributor_fqdn = "${var.catalog_contributor_subdomain}.${var.domain}"
 
   image_base      = "${var.image_registry}/${var.image_prefix}"
   exchange_image  = "${local.image_base}/exchange:${var.image_tag}"
@@ -34,10 +38,11 @@ locals {
   # calls with it directly and no service on the VM needs it.
   #
   # Two of these are Broker keys and they are not interchangeable:
-  # broker-relay-key.json signs Broker->Exchange calls (verified from
-  # keys.json), while broker-identity-key.pem is the identity the Broker publishes
-  # in its own WBA directory. Both must be stable across restarts and VM
-  # recreates, which is why they live here rather than being minted on the VM.
+  # broker-relay-key.json signs Broker->Exchange calls (the Broker publishes
+  # its pubkey in its own WBA directory, where the Exchange resolves it), while
+  # broker-identity-key.pem is the identity key that same directory is signed
+  # under. Both must be stable across restarts and VM recreates, which is why
+  # they live here rather than being minted on the VM.
   keys_dir = "${path.root}/keys"
   # Optional: the Exchange only needs it for AWS_CLOUDFRONT_RSA tenants, which
   # staging has none of. gen-staging-keys.sh writes one anyway, so it is normally
@@ -79,9 +84,30 @@ module "compose_stack" {
 
   ed25519_private_pem     = file("${local.keys_dir}/ed25519-private.pem")
   rsa_private_pem         = local.rsa_private_pem
-  keys_json               = file("${local.keys_dir}/keys.json")
   broker_relay_key_json   = file("${local.keys_dir}/broker-relay-key.json")
   broker_identity_key_pem = file("${local.keys_dir}/broker-identity-key.pem")
+
+  # PUBLIC key directories for the smoke identities (gen-staging-keys.sh
+  # derives them from the local keypairs — the private halves never leave the
+  # operator's machine). Caddy serves each at its identity's hostname, which is
+  # how the Exchange and Broker verify the smoke and ingest signatures.
+  static_wba_directories = {
+    (local.smoke_agent_fqdn)         = file("${local.keys_dir}/smoke-agent-wba.json")
+    (local.catalog_contributor_fqdn) = file("${local.keys_dir}/catalog-contributor-wba.json")
+  }
+}
+
+# Renders the worker's publisher-manifest env values (EXCHANGES_JSON,
+# CATALOG_CONTRIBUTORS_JSON) — the one Terraform home of that JSON shape,
+# shared with the Lambda@Edge config rendering in stacks/demo-aws.
+module "manifest" {
+  source = "../../modules/publisher-manifest"
+
+  exchange_fqdn     = local.exchange_fqdn
+  resource_owner_id = var.resource_owner_id
+  # The contributor id IS the hostname its key directory is served at (the
+  # smoke identity hostname derived above) — there is no separate id variable.
+  catalog_contributor_id = local.catalog_contributor_fqdn
 }
 
 module "vm" {
@@ -104,6 +130,10 @@ module "dns" {
     (var.identity_subdomain) = module.vm.public_ip
     (var.zitadel_subdomain)  = module.vm.public_ip
     (var.origin_subdomain)   = module.vm.public_ip
+    # The smoke identities' key directory hostnames — Caddy serves each
+    # identity's public JWK Set there (static_wba_directories above).
+    (var.smoke_agent_subdomain)         = module.vm.public_ip
+    (var.catalog_contributor_subdomain) = module.vm.public_ip
     # Agent Web Bot Auth directories: one hostname per agent, created by a
     # developer signing up rather than by Terraform, so the record has to be a
     # wildcard. Caddy mints each subdomain's certificate on demand.
@@ -137,18 +167,12 @@ module "edge" {
   exchange_url     = "https://${local.exchange_fqdn}"
   exchange_wba_url = "https://${local.exchange_fqdn}/.well-known/http-message-signatures-directory"
   provider_domain  = local.publisher_fqdn
-  exchanges_json = jsonencode([{
-    domain             = local.exchange_fqdn
-    endpoint           = "https://${local.exchange_fqdn}"
-    supported_profiles = ["ramp-news-v1"]
-    ext                = { resource_owner_id = var.resource_owner_id }
-  }])
+  exchanges_json   = module.manifest.exchanges_json
 
   origin_url = "https://${local.origin_fqdn}"
-  catalog_contributors_json = jsonencode([{
-    domain       = var.catalog_contributor_id
-    relationship = "operator"
-  }])
+  # Rendered by the manifest module — the one Terraform home of this JSON
+  # shape, shared with the Lambda@Edge config rendering in stacks/demo-aws.
+  catalog_contributors_json = module.manifest.catalog_contributors_json
 
   ramp_enforce_binding = var.ramp_enforce_binding
 

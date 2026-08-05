@@ -40,7 +40,13 @@ src/mcp/**/__pycache__/
 # Legacy / paused workstreams (not needed in any container)
 docs/
 pkg/
-scripts/
+# scripts/ stays out of build contexts EXCEPT the shared key helpers, which
+# the publisher-jwks image copies in so its entrypoint renders the WBA
+# directory through the same module the key-gen scripts use.
+scripts/*
+!scripts/lib/
+scripts/lib/*
+!scripts/lib/ed25519_keys.py
 analysis/
 analysis-*
 ec-br-*

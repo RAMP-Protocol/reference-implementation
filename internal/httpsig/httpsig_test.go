@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
@@ -30,7 +32,7 @@ func TestVerifyRequest_TamperedBodyRejected(t *testing.T) {
 	// so the digest check (which runs before the ed25519 verify) must reject.
 	req.Body = io.NopCloser(bytes.NewReader([]byte(`{"hello":"mars"}`)))
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("want ErrDigestMismatch, got %v", err)
@@ -46,7 +48,7 @@ func TestVerifyRequest_MissingContentDigestRejected(t *testing.T) {
 	req := newRAMPSignedRequest(t, []byte(`{"hello":"world"}`), priv, now)
 	req.Header.Del("Content-Digest")
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrMissingContentDigest) {
 		t.Fatalf("want ErrMissingContentDigest, got %v", err)
@@ -62,7 +64,7 @@ func TestVerifyRequest_MissingSignatureRejected(t *testing.T) {
 	req := newRAMPSignedRequest(t, []byte(`{"hello":"world"}`), priv, now)
 	req.Header.Del("Signature") // keep Signature-Input so the miss is on Signature
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrMissingSignature) {
 		t.Fatalf("want ErrMissingSignature, got %v", err)

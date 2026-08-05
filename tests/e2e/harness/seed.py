@@ -23,7 +23,7 @@ key (caller_id == domain); the Exchange learns that key ONLY by fetching the
 publisher's edge Web Bot Auth directory
 (``/.well-known/http-message-signatures-directory``) keys[] (Gate-1 self-signup).
 The 3rd-party ``catalog-contributor-e2e`` identity is likewise learned only via
-its own well-known host (the ``catalog-contributor`` compose service).
+its own well-known host (the ``catalog-contributor-e2e-jwks`` compose service).
 
 The three demo domains resolve in-network to their edges via docker-compose
 network aliases (demo.→Cloudflare, music.→Fastly, sfx.→AWS), each edge serving
@@ -550,23 +550,6 @@ def seed_stack(
         },
     )
     return _build_fixture()
-
-
-def _contributor_key_path() -> Path:
-    """Return the keyfile path appropriate to the run environment.
-
-    The keypair is a committed test fixture under
-    ``tests/e2e/harness/fixtures/catalog_contributor_key.json`` — the
-    matching pubkey is also pinned in ``deploy/broker/keys.json`` with
-    kid ``catalog-contributor-e2e`` so the Exchange's static httpsig
-    resolver finds it. A ``RAMP_CATALOG_KEY_PATH`` override lets CI
-    pin a different location (e.g. for a rotated key); when set, the
-    file there MUST match the pubkey in ``deploy/broker/keys.json``.
-    """
-    override = os.environ.get("RAMP_CATALOG_KEY_PATH")
-    if override:
-        return Path(override)
-    return Path(__file__).resolve().parent / "fixtures" / "catalog_contributor_key.json"
 
 
 def _agent_public_key(agent_id: str) -> bytes:

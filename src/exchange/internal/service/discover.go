@@ -13,6 +13,24 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 )
 
+// newOfferGroup starts the per-URI OfferGroup every discovery answer is built
+// from. It states the discovery method for THIS service's answer: the Exchange
+// resolves a URI against its own catalog and nothing else, so every group it
+// emits is EXCHANGE, on all three groupFor branches alike.
+//
+// That claim is scoped to callers of ExchangeService.DiscoverResources, which
+// includes the Broker's discover relay, where this value reaches the agent
+// unchanged. It is NOT the value an agent sees from BrokerService/Resolve: how
+// a URI came to be asked about is something only the Broker knows, so the
+// Broker decides it there. A second discovery source is a change in the Broker;
+// this function keeps saying EXCHANGE, because that is what the Exchange did.
+func newOfferGroup(uri string) *rampv1.OfferGroup {
+	return &rampv1.OfferGroup{
+		Uri:             uri,
+		DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE.Enum(),
+	}
+}
+
 // groupFor builds the per-URI OfferGroup and returns the concrete offers that
 // also land in the flat ResourceResponse.Offers slice (for backwards-compat
 // with single-URI callers). The second return value is a subset of
@@ -26,8 +44,9 @@ func (s *ExchangeService) groupFor(
 ) (*rampv1.OfferGroup, []*rampv1.Offer, error) {
 	switch verdict {
 	case LookupMiss:
-		absence := rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_NOT_IN_CATALOG
-		return &rampv1.OfferGroup{Uri: uri, AbsenceReason: &absence}, nil, nil
+		group := newOfferGroup(uri)
+		group.AbsenceReason = rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_NOT_IN_CATALOG.Enum()
+		return group, nil, nil
 	case LookupHitPublic:
 		offer, err := s.buildOffer(entry, requester, profiles)
 		if err != nil {
@@ -41,9 +60,11 @@ func (s *ExchangeService) groupFor(
 		// OFFER_ABSENCE_REASON_RESTRICTION_FILTERED reason on a restriction-driven
 		// filter-out is a flagged follow-up.)
 		if offer == nil {
-			return &rampv1.OfferGroup{Uri: uri}, nil, nil
+			return newOfferGroup(uri), nil, nil
 		}
-		return &rampv1.OfferGroup{Uri: uri, Offers: []*rampv1.Offer{offer}}, []*rampv1.Offer{offer}, nil
+		group := newOfferGroup(uri)
+		group.Offers = []*rampv1.Offer{offer}
+		return group, []*rampv1.Offer{offer}, nil
 	default:
 		return nil, nil, exchange.Newf(exchange.KindInternal, "unknown lookup verdict %d", verdict)
 	}

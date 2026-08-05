@@ -14,7 +14,9 @@
 #     naive `grep docs/` misses)
 #   - CLAUDE.md, AGENTS.md, .claude/, .beads/, .gitlab-ci.yml
 #   - the beads tracker and GitLab merge requests (MR !2)
-#   - other repositories (piarch, pi-terraform)
+#   - other repositories (currently the piarch pattern only; the pi-terraform
+#     pattern is added when the old-demo ops scripts that still name it are
+#     deleted — until then it would flag those known mentions on every run)
 #   - absolute developer paths (/Users/..., /home/...)
 #   - the vendored in-tree copy of ramp.proto, which no longer exists — the
 #     protocol is the pinned module github.com/RAMP-Protocol/protocol. A bare

@@ -46,11 +46,13 @@ acme_email = "ops@example.com"
 # Iterating on apply/destroy? Use the LE staging CA (untrusted certs):
 # acme_staging = true
 
-# Identity that pushes the demo catalog. MUST equal CONTRIBUTOR_ID in
-# ../../scripts/lib/staging-env.sh — key files and ramp.agents rows are keyed
-# by that id, so a mismatch breaks staging auth silently. The variable carries
-# no default on purpose; change it only together with that file.
-catalog_contributor_id = "catalog-contributor-staging"
+# The smoke identities (the smoke agent and the demo-catalog contributor) are
+# hostnames under `domain`: Caddy serves each identity's public key directory
+# at <label>.<domain>, which is how the services verify their signatures. The
+# label defaults ("smoke-agent", "catalog-contributor") match what
+# gen-staging-keys.sh mints, so normally nothing to set here:
+# smoke_agent_subdomain         = "smoke-agent"
+# catalog_contributor_subdomain = "catalog-contributor"
 
 # The stack also deploys its own Cloudflare edge worker (demo.<domain>) by
 # default. Set false to skip ONLY the worker — the backend and the demo origin

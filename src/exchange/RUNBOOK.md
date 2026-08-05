@@ -2,10 +2,10 @@
 
 Operated by the Exchange Operator.
 
-**Escalation.** If §3 does not resolve it, contact Postindustria at
-`<support channel — fill in before handover>`. Send the `request_id` of a failing
-request together with the matching log lines from the Exchange, the Broker and the
-Edge. Postindustria has no access to your infrastructure, so that correlation ID is
+**Escalation.** If §3 does not resolve it, contact Postindustria over the
+existing communication channel. Send the `request_id` of a failing request
+together with the matching log lines from the Exchange, the Broker and the Edge.
+Postindustria has no access to your infrastructure, so that correlation ID is
 the only way the request can be traced.
 
 > This runbook assumes the Exchange is already deployed. For installation,
@@ -23,18 +23,20 @@ signed delivery URL the agent finally fetches. **It is the only component that
 charges money** — no other component moves money, and no other component can tell
 you what was charged.
 
-**Its dependency on the Broker comes first, because it governs start-up.** The
-Broker publishes the list of signing keys that have been withdrawn, and the
-Exchange treats that list as the final word:
+**Its dependency on the Broker comes first, because it is the one operators
+misread.** The Broker publishes the list of signing keys that have been
+withdrawn, and the Exchange treats that list as the final word:
 
-- The Exchange **refuses to start** without `EXCHANGE_BROKER_WELLKNOWN_URL`, and
-  fetches that document over public HTTPS during boot. A Broker that is down, or a
-  hostname that does not resolve yet, makes the Exchange start, fail and restart
-  over and over — a *crash-loop* (§3.3).
-- While the document is unreachable at runtime, the Exchange **rejects signed
-  requests** rather than falling back to its own key file — it cannot prove a key
-  has not been withdrawn, so it does not accept it. A Broker outage therefore
-  looks like mass authentication failure on the Exchange.
+- The Exchange **refuses to start** without `EXCHANGE_BROKER_WELLKNOWN_URL`. The
+  address alone satisfies the boot check — the document itself is fetched over
+  public HTTPS at runtime, so a Broker that is down, or a hostname
+  that does not resolve yet, does not stop the Exchange from starting (§3.3).
+- While the document is unreachable, the Exchange **rejects signed requests**
+  and logs `exchange.httpsig.broker_wellknown_unavailable` — it holds no local
+  copy of the keys to fall back to, cannot prove a key has not been withdrawn,
+  and so does not accept it. A Broker outage therefore looks like mass
+  authentication failure on the Exchange, while its own health checks stay
+  passing.
 
 Withdrawing a key is a Broker procedure even though the Exchange enforces it; see
 the Broker's runbook.
@@ -112,7 +114,8 @@ table below gives both.
 | `exchange.execute_transaction` with `event=release_hold_failed` | ERROR | A failed purchase's reservation could not be released. It expires on its own; money is not lost, but the agent's available balance is understated until it does. |
 | `exchange.report_usage` | INFO on success, WARN on rejection | One line per usage report. `outcome` is `VALIDATED`, `REPLAY`, `REJECTED_AUTHZ`, `REJECTED_FIELDS`, `REJECTED_WINDOW`, `REJECTED_TOLERANCE`, `REJECTED_BILLING_ID`, `REJECTED_TIMESTAMP` or `REJECTED_EXCHANGE`. |
 | `migrations applied` | INFO | Boot. Carries `version`, `dirty` and `table`. **Appears twice** — once per database. Read `table` to tell them apart: `schema_migrations_ramp` is the catalog database, `schema_migrations_sor` the account registry. |
-| `ed25519 signing key loaded` / `rsa signing key loaded` | INFO | Boot. Both must appear. |
+| `ed25519 signing key loaded` | INFO | Boot. Must always appear. |
+| `rsa signing key loaded` | INFO | Boot. Appears only when an RSA key is configured. Without one, `no RSA signing key configured; AWS_CLOUDFRONT_RSA tenants will be refused` appears instead — fine for an all-Ed25519 deployment, a problem the moment a publisher uses CloudFront. |
 | `billing adapter: tigerbeetle` | INFO | Boot. Carries `ledger`, `currency`, `address`. Its **absence** means the `free` adapter. |
 | `billing adapter seeded` | INFO | Boot, `inmemory` adapter only. Carries the number of seeded agents. |
 | `sor adapter: postgres` | INFO | Boot. The account registry is connected and migrated. Carries `cache_ttl`. **Not optional** — its absence means the Exchange is not running. |
@@ -122,7 +125,6 @@ table below gives both.
 | `exchange.httpsig.replay_store_ready` | INFO | Boot. Redis-backed replay protection is live. Carries `addr`. |
 | `exchange.httpsig.replay_store_disabled` | INFO | Boot. `REDIS_URL` is unset, so replay protection is per-process — safe at one instance, not above (§3.3). |
 | `exchange.httpsig.wellknown_enabled` | INFO | Boot. Carries `well_known_url` and `poll_interval` — where to confirm the interval you configured took effect. |
-| `exchange.httpsig.agent_wellknown_enabled` | INFO | Boot. Unknown agents may be resolved from their own websites. |
 | `exchange listening` / `admin listening` | INFO | Boot. Both must appear. |
 
 ### 2.3 Alerts
@@ -158,9 +160,8 @@ design, and the internet will try it.
 | Symptom | Why | What to do |
 |---|---|---|
 | **Every signed request rejected, `outcome=signature`** | A proxy in front terminates HTTPS and forwards HTTP, so the URL the caller signed is not the URL the Exchange checks | Set `RAMP_TRUST_PROXY_HEADERS=true` — [`CONFIGURATION.md`](CONFIGURATION.md) §4. Only behind a proxy you control, never on a directly-exposed Exchange. |
-| Refuses to start: `no RSA signing key` | The RSA key is loaded unconditionally at boot, even when no publisher uses CloudFront | Generate one and supply it: [`DEPLOYMENT.md`](DEPLOYMENT.md) §5. |
+| A CloudFront publisher's purchases refused: `no RSA signing key` | An absent RSA key never stops the boot. The Exchange runs, serves every Ed25519 publisher, and refuses only a CloudFront-scheme tenant's requests — per request, with the `failed_precondition` code | Generate the key and supply it: [`DEPLOYMENT.md`](DEPLOYMENT.md) §5. No restart loop to worry about; add the key and restart once. |
 | Refuses to start: `EXCHANGE_BROKER_WELLKNOWN_URL is required` | Refusing is deliberate — with nothing to check the withdrawn-key list against, a withdrawn key would keep working | Point it at the Broker's `/.well-known/ramp.json`. |
-| Refuses to start: `httpsig: no keys loaded` | `RAMP_KEYS_FILE` is missing, empty, or every entry was malformed. Its default is **relative** and resolves to `/deploy/broker/keys.json` in the container | Set an absolute path to a real key file (a JWKS — a JSON document with a `keys` array). |
 | **Every catalog push rejected, `missing_resource_owner_id`** | The publisher's `ramp.json` names no payee (the one who gets paid) for this Exchange — it does not "attest" one. The payee is never guessed, and there is no fallback to the tenant id | The manifest needs `exchanges[].ext.resource_owner_id` on the entry whose `domain` equals your `EXCHANGE_DOMAIN`. §4.2. |
 | Every push rejected, `caller_not_in_catalog_contributors` | The publisher's `ramp.json` does not list the pushing key's identifier, or could not be fetched at all | Add it to `catalog_contributors[].domain`, or make it equal the manifest's own `domain`. §4.2. |
 | Every push rejected, `unknown_publisher_domain` | No tenant row exists for the entry's domain | Create the tenant first. §4.2. |
@@ -256,10 +257,14 @@ SELECT resource_id, uri, resource_owner_id, pricing FROM ramp.catalog
 
 ### 3.3 Gotchas
 
-- **The first boot fails and retries repeatedly, and that is expected.** The
-  Exchange fetches the Broker's document at boot over public HTTPS; until DNS,
-  certificates and the Broker are all live it exits and retries. It fixes itself
-  with `restart: unless-stopped`. [`DEPLOYMENT.md`](DEPLOYMENT.md) §8.
+- **On day one the Exchange starts, but rejects every signed request until the
+  Broker answers.** The Broker's document is fetched at runtime, not at boot;
+  until DNS, certificates and the Broker are all live the Exchange runs with
+  passing health checks and logs
+  `exchange.httpsig.broker_wellknown_unavailable` on each rejected request. It
+  fixes itself the moment the document is reachable. A process that instead
+  exits and restarts has a configuration fault — see
+  [`DEPLOYMENT.md`](DEPLOYMENT.md) §8 for both shapes.
 - **`ADMIN_ADDR` defaults to `:8082`, which is the Broker's published port.**
   Running both on one host with host networking collides. Change one.
 - **A proxy in front makes the admin allowlist useless.** It reads the
@@ -278,11 +283,10 @@ SELECT resource_id, uri, resource_owner_id, pricing FROM ramp.catalog
   Exchange with two tenants — and each of those Exchanges needs its own account
   registry as well, because an agent's `billing_ref` is issued by one Exchange and
   means nothing to another.
-- **The Broker and the Exchange read the same key file under different variable
-  names** (`RAMP_KEYS_FILE`, `BROKER_KEYS_FILE`). Deliberate — one shared list of
-  public keys. Update both, or the two disagree about who is trusted.
-- **The key files under `deploy/` are test files whose private keys are published
-  in this repository.** Never deploy them.
+- **There is no shared key file.** The Exchange learns every verification key
+  from the key owner's own published documents: the Broker's directory for the
+  relay key and the withdrawn-key list, and each signer's own directory for
+  that signer's key.
 
 ---
 
@@ -305,10 +309,13 @@ fails — its ledger reservation is not released explicitly and expires on its o
 about six minutes later. Delivery URLs already issued keep working; the CDN
 verifies them without asking the Exchange.
 
-**Everything needs a restart.** There is no live reload of anything: not the
-signing keys, not the trusted-key file, not the Broker URL, not the billing
-configuration. The one exception is a fee rate or reporting policy set through the
-admin API (§4.2).
+**Configuration needs a restart.** There is no live reload of any setting: not
+the signing keys, not the Broker URL, not the billing configuration. Two
+exceptions: a fee rate or reporting policy set through the admin API (§4.2)
+takes effect immediately, and **verification keys were never configuration** —
+they are fetched from the key owners' published documents and refresh on their
+own as the cached copies expire (`EXCHANGE_DIRECTORY_TTL`,
+`EXCHANGE_REVOCATION_POLL_INTERVAL`), with no restart involved.
 
 **Running more than one instance.** Above one instance `REDIS_URL` is mandatory
 and every instance must use the **same** Redis. Check each instance's boot log for
@@ -365,40 +372,30 @@ every other tenant row is never read. And until that one row exists, **every**
 agent registration fails.
 
 **2. Generate the catalog-contributor key** — the key the ingest tool signs
-pushes with, not the Exchange's own key. The public half is appended to the
-shared `keys.json` (give the updated file to the Broker operator too, then
-restart the Exchange so it loads it); the private half is what you pass to
-`--key` below, so treat it as a secret and move it out of the repository.
+pushes with, not the Exchange's own key:
 
 ```bash
-AGENT_KID=catalog.example.v1 scripts/gen-demo-agent-key.sh
-# Expect: "wrote deploy/broker/keys.json and deploy/mcp/agent-key.json
-#          (kid=catalog.example.v1)"
+scripts/gen-contributor-key.sh <contributor-id>
+# → deploy/publisher-keys/<contributor-id>-key.json
 ```
 
-**3. Have the publisher publish `/.well-known/ramp.json`.** Two fields matter, and
-both fail silently when wrong:
+The contributor id is the hostname of the contributor's key directory. The
+public half must be published in the contributor's own well-known directory
+(the Exchange learns it by fetching that directory — there is no shared key
+file to update); the private half is what you pass to `--key` below, so treat
+it as a secret and keep it out of the repository.
 
-```json
-{
-  "ver": "1.0",
-  "role": "ROLE_PUBLISHER",
-  "domain": "www.publisher.example",
-  "exchanges": [
-    { "domain": "exchange.example",
-      "endpoint": "https://exchange.example",
-      "relationship": "PROVIDER_RELATIONSHIP_DIRECT",
-      "ext": { "resource_owner_id": "publisher-payee" } }
-  ],
-  "catalog_contributors": [ { "domain": "catalog.example.v1" } ],
-  "supported_profiles": ["ramp-news-v1"]
-}
-```
+**3. Have the publisher publish `/.well-known/ramp.json`.** The document's shape,
+with every field traced to the setting that produces it, is in
+[`../../deploy/publisher-wellknown/`](../../deploy/publisher-wellknown/); the copy
+there is the one the test suite pins to the Edge Worker's output. Two fields
+matter from this side, and both fail silently when wrong:
 
 - `exchanges[].domain` must equal your `EXCHANGE_DOMAIN` **exactly**, and that
   entry's `ext.resource_owner_id` is the **payee** — the one who gets paid. Every
   euro of this publisher's revenue goes to it. Absent or empty, every push is
-  rejected.
+  rejected. Present but wrong, nothing is rejected: the value is stored and paid
+  out as written.
 - `catalog_contributors[].domain` must contain the kid from step 2 — unless that
   kid equals the manifest's own `domain`, which is also accepted.
 
@@ -409,7 +406,8 @@ their checks here. On the Exchange side:
 
 ```bash
 curl -s https://www.publisher.example/.well-known/ramp.json
-# Expect: the document above, served over HTTPS with a valid certificate
+# Expect: the document described above — matching the reference copy in
+#         deploy/publisher-wellknown/ — served over HTTPS with a valid certificate
 ```
 
 ```sql

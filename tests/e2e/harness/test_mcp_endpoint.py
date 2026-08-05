@@ -67,6 +67,12 @@ def _required_env(name: str) -> str:
 # socrates lyric/article marker — the real delivered body, not a non-empty stub.
 _CONTENT_MARKER = "Socrates"
 
+# The discovery method the MCP projection reports. Kept file-local rather than
+# shared with the Exchange-facing obligation suites: this one reads the value
+# through rampclient.EnumName in the MCP adapter, they read it off the Exchange
+# wire through protojson, and one shared name would hide two separate contracts.
+_EXCHANGE_METHOD = "DISCOVERY_METHOD_EXCHANGE"
+
 
 def _require_in_network(compose_stack: StackURLs) -> None:
     """The MCP-endpoint test is in-network only: identity publishes no host port."""
@@ -160,6 +166,13 @@ async def test_agent_discovers_executes_and_receives_content_over_mcp(
         disc = discovered.structured_content
         groups = disc["offer_groups"]
         assert groups and groups[0]["offers"], f"no offers discovered for {res.uri!r}: {disc}"
+        # How the URL was found reaches the agent through the MCP projection, not
+        # only over the wire between the services. This test names the URL in the
+        # tool call, so the Broker reports EXCHANGE — the agent asked for it
+        # directly.
+        assert groups[0].get("discovery_method") == _EXCHANGE_METHOD, (
+            f"the discovery method must reach the agent; got {groups[0]}"
+        )
         offer = groups[0]["offers"][0]
         assert offer["offer_id"], offer
         assert offer["signature"], offer

@@ -5,14 +5,17 @@ import { defineConfig } from 'vitest/config';
 // membership is its test DIRECTORY, so there are no hand-mirrored
 // include/exclude lists to keep in sync:
 //
-//   tests/workers/       real Workers runtime, binding enforcement ON,
-//                        origin configured (mocked per test via the shared
-//                        fetch-mock helper)
-//   tests/article-path/  same runtime, the shared-URL four-outcome acceptance
-//                        suite against a mocked origin backend
-//   tests/node/          plain Node: fs-reading parity/schema guards, the
-//                        console-spy log suites, and the programmatic AWS
-//                        Lambda / Fastly harnesses (no CLI dependencies)
+//   tests/workers/            real Workers runtime, binding enforcement ON,
+//                             origin configured (mocked per test via the shared
+//                             fetch-mock helper)
+//   tests/article-path/       same runtime, the shared-URL four-outcome
+//                             acceptance suite against a mocked origin backend
+//   tests/wellknown-keyless/  same runtime, the publisher that issues no signing
+//                             keys: the discovery surface with WBA_KEYS_JSON
+//                             deliberately unset
+//   tests/node/               plain Node: fs-reading parity/schema guards, the
+//                             console-spy log suites, and the programmatic AWS
+//                             Lambda / Fastly harnesses (no CLI dependencies)
 //
 // Run one project with `vitest run --project <name>`.
 
@@ -67,6 +70,12 @@ export default defineConfig({
       // change to that default surfaces here rather than only in config.test.ts.
       workersProject('workers', { ...BASE_BINDINGS, WBA_KEYS_JSON }),
       workersProject('article-path', BASE_BINDINGS),
+      // BASE_BINDINGS WITHOUT WBA_KEYS_JSON is the configuration under test here,
+      // not an omission: a publisher that issues no signing keys must answer 404
+      // at the key directory, and four operator documents tell people that answer
+      // is correct. Adding WBA_KEYS_JSON to BASE_BINDINGS would turn that 404
+      // into a 200 and break this project.
+      workersProject('wellknown-keyless', BASE_BINDINGS),
       {
         test: {
           name: 'node',

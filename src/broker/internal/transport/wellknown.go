@@ -10,36 +10,33 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/signing"
 )
 
-// brokerKeyLifetime bounds the validity window the Broker publishes for its OWN
-// relay key: not_before is the issued-at instant (the signer clock at document
-// build) and not_after is issued-at + brokerKeyLifetime. A bounded window means a
-// rotated-out relay key stops verifying on its own rather than remaining valid
-// for decades.
+// brokerKeyLifetime bounds the validity window the Broker publishes for every
+// key it speaks for — the co-signing identity key and every registry key (the
+// relay key). Each window is [now - brokerKeyClockSkew, now + brokerKeyLifetime),
+// with now read from the signer clock at each document build. A bounded window
+// means a rotated-out key stops verifying on its own rather than remaining
+// valid for decades in a verifier's stale cached directory.
 const brokerKeyLifetime = 90 * 24 * time.Hour
 
-// agentKeyNotBefore / agentKeyNotAfter are the wide placeholder window every
-// agent key folded in from the registry inherits. The registry's on-disk JWKS
-// carries no per-key window, so there is nothing tighter to publish for them yet.
-//
-// LIMITATION: because this window is operator-flattened, a registry key cannot
-// express its own expiry through this surface — an expired agent key keeps
-// verifying until removed from the file. Benign while the registry is statically
-// operator-provisioned (the file IS the source of truth); it becomes a latent
-// expiry bypass once dynamic agent registration lands, at which point folded
-// keys must carry their own not_before/not_after. Agents that rotate today
-// publish bounded windows in their OWN WBA directories, not here.
-//
-// TODO: fold per-key not_before/not_after through the registry (KeyEntry +
-// KeyRegistry) so agent keys express their own bounded window instead of
-// inheriting this placeholder — a follow-up beyond the broker-own-key window fix.
-var (
-	agentKeyNotBefore = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-	agentKeyNotAfter  = time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
-)
+// brokerKeyClockSkew backdates every published not_before so a verifier whose
+// clock runs slightly behind the Broker never rejects a freshly built
+// document. The window start recurs at every rebuild (daily), not just at
+// boot, so without this allowance the rejection edge would too. One hour
+// matches the allowance the deployment key-generation tooling applies to the
+// static WBA documents it renders.
+const brokerKeyClockSkew = time.Hour
+
+// WellKnownRebuildInterval is how often the Broker re-derives its served
+// discovery documents (server.Handlers.RunRefresher, started by run()). It is
+// DERIVED from brokerKeyLifetime — never an independent literal — so
+// shortening the lifetime automatically tightens the rebuild cadence instead
+// of leaving a frozen directory serving lapsed windows.
+var WellKnownRebuildInterval = server.RebuildIntervalFor(brokerKeyLifetime)
 
 // WellKnownConfig carries the inputs the Broker's discovery surface needs: a
 // role=ROLE_BROKER commercial overlay manifest (no identity keys) plus a WBA
-// directory carrying the relay key and every folded agent key.
+// directory carrying the Broker's own keys (the co-signing identity key and
+// the relay key).
 type WellKnownConfig struct {
 	Signer        *signing.CoSigner
 	BrokerID      string
@@ -48,19 +45,21 @@ type WellKnownConfig struct {
 }
 
 // NewWellKnown builds the Broker's role=ROLE_BROKER overlay-manifest handler
-// plus its WBA directory handler. The WBA directory carries the relay key plus
-// every key in the agent registry so RFC 9421 verifiers resolve every
-// thumbprint the Broker speaks for from one canonical document. Both documents
-// are schema-validated at construction, so a misconfiguration surfaces here
-// rather than at the first request. v1 requires an agent registry; a nil Keys is
-// a configuration error returned to the caller. RevocationURL, when non-empty,
-// is published as the WBA directory's revocation_url so verifiers learn where to
-// poll the Broker's KeyRevocationList; empty omits the field.
+// plus its WBA directory handler. The WBA directory carries the Broker's own
+// keys — the co-signing identity key plus every registry key (the relay key) —
+// so RFC 9421 verifiers resolve every thumbprint the Broker speaks for from one
+// canonical document. Both documents are schema-validated at construction, so a
+// misconfiguration surfaces here rather than at the first request. A nil Keys
+// is a configuration error returned to the caller. RevocationURL, when
+// non-empty, is published as the WBA directory's revocation_url so verifiers
+// learn where to poll the Broker's KeyRevocationList; empty omits the field.
 //
-// The WBA directory reflects a snapshot of the registry taken at construction.
-// If dynamic agent registration is added, the mutation site must rebuild the
-// served document (server.Handler.Rebuild re-reads the KeySource); the flattened
-// key window above must also gain per-key bounds at that point.
+// The registry's KEY SET is fixed at construction, but the published validity
+// windows depend on the clock at build time — so the served documents do need
+// periodic rebuilding. The caller keeps them fresh by running the returned
+// pair's RunRefresher (run() starts it at WellKnownRebuildInterval); without
+// it, a Broker up longer than brokerKeyLifetime would serve only lapsed
+// windows.
 func NewWellKnown(cfg WellKnownConfig) (server.Handlers, error) {
 	if cfg.Keys == nil {
 		return server.Handlers{}, fmt.Errorf("transport: broker well-known requires a non-nil *KeyRegistry")
@@ -75,36 +74,37 @@ func NewWellKnown(cfg WellKnownConfig) (server.Handlers, error) {
 	})
 }
 
-// brokerKeySource yields the relay key plus the registry's agent keys as
-// published JWKs. The relay key is always present (even when the registry is
-// empty) so verifiers can confirm Broker→Exchange signatures. Keys carry no
-// kid — identity is the RFC 7638 thumbprint — so dedup is by the JWK `x`.
+// brokerKeySource yields the co-signing identity key plus the registry's keys
+// (the relay key) as published JWKs. The identity key is always present (even
+// when the registry is empty); the relay key lets verifiers confirm
+// Broker→Exchange signatures. Keys carry no kid — identity is the RFC 7638
+// thumbprint — so dedup is by the JWK `x`.
 type brokerKeySource struct {
 	signer *signing.CoSigner
 	keys   *KeyRegistry
 }
 
 func (s brokerKeySource) Keys() []*rampwellknown.Key {
-	relayX := rampwellknown.EncodeEd25519X(s.signer.PublicKey())
-	// The broker's OWN relay key carries a realistic issued-at → bounded not-after
-	// window anchored to the signer clock; the folded agent keys still inherit the
-	// wide placeholder window (the registry carries no per-key bounds — see TODO).
+	identityX := rampwellknown.EncodeEd25519X(s.signer.PublicKey())
+	// Every published key carries the same bounded window, anchored to the
+	// signer clock at THIS build. Handler.Rebuild re-reads this source, so the
+	// periodic refresher re-anchors the served windows on every rebuild. The
+	// window starts brokerKeyClockSkew before the build instant so verifiers
+	// with slightly-behind clocks accept a just-built document.
 	issuedAt := s.signer.Now()
+	notBefore := issuedAt.Add(-brokerKeyClockSkew)
+	notAfter := issuedAt.Add(brokerKeyLifetime)
 	keys := []*rampwellknown.Key{
-		rampwellknown.NewKey(s.signer.PublicKey(), issuedAt, issuedAt.Add(brokerKeyLifetime)),
+		rampwellknown.NewKey(s.signer.PublicKey(), notBefore, notAfter),
 	}
-	seen := map[string]struct{}{relayX: {}}
-	notBefore := agentKeyNotBefore.Format(time.RFC3339)
-	notAfter := agentKeyNotAfter.Format(time.RFC3339)
-	for _, k := range s.keys.Document().Keys {
-		if _, dup := seen[k.X]; dup {
+	seen := map[string]struct{}{identityX: {}}
+	for _, pub := range s.keys.Keys() {
+		x := rampwellknown.EncodeEd25519X(pub)
+		if _, dup := seen[x]; dup {
 			continue
 		}
-		seen[k.X] = struct{}{}
-		// Registry entries are pre-filtered to OKP/Ed25519 with a valid 32-byte
-		// x (see KeyRegistry.LoadBytes), and X is already base64url, so the
-		// shared KeyFromEncodedX helper stamps the fixed RAMP headers.
-		keys = append(keys, rampwellknown.KeyFromEncodedX(k.X, notBefore, notAfter))
+		seen[x] = struct{}{}
+		keys = append(keys, rampwellknown.NewKey(pub, notBefore, notAfter))
 	}
 	return keys
 }

@@ -15,8 +15,8 @@ let cachedApp: App | undefined;
 // readFastlyEnv assembles the EdgeEnv from a Fastly env reader. Fastly Compute
 // has no enumerable env object (unlike Cloudflare/AWS, which cast the whole env),
 // so every schema key MUST be hand-forwarded here — an omission silently drops
-// that signal on the Fastly runtime ONLY. Exported so the cross-runtime
-// manifest-parity test can exercise this hand-enumeration directly.
+// that signal on the Fastly runtime ONLY. Exported so tests can drive this
+// hand-enumeration directly.
 export function readFastlyEnv(getEnv: (name: string) => string | undefined): EdgeEnv {
   return parseEnv({
     EXCHANGE_URL: getEnv('EXCHANGE_URL'),

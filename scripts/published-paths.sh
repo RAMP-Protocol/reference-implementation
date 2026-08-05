@@ -93,11 +93,16 @@ ALLOW_SCRIPTS=(
   scripts/devstack.sh
   scripts/gen-broker-relay-key.sh
   scripts/gen-buyer-delegation-key.sh
-  scripts/gen-demo-agent-key.sh
+  # Named by ramp-ingest's --key help text and the Exchange RUNBOOK, both of
+  # which ship — the command a published document tells the reader to run has
+  # to exist in the published tree.
+  scripts/gen-contributor-key.sh
   scripts/gen-e2e-keys.sh
   scripts/gen-examplenews-publisher-key.sh
-  # Imported by both gen-*-key scripts via an inline heredoc.
+  # Imported by the gen-*-key scripts via an inline heredoc.
   scripts/lib/ed25519_keys.py
+  # Sourced by every key-gen script to pick a cryptography-capable interpreter.
+  scripts/lib/select-python.sh
   # Bind-mounted read-only by docker-compose.e2e.yml into a service with no
   # profile; identity waits on it with service_completed_successfully. A missing
   # source makes Docker materialise a DIRECTORY there, so the stack fails with

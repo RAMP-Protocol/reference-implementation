@@ -77,11 +77,11 @@ type exchangeServerDeps struct {
 	signer    *signing.Ed25519Signer
 	keystore  *signing.InMemoryKeyStore
 	logger    *slog.Logger
-	// httpsigKeys registers caller pubkeys with the global httpsig
+	// httpsigKeys registers caller pubkeys with the connectserver verify
 	// middleware that wraps the mux (mirror of production wiring in
 	// cmd/server/main.go::buildWrapped). Tests that issue any /ramp.* RPC
 	// MUST register the signer's keyID + pubkey here; the global gate
-	// will reject the request with httpsig.ErrUnknownKey otherwise.
+	// will reject the request with helpers.ErrUnknownKey otherwise.
 	httpsigKeys map[string]ed25519.PublicKey
 	// clk is optional. nil → clock.System{}. Pass a DeterministicClock to
 	// control time in tests that exercise window-expiry logic.
@@ -119,7 +119,7 @@ type exchangeServerDeps struct {
 // startExchangeServer wires the Exchange's public HTTP surface — Connect-Go
 // CatalogService + ExchangeService, the three /.well-known/ routes, and the
 // public agents/register handler — onto a fresh mux behind
-// RequestIDMiddleware + httpsig.Middleware + CatalogSignatureMiddleware,
+// RequestIDMiddleware + the connectserver verify middleware + CatalogSignatureMiddleware,
 // serves it via httptest, and returns the fixture. Mirror of
 // cmd/server/main.go::buildWrapped so the integration tests exercise the
 // SAME middleware chain as production (per ADR-008 D1). Admin-plane
@@ -128,7 +128,7 @@ type exchangeServerDeps struct {
 // Callers still own DB bring-up, tenant seeding, and any post-wiring
 // bootstrap (e.g. catalog.Bootstrap). Callers MUST also register every
 // signer's keyID + pubkey via deps.httpsigKeys; the global gate rejects
-// unknown keyids with httpsig.ErrUnknownKey.
+// unknown keyids with helpers.ErrUnknownKey.
 func startExchangeServer(t *testing.T, deps exchangeServerDeps) *exchangeServerFixture {
 	t.Helper()
 	catalogSvc := service.NewCatalogService(
@@ -247,8 +247,8 @@ func startExchangeServer(t *testing.T, deps exchangeServerDeps) *exchangeServerF
 		BaseCurrency:      "USD",
 		SupportedProfiles: []string{"ramp-news-v1"},
 		OfferKey:          deps.signer.PublicKey(),
-		KeyNotBefore:      time.Unix(1700000000, 0).UTC(),
-		KeyNotAfter:       time.Unix(1700000000, 0).UTC().Add(10 * 365 * 24 * time.Hour),
+		Clock:             clock.NewDeterministic(time.Unix(1700000000, 0).UTC()),
+		KeyLifetime:       10 * 365 * 24 * time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("wellknown: %v", err)

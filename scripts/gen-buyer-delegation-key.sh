@@ -62,54 +62,44 @@ mkdir -p "$KEYS_DIR" "$JWKS_DIR"
 VERIFY_PRIV_FILE="${KEYS_DIR}/${BUYER_NAME}-delegation-key.json"
 REVOKE_PRIV_FILE="${KEYS_DIR}/${BUYER_NAME}-revocation-key.json"
 
-python3 - \
+# Interpreter selection (PYTHON array) shared by every key-gen script.
+. "$REPO_ROOT/scripts/lib/select-python.sh"
+
+"${PYTHON[@]}" - \
+    "$REPO_ROOT/scripts/lib" \
     "$VERIFY_PRIV_FILE" "$REVOKE_PRIV_FILE" "$JWKS_FILE" \
     "$BUYER_VERIFY_KID" "$BUYER_REVOKE_KID" <<'PY'
-import base64
 import json
 import os
 import sys
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import (
-    Encoding, NoEncryption, PrivateFormat, PublicFormat,
-)
+sys.path.insert(0, sys.argv[1])
+from ed25519_keys import generate_seed_pub_b64
 
-verify_priv_path, revoke_priv_path, jwks_path, verify_kid, revoke_kid = sys.argv[1:6]
+verify_priv_path, revoke_priv_path, jwks_path, verify_kid, revoke_kid = sys.argv[2:7]
 
 
-def b64u(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-
-
-def make_keypair() -> tuple[bytes, bytes]:
-    priv = Ed25519PrivateKey.generate()
-    seed = priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
-    pub = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    return seed, pub
-
-
-def jwk_entry(kid: str, pub: bytes, use: str) -> dict:
+def jwk_entry(kid: str, pub_b64: str, use: str) -> dict:
     return {
         "kid": kid,
         "kty": "OKP",
         "crv": "Ed25519",
         "alg": "EdDSA",
         "use": use,
-        "x": b64u(pub),
+        "x": pub_b64,
     }
 
 
-verify_seed, verify_pub = make_keypair()
-revoke_seed, revoke_pub = make_keypair()
+verify_seed, verify_pub = generate_seed_pub_b64()
+revoke_seed, revoke_pub = generate_seed_pub_b64()
 
 Path(verify_priv_path).write_text(json.dumps({
     "kid": verify_kid,
     "alg": "EdDSA",
     "use": "verify",
-    "seed": b64u(verify_seed),
-    "public": b64u(verify_pub),
+    "seed": verify_seed,
+    "public": verify_pub,
 }, indent=2) + "\n")
 os.chmod(verify_priv_path, 0o600)
 
@@ -117,8 +107,8 @@ Path(revoke_priv_path).write_text(json.dumps({
     "kid": revoke_kid,
     "alg": "EdDSA",
     "use": "revoke",
-    "seed": b64u(revoke_seed),
-    "public": b64u(revoke_pub),
+    "seed": revoke_seed,
+    "public": revoke_pub,
 }, indent=2) + "\n")
 os.chmod(revoke_priv_path, 0o600)
 

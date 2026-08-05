@@ -14,10 +14,12 @@ deploy/broker/broker-key.json
 # Demo/contributor/publisher signing keys are generated at bootstrap (see
 # scripts/gen-*-key.sh) and mounted at runtime. This broad pattern blocks any
 # accidental re-add of a *key*.json under deploy/.
+# If demo fixture CONTENT ever needs a name containing "key" (say a
+# typewriter-keystroke sound-effect file), re-include exactly that file by its
+# full path — never a subtree pattern, which would make any agent-key.json
+# placed under the tree committable.
 deploy/**/*key*.json
-# Exception: the Broker pubkey registry carries NO private material and is the
-# checked-in source of truth for verify-side keys, so it must stay tracked.
-!deploy/broker/keys.json
+!deploy/content/demo/foleyworks/sfx/typewriter-keystroke.json
 
 # The E2E harness private signing fixtures are generated at
 # bootstrap (scripts/gen-e2e-keys.sh, wired into `make e2e-up`) and never

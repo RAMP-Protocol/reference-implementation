@@ -12,10 +12,11 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/app"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/keystore"
@@ -58,7 +59,7 @@ type fixture struct {
 	// for both, a regression that ignored the offer's exchange entirely and posted
 	// to the configured URL would land on the same server and pass.
 	issuer *rampPeer
-	trust  *httpsig.StaticResolver
+	trust  *helpers.StaticKeyResolver
 	keys   *keystore.VaultStore
 	signUp *signup.Service
 }

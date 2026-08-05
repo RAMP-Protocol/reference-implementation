@@ -91,7 +91,7 @@ npm ci
 npm run build:worker
 # Expect: an esbuild summary ending with
 #   dist/worker.mjs   <size>
-#   built dist/worker.mjs from src/entries/cloudflare.ts
+#   built dist/worker.mjs from src/entries/cloudflare.ts (workerd)
 ```
 
 The single output file is `dist/worker.mjs`. The entry point it is built from is
@@ -165,6 +165,10 @@ curl -s -o /dev/null -w '%{http_code}\n' https://staging.publisher.example/.well
 #         the origin answered instead.
 ```
 
+For what those documents should contain once the route reaches them, see the
+filled-in copies in
+[`../../deploy/publisher-wellknown/`](../../deploy/publisher-wellknown/).
+
 ### 6.2 DNS records must be proxied
 
 For every hostname the Worker serves, the zone's DNS record must be **proxied** —
@@ -235,7 +239,7 @@ fetch to the origin simply follows whatever cache rules the zone already has.
 
 ## 8. Verify the deployment
 
-Five checks. Replace `<host>` with the real article hostname and
+Six checks. Replace `<host>` with the real article hostname and
 `/some-article-path` with a real article.
 
 **Check A — humans pass through.**
@@ -260,15 +264,27 @@ curl -s -D - -o /dev/null -A "GPTBot/1.0" https://<host>/some-article-path
 
 ```bash
 curl -s https://<host>/.well-known/ramp.json
-# Expect: 200 and JSON with "role":"ROLE_PUBLISHER", your PROVIDER as "domain",
-#         and an "exchanges" array whose entry carries
-#         "ext":{"resource_owner_id":"…"}.
 ```
 
-If `ext` is absent from that output, the publisher's content cannot enter the
-catalog — [`CONFIGURATION.md`](CONFIGURATION.md) §3.5.
+What a correct answer contains, and what a missing or wrong
+`ext.resource_owner_id` costs, is in
+[`../../deploy/publisher-wellknown/`](../../deploy/publisher-wellknown/) beside a
+reference copy of the document. See also [`CONFIGURATION.md`](CONFIGURATION.md)
+§3.5.
 
-**Check D — signed URLs work.** Take a signed address produced by the Exchange
+**Check D — the key directory answers correctly.**
+
+```bash
+curl -s -D - https://<host>/.well-known/http-message-signatures-directory
+```
+
+Both `200` and `404` are correct answers here, depending on whether this publisher
+issues its own signing keys, and neither the status nor the content type proves
+the Worker rather than the origin produced the response. Which answer to expect,
+and what to compare inside the body, is in the same folder. If the body does not
+match what you configured, re-check the routes in §6.1.
+
+**Check E — signed URLs work.** Take a signed address produced by the Exchange
 and request it. This needs the Exchange side done first: the publisher's tenant
 must be set up with `signing_scheme = 'ED25519'`.
 
@@ -281,7 +297,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 A `403` here with a valid, unexpired address usually means the Exchange's key
 directory and the Worker disagree — [`RUNBOOK.md`](RUNBOOK.md) §3.1.
 
-**Check E — observability is retaining records.** Open Workers Logs for this
+**Check F — observability is retaining records.** Open Workers Logs for this
 Worker in the Cloudflare dashboard and re-run Check B. Confirm a record named
 `edge.deny.bot` appears. If the log stays empty, §6.4 is not in effect and the
 runbook's diagnostics will not work.
@@ -290,13 +306,18 @@ runbook's diagnostics will not work.
 
 ## 9. If a platform team applies this with Terraform
 
-The Terraform module is not part of this branch; the supported procedure here is
-`wrangler deploy`. A platform team that uses Terraform creates the same
-resources:
+A ready-made module is available at
+[`../../deploy/terraform/modules/cloudflare-edge/`](../../deploy/terraform/modules/cloudflare-edge/),
+wrapped by the stack in
+[`../../deploy/terraform/stacks/edge/`](../../deploy/terraform/stacks/edge/); the
+step-by-step version of this page for that route is
+[`../../deploy/terraform/docs/deploy-edge-standalone.md`](../../deploy/terraform/docs/deploy-edge-standalone.md).
+`wrangler deploy` remains supported and is what §5 describes. A platform team
+building its own configuration instead creates the same resources:
 
 | Resource | Setting |
 |---|---|
-| Worker script | Entry `src/entries/cloudflare.ts`, or the pre-built `dist/worker.mjs` from §3 |
+| Worker script | The pre-built `dist/worker.mjs` from §3 |
 | Worker vars | The variables from [`CONFIGURATION.md`](CONFIGURATION.md) §2, as plain vars — there are no secrets |
 | Worker routes | Article paths **and** `/.well-known/*` (§6.1) |
 | DNS records | `proxied = true` for every served hostname (§6.2) |
@@ -308,7 +329,7 @@ resources:
 provider does not support the Workers Logs setting, so do not expect an
 `observability` block in the Worker resource to take effect. Enable it on the
 Worker in the Cloudflare dashboard with `head_sampling_rate = 1`, and verify with
-Check E in §8 after every apply.
+Check F in §8 after every apply.
 
 ---
 

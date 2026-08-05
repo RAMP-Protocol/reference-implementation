@@ -225,6 +225,50 @@ func TestDiscoverRelay_MultisigBindsToAgent(t *testing.T) {
 	}
 }
 
+// TestDiscoverRelay_CarriesTheExchangesDiscoveryMethod pins the relay half of
+// the discovery-method contract. On this surface the Exchange decides the method
+// and the Broker states nothing of its own: the relay decodes the Exchange's
+// ResourceResponse and protojson-marshals it again, so "the Exchange's value
+// reaches the agent" is a claim about a round trip, not about byte forwarding.
+//
+// The Broker's OTHER discovery surface, BrokerService/Resolve, works the
+// opposite way — resolve.stampMethod states the Broker's own answer and never
+// reads the Exchange's. That is why this needs its own test: nothing about
+// Resolve's behaviour tells you what the relay does with the field.
+//
+// The mock reports SEARCH, which the relay has no code path to produce, so the
+// assertion names its source. Were the relay to drop the field or substitute a
+// value, this reads EXCHANGE or nothing at all.
+func TestDiscoverRelay_CarriesTheExchangesDiscoveryMethod(t *testing.T) {
+	env := newDiscoverRelayTestEnv(t)
+	env.mockExch.discoveryMethod = rampv1.DiscoveryMethod_DISCOVERY_METHOD_SEARCH
+
+	resp, err := http.DefaultClient.Do(env.signedDiscoverRequest(t, env.queryBody(t), true))
+	if err != nil {
+		t.Fatalf("send to broker: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("broker discover relay failed: %d %s", resp.StatusCode, bodyBytes)
+	}
+
+	var rResp rampv1.ResourceResponse
+	if err := protojson.Unmarshal(bodyBytes, &rResp); err != nil {
+		t.Fatalf("parse ResourceResponse: %v", err)
+	}
+	groups := rResp.GetOfferGroups()
+	if len(groups) != 1 {
+		t.Fatalf("offer_groups = %d, want 1 (one requested URI)", len(groups))
+	}
+	want := rampv1.DiscoveryMethod_DISCOVERY_METHOD_SEARCH
+	if got := groups[0].GetDiscoveryMethod(); got != want {
+		t.Errorf("discovery_method = %v, want %v — the relay must carry what the Exchange stated, "+
+			"not drop it in the decode/re-marshal or substitute its own", got, want)
+	}
+}
+
 // TestDiscoverRelay_RejectsUnsignedRequest verifies the broker refuses to relay
 // (and stamp sig2 onto) a discovery request carrying no agent signature — the
 // open-proxy guard.

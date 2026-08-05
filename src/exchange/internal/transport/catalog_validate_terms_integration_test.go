@@ -466,19 +466,7 @@ func setupTermContributor(t *testing.T, h *pushHarness, callerID string) rampcon
 // term assertion in this package reads back through this RPC, never the DB.
 func discoverOffers(t *testing.T, h *pushHarness, uri string) []*rampv1.Offer {
 	t.Helper()
-	resp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{uri},
-		Requester: &rampv1.Requester{
-			Id:     "agent-discover",
-			Domain: "agent.example",
-			Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
-	if err != nil {
-		t.Fatalf("discover %s: %v", uri, err)
-	}
-	return resp.Msg.GetOffers()
+	return discoverOffersAs(t, h, uri, requesterWithScopes("agent-discover"))
 }
 
 // discoverOfferCount returns how many offers DiscoverResources yields for uri.

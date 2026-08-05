@@ -77,8 +77,8 @@ type Fetcher struct {
 
 type cacheEntry struct {
 	fetchedAt time.Time
-	keys      []ed25519.PublicKey
-	rawKIDs   map[string]ed25519.PublicKey // kid → key for look-by-kid
+	keys      []keypolicy.TimedKey
+	rawKIDs   map[string]keypolicy.TimedKey // kid → key for look-by-kid
 }
 
 // New constructs a Fetcher honoring cfg. The SSRF-guarded HTTP client is a
@@ -120,12 +120,24 @@ func (f *Fetcher) Contains(ctx context.Context, url string, pub ed25519.PublicKe
 	if err != nil {
 		return false, err
 	}
+	now := f.clk.Now()
 	for _, k := range entry.keys {
 		// Constant-time compare (subtle) over the raw public keys: returns 1 only
 		// when the byte slices are equal AND the same length, so the explicit
 		// length guard is subsumed. Public keys are not secret, but this removes a
 		// hand-rolled early-return byte loop in favor of the vetted primitive.
-		if subtle.ConstantTimeCompare(k, pub) == 1 {
+		//
+		// The validity window is checked at USE time against the fetcher clock,
+		// not at fetch time: a key can lapse while the cache is warm, and a
+		// published window that only gated the fetch would keep honoring the key
+		// until the next refresh.
+		//
+		// The window is part of the MATCH condition, not a verdict on the first
+		// byte-equal entry: a document may list the same public key twice (a kid
+		// rename mid-rotation), and an out-of-window duplicate listed first must
+		// not hide a currently valid entry — the answer must not depend on
+		// document order.
+		if subtle.ConstantTimeCompare(k.Public, pub) == 1 && k.InWindow(now) {
 			return true, nil
 		}
 	}
@@ -141,7 +153,12 @@ func (f *Fetcher) LookupKID(ctx context.Context, url, kid string) (ed25519.Publi
 		return nil, false, err
 	}
 	k, ok := entry.rawKIDs[kid]
-	return k, ok, nil
+	// Same use-time window gate as Contains: a kid whose key is outside its
+	// published validity window reports absent.
+	if !ok || !k.InWindow(f.clk.Now()) {
+		return nil, false, nil
+	}
+	return k.Public, true, nil
 }
 
 // resolve returns the current cache entry for url, refreshing if the TTL
@@ -237,15 +254,15 @@ func parseJWKS(body []byte) (cacheEntry, error) {
 	for _, k := range raw.Keys {
 		meta[k.X] = kidUse{kid: k.Kid, use: k.Use}
 	}
-	entry := cacheEntry{rawKIDs: make(map[string]ed25519.PublicKey)}
+	entry := cacheEntry{rawKIDs: make(map[string]keypolicy.TimedKey)}
 	if err := keypolicy.LoadJWKSBytes(body, func(tk keypolicy.TimedKey) {
 		m := meta[rampwellknown.EncodeEd25519X(tk.Public)]
 		if m.use != "" && m.use != "verify" {
 			return
 		}
-		entry.keys = append(entry.keys, tk.Public)
+		entry.keys = append(entry.keys, tk)
 		if m.kid != "" {
-			entry.rawKIDs[m.kid] = tk.Public
+			entry.rawKIDs[m.kid] = tk
 		}
 	}); err != nil {
 		return cacheEntry{}, fmt.Errorf("%w: %w", ErrMalformed, err)

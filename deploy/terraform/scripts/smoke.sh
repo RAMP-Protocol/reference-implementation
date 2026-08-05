@@ -13,7 +13,8 @@
 #
 # Env (optional):
 #   STACK_DIR         default deploy/terraform/stacks/staging-aws
-#   AGENT_ID          default from lib/staging-env.sh (shared with key
+#   AGENT_ID          default from lib/staging-env.sh, which reads it from the
+#                     generated agent key file's kid (shared with key
 #                     generation and seeding so the id can never drift apart)
 #   PUBLISHER_DOMAIN  publisher hostname to smoke against. Default: the
 #                     stack's own edge-fronted hostname (publisher_hostname
@@ -45,6 +46,10 @@ command -v uv >/dev/null 2>&1 || { echo "missing: uv" >&2; exit 2; }
 EXCHANGE_URL="$(tf_out exchange_url)"
 BROKER_URL="$(tf_out broker_url)"
 IDENTITY_URL="$(tf_out identity_url)"
+# The proof signs as the smoke agent, and the services verify that signature by
+# fetching https://<AGENT_ID>/.well-known/... — catch an id/hostname mismatch
+# here with an explanation instead of as an unexplained 401 below.
+require_ids_match_stack
 # With deploy_edge = false the publisher_hostname output is null and tf_out
 # fails — in that mode the hostname to smoke MUST come from PUBLISHER_DOMAIN.
 PUBLISHER="${PUBLISHER_DOMAIN:-$(tf_out publisher_hostname 2>/dev/null || true)}"

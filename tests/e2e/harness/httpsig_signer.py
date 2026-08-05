@@ -119,9 +119,7 @@ def sign_request(
 def load_keypair(key_path: Path) -> tuple[str, Ed25519PrivateKey]:
     """Read a contributor-style keyfile and return ``(kid, Ed25519PrivateKey)``.
 
-    The key file format is the one written by
-    ``scripts/gen-demo-agent-key.sh`` and by
-    ``catalog_push.generate_contributor_key``:
+    The key file format is the one written by ``scripts/gen-e2e-keys.sh``:
     ``{"kid": "...", "private_key": "<b64url seed>", "public_key": "..."}``.
     """
     doc = json.loads(key_path.read_text())

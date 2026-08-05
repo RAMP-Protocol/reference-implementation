@@ -28,6 +28,7 @@ import pytest
 # put tests/e2e on sys.path so the canonical response carriers import resolves.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "e2e"))
 
+from harness.constants import AI_BOT_UA  # noqa: E402
 from harness.resolve_carriers import (  # noqa: E402
     licensed_of,
     retrieval_endpoint_of,
@@ -121,7 +122,7 @@ def test_bot_redirect_without_signature(broker_url: str) -> None:
     cloudfront_url = _env("RAMP_E2E_CLOUDFRONT_URL")
     resp = httpx.get(
         f"{cloudfront_url}/any-path",
-        headers={"User-Agent": "GPTBot/1.0 (+https://openai.com/gptbot)"},
+        headers={"User-Agent": AI_BOT_UA},
         timeout=30.0,
     )
     # Acceptable outcomes: CloudFront's own missing-key-pair 403 (native)

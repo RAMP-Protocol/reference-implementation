@@ -63,6 +63,10 @@ if [ "${schema_keys}" != "${module_keys}" ]; then
 fi
 echo "cloudflare-edge bindings mirror the worker env contract ($(printf '%s\n' "${schema_keys}" | wc -l | tr -d ' ') keys)"
 
+# The staging id/hostname guard exists to fail; prove it still can (stubbed
+# terraform on PATH + fabricated key files — see the test script).
+"$(dirname "${BASH_SOURCE[0]}")/tests/staging-env-guard-test.sh"
+
 failed=0
 for module in "${MODULES_DIR}"/*/; do
     [ -d "${module}tests" ] || continue
@@ -75,44 +79,55 @@ for module in "${MODULES_DIR}"/*/; do
     ) || failed=1
 done
 
-# stacks/staging-aws reads its key material with file() on constant paths,
-# which terraform evaluates while loading the configuration — so a checkout
-# without the gitignored keys/ directory (CI, a fresh clone) fails validate
-# before any reference checking happens. Placeholders keep the step hermetic:
-# create exactly the files that are missing, remove exactly those afterwards.
-# A real key on disk is never touched (the -f guard skips it) and never
-# removed (only created paths are recorded for cleanup). The content is
-# throwaway text; only broker-identity-key.pem has plan-time shape checks
-# (the ED25519 label and an 88-character base64 payload), which the zero-byte
-# payload below satisfies.
-STAGING_KEYS_DIR="${REPO_ROOT}/deploy/terraform/stacks/staging-aws/keys"
+# stacks/staging-aws and stacks/demo-aws read their key material with file()
+# on constant paths, which terraform evaluates while loading the configuration
+# — so a checkout without the gitignored keys/ directories (CI, a fresh clone)
+# fails validate before any reference checking happens. Placeholders keep the
+# step hermetic: create exactly the files that are missing, remove exactly
+# those afterwards. A real key on disk is never touched (the -f guard skips
+# it) and never removed (only created paths are recorded for cleanup). The
+# content is throwaway text; only broker-identity-key.pem has plan-time shape
+# checks (the ED25519 label and an 88-character base64 payload), which the
+# zero-byte payload below satisfies.
+KEYED_STACKS=(staging-aws demo-aws)
 placeholder_keys=()
 cleanup_placeholder_keys() {
-    local f
+    local f s
     for f in ${placeholder_keys[@]+"${placeholder_keys[@]}"}; do
         rm -f "${f}"
     done
-    rmdir "${STAGING_KEYS_DIR}" 2>/dev/null || true
+    for s in "${KEYED_STACKS[@]}"; do
+        rmdir "${REPO_ROOT}/deploy/terraform/stacks/${s}/keys" 2>/dev/null || true
+    done
 }
 trap cleanup_placeholder_keys EXIT
-place_key() { # <filename> <content> — no-op when the real file exists
-    local path="${STAGING_KEYS_DIR}/$1"
+place_key() { # <keys-dir> <filename> <content> — no-op when the real file exists
+    local path="$1/$2"
     [ -f "${path}" ] && return 0
-    printf '%s\n' "$2" > "${path}"
+    printf '%s\n' "$3" > "${path}"
     placeholder_keys+=("${path}")
 }
-mkdir -p "${STAGING_KEYS_DIR}"
-place_key ed25519-private.pem "placeholder written by test-terraform.sh for validate; never a real key"
-place_key keys.json '{}'
-place_key broker-relay-key.json '{}'
 # The label is named once and interpolated into both halves so this file never
 # carries a BEGIN header and its matching END footer as literals — that pair is
 # what the secret scanner matches on, whatever sits between the two. The
 # placeholder written is unchanged.
 ed25519_label="ED25519 PRIVATE KEY"
-place_key broker-identity-key.pem "-----BEGIN ${ed25519_label}-----
+for s in "${KEYED_STACKS[@]}"; do
+    keys_dir="${REPO_ROOT}/deploy/terraform/stacks/${s}/keys"
+    mkdir -p "${keys_dir}"
+    place_key "${keys_dir}" ed25519-private.pem "placeholder written by test-terraform.sh for validate; never a real key"
+    place_key "${keys_dir}" broker-relay-key.json '{}'
+    place_key "${keys_dir}" broker-identity-key.pem "-----BEGIN ${ed25519_label}-----
 $(head -c 64 /dev/zero | base64)
 -----END ${ed25519_label}-----"
+    # The smoke identities' public WBA documents (JWK Sets, no private
+    # material even in the real files) — both keyed stacks read them into
+    # static_wba_directories. Empty keys[] is fine here: the module's
+    # validation runs at plan time with values, and this step only runs
+    # validate.
+    place_key "${keys_dir}" smoke-agent-wba.json '{"keys":[]}'
+    place_key "${keys_dir}" catalog-contributor-wba.json '{"keys":[]}'
+done
 
 # The module suites never load the root stacks, so a stack-level reference
 # error (an output naming a local that only ever existed as an inline module

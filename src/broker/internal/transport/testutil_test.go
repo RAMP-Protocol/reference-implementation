@@ -130,6 +130,21 @@ type mockExchange struct {
 	// shape an Exchange uses to advertise a resource the caller's scopes
 	// don't cover.
 	scopeRestricted bool
+	// discoveryMethod is the method the mock reports on every OfferGroup it
+	// returns. It defaults to EXCHANGE in mockOfferGroup, matching the real
+	// Exchange; a test sets it to another value to prove the Broker IGNORES what
+	// the exchange reported and states its own, which is the contract on the
+	// Resolve path.
+	discoveryMethod rampv1.DiscoveryMethod
+	// rejectURILessQuery makes DiscoverResources refuse a ResourceQuery carrying
+	// no uris, which is what the REAL Exchange does ("at least one uri
+	// required"). It is opt-in and defaults false because this mock has always
+	// answered a uri-less query, and the free-text-query suites are built on
+	// that: turning it on globally would rewrite what sixteen pre-existing tests
+	// exercise. A test sets it when the behaviour under test is what the Broker
+	// does against a COMPLIANT Exchange — today, on the query path, that is
+	// producing no groups at all.
+	rejectURILessQuery bool
 	// offerEstimatedQuantity, when > 0, is set as the offer's
 	// Pricing.EstimatedQuantity. The Broker relay echoes this value as
 	// Usage.ConsumedQuantity on the synthesised UsageReport so tests can
@@ -192,6 +207,33 @@ type mockExchange struct {
 	offerSigningPub ed25519.PublicKey
 }
 
+// mockOfferGroup builds an OfferGroup the way the REAL Exchange does
+// (service/discover.go newOfferGroup): the uri plus the discovery method, which
+// the Exchange states on every group it emits. method is the mock's configured
+// value; UNSPECIFIED means "behave like the real Exchange" and yields EXCHANGE.
+// Every group this mock returns goes through here, so the METHOD cannot drift
+// from the producer it stands in for. Other parts of the shape do differ — the
+// real Exchange returns one group per requested URI and this mock returns one
+// for uris[0] — so this is not a general fidelity guarantee.
+//
+// groupURIFor resolves that single URI: the first requested one, or fallback for
+// the suites that drive this mock with no URIs at all. It lives beside the
+// builder because all three return paths need the same resolution and had a copy
+// of it each.
+func groupURIFor(req *connect.Request[rampv1.ResourceQuery], fallback string) string {
+	if uris := req.Msg.GetUris(); len(uris) > 0 {
+		return uris[0]
+	}
+	return fallback
+}
+
+func mockOfferGroup(uri string, method rampv1.DiscoveryMethod) *rampv1.OfferGroup {
+	if method == rampv1.DiscoveryMethod_DISCOVERY_METHOD_UNSPECIFIED {
+		method = rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE
+	}
+	return &rampv1.OfferGroup{Uri: uri, DiscoveryMethod: method.Enum()}
+}
+
 func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request[rampv1.ResourceQuery]) (*connect.Response[rampv1.ResourceResponse], error) {
 	m.mu.Lock()
 	m.discoverCalls++
@@ -200,19 +242,21 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 	rate := m.offerRate
 	scopeRestricted := m.scopeRestricted
 	signingKey := m.offerSigningKey
+	method := m.discoveryMethod
+	rejectURILess := m.rejectURILessQuery
 	m.mu.Unlock()
+	// Mirrors the real Exchange's first validation: a ResourceQuery must name at
+	// least one uri (src/exchange/internal/service/exchange.go). Opt-in — see the
+	// field's comment for why this mock answers a uri-less query by default.
+	if rejectURILess && len(req.Msg.GetUris()) == 0 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("at least one uri required"))
+	}
 	if scopeRestricted {
-		absence := rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_SCOPE_INSUFFICIENT
-		uri := "https://acme.example/article-42"
-		if uris := req.Msg.GetUris(); len(uris) > 0 {
-			uri = uris[0]
-		}
+		group := mockOfferGroup(groupURIFor(req, "https://acme.example/article-42"), method)
+		group.AbsenceReason = rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_SCOPE_INSUFFICIENT.Enum()
 		return connect.NewResponse(&rampv1.ResourceResponse{
-			Ver: "0.3",
-			OfferGroups: []*rampv1.OfferGroup{{
-				Uri:           uri,
-				AbsenceReason: &absence,
-			}},
+			Ver:         "0.3",
+			OfferGroups: []*rampv1.OfferGroup{group},
 		}), nil
 	}
 	costStr := mustMoney(cost)
@@ -349,17 +393,12 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 		}
 		secondOffer.Signature = secondSig
 
-		groupURI := url
-		if uris := req.Msg.GetUris(); len(uris) > 0 {
-			groupURI = uris[0]
-		}
+		group := mockOfferGroup(groupURIFor(req, url), method)
+		group.Offers = []*rampv1.Offer{validOffer, secondOffer}
 		return connect.NewResponse(&rampv1.ResourceResponse{
-			Ver:    "0.3",
-			Offers: []*rampv1.Offer{validOffer, secondOffer},
-			OfferGroups: []*rampv1.OfferGroup{{
-				Uri:    groupURI,
-				Offers: []*rampv1.Offer{validOffer, secondOffer},
-			}},
+			Ver:         "0.3",
+			Offers:      []*rampv1.Offer{validOffer, secondOffer},
+			OfferGroups: []*rampv1.OfferGroup{group},
 		}), nil
 	}
 
@@ -374,17 +413,12 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 	// agent<->broker DiscoveryRequest/DiscoveryResponse rename: the broker reads
 	// resp.GetOffers() (and, post per-URL fan-out, resp.GetOfferGroups()) from the
 	// Exchange exactly as before.
-	groupURI := url
-	if uris := req.Msg.GetUris(); len(uris) > 0 {
-		groupURI = uris[0]
-	}
+	group := mockOfferGroup(groupURIFor(req, url), method)
+	group.Offers = []*rampv1.Offer{offer}
 	return connect.NewResponse(&rampv1.ResourceResponse{
-		Ver:    "0.3",
-		Offers: []*rampv1.Offer{offer},
-		OfferGroups: []*rampv1.OfferGroup{{
-			Uri:    groupURI,
-			Offers: []*rampv1.Offer{offer},
-		}},
+		Ver:         "0.3",
+		Offers:      []*rampv1.Offer{offer},
+		OfferGroups: []*rampv1.OfferGroup{group},
 	}), nil
 }
 

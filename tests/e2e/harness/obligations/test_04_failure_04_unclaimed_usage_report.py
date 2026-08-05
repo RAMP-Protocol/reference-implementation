@@ -18,12 +18,12 @@ phantom transaction to.
 
 Per obligation 04's "every request is signed by the agent's well-known
 key" clause, the request is signed by the agent's own Ed25519 keypair
-(no separate-principal delegation header). The refusal can come from
-either the httpsig layer (if the agent's kid is unknown to the
-Exchange's static resolver — see the gap citation below) OR from the
-service-layer "no such transaction" check; the obligation only
-requires refusal, not a specific classification, and ``_REFUSAL_CODES``
-below accepts both flavours.
+(no separate-principal delegation header). The caller's key resolves
+from its own well-known directory, so the signature verifies and the
+refusal comes from the service layer's no-obligation-for-transaction
+check — surfaced as the single ``not_found`` code that
+``_REFUSAL_CODES`` pins, so the test notices if a future change moves
+the refusal to a different layer or classification.
 
 The observable: the platform refuses the report (Connect-Go non-2xx
 with a refusal code) and does NOT side-effect the ledger. In
@@ -31,8 +31,9 @@ particular:
 
   1. The ``ramp.transaction_log`` row count is unchanged — no
      synthetic row is invented for the unknown transaction id.
-  2. The ``ramp.agents`` row count is unchanged — a missing identity
-     must not cause a synthetic agent insert.
+  2. The ``ramp.agents`` row count grows by at most the caller's own
+     lazy registration — a missing identity must not cause a synthetic
+     agent insert (see the in-test comment on the exact bound).
 
 The test exercises the canonical v1 entry point — the Exchange direct
 call at ``/ramp.v1.ExchangeService/ReportUsage``. Slice #2 deleted the
@@ -78,18 +79,12 @@ pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 
 _REPORT_USAGE_PATH = "/ramp.v1.ExchangeService/ReportUsage"
 
-# Connect-Go JSON error codes that qualify as "refusal". We deliberately
-# allow a family of codes here rather than locking the test to one: the
-# obligation requires refusal, not a specific classification. Any of
-# these is a valid refusal; 2xx is not.
-_REFUSAL_CODES: frozenset[str] = frozenset(
-    {
-        "unauthenticated",
-        "not_found",
-        "permission_denied",
-        "invalid_argument",
-    }
-)
+# The Connect-Go JSON error code that qualifies as "refusal". Pinned to the
+# one code the deployed path actually returns — the service layer's
+# no-obligation-for-transaction check maps to ``not_found`` — so a change
+# that moves the refusal to another layer or classification is noticed
+# here instead of being absorbed silently.
+_REFUSAL_CODES: frozenset[str] = frozenset({"not_found"})
 
 
 def _post_signed_json(url: str, body: dict[str, Any]) -> httpx.Response:
@@ -101,10 +96,9 @@ def _post_signed_json(url: str, body: dict[str, Any]) -> httpx.Response:
     (agent identity) but no ``Authorization`` bearer and no
     ``X-RAMP-Entitlement-Biscuit`` (those would carry a separate
     principal). The platform cannot find a matching ``agent_id`` on
-    the (nonexistent) transaction and must refuse; the refusal may
-    surface at the httpsig layer (unknown kid) or at the service-layer
-    "no such transaction" check, and ``_REFUSAL_CODES`` accepts both
-    flavours.
+    the (nonexistent) transaction and must refuse with the service
+    layer's no-obligation-for-transaction ``not_found`` (the only code
+    ``_REFUSAL_CODES`` accepts).
     """
     payload = json.dumps(body, separators=(",", ":")).encode()
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)
@@ -139,10 +133,10 @@ def _assert_refused(resp: httpx.Response, unknown_tx_id: str) -> None:
         f"report for unclaimed transaction {unknown_tx_id} was NOT refused: "
         f"status={resp.status_code} body={resp.text[:256]}"
     )
-    # Connect-Go JSON errors always carry a code + message. We don't lock
-    # the code to a single value — see _REFUSAL_CODES above — but we do
-    # require it to be a known refusal kind so a stray 5xx without a body
-    # does not silently pass.
+    # Connect-Go JSON errors always carry a code + message. The code is
+    # pinned to the one value the deployed path returns — see
+    # _REFUSAL_CODES above — so a stray 5xx without a body (or a shifted
+    # refusal layer) does not silently pass.
     try:
         payload = resp.json()
     except ValueError as exc:
@@ -184,10 +178,9 @@ def test_report_for_unclaimed_tx_is_refused_by_exchange(
         ``X-RAMP-Entitlement-Biscuit`` (those would carry a separate
         principal, contradicting the agent-as-own-principal setup).
       - "The report is refused" — the response is a Connect-Go non-2xx
-        with a refusal code (one of ``_REFUSAL_CODES``). The refusal
-        may originate at the httpsig layer (unknown kid) or at the
-        service-layer "no such transaction" check; both flavours are
-        accepted refusals.
+        carrying the pinned ``not_found`` refusal code (the service
+        layer's no-obligation-for-transaction check; see
+        ``_REFUSAL_CODES``).
       - Platform invariant: no ledger side effects — ``transaction_log``
         row count is unchanged (the obligation's "no separate principal
         was delegated" framing forbids inventing an agent identity to

@@ -117,7 +117,12 @@ trap 'rm -f "${list_file}"' EXIT
 git -C "${repo_root}" ls-files -z -- "${SCAN_ROOTS[@]}" > "${list_file}" \
   || die "could not list tracked files under the scan roots"
 
-mapfile -d '' -t tracked < "${list_file}"
+# A read loop, not mapfile: macOS ships bash 3.2 as /bin/bash, and mapfile
+# arrived in bash 4 — the gate (and its harness tests) must run there too.
+tracked=()
+while IFS= read -r -d '' tracked_path; do
+  tracked+=("${tracked_path}")
+done < "${list_file}"
 [ "${#tracked[@]}" -gt 0 ] || die "no tracked files under the scan roots — nothing was
       read, so a PASS here would mean nothing."
 

@@ -12,7 +12,7 @@
 // party can serve either.
 //
 // The scheme is a property of the DEPLOYMENT, not of the agent: the directory
-// fetch uses the configured RAMP_WELLKNOWN_SCHEME / RAMP_MANIFEST_FETCH_SCHEME,
+// fetch uses the configured RAMP_WELLKNOWN_SCHEME,
 // which is http on a compose stack and https in production. So the identity is
 // the host — with its port, which a compose stack does distinguish by — and the
 // fetch URL is rebuilt from it by rampwellknown.WBAURL.

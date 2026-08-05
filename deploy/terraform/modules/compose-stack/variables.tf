@@ -30,6 +30,53 @@ variable "origin_hostname" {
   default     = null
 }
 
+variable "static_wba_directories" {
+  description = "Static Web Bot Auth key directories Caddy serves itself: hostname => JWK Set JSON document (public keys only). For identities whose private keys deliberately never reach the VM — e.g. an operator-held smoke signer: a verifier resolves the signer's key by fetching https://<hostname>/.well-known/http-message-signatures-directory, so serving the public document here is what lets the services verify those signatures. Each hostname needs its own DNS record pointing at this VM."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    # Mirrors the required half of the canonical directory schema
+    # (internal/rampwellknown/schema/ramp-wba-directory.json): at least one
+    # key, and every entry carries all seven members with an unpadded
+    # 43-character base64url x and RFC 3339 window bounds. Without this, a
+    # document missing `use` or carrying a padded x applies cleanly, serves
+    # 200, and fails the first signed request with an error that points at
+    # the signature — this check moves that failure to `terraform plan`.
+    condition = alltrue([
+      for doc in values(var.static_wba_directories) : (
+        length(try(jsondecode(doc).keys, [])) > 0 &&
+        alltrue([
+          for k in try(jsondecode(doc).keys, []) :
+          try(k.kty, null) == "OKP" &&
+          try(k.crv, null) == "Ed25519" &&
+          try(k.use, null) == "sig" &&
+          try(k.alg, null) == "EdDSA" &&
+          can(regex("^[A-Za-z0-9_-]{43}$", try(k.x, ""))) &&
+          can(regex("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$", try(k.not_before, ""))) &&
+          can(regex("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$", try(k.not_after, "")))
+        ])
+      )
+    ])
+    error_message = "Every static_wba_directories document must be a JWK Set with at least one key, and every key must carry kty=OKP, crv=Ed25519, use=sig, alg=EdDSA, an unpadded 43-character base64url x, and RFC 3339 not_before/not_after. Verifiers require this exact shape — a malformed document would deploy fine and then fail every signed request."
+  }
+
+  validation {
+    # The map KEYS are the half that reaches configuration verbatim: each
+    # hostname is interpolated into a Caddy site block and rewrite target
+    # (Caddyfile.tftpl) and a cloud-init write_files path — the documents
+    # themselves travel base64-encoded, so the hostname is the only part
+    # that lands in rendered configuration as-is. Same restriction the
+    # module's other template-bound string inputs carry (registry_server,
+    # registry_username, extra_databases).
+    condition = alltrue([
+      for hostname in keys(var.static_wba_directories) :
+      can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", hostname))
+    ])
+    error_message = "Every static_wba_directories key must be a lowercase DNS hostname (labels of letters, digits, and inner hyphens, joined by dots) — it is interpolated verbatim into the Caddyfile and a cloud-init file path."
+  }
+}
+
 # ── Container images ─────────────────────────────────────────────────────────
 
 variable "exchange_image" {
@@ -190,12 +237,6 @@ variable "rsa_private_pem" {
   type        = string
   default     = null
   sensitive   = true
-}
-
-variable "keys_json" {
-  description = "Shared httpsig key registry content (public keys only) read by Exchange and Broker via RAMP_KEYS_FILE/BROKER_KEYS_FILE."
-  type        = string
-  nullable    = false
 }
 
 variable "broker_relay_key_json" {

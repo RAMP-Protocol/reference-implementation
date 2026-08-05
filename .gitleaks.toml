@@ -79,7 +79,6 @@ paths = [
   '''\.pyc$''',
   # Throwaway demo / e2e / conformance key material (public keys + test seeds).
   '''(^|/)deploy/publisher-keys/[^/]*\.json$''',
-  '''(^|/)deploy/broker/keys\.json$''',
   '''(^|/)tests/e2e/harness/fixtures/[^/]*\.json$''',
   '''(^|/)testdata/[^/]*\.json$''',
   '''(^|/)tests/e2e/harness/seed\.py$''',

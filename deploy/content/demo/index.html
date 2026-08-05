@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo Publisher Catalog</title>
+<style>
+  body { margin: 0; font-family: Georgia, "Times New Roman", serif; background: #faf8f4; color: #2b2b2b; }
+  header { background: #1f3a5f; color: #ffffff; padding: 2rem 1.5rem; }
+  header h1 { margin: 0 0 0.3rem; font-size: 1.8rem; }
+  header p { margin: 0; opacity: 0.85; }
+  main { max-width: 46rem; margin: 0 auto; padding: 1.5rem; }
+  section { margin-bottom: 2rem; }
+  h2 { border-bottom: 2px solid #d8cfc0; padding-bottom: 0.3rem; }
+  section p { margin-top: 0.4rem; }
+  ul { list-style: none; padding: 0; columns: 2; column-gap: 2rem; }
+  li { margin: 0.35rem 0; break-inside: avoid; }
+  a { color: #1f3a5f; }
+  footer { max-width: 46rem; margin: 0 auto; padding: 0 1.5rem 2rem; font-size: 0.85rem; color: #6b6b6b; border-top: 1px solid #d8cfc0; }
+  code { background: #eee7da; padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.9em; }
+  @media (max-width: 32rem) { ul { columns: 1; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Demo Publisher Catalog</h1>
+  <p>Licensed content from three fictional publishers: Stoa Press, Harmonia Records, and FoleyWorks.</p>
+</header>
+<main>
+  <section>
+    <h2>Stoa Press &mdash; Philosophy Essays</h2>
+    <p>Short essays on the early Greek philosophers.</p>
+    <ul>
+      <li><a href="/articles/philosophers/thales-of-miletus.txt">Thales of Miletus</a></li>
+      <li><a href="/articles/philosophers/socrates.txt">Socrates</a></li>
+      <li><a href="/articles/philosophers/plato.txt">Plato</a></li>
+      <li><a href="/articles/philosophers/aristotle.txt">Aristotle</a></li>
+      <li><a href="/articles/philosophers/heraclitus.txt">Heraclitus</a></li>
+      <li><a href="/articles/philosophers/parmenides.txt">Parmenides</a></li>
+      <li><a href="/articles/philosophers/epicurus.txt">Epicurus</a></li>
+      <li><a href="/articles/philosophers/democritus.txt">Democritus</a></li>
+      <li><a href="/articles/philosophers/pythagoras.txt">Pythagoras</a></li>
+      <li><a href="/articles/philosophers/zeno-of-citium.txt">Zeno of Citium</a></li>
+    </ul>
+  </section>
+  <section>
+    <h2>Harmonia Records &mdash; Lyrics and Tracks</h2>
+    <p>Song lyrics and track metadata from the Harmonia Records catalog.</p>
+    <ul>
+      <li><a href="/lyrics/midnight-harbour.txt">Midnight Harbour (lyrics)</a></li>
+      <li><a href="/lyrics/paper-satellites.txt">Paper Satellites (lyrics)</a></li>
+      <li><a href="/lyrics/ferrograph-blues.txt">Ferrograph Blues (lyrics)</a></li>
+      <li><a href="/tracks/aurora-drift.json">Aurora Drift (track)</a></li>
+      <li><a href="/tracks/copper-mile.json">Copper Mile (track)</a></li>
+      <li><a href="/tracks/static-garden.json">Static Garden (track)</a></li>
+    </ul>
+  </section>
+  <section>
+    <h2>FoleyWorks &mdash; Sound Effects</h2>
+    <p>Sound-effect metadata from the FoleyWorks library.</p>
+    <ul>
+      <li><a href="/sfx/rain-on-tin-roof.json">Rain on a Tin Roof</a></li>
+      <li><a href="/sfx/thunder-rumble.json">Thunder Rumble</a></li>
+      <li><a href="/sfx/wooden-door-creak.json">Wooden Door Creak</a></li>
+      <li><a href="/sfx/sci-fi-door-whoosh.json">Sci-Fi Door Whoosh</a></li>
+      <li><a href="/sfx/footsteps-gravel.json">Footsteps on Gravel</a></li>
+      <li><a href="/sfx/typewriter-keystroke.json">Typewriter Keystroke</a></li>
+    </ul>
+  </section>
+</main>
+<footer>
+  <p>People can read this catalog freely in a browser. AI systems must license
+  content before use: the machine-readable access rules are published at
+  <a href="/.well-known/ramp.json"><code>/.well-known/ramp.json</code></a>.</p>
+</footer>
+</body>
+</html>

@@ -191,9 +191,17 @@ variable "exa_api_key" {
   sensitive   = true
 }
 
-variable "catalog_contributor_id" {
-  description = "Identity that pushes the demo catalog (seed-staging.sh signs ingest with its key; the edge manifest authorizes it). No default on purpose: the value MUST equal CONTRIBUTOR_ID in scripts/lib/staging-env.sh — set the same value here in tfvars."
+variable "smoke_agent_subdomain" {
+  description = "Label for the smoke agent's Web Bot Auth directory hostname. The full hostname <label>.<domain> IS the smoke agent's identity: gen-staging-keys.sh mints the agent key with that kid, seed-staging.sh registers it, and Caddy serves the public key directory at it so the services can verify the smoke signatures. The default matches the label scripts/lib/staging-env.sh derives ids with; seeding and smoke verify the two agree before running."
   type        = string
+  default     = "smoke-agent"
+  nullable    = false
+}
+
+variable "catalog_contributor_subdomain" {
+  description = "Label for the catalog contributor's Web Bot Auth directory hostname. The full hostname <label>.<domain> IS the identity that pushes the demo catalog (seed-staging.sh signs ingest with its key; the edge manifest authorizes it), and Caddy serves its public key directory at it. The default matches the label scripts/lib/staging-env.sh derives ids with; seeding and smoke verify the two agree before running."
+  type        = string
+  default     = "catalog-contributor"
   nullable    = false
 }
 

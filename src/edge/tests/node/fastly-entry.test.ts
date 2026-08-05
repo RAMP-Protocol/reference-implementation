@@ -10,6 +10,7 @@
 
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
+import { WBA_PATH } from '../../src/types.js';
 import {
   type TestKeypair,
   futureExp,
@@ -104,6 +105,17 @@ describe('Fastly Compute entry (stubbed runtime)', () => {
     const body = (await res.json()) as { role: string; domain: string };
     expect(body.role).toBe('ROLE_PUBLISHER');
     expect(body.domain).toBe('fastly-edge.test');
+  });
+
+  it('answers 404 on the key directory when the publisher issues no keys', async () => {
+    // This deployment's env omits WBA_KEYS_JSON, which is the setup where a named
+    // contributor pushes catalog entries on the publisher's behalf and signs with
+    // its own key from its own directory. The publisher then has no keys of its
+    // own to publish, so 404 is the correct answer and the operator docs tell
+    // people not to treat it as an incident. That advice is only safe while a
+    // test drives it.
+    const res = await invoke(new Request(`${PUB_ORIGIN}${WBA_PATH}`));
+    expect(res.status).toBe(404);
   });
 
   it('blocks bot UA', async () => {

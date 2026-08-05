@@ -27,8 +27,8 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentkeys"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/keypolicy"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/server"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/replay"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/budget"
@@ -101,13 +101,13 @@ func run(logger *slog.Logger) error {
 
 	discovery := buildDiscoveryClient(logger)
 	fetchWiring := buildFetchWiring(ctx, logger)
-	xpool, agentKeys, err := setupRelayAndKeys(logger, brokerDomain)
+	xpool, ownKeys, err := setupRelayAndKeys(logger, brokerDomain)
 	if err != nil {
 		return err
 	}
 	budgetSvc := budget.Select(redisCli, 0, clock.System{})
 
-	mux := buildBrokerMux(brokerMuxDeps{
+	mux, wk, err := buildBrokerMux(brokerMuxDeps{
 		pool: pool,
 		resolveDeps: resolve.Deps{
 			Exchanges: exchangeRepo,
@@ -123,14 +123,23 @@ func run(logger *slog.Logger) error {
 		},
 		signer:        signer,
 		brokerID:      brokerID,
-		agentKeys:     agentKeys,
+		ownKeys:       ownKeys,
 		agentResolver: fetchWiring.agentResolver,
 		redisCli:      redisCli,
 	})
+	if err != nil {
+		return err
+	}
 
 	// Launch refresher goroutine — fire-and-forget.
 	refresher := registry.NewRefresher(exchangeRepo, nil, logger, 0)
 	go refresher.Run(ctx)
+
+	// Keep the served discovery documents fresh: their validity windows are
+	// stamped from the signer clock at each build, so a long-lived Broker must
+	// rebuild them periodically — the windows exist to expire stale cached
+	// copies, never the live service.
+	go wk.RunRefresher(ctx, transport.WellKnownRebuildInterval, logger)
 
 	// Request-id is outermost so every route (healthz, well-known, relay) carries
 	// request_id in context and echoes X-Request-ID on responses. The
@@ -153,45 +162,29 @@ func buildWrapped(logger *slog.Logger, mux http.Handler) http.Handler {
 	return transport.WrapPublicSurface(logger, mux, runhttp.PublicSurfaceOptionsFromEnv())
 }
 
-// loadKeysIfConfigured seeds reg from the JWKS file at BROKER_KEYS_FILE
-// (default deploy/broker/keys.json). A missing file is a warning in demo
-// mode, not a fatal — tests boot without a file and register keys dynamically.
-func loadKeysIfConfigured(reg *transport.KeyRegistry, logger *slog.Logger) error {
-	path := runhttp.EnvOr("BROKER_KEYS_FILE", "deploy/broker/keys.json")
-	_, statErr := os.Stat(path)
-	if errors.Is(statErr, os.ErrNotExist) {
-		logger.Warn("broker.registry.absent", "path", path)
-		return nil
-	}
-	if statErr != nil {
-		return fmt.Errorf("ramp.json stat %s: %w", path, statErr)
-	}
-	if err := reg.LoadFile(path); err != nil {
-		return fmt.Errorf("ramp.json load: %w", err)
-	}
-	logger.Info("broker.registry.loaded", "path", path, "count", len(reg.Snapshot()))
-	return nil
-}
-
 // setupRelayAndKeys builds the Broker's outbound xclient.Pool (wrapped in the
-// relay signing transport when a key is present) and the inbound KeyRegistry
-// (seeded from the shared ramp.json JWKS plus the relay pubkey, so downstream
-// Exchange callers verifying broker-relay signatures find the kid).
+// relay signing transport when a key is present) and the KeyRegistry carrying
+// the Broker's own published keys (the relay pubkey, so downstream Exchange
+// callers verifying broker-relay signatures find the kid in the Broker's WBA
+// directory). There is no key-file seeding: every other participant's key is
+// learned via well-known discovery.
 func setupRelayAndKeys(logger *slog.Logger, brokerDomain string) (*xclient.Pool, *transport.KeyRegistry, error) {
 	relayHTTP, relayKey, err := newRelayHTTPClient(logger, brokerDomain)
 	if err != nil {
 		return nil, nil, fmt.Errorf("broker relay signing: %w", err)
 	}
-	agentKeys := transport.NewKeyRegistry()
-	if err := loadKeysIfConfigured(agentKeys, logger); err != nil {
-		return nil, nil, err
-	}
+	var own []ed25519.PublicKey
 	if relayKey != nil {
-		// After the WBA split the relay key is registered under its RFC 7638
-		// thumbprint (derived by PutPublicKey), not a broker-prefixed kid.
-		agentKeys.PutPublicKey(relayKey.Private.Public().(ed25519.PublicKey))
+		// The served WBA directory publishes this key with a validity window
+		// stamped from the signer clock at each document build. Verifiers
+		// address it by its RFC 7638 thumbprint, not a broker-prefixed kid.
+		own = append(own, relayKey.Private.Public().(ed25519.PublicKey))
 	}
-	return xclient.NewPool(relayHTTP), agentKeys, nil
+	ownKeys, err := transport.NewKeyRegistry(own...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("broker own-key registry: %w", err)
+	}
+	return xclient.NewPool(relayHTTP), ownKeys, nil
 }
 
 // newRelayHTTPClient loads the broker-relay private key and builds an
@@ -231,9 +224,13 @@ type brokerMuxDeps struct {
 	resolveDeps resolve.Deps
 	signer      *signing.CoSigner
 	brokerID    string
-	agentKeys   *transport.KeyRegistry
-	// agentResolver is the per-agent well-known fallback (nil when disabled).
-	// Composed AFTER agentKeys so a bootstrap-file kid resolves without a fetch.
+	// ownKeys carries the Broker's own published keys (the relay key) for the
+	// served WBA directory. It plays no part in verifying inbound signatures —
+	// see agentSig1Resolver.
+	ownKeys *transport.KeyRegistry
+	// agentResolver is the per-agent well-known resolver — the way every agent
+	// key is learned. REQUIRED: buildBrokerMux refuses a nil (tests that never
+	// verify a signature pass transporttest.NeverResolves()).
 	agentResolver helpers.KeyResolver
 	// redisCli backs the relay route's own replay store (Redis when present,
 	// in-memory otherwise). The relay route is excluded from the connectserver
@@ -241,46 +238,60 @@ type brokerMuxDeps struct {
 	redisCli *redis.Client
 }
 
-// agentSig1Resolver composes the static agent-key registry with the per-agent
-// well-known fallback (when enabled) for verifying an agent's sig1. Both
-// agent-facing surfaces authenticate identically and MUST stay that way: the
-// bespoke relay routes (which self-verify at the boundary) and the
+// agentSig1Resolver returns the resolver both agent-facing surfaces verify an
+// agent's sig1 with. Both surfaces authenticate identically and MUST stay that
+// way: the bespoke relay routes (which self-verify at the boundary) and the
 // /ramp.v1.BrokerService connectserver verify gate both drive the SDK verifier
-// with this one composite (static bootstrap kid first, then the well-known
-// fallback for a never-seen agent). If a surface ever needs a genuinely
-// different trust policy, encode it as an explicit parameter here rather than
-// forking a second copy.
+// with this one resolver (the per-agent well-known lookup, which learns every
+// agent key from the signer's own directory). If a surface ever needs a
+// genuinely different trust policy, encode it as an explicit parameter here
+// rather than forking a second copy.
 //
-// Revocation is DELIBERATELY not enforced here: this composite carries no
-// revocation-aware delegate against a revocation channel, so an agent kid the
-// operator has revoked but which is still present in the static bootstrap
-// registry verifies at the Broker. That is by design — the Broker only RELAYS
-// (it never terminates a transaction: it holds no funds and binds no delivery
-// URL), and every relayed request is re-verified downstream at the Exchange,
-// which is the single authoritative revocation checkpoint. The Exchange fails
-// CLOSED (it refuses to boot without EXCHANGE_BROKER_WELLKNOWN_URL) and its
-// composite consults the Broker's revocation channel FIRST, rejecting a revoked
-// thumbprint even when it is directory-absent (via the SDK revocation-set
-// membership accessor) — so a revoked static-bootstrap key has a fail-closed
-// checkpoint on the whole Agent→Broker→Exchange path. Duplicating that check at
-// the Broker would need the Broker to CONSUME its own revocation channel
-// (it currently only PUBLISHES one, via BROKER_REVOCATION_URL/_FILE, for the
-// Exchange to poll) — added inbound revocation infra for no security gain, since
-// the terminal checkpoint already covers this path. Should the Broker ever gain
-// a terminal (non-relay) agent surface, a revocation-aware delegate belongs here
-// FIRST, mirroring the Exchange's brokerRevocationResolver.
+// The Broker's own-key registry is deliberately NOT a delegate here: it holds
+// only keys whose private halves never sign an inbound request (the relay key
+// signs outbound Broker→Exchange calls), so a lookup over it could never match
+// an inbound signature — it exists solely to build the served WBA directory.
+//
+// Revocation is DELIBERATELY not enforced here: the returned resolver checks
+// no revocation channel, so an agent kid the operator has revoked but whose
+// directory still publishes it verifies at the Broker. That is by design —
+// the Broker only RELAYS (it never terminates a
+// transaction: it holds no funds and binds no delivery URL), and every relayed
+// request is re-verified downstream at the Exchange, which is the single
+// authoritative revocation checkpoint. The Exchange fails CLOSED (it refuses to
+// boot without EXCHANGE_BROKER_WELLKNOWN_URL) and its composite consults the
+// Broker's revocation channel FIRST, rejecting a revoked thumbprint even when
+// it is directory-absent (via the SDK revocation-set membership accessor) — so
+// a revoked key has a fail-closed checkpoint on the whole
+// Agent→Broker→Exchange path. Duplicating that check at the Broker would need
+// the Broker to CONSUME its own revocation channel (it currently only
+// PUBLISHES one, via BROKER_REVOCATION_URL/_FILE, for the Exchange to poll) —
+// added inbound revocation infra for no security gain, since the terminal
+// checkpoint already covers this path. Should the Broker ever gain a terminal
+// (non-relay) agent surface, a revocation-aware delegate belongs here FIRST,
+// mirroring the Exchange's brokerRevocationResolver.
 func (d brokerMuxDeps) agentSig1Resolver() helpers.KeyResolver {
-	static := d.agentKeys.WindowedResolver(clock.System{})
-	if d.agentResolver == nil {
-		return static
-	}
-	return keypolicy.NewCompositeResolver(static, d.agentResolver)
+	return d.agentResolver
 }
 
 // buildBrokerMux assembles the Broker's HTTP surface: healthz, the canonical
 // ramp.v1.BrokerService Connect endpoint, the bespoke relay
-// routes, and the unified /.well-known/ramp.json route.
-func buildBrokerMux(d brokerMuxDeps) *http.ServeMux {
+// routes, and the unified /.well-known/ramp.json route. It also returns the
+// well-known handler pair so run() can keep the served documents fresh with
+// RunRefresher — the published validity windows are stamped at build time, so
+// a never-rebuilt document lapses under uptime.
+//
+// Both failure modes here are wiring bugs at the composition root, so they
+// fail construction loudly as errors — the same contract NewKeyRegistry has —
+// and run() propagates them instead of this function panicking mid-wire.
+func buildBrokerMux(d brokerMuxDeps) (*http.ServeMux, server.Handlers, error) {
+	// The inbound resolver is REQUIRED: production wiring always builds one
+	// (buildProbeWiring has no off switch), and a test that never presents a
+	// signature passes transporttest.NeverResolves() explicitly.
+	if d.agentResolver == nil {
+		return nil, server.Handlers{},
+			errors.New("broker mux: agentResolver is required (tests use transporttest.NeverResolves())")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz(d.pool))
 	resolveHandler := resolve.NewService(d.resolveDeps)
@@ -293,8 +304,8 @@ func buildBrokerMux(d brokerMuxDeps) *http.ServeMux {
 	// unbounded): the hop bound is an Exchange-terminal policy; bounding it at the
 	// Broker too would double-count the relay hop the Broker is about to add.
 	// The resolver and replay store for the BrokerService surface are
-	// constructed inline from the same agentKeys + agentResolver and redisCli
-	// that the relay routes also draw from.
+	// constructed inline from the same agentResolver and redisCli that the
+	// relay routes also draw from.
 	brokerResolver := d.agentSig1Resolver()
 	replayStore := replay.NewCoreAdapter(replay.NewStore(d.redisCli, "httpsig:broker:replay:"))
 	svrOpts := []connectserver.ServerOption{
@@ -329,16 +340,16 @@ func buildBrokerMux(d brokerMuxDeps) *http.ServeMux {
 	wk, err := transport.NewWellKnown(transport.WellKnownConfig{
 		Signer:        d.signer,
 		BrokerID:      d.brokerID,
-		Keys:          d.agentKeys,
+		Keys:          d.ownKeys,
 		RevocationURL: revURL,
 	})
 	if err != nil {
-		panic(fmt.Sprintf("broker well-known manifest build failed: %v", err))
+		return nil, server.Handlers{}, fmt.Errorf("broker well-known manifest build failed: %w", err)
 	}
 	wk.RegisterRoutes(mux)
 	mux.Handle("GET "+rampwellknown.RevocationPath,
 		transport.NewRevocationHandler(runhttp.EnvOr("BROKER_REVOCATION_FILE", "")))
-	return mux
+	return mux, wk, nil
 }
 
 // mountExchangeRelay registers the bespoke relay route
@@ -347,8 +358,8 @@ func buildBrokerMux(d brokerMuxDeps) *http.ServeMux {
 // the BrokerService connectserver verify gate. The relay handler self-verifies
 // the agent's sig1 at the boundary (open-proxy guard) and enforces its OWN
 // relay-scoped replay store. sig1 is verified by agentSig1Resolver — the
-// static bootstrap kid first, then the per-agent well-known fallback (ADR-009
-// D2) for a never-seen agent.
+// per-agent well-known lookup (ADR-009 D2), which learns a never-seen agent's
+// key from the signer's own directory.
 
 // mountExchangeRelay wires the bespoke relay route. Each request surface takes
 // its own prefix-scoped replay.NewStore instance (a fresh store per call — the
@@ -389,16 +400,13 @@ func mountDiscoverRelay(mux *http.ServeMux, d brokerMuxDeps) {
 }
 
 // buildAgentResolver builds the per-agent well-known transport-key resolver
-// (ADR-009 D2): when an agent's kid is absent from the bootstrap keys file, it
-// resolves the key from the agent's own /.well-known/ramp.json so a
-// never-before-seen agent's sig1 verifies at the resolve gate and in the relay
-// handler. Returns nil (resolution disabled) when BROKER_AGENT_WELLKNOWN_RESOLUTION
-// is off; mirrors the Exchange-side resolver.
+// (ADR-009 D2): it resolves an agent's key from the agent's own
+// /.well-known/http-message-signatures-directory (the WBA directory the
+// Signature-Agent header names) so every agent's sig1 verifies at the resolve
+// gate and in the relay handler. This is the only way agent keys are learned — there is
+// no static key file and no off switch, so there is nothing to announce at
+// boot; mirrors the Exchange-side resolver, which is equally silent.
 func buildAgentResolver(ctx context.Context, fetch *http.Client, logger *slog.Logger) helpers.KeyResolver {
-	if !runhttp.EnvBool("BROKER_AGENT_WELLKNOWN_RESOLUTION", true) {
-		return nil
-	}
-	logger.Info("broker.httpsig.wellknown")
 	return agentkeys.NewFromEnv(ctx, fetch, logger)
 }
 

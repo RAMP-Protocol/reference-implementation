@@ -257,6 +257,8 @@ def main() -> None:
         edge="",
         aws_edge="",
         fastly_edge="",
+        lambda_edge="",
+        lambda_edge_no_wba="",
         identity="",
         zitadel="",
     )

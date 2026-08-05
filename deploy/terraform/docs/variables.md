@@ -36,7 +36,7 @@ or `TF_VAR_*` environment variables — never in committed files.
 | `billing_adapter` | `tigerbeetle` | Also controls whether the TigerBeetle container runs |
 | `acme_staging` | `false` | Untrusted staging CA — use while iterating on apply/destroy |
 | `exa_api_key` | null | **Sensitive.** Broker discovery |
-| `catalog_contributor_id` | `catalog-contributor-staging` | Signs the demo ingest |
+| `smoke_agent_subdomain` / `catalog_contributor_subdomain` | `smoke-agent`, `catalog-contributor` | Hostname labels for the smoke identities' public key directories. The full hostname IS each identity's id — `gen-staging-keys.sh` mints the matching kids, and seeding/smoke verify they agree with the stack |
 | `resource_owner_id` | `staging-resource-owner` | Settlement payee in the publisher manifest |
 | `worker_bundle_path` | in-repo `src/edge/dist/worker.mjs` | Override for out-of-repo bundles |
 | `deploy_edge` | `true` | Staging's own edge worker on `demo.<domain>`. Off = backend + demo origin still run in full — the mode for fronting a client hostname with a separately applied `stacks/edge` (see the client-simulation section in deploy-edge-standalone.md) |
@@ -45,10 +45,13 @@ or `TF_VAR_*` environment variables — never in committed files.
 | `create_waf_skip_rule` | `false` | See cloudflare-edge README before enabling |
 
 Key material is not passed as variables — the stack reads
-`keys/{keys.json,ed25519-private.pem,rsa-private.pem,broker-relay-key.json}`
+`keys/{ed25519-private.pem,rsa-private.pem,broker-relay-key.json}`
 written by `gen-staging-keys.sh` (gitignored). The same script also writes
 `agent-key.json` and `contributor-key.json`, which stay local: the smoke check
-and the demo ingest sign with them directly.
+and the demo ingest sign with them directly. Their PUBLIC halves travel as
+`keys/{smoke-agent-wba.json,catalog-contributor-wba.json}` — JWK Set documents
+the stack reads at apply time and serves via Caddy at each identity's
+hostname, so the services can verify the smoke and ingest signatures.
 
 ## stacks/edge
 

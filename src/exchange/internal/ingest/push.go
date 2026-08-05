@@ -27,9 +27,12 @@ import (
 // harness's 30s TTL (tests/e2e/harness/catalog_push.py).
 const signatureTTL = 30 * time.Second
 
-// ContributorKey is the on-disk shape of a catalog-contributor Ed25519 keypair,
-// matching scripts/gen-demo-agent-key.sh and the e2e harness fixture: a kid plus
-// base64url-encoded raw (32-byte) seed and public key.
+// ContributorKey is the on-disk shape of a catalog-contributor Ed25519
+// keypair: a kid plus base64url-encoded raw (32-byte) seed and public key.
+// Both key-gen paths emit it — scripts/gen-contributor-key.sh (the operator
+// path the ramp-ingest --key flag names) and scripts/gen-e2e-keys.sh (the
+// e2e fixtures) — via the same shared materializer, so the shapes cannot
+// diverge.
 type ContributorKey struct {
 	KID        string `json:"kid"`
 	PrivateKey string `json:"private_key"`
@@ -122,10 +125,16 @@ func PushEntries(
 	client *http.Client,
 	entries []*rampv1.ResourceEntry,
 ) (PushReport, error) {
+	// The Connect protocol (the connect-go default — deliberately NOT
+	// connect.WithGRPC()): the CLI pushes over public HTTPS through the
+	// deployment's TLS proxy, whose upstream hop is HTTP/1.1. gRPC carries
+	// the RPC verdict in HTTP trailers, which do not survive that hop — the
+	// proxy aborts the stream and the push fails with a transport error
+	// before any verdict arrives. Connect has no trailer dependency. Same
+	// decision, same reason, as the Broker's Exchange relay client.
 	svc := rampconnect.NewCatalogServiceClient(
 		client,
 		strings.TrimRight(exchangeURL, "/"),
-		connect.WithGRPC(),
 	)
 	resp, err := svc.PushResources(ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
 		TenantId: tenantID,

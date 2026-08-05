@@ -4,11 +4,11 @@ Operated by the Exchange Operator. Written for you, the DevOps engineer running
 the cache for the RAMP platform: you do not need to read the source code, and
 words that may be new are explained the first time they appear.
 
-**Escalation.** If §3 does not resolve it, contact Postindustria at
-`<support channel — fill in before handover>`. Send the `request_id` of a failing
-request together with the matching log lines from the Exchange and the Broker.
-Postindustria has no access to your infrastructure, so that correlation ID is the
-only way the request can be traced.
+**Escalation.** If §3 does not resolve it, contact Postindustria over the
+existing communication channel. Send the `request_id` of a failing request
+together with the matching log lines from the Exchange and the Broker.
+Postindustria has no access to your infrastructure, so that correlation ID is
+the only way the request can be traced.
 
 > This runbook assumes Redis is already running and both services are pointed at
 > it. For setting it up and first-boot verification, see

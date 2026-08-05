@@ -1,10 +1,11 @@
 // Package keypolicy provides the composite key-resolver policy the RAMP app
-// uses for authority ordering: a RevocationAware resolver first, a static
-// bootstrap resolver last, an optional per-agent well-known fallback at the
-// end. The SDK deliberately does not ship a composite resolver (authority
-// ordering is app policy, not protocol mechanics), so this package is the
-// app's home for that logic. All types operate over the sdk/go helpers
-// KeyResolver interface.
+// uses for authority ordering: a revocation-aware resolver first, then the
+// well-known directory resolvers (the Broker's own directory, each agent's
+// per-agent directory). There is no static key file anywhere in the chain —
+// every verification key is learned from a signer's published directory. The
+// SDK deliberately does not ship a composite resolver (authority ordering is
+// app policy, not protocol mechanics), so this package is the app's home for
+// that logic. All types operate over the sdk/go helpers KeyResolver interface.
 package keypolicy
 
 import (
@@ -36,9 +37,10 @@ func (f ResolverFunc) Resolve(ctx context.Context, keyID string) (ed25519.Public
 // more permissive delegate. Exhausting every delegate yields helpers.ErrUnknownKey.
 //
 // Order encodes authority: place the revocation-aware resolver first and the
-// static bootstrap resolver last. A caller that wants a transport failure in
-// an early delegate to fall through to a later one must translate that failure
-// to helpers.ErrUnknownKey before it reaches the composite.
+// more permissive delegates (e.g. the per-agent well-known lookup) last. A
+// caller that wants a transport failure in an early delegate to fall through
+// to a later one must translate that failure to helpers.ErrUnknownKey before
+// it reaches the composite.
 type CompositeResolver struct {
 	delegates []helpers.KeyResolver
 }

@@ -14,6 +14,13 @@
 // verification, the forwarding-chain structure gate, the replay store, the key
 // resolvers, and the net/http middleware.
 //
+// Scope note: production request verification runs through the SDK's
+// connectserver middleware in every service; this package's verify side
+// (VerifyRequest, VerifyMultisigRequest, Middleware) is kept as the reference
+// verifier the signing suites here and in internal/ramphttpsig assert
+// against. Resolver composition lives in internal/keypolicy — the composite
+// this package once carried was an unused line-for-line copy and was deleted.
+//
 // The agent-binding profile in pop.go is the ONE exception: it builds its own
 // signature base. Two properties of that wire contract lie outside what yaronf
 // can express, and neither is negotiable — the parameter order is
@@ -56,18 +63,6 @@ var ErrDigestMismatch = errors.New("httpsig: content-digest mismatch")
 
 // ErrSignatureVerify is returned when the ed25519 verify step fails.
 var ErrSignatureVerify = errors.New("httpsig: signature verification failed")
-
-// ErrUnknownKey is returned when the KeyResolver cannot find the keyid. Return
-// it (wrapped or direct) to signal a miss that should trigger lazy self-signup
-// at the caller site.
-var ErrUnknownKey = errors.New("httpsig: unknown keyid")
-
-// ErrKeyExpired is returned when a resolver knows the keyid but the key is
-// outside its validity window (not_before/not_after). Unlike ErrUnknownKey it is
-// an AUTHORITATIVE negative — a CompositeResolver must NOT fall through to a
-// later delegate on it, so an expired static-bootstrap key is rejected rather
-// than silently re-served by another source.
-var ErrKeyExpired = errors.New("httpsig: key outside validity window")
 
 // ErrBrokenSignatureChain is returned when a multisig request's signatures do
 // not form a valid forwarding chain: labels are non-contiguous, reordered, or a

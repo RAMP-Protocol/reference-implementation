@@ -67,17 +67,36 @@ environment variables, if you prefer.
 ## Step 1 — generate keys
 
 ```bash
-deploy/terraform/scripts/gen-staging-keys.sh
+STAGING_DOMAIN=<your tfvars 'domain'> deploy/terraform/scripts/gen-staging-keys.sh
 ```
+
+`STAGING_DOMAIN` is needed on the first run only, and must equal `domain`
+in `terraform.tfvars`: the smoke agent and the catalog contributor get
+hostname-shaped ids (`smoke-agent.<domain>`, `catalog-contributor.<domain>`)
+because each id is the hostname the stack serves that identity's public key
+directory at — that is how the services verify their signatures. Re-runs
+read the ids back from the existing key files, and the seed and smoke
+scripts check the ids against the applied stack before signing anything.
 
 Writes `deploy/terraform/stacks/staging-aws/keys/` (gitignored):
 signing PEMs for the Exchange, keypairs for the Broker relay, the smoke
-agent, and the catalog contributor, the Broker's identity key, plus the
-shared public-key registry `keys.json`. Re-running never rotates existing
-keys.
+agent, and the catalog contributor, the Broker's identity key, and the two
+public JWK Set documents (`smoke-agent-wba.json`,
+`catalog-contributor-wba.json`) the stack serves for the smoke identities.
+Re-running never rotates existing keys. There is no shared public-key
+registry file: services learn verification keys via well-known discovery.
+
+A `keys/` directory generated before the ids were hostname-shaped (kid
+`agent-staging` rather than `smoke-agent.<domain>`) fails the id check in
+the seed and smoke scripts with instructions. To migrate: delete
+`agent-key.json` and `contributor-key.json`, re-run this script with
+`STAGING_DOMAIN`, apply, and re-run `seed-staging.sh` — the new agent id
+gets a fresh billing account, so fund it again afterwards
+(`fund-staging-agent.sh`).
 
 The Broker gets two keys and they do different jobs. The relay keypair
-signs its calls to the Exchange, which verifies them against `keys.json`.
+signs its calls to the Exchange; the Broker publishes the relay public key
+in its own Web Bot Auth directory, which is where the Exchange resolves it.
 The identity key (`broker-identity-key.pem`, derived once from
 `broker-identity-seed`) is the identity the Broker publishes in its own Web
 Bot Auth directory, with a 90-day validity window — so it has to survive a
@@ -168,14 +187,16 @@ output name the edge-fronted hostname (`demo.<domain>`) that sits IN FRONT of
 that origin. Agents fetch from the second; the first is what the edge worker
 proxies verified requests to.
 
-**Expected on first boot**: the Exchange crash-loops for a few minutes until
-DNS answers, Caddy has certificates, and the Broker's well-known endpoint is
-reachable — it refuses to run without its revocation authority. It settles on
-its own (`restart: unless-stopped`).
+**Expected on first boot**: the Exchange starts right away — it only checks
+that the Broker's well-known address is configured, it does not fetch it at
+boot. Until DNS answers, Caddy has certificates, and the Broker is reachable
+(a few minutes), it rejects every signed request with 401 and logs
+`exchange.httpsig.broker_wellknown_unavailable`. It recovers on its own once
+the Broker answers — no restart needed.
 
-The Identity Service also crash-loops, and unlike the Exchange it does NOT
-settle on its own: it needs the OIDC client that step 5 provisions. That is
-expected here, not a failure.
+The Identity Service crash-loops, and does NOT settle on its own: it needs
+the OIDC client that step 5 provisions. That is expected here, not a
+failure.
 
 **Let's Encrypt rate limits**: if you apply/destroy repeatedly, set
 `acme_staging = true` (untrusted certificates, no rate limits) while

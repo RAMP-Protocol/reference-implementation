@@ -7,6 +7,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -207,5 +210,66 @@ func TestIngest_UnknownVocabAcceptedWithWarning(t *testing.T) {
 	}
 	if len(report.Warnings) == 0 {
 		t.Fatalf("expected non-empty warnings[] for unknown vocab token, got none")
+	}
+}
+
+// TestIngest_PushCrossesTrailerlessProxy proves the catalog push works through
+// an intermediary that forwards status, headers, and body but never HTTP
+// trailers — the shape of a TLS-terminating proxy whose upstream hop is
+// HTTP/1.1, which is what fronts the Exchange in a deployment. The gRPC
+// protocol puts the RPC verdict in trailers, so a client pinned to it fails
+// behind such a proxy with a transport error before any verdict arrives; the
+// Connect protocol the ingest client speaks has no trailer dependency. A
+// regression back onto a trailer-dependent protocol fails this test.
+func TestIngest_PushCrossesTrailerlessProxy(t *testing.T) {
+	h := newPushHarness(t)
+	const publisherDomain = "publisher.example"
+	kid, priv := registerContributor(t, h, publisherDomain)
+	publisherTenant := seedTenantForDomain(t, h, publisherDomain)
+
+	upstream := h.server.URL
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, upstream+r.URL.RequestURI(), r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		req.Header = r.Header.Clone()
+		// Keep the authority the client signed (@target-uri covers it), the
+		// way a TLS proxy preserves the public hostname on its upstream hop.
+		req.Host = r.Host
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		// resp.Trailer is deliberately not forwarded: this proxy never passes
+		// trailers on, like the deployment hop this test models.
+	}))
+	defer proxy.Close()
+
+	entries := []*rampv1.ResourceEntry{{
+		Domain: publisherDomain, Path: "/article/behind-proxy",
+		Terms: []*rampv1.LicenseTerm{{
+			Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
+			Pricing:   seedPricedTerm().GetPricing(),
+		}},
+	}}
+
+	report, err := ingest.PushEntries(h.ctx, proxy.URL, publisherTenant, kid, mustSigningClient(t, kid, priv), entries)
+	if err != nil {
+		t.Fatalf("push through trailer-dropping proxy: %v", err)
+	}
+	if report.Accepted != 1 || report.Rejected != 0 {
+		t.Fatalf("push report = accepted %d / rejected %d, want 1 / 0 (warnings: %v)",
+			report.Accepted, report.Rejected, report.Warnings)
 	}
 }

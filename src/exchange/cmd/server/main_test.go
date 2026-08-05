@@ -47,22 +47,29 @@ func TestRun_MissingDSNErrors(t *testing.T) {
 // line to grep and alert on — the Broker has emitted broker.redis.disabled for
 // exactly this reason since it was written.
 //
-// The assertion is on the log, NOT the return value: REDIS_URL is read before
-// the key file is loaded and before the fail-closed well-known guard, so the
-// line is emitted and the call then fails for unrelated reasons. That error is
-// ignored on purpose. Reading a slog sink to observe behaviour is permitted as
-// an observation seam (Testing Doctrine point 9).
+// The assertion is on the log, NOT the return value. The fail-closed
+// well-known guard runs before anything else in buildHTTPSigDeps (a refused
+// boot must not open connections or start goroutines), so the test supplies
+// the mandatory URL to get past it; the URL is never dialed here — resolvers
+// fetch lazily and the poller fetches nothing until its first tick. Reading a
+// slog sink to observe behaviour is permitted as an observation seam (Testing
+// Doctrine point 9).
 func TestBuildHTTPSigDeps_AnnouncesPerProcessReplayStore(t *testing.T) {
 	// Empty, not unset: runhttp.EnvOr treats the two identically, and t.Setenv
 	// restores whatever the environment had.
 	t.Setenv("REDIS_URL", "")
+	t.Setenv("EXCHANGE_BROKER_WELLKNOWN_URL", "https://broker.example/.well-known/http-message-signatures-directory")
 
 	var logged bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logged, nil))
 
-	//nolint:errcheck // the call is expected to fail after the line under test
-	// is emitted; the boot inputs it needs next are deliberately not supplied.
-	_, _, _ = buildHTTPSigDeps(context.Background(), logger, http.DefaultClient)
+	// A cancellable context so the per-agent poller goroutine the call starts
+	// is torn down with the test.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	//nolint:errcheck // only the log line is under test
+	_, _, _ = buildHTTPSigDeps(ctx, logger, http.DefaultClient)
 
 	if !strings.Contains(logged.String(), "exchange.httpsig.replay_store_disabled") {
 		t.Fatalf("no exchange.httpsig.replay_store_disabled line with REDIS_URL unset; logged: %s", logged.String())

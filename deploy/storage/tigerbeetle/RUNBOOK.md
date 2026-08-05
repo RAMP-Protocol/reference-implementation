@@ -2,12 +2,11 @@
 
 Operated by the Exchange Operator.
 
-**Escalation.** If §3 does not resolve it, contact Postindustria at
-`<support channel — fill in before handover>`. Send the `request_id` and
-`billing_id` of a failing transaction together with the matching Exchange log
-lines and the ledger's own container log. Postindustria has no access to your
-infrastructure, so those correlation IDs are the only way a transaction can be
-traced.
+**Escalation.** If §3 does not resolve it, contact Postindustria over the
+existing communication channel. Send the `request_id` and `billing_id` of a
+failing transaction together with the matching Exchange log lines and the
+ledger's own container log. Postindustria has no access to your infrastructure,
+so those correlation IDs are the only way a transaction can be traced.
 
 > This runbook assumes the ledger is already deployed. For installation,
 > configuration values and deploy-time verification, see

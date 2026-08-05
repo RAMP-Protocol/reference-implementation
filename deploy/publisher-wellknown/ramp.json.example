@@ -1,0 +1,22 @@
+{
+  "ver": "1.0",
+  "role": "ROLE_PUBLISHER",
+  "domain": "www.publisher.example",
+  "exchanges": [
+    {
+      "domain": "exchange.example",
+      "endpoint": "https://exchange.example",
+      "relationship": "PROVIDER_RELATIONSHIP_DIRECT",
+      "ext": {
+        "resource_owner_id": "<the payee id the Exchange operator assigns — fill in>"
+      }
+    }
+  ],
+  "supported_profiles": ["ramp-news-v1"],
+  "catalog_contributors": [
+    {
+      "domain": "catalog-contributor.example",
+      "relationship": "operator"
+    }
+  ]
+}

@@ -44,6 +44,11 @@ describe('unified manifest', () => {
   });
 });
 
+// Where these throws land: buildDeps runs on the first request, not at deploy
+// time, so a rejected list makes the Worker answer 500 to every request while
+// `wrangler deploy` reports success. What the assertions below pin is that the
+// value is REJECTED rather than trimmed or ignored — the timing is a property of
+// the entries, which call buildDeps from inside fetch.
 describe('bot pattern overrides', () => {
   it('compiles BOT_UA_ALLOW_JSON / BOT_UA_DENY_JSON case-insensitively', () => {
     const deps = buildDeps(
@@ -57,12 +62,12 @@ describe('bot pattern overrides', () => {
     expect(deps.botDenyPatterns?.[0]?.test('EVILSCRAPER/2.0')).toBe(true);
   });
 
-  it('rejects more than 64 patterns — a bloated list must fail the deploy', () => {
+  it('rejects more than 64 patterns — a bloated list throws instead of being trimmed', () => {
     const tooMany = JSON.stringify(Array.from({ length: 65 }, (_, i) => `bot-${i}`));
     expect(() => buildDeps(parseEnv({ ...baseEnv, BOT_UA_DENY_JSON: tooMany }))).toThrow();
   });
 
-  it('rejects a pattern source over 256 chars — oversized sources must fail the deploy', () => {
+  it('rejects a pattern source over 256 chars — an oversized source throws instead of being skipped', () => {
     // Length cap only: regex STRUCTURE is not analyzed, so a short
     // backtracking pattern would pass. The comment on parseBotPatterns says
     // why and what operators must avoid.
@@ -95,7 +100,9 @@ describe('binding enforcement', () => {
   });
 
   it('rejects a value that is neither true nor false', () => {
-    // A typo must fail the deploy rather than silently pick a posture.
+    // A typo must throw rather than silently pick a posture. parseEnv runs on the
+    // request path, so that throw reaches an operator as a 500 on every request,
+    // not as a rejected deploy.
     expect(() => parseEnv({ ...baseEnv, RAMP_ENFORCE_BINDING: 'yes' })).toThrow();
   });
 });

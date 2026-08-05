@@ -2,11 +2,11 @@
 
 Operated by the Exchange Operator, on infrastructure you provide.
 
-**Escalation.** If §3 does not resolve it, contact Postindustria at
-`<support channel — fill in before handover>`. Send the failing service's log lines
-around the migration output, the output of the diagnostics in §3.2, and your
-PostgreSQL version. Postindustria has no access to your infrastructure, so those
-outputs are the only way the problem can be traced.
+**Escalation.** If §3 does not resolve it, contact Postindustria over the
+existing communication channel. Send the failing service's log lines around the
+migration output, the output of the diagnostics in §3.2, and your PostgreSQL
+version. Postindustria has no access to your infrastructure, so those outputs
+are the only way the problem can be traced.
 
 > This runbook assumes PostgreSQL is already running and RAMP is pointed at it. For
 > preparing a cluster and first-boot verification, see

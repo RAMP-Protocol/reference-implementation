@@ -1,38 +1,11 @@
 import { generateKeyPairSync } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { URL, fileURLToPath } from 'node:url';
 
-import Ajv2020 from 'ajv/dist/2020.js';
 import { describe, expect, it } from 'vitest';
 
 import { buildDeps, parseEnv } from '../../src/config.js';
 import { MAX_WBA_KEYS } from '../../src/keys.js';
 import { type WbaKey, buildPublisherManifest, buildPublisherWba } from '../../src/types.js';
-
-// The edge is the only one of the three manifest producers (Go exchange/broker,
-// Python mcp, TS edge) whose output is hand-built rather than schema-validated.
-// Pin BOTH discovery documents to the SAME canonical schemas the Go consumer
-// enforces, so a required field, renamed enum, or shape change fails here
-// instead of silently serving a document the broker probe would reject.
-// strict:false: the schemas carry a non-standard `comment` keyword for docs.
-const ajv = new Ajv2020({ strict: false });
-
-function compile(relPath: string): (doc: unknown) => void {
-  const schemaPath = fileURLToPath(new URL(relPath, import.meta.url));
-  // biome-ignore lint/suspicious/noExplicitAny: a JSON Schema document is untyped.
-  const schema = JSON.parse(readFileSync(schemaPath, 'utf8')) as any;
-  const validate = ajv.compile(schema);
-  return (doc: unknown) => {
-    if (!validate(doc)) {
-      throw new Error(`schema validation failed: ${JSON.stringify(validate.errors)}`);
-    }
-  };
-}
-
-const assertValidManifest = compile(
-  '../../../../internal/rampwellknown/schema/ramp-well-known.json',
-);
-const assertValidWba = compile('../../../../internal/rampwellknown/schema/ramp-wba-directory.json');
+import { assertValidManifest, assertValidWba } from '../helpers/wellknown-schema.js';
 
 describe('edge publisher overlay manifest conforms to the canonical RAMP schema', () => {
   it('buildPublisherManifest with exchanges, profiles, and contributors', () => {

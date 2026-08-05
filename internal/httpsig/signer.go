@@ -49,9 +49,10 @@ func bindAuthorization(req *http.Request) {
 // bindSignatureAgent ensures the Signature-Agent header is present so the
 // signature always commits to the discovery pointer (the empty string
 // included). A signer that knows its own directory origin sets the header
-// before signing; one that does not (the static bootstrap path, where the keyid
-// thumbprint is resolved without discovery) still binds the empty value so the
-// covered-component set is uniform and the verifier's requirement is met.
+// before signing; one that does not (a signer with no directory origin, whose
+// keyid thumbprint is resolved without discovery) still binds the empty value
+// so the covered-component set is uniform and the verifier's requirement is
+// met.
 func bindSignatureAgent(req *http.Request) {
 	if req.Header.Get(SignatureAgentHeader) == "" {
 		req.Header.Set(SignatureAgentHeader, "")

@@ -30,6 +30,7 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/server"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/replay"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
@@ -101,7 +102,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// process starts (see warnIfDefaultTenantMissing).
 	warnIfDefaultTenantMissing(ctx, logger, repo.NewTenantReadRepo(queries))
 	// Gate-1 self-signup fetches a caller's own /.well-known/ramp.json to learn
-	// its signing key. It honors the SAME RAMP_MANIFEST_FETCH_{SCHEME,PORT} the
+	// its signing key. It honors the SAME RAMP_WELLKNOWN_{SCHEME,PORT} the
 	// Gate-2 publisher-manifest cache uses (newManifestCache), so a compose/local
 	// http edge is reachable without a DB key pre-seed.
 	agentRegistry := agentreg.New(agentreg.Config{
@@ -146,7 +147,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 	maxSignatures := int(exchangeMaxIntermediaryHops()) + 1
-	mux, err := buildMux(muxDeps{
+	mux, wk, err := buildMux(muxDeps{
 		pool:          pool,
 		exchange:      exchangeSvc,
 		catalog:       catalogSvc,
@@ -160,6 +161,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// The served discovery documents embed validity windows read from the
+	// clock at build time, so a long-lived process must rebuild them
+	// periodically or it eventually serves only lapsed windows.
+	go wk.RunRefresher(ctx, wellknown.RebuildInterval, logger)
 
 	wrapped := buildWrapped(logger, mux)
 	return serveExchangeAndAdmin(ctx, logger, pool, queries, wrapped)
@@ -245,22 +250,24 @@ type muxDeps struct {
 // buildMux wires the Exchange's HTTP surface: healthz, Connect-Go RPCs, the
 // well-known endpoints, and the public agents/register route. Admin-plane
 // endpoints have been removed; any request to
-// /admin/* falls through to http.ServeMux's 404.
-func buildMux(d muxDeps) (*http.ServeMux, error) {
+// /admin/* falls through to http.ServeMux's 404. The well-known handler pair
+// is returned alongside the mux so run() can start its periodic refresher.
+func buildMux(d muxDeps) (*http.ServeMux, server.Handlers, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler(d.pool))
 	mux.HandleFunc("GET /readyz", readyzHandler(d.pool, d.ledgerHealth))
 	if err := registerConnect(
 		mux, d.exchange, d.catalog, d.agentRegistry, d.resolver, d.replay, d.maxSignatures,
 	); err != nil {
-		return nil, err
+		return nil, server.Handlers{}, err
 	}
-	if err := registerWellKnown(mux, d.offerSigner); err != nil {
-		return nil, err
+	wk, err := registerWellKnown(mux, d.offerSigner)
+	if err != nil {
+		return nil, server.Handlers{}, err
 	}
 	transport.NewAgentsRegisterHandler(d.agentRegistry, transport.AgentsRegisterOptions{}).
 		RegisterRoutes(mux)
-	return mux, nil
+	return mux, wk, nil
 }
 
 func registerConnect(
@@ -324,8 +331,7 @@ func exchangeSupportedProfiles() []string {
 	return []string{"ramp-news-v1", "ramp-comp-v1"}
 }
 
-func registerWellKnown(mux *http.ServeMux, signer *signing.Ed25519Signer) error {
-	now := clock.System{}.Now()
+func registerWellKnown(mux *http.ServeMux, signer *signing.Ed25519Signer) (server.Handlers, error) {
 	hops := exchangeMaxIntermediaryHops()
 	// Endpoint is the ExchangeService ORIGIN (e.g. http://exchange:8081), NOT a
 	// service path: the manifest's top-level endpoint (WellKnownManifest.endpoint)
@@ -344,14 +350,14 @@ func registerWellKnown(mux *http.ServeMux, signer *signing.Ed25519Signer) error 
 		SupportedProfiles:   exchangeSupportedProfiles(),
 		MaxIntermediaryHops: &hops,
 		OfferKey:            signer.PublicKey(),
-		KeyNotBefore:        now,
-		KeyNotAfter:         now.Add(10 * 365 * 24 * time.Hour),
+		Clock:               clock.System{},
+		KeyLifetime:         wellknown.OfferKeyLifetime,
 	})
 	if err != nil {
-		return fmt.Errorf("register well-known: %w", err)
+		return server.Handlers{}, fmt.Errorf("register well-known: %w", err)
 	}
 	wk.RegisterRoutes(mux)
-	return nil
+	return wk, nil
 }
 
 // exchangeMaxIntermediaryHops reads EXCHANGE_MAX_INTERMEDIARY_HOPS (default 4):

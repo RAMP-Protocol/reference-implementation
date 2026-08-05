@@ -5,6 +5,7 @@ go 1.26
 require (
 	connectrpc.com/connect v1.19.1
 	connectrpc.com/validate v0.6.0
+	filippo.io/edwards25519 v1.2.0
 	github.com/RAMP-Protocol/protocol v0.1.1-0.20260731084709-104d867aa9a1
 	github.com/armon/go-radix v1.0.0
 	github.com/aws/aws-sdk-go-v2/feature/cloudfront/sign v1.9.21
@@ -25,6 +26,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/redis v0.42.0
 	github.com/tigerbeetle/tigerbeetle-go v0.17.8
 	github.com/yaronf/httpsign v0.5.1
+	go.uber.org/goleak v1.3.0
 	golang.org/x/net v0.49.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.22.0

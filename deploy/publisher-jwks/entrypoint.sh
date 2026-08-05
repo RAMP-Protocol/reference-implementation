@@ -26,6 +26,10 @@ KID="${SIGNING_KID_OVERRIDE:-}"
 # catalog-contributor host behaviour. ROLE_AGENT serves an agent identity's
 # manifest (no catalog_contributors) for the lazy-registration e2e.
 ROLE="${MANIFEST_ROLE:-ROLE_PUBLISHER}"
+# Directory holding the shared ed25519_keys.py (the one WBA entry shape +
+# validity-window helper, copied in by the Dockerfile). Overridable so the
+# harness guard suite can run this heredoc against the in-repo scripts/lib.
+PY_LIB_DIR="${RAMP_PY_LIB_DIR:-/opt/ramp/lib}"
 WEB_ROOT=/var/www/ramp
 
 mkdir -p "$WEB_ROOT/.well-known"
@@ -38,12 +42,11 @@ fi
 EXCHANGES_JSON="${EXCHANGES_JSON:-}" \
 CATALOG_CONTRIBUTORS_JSON="${CATALOG_CONTRIBUTORS_JSON:-}" \
 MANIFEST_DOMAIN_OVERRIDE="${MANIFEST_DOMAIN_OVERRIDE:-}" \
-python3 - "$KEY_FILE" "$WEB_ROOT/.well-known/ramp.json" "$KID" "$ROLE" <<'PY'
+python3 - "$KEY_FILE" "$WEB_ROOT/.well-known/ramp.json" "$KID" "$ROLE" "$PY_LIB_DIR" <<'PY'
 import base64
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -52,14 +55,20 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
 )
 
-key_path, manifest_path, kid_override, role = sys.argv[1:5]
+key_path, manifest_path, kid_override, role, py_lib_dir = sys.argv[1:6]
+
+# The WBA entry shape and validity window come from the same shared module
+# every key-gen script uses (copied into the image by the Dockerfile), so the
+# served directory cannot drift from the shape those scripts emit.
+sys.path.insert(0, py_lib_dir)
+from ed25519_keys import wba_directory_key, wba_validity_window
 
 with Path(key_path).open() as fh:
     spec = json.load(fh)
 
 # The resource-owner key fixture stores the Ed25519 seed (32 bytes) base64url-
 # encoded under "private". Some fixtures use "seed"; the e2e harness contributor
-# fixture (catalog_push.generate_contributor_key / gen-e2e-keys.sh) and the agent
+# fixture (gen-e2e-keys.sh) and the agent
 # fixtures (shared with the pytest signer) use "private_key". Accept any of the three.
 priv_b64 = spec.get("private") or spec.get("seed") or spec.get("private_key")
 if not priv_b64:
@@ -78,9 +87,9 @@ pub_obj = priv.public_key()
 pub_raw = pub_obj.public_bytes(Encoding.Raw, PublicFormat.Raw)
 pub_x = base64.urlsafe_b64encode(pub_raw).rstrip(b"=").decode("ascii")
 
-now = datetime.now(timezone.utc)
-valid_from = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-valid_until = (now + timedelta(days=3650)).strftime("%Y-%m-%dT%H:%M:%SZ")
+# Wide-open fixture window (now-1h .. now+10y): the shared helper applies the
+# same one-hour clock-skew backdate every issuer in the repo uses.
+valid_from, valid_until = wba_validity_window(lifetime_days=3650)
 
 kid = kid_override or spec.get("kid") or "publisher-key"
 
@@ -101,12 +110,24 @@ exchanges = [
 ]
 profiles = sorted({p for e in exchanges_in for p in e.get("supported_profiles", [])})
 
-# A self-hosting contributor needs its manifest domain to EQUAL its
-# fetched agent_id (registry.go rejects m.GetDomain() != agentID). Allow an
-# explicit override; default to the issuer / kid-prefix derivation otherwise.
+# The manifest domain should equal the host this document is served at, so
+# the published document stays self-consistent (registration itself anchors
+# identity to the host the key directory is fetched from and never reads the
+# manifest's domain). Allow an explicit override; otherwise the key
+# file's `issuer` is REQUIRED — guessing the domain from the kid up to its
+# first dot would silently truncate a dotted identity (test-signer-e2e.v1
+# would serve domain test-signer-e2e), so an absent issuer fails container
+# start loudly instead.
 domain = os.environ.get("MANIFEST_DOMAIN_OVERRIDE", "").strip() or spec.get(
-    "issuer", kid.split(".", 1)[0]
-)
+    "issuer", ""
+).strip()
+if not domain:
+    sys.exit(
+        f"publisher-jwks: {key_path} carries no 'issuer' and "
+        "MANIFEST_DOMAIN_OVERRIDE is unset — refusing to guess the manifest "
+        "domain from the kid. Re-run the key-gen script (it stamps/backfills "
+        "issuer) or set MANIFEST_DOMAIN_OVERRIDE."
+    )
 
 # catalog_contributors defaults to the demo harness contributor (the examplenews
 # subscription publisher authorizes it); a self-hosting contributor host serves
@@ -139,20 +160,9 @@ if role == "ROLE_PUBLISHER":
         manifest["supported_profiles"] = profiles
 
 # Web Bot Auth directory — the signing key as a JWK Set, NO kid (named by
-# thumbprint). kid is retained only for the log line below.
-wba = {
-    "keys": [
-        {
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "use": "sig",
-            "alg": "EdDSA",
-            "x": pub_x,
-            "not_before": valid_from,
-            "not_after": valid_until,
-        },
-    ],
-}
+# thumbprint). kid is retained only for the log line below. The entry comes
+# from the shared wba_directory_key helper, never hand-written here.
+wba = {"keys": [wba_directory_key(pub_x, valid_from, valid_until)]}
 
 Path(manifest_path).write_text(json.dumps(manifest, indent=2) + "\n")
 wba_path = Path(manifest_path).parent / "http-message-signatures-directory"

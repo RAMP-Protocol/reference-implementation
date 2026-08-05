@@ -10,12 +10,13 @@
 #   broker-identity-seed     Broker IDENTITY key seed, b64url 32 bytes (LOCAL
 #                            source of truth; the derived PEM below is what
 #                            ships). A DIFFERENT key from the relay one above:
-#                            the relay key signs Broker->Exchange calls and is
-#                            verified from keys.json, while this one is the
-#                            identity the Broker publishes in its own WBA
-#                            directory with a 90-day validity window. It must
-#                            survive a restart, or the Broker breaks a promise
-#                            it just published.
+#                            the relay key signs Broker->Exchange calls (its
+#                            pubkey is published in the Broker's own WBA
+#                            directory, where the Exchange resolves it), while
+#                            this one is the identity the Broker publishes in
+#                            that same directory with a 90-day validity window.
+#                            It must survive a restart, or the Broker breaks a
+#                            promise it just published.
 #   broker-identity-key.pem  The same identity key as a PEM (raw 64-byte
 #                            payload, the shape the Broker's key-file loader
 #                            accepts — NOT PKCS#8). Uploaded to the VM and
@@ -26,16 +27,32 @@
 #                            Broker calls with it; no service on the VM reads it)
 #   contributor-key.json     Catalog-contributor keypair (LOCAL ONLY — signs
 #                            seed-staging.sh's ramp-ingest push, never uploaded)
-#   keys.json                Shared httpsig registry: PUBLIC keys of the three
-#                            identities above (uploaded, read by Exchange+Broker)
+#   smoke-agent-wba.json         PUBLIC Web Bot Auth directory documents (JWK
+#   catalog-contributor-wba.json Sets, public keys only) for the two smoke
+#                            identities. The stack reads them at apply time and
+#                            serves each at its identity's hostname
+#                            (/.well-known/http-message-signatures-directory),
+#                            which is how the Exchange and Broker verify the
+#                            smoke signatures — the private halves never leave
+#                            this machine. Re-derived on every run from
+#                            whatever keypair is current.
+#
+# There is no shared key registry file: services learn verification keys only
+# via well-known discovery (each participant publishes its own keys).
 #
 # Idempotent: existing keypairs are reused (re-running never rotates keys under
-# a live stack); keys.json is re-derived from whatever exists.
+# a live stack).
 #
-# Identity kids (BROKER_RELAY_KID, AGENT_ID, CONTRIBUTOR_ID) come from
-# lib/staging-env.sh — the single home of the defaults shared with
-# seed-staging.sh and smoke.sh. Override via env; AGENT_ID must match the
-# tfvars agent_id.
+# The smoke identity ids ARE hostnames — <label>.<domain> — because each id is
+# the host the services fetch the signer's key directory from. lib/staging-env.sh
+# resolves them: from the existing key files' kids, or (first run only) from
+# STAGING_DOMAIN — the domain the stack serves the identity directories
+# directly under. For stacks/staging-aws that is the tfvars `domain`; for
+# stacks/demo-aws, where every name nests under the publisher label, it is
+# the publisher hostname (<publisher_subdomain>.<domain>):
+#
+#   STAGING_DOMAIN=staging-zone.example deploy/terraform/scripts/gen-staging-keys.sh
+#   STAGING_DOMAIN=demo.publisher.example STACK_DIR=... # demo-aws
 #
 # Usage:
 #   deploy/terraform/scripts/gen-staging-keys.sh
@@ -48,15 +65,19 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/staging-env.sh"
 
 # Fail fast with one clear line when a tool is absent: openssl generates the
-# PEM signing keys, python3 the Ed25519 JSON keypairs and keys.json.
+# PEM signing keys. The Python interpreter needs no check here — staging-env.sh
+# above already sourced select-python.sh, which picks uv or system python3.
 command -v openssl >/dev/null 2>&1 || { echo "missing: openssl" >&2; exit 2; }
-command -v python3 >/dev/null 2>&1 || { echo "missing: python3" >&2; exit 2; }
 
-# The Ed25519 helper needs the `cryptography` package; prefer uv (repo
-# standard) so a bare system python3 works too.
-PYTHON=(python3)
-if command -v uv >/dev/null 2>&1; then
-    PYTHON=(uv run --with cryptography python)
+# Empty ids mean the key files do not exist yet AND STAGING_DOMAIN is unset —
+# there is nothing to mint hostname-shaped ids from (see staging-env.sh).
+if [ -z "${AGENT_ID}" ] || [ -z "${CONTRIBUTOR_ID}" ]; then
+    echo "the smoke identity key files do not exist yet, so their ids must be minted:" >&2
+    echo "set STAGING_DOMAIN to the domain the stack serves the identity directories under and re-run, e.g." >&2
+    echo "  STAGING_DOMAIN=staging-zone.example $0        # stacks/staging-aws: the tfvars 'domain'" >&2
+    echo "  STAGING_DOMAIN=demo.publisher.example $0      # stacks/demo-aws: the publisher hostname" >&2
+    echo "(each id becomes <label>.<STAGING_DOMAIN> — the hostname the stack serves that identity's key directory at)" >&2
+    exit 2
 fi
 
 mkdir -p "${KEYS_DIR}"
@@ -71,9 +92,9 @@ if [ ! -f "${KEYS_DIR}/rsa-private.pem" ]; then
 fi
 
 # The Python below stays inline in this shell script on purpose. It is mostly
-# glue — write each keypair file if it does not exist yet, then assemble
-# keys.json from the public keys — with one deliberate exception: the Broker
-# identity PEM derivation at the bottom hand-rolls a non-standard PEM (raw
+# glue — write each keypair file if it does not exist yet — with one
+# deliberate exception: the Broker identity PEM derivation at the bottom
+# hand-rolls a non-standard PEM (raw
 # 64-byte payload) because its ONLY consumer is the Broker's own loader and no
 # library writes that shape. Everything else imports the shared helpers in
 # scripts/lib. Moving this into a Python module of its own would mean one more
@@ -89,7 +110,12 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 sys.path.insert(0, sys.argv[1])
-from ed25519_keys import generate_seed_pub_b64
+from ed25519_keys import (
+    generate_seed_pub_b64,
+    materialize_keypair,
+    wba_directory_key,
+    wba_validity_window,
+)
 
 keys_dir = Path(sys.argv[2])
 broker_relay_kid, agent_id, contributor_id = sys.argv[3:6]
@@ -103,51 +129,47 @@ IDENTITIES = [
 ]
 
 
-def materialize(kid: str, filename: str) -> str:
-    """Idempotently ensure an Ed25519 keypair file; return its pubkey b64url."""
-    path = keys_dir / filename
-    if path.exists():
-        return json.loads(path.read_text())["public_key"]
-    seed_b64, pub_b64 = generate_seed_pub_b64()
-    path.write_text(
-        json.dumps(
-            {
-                "kid": kid,
-                "kty": "OKP",
-                "crv": "Ed25519",
-                "alg": "EdDSA",
-                "private_key": seed_b64,
-                "public_key": pub_b64,
-            },
-            indent=2,
-        )
-        + "\n"
-    )
-    path.chmod(0o600)
-    return pub_b64
+# Shared materializer: reuse-never-rotate, issuer stamped (and backfilled on
+# reuse) so a staging key file mounted into a jwks host passes its issuer
+# guard, 0600 — these are operator-held keys that never leave this machine.
+pubkeys = {
+    filename: materialize_keypair(keys_dir / filename, kid)
+    for kid, filename in IDENTITIES
+}
 
+# Public Web Bot Auth directory documents for the two smoke identities. The
+# stack serves each verbatim at its identity's hostname
+# (/.well-known/http-message-signatures-directory), so the Exchange and Broker
+# can verify the smoke signatures without any private material leaving this
+# machine. The relay key needs none: the Broker publishes it in its own
+# directory. Directory keys carry NO kid — a verifier names them by RFC 7638
+# thumbprint. Re-derived unconditionally so the served document can never
+# drift from the keypair it describes.
+#
+# The validity window is 90 days, matching what the Broker publishes for its
+# own keys. These are real public hostnames whose private halves sit on an
+# operator's machine with no revocation channel, so the window is the only
+# thing that ever retires a leaked smoke key — a wide window would leave it
+# verifying for years. Re-running this script before an apply is already the
+# documented refresh path, so the bound costs nothing; a smoke run against a
+# stack whose documents are older than 90 days fails signature verification,
+# and the fix is exactly that documented path (re-run this script, re-apply).
+_not_before, _not_after = wba_validity_window(lifetime_days=90)
 
-registry = {"keys": []}
-for kid, filename in IDENTITIES:
-    pub_b64 = materialize(kid, filename)
-    registry["keys"].append(
-        {
-            "kid": kid,
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "use": "sig",
-            "alg": "EdDSA",
-            "x": pub_b64,
-        }
-    )
+WBA_DOCUMENTS = [
+    ("agent-key.json", "smoke-agent-wba.json"),
+    ("contributor-key.json", "catalog-contributor-wba.json"),
+]
 
-registry["keys"].sort(key=lambda k: k["kid"])
-(keys_dir / "keys.json").write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n")
+for key_filename, wba_filename in WBA_DOCUMENTS:
+    document = {"keys": [wba_directory_key(pubkeys[key_filename], _not_before, _not_after)]}
+    wba_path = keys_dir / wba_filename
+    wba_path.write_text(json.dumps(document, indent=2) + "\n")
+    wba_path.chmod(0o644)
 
-# The Broker's IDENTITY key, kept OUT of keys.json on purpose. keys.json is the
-# registry of public keys used to VERIFY inbound signatures; this key is
-# outbound-only (it stamps the intermediary attestation) and the Broker
-# publishes its own public half in its WBA directory.
+# The Broker's IDENTITY key. It is outbound-only (it stamps the intermediary
+# attestation) and the Broker publishes its own public half in its WBA
+# directory.
 #
 # Two artifacts, one key. The seed is the compact source of truth; the PEM is
 # derived from it deterministically and is what ships to the VM, so the key
@@ -227,7 +249,8 @@ else:
 print(
     "gen-staging-keys: "
     + ", ".join(kid for kid, _ in IDENTITIES)
-    + f" -> {keys_dir}/ (keys.json + private keypairs + broker identity seed/PEM)"
+    + f" -> {keys_dir}/ (private keypairs + broker identity seed/PEM; "
+    + "public WBA directory documents for the smoke identities)"
 )
 PY
 

@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from ._compose import resolve_host_port
+from .lambda_edge import wait_ready as wait_lambda_ready
 
 # Re-export: the existing tests import StackURLs from conftest; its home is
 # stack_urls.py so non-pytest consumers (smoke_staging.py) can import it
@@ -62,6 +63,8 @@ def _resolve_stack_urls(compose_file: Path) -> StackURLs:
             edge="http://edge:80",
             aws_edge="http://aws-edge:80",
             fastly_edge="http://fastly-edge:80",
+            lambda_edge="http://lambda-edge:8080",
+            lambda_edge_no_wba="http://lambda-edge-no-wba:8080",
             identity="http://identity",
             zitadel="http://zitadel:8080",
         )
@@ -73,6 +76,10 @@ def _resolve_stack_urls(compose_file: Path) -> StackURLs:
         edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'edge', 80)}",
         aws_edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'aws-edge', 80)}",
         fastly_edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'fastly-edge', 80)}",
+        lambda_edge=f"http://127.0.0.1:{resolve_host_port(compose_file, 'lambda-edge', 8080)}",
+        lambda_edge_no_wba=(
+            f"http://127.0.0.1:{resolve_host_port(compose_file, 'lambda-edge-no-wba', 8080)}"
+        ),
         identity="",
         zitadel="",
     )
@@ -145,6 +152,10 @@ def compose_stack() -> Iterator[StackURLs]:
         # the Exchange to fastly-edge race connection-refused for the first few
         # seconds on a cold stack. Wait on the bridge-reachable URL too.
         _wait_healthy(f"{urls.fastly_edge}/.well-known/ramp.json")
+        # The Lambda runtime emulator serves no GET route at all — readiness is
+        # an actual function invocation, so it needs its own poller.
+        wait_lambda_ready(urls.lambda_edge)
+        wait_lambda_ready(urls.lambda_edge_no_wba)
         yield urls
     finally:
         if not reuse and os.environ.get("RAMP_E2E_KEEP_UP") != "1":

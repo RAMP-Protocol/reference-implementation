@@ -20,11 +20,13 @@ import (
 )
 
 type jwk struct {
-	Kty string `json:"kty"`
-	Crv string `json:"crv"`
-	X   string `json:"x"`
-	Kid string `json:"kid"`
-	Use string `json:"use,omitempty"`
+	Kty       string `json:"kty"`
+	Crv       string `json:"crv"`
+	X         string `json:"x"`
+	Kid       string `json:"kid"`
+	Use       string `json:"use,omitempty"`
+	NotBefore string `json:"not_before,omitempty"`
+	NotAfter  string `json:"not_after,omitempty"`
 }
 
 func encodePub(p ed25519.PublicKey) string {
@@ -110,6 +112,116 @@ func TestContainsSkipsMalformedEntry(t *testing.T) {
 	}
 	if !ok {
 		t.Fatal("valid key must resolve despite a sibling malformed entry")
+	}
+}
+
+// TestContainsSkipsTypoedWindow drives the fail-closed window parse through
+// the surface that reaches it in this service: a buyer key whose not_after is
+// a typo must be SKIPPED by the shared decode, never treated as unbounded — a
+// typo that widened validity would make the key permanently valid. The sibling
+// valid key still resolves, proving the skip is per-entry.
+func TestContainsSkipsTypoedWindow(t *testing.T) {
+	relaxEnv(t)
+	typoed, _, _ := ed25519.GenerateKey(rand.Reader)
+	valid, _, _ := ed25519.GenerateKey(rand.Reader)
+	srv := newJWKSServer(t,
+		jwk{Kty: "OKP", Crv: "Ed25519", X: encodePub(typoed), Kid: "typo", NotAfter: "not-a-timestamp"},
+		jwk{Kty: "OKP", Crv: "Ed25519", X: encodePub(valid), Kid: "buyer-1"},
+	)
+	f := newFetcher(t, buyerkeys.Config{})
+	if ok, err := f.Contains(context.Background(), srv.URL, typoed); err != nil || ok {
+		t.Fatalf("key with unparseable window resolved (ok=%v, err=%v); a typo must never widen validity", ok, err)
+	}
+	if ok, err := f.Contains(context.Background(), srv.URL, valid); err != nil || !ok {
+		t.Fatalf("sibling valid key must still resolve (ok=%v, err=%v)", ok, err)
+	}
+}
+
+// TestWindowEnforcedAtUseTime pins the property that a published validity
+// window actually gates lookups, and does so at USE time against the fetcher's
+// clock — not once at fetch time. A key can lapse while sitting in a warm
+// cache; the moment now passes not_after, both lookup surfaces must stop
+// returning it.
+func TestWindowEnforcedAtUseTime(t *testing.T) {
+	relaxEnv(t)
+	frozen := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewDeterministic(frozen)
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	srv := newJWKSServer(t, jwk{
+		Kty: "OKP", Crv: "Ed25519", X: encodePub(pub), Kid: "buyer-1",
+		NotBefore: frozen.Add(-time.Hour).Format(time.RFC3339),
+		NotAfter:  frozen.Add(time.Hour).Format(time.RFC3339),
+	})
+	// TTL longer than the clock jump below, so the lapsed-key lookups hit the
+	// WARM cache. That is the point of the test: with the default 5-minute TTL
+	// the +62m lookup would refetch, and a window check that ran only at fetch
+	// time would pass here while failing in production between refreshes.
+	f := newFetcher(t, buyerkeys.Config{Clk: clk, TTL: 2 * time.Hour})
+
+	if ok, err := f.Contains(context.Background(), srv.URL, pub); err != nil || !ok {
+		t.Fatalf("in-window key must resolve (ok=%v, err=%v)", ok, err)
+	}
+	if _, ok, err := f.LookupKID(context.Background(), srv.URL, "buyer-1"); err != nil || !ok {
+		t.Fatalf("in-window kid must resolve (ok=%v, err=%v)", ok, err)
+	}
+
+	// Two minutes past not_after: the cache still holds the entry (2h TTL) —
+	// the verdict must flip anyway.
+	clk.SetNow(frozen.Add(time.Hour + 2*time.Minute))
+	if ok, err := f.Contains(context.Background(), srv.URL, pub); err != nil || ok {
+		t.Fatalf("lapsed key resolved (ok=%v, err=%v); the window must gate use, not just fetch", ok, err)
+	}
+	if _, ok, err := f.LookupKID(context.Background(), srv.URL, "buyer-1"); err != nil || ok {
+		t.Fatalf("lapsed kid resolved (ok=%v, err=%v)", ok, err)
+	}
+}
+
+// TestDuplicateEntriesDocumentOrderIrrelevant pins Contains against document
+// order: a JWKS may list the same public key twice (a kid rename
+// mid-rotation), and a lapsed duplicate listed FIRST must not hide the
+// currently valid entry behind it. A loop that returned the first byte-equal
+// entry's window verdict would answer false here.
+func TestDuplicateEntriesDocumentOrderIrrelevant(t *testing.T) {
+	relaxEnv(t)
+	frozen := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewDeterministic(frozen)
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	srv := newJWKSServer(t,
+		jwk{
+			Kty: "OKP", Crv: "Ed25519", X: encodePub(pub), Kid: "buyer-1.old",
+			NotBefore: frozen.Add(-2 * time.Hour).Format(time.RFC3339),
+			NotAfter:  frozen.Add(-time.Hour).Format(time.RFC3339),
+		},
+		jwk{
+			Kty: "OKP", Crv: "Ed25519", X: encodePub(pub), Kid: "buyer-1.new",
+			NotBefore: frozen.Add(-time.Hour).Format(time.RFC3339),
+			NotAfter:  frozen.Add(time.Hour).Format(time.RFC3339),
+		},
+	)
+	f := newFetcher(t, buyerkeys.Config{Clk: clk})
+	if ok, err := f.Contains(context.Background(), srv.URL, pub); err != nil || !ok {
+		t.Fatalf("valid key hidden behind a lapsed duplicate (ok=%v, err=%v)", ok, err)
+	}
+}
+
+// TestNotYetValidKeyIsRejected covers the other window edge: a key published
+// ahead of its not_before must not resolve until the bound passes.
+func TestNotYetValidKeyIsRejected(t *testing.T) {
+	relaxEnv(t)
+	frozen := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewDeterministic(frozen)
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	srv := newJWKSServer(t, jwk{
+		Kty: "OKP", Crv: "Ed25519", X: encodePub(pub), Kid: "buyer-1",
+		NotBefore: frozen.Add(time.Hour).Format(time.RFC3339),
+	})
+	f := newFetcher(t, buyerkeys.Config{Clk: clk})
+	if ok, err := f.Contains(context.Background(), srv.URL, pub); err != nil || ok {
+		t.Fatalf("not-yet-valid key resolved (ok=%v, err=%v)", ok, err)
+	}
+	clk.SetNow(frozen.Add(2 * time.Hour))
+	if ok, err := f.Contains(context.Background(), srv.URL, pub); err != nil || !ok {
+		t.Fatalf("key must resolve once not_before passes (ok=%v, err=%v)", ok, err)
 	}
 }
 

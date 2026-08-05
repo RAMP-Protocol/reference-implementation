@@ -23,6 +23,7 @@ agent software discovers and calls tools.)
 | HashiCorp Vault | **Yes** | The only place agent private keys are stored. See [`deploy/storage/vault/`](../../deploy/storage/vault/CONFIGURATION.md), and §4 below for the one surprise. |
 | An OIDC provider | **Yes** | OIDC is OpenID Connect, the standard way one service hands sign-in to another. This is where developers actually sign in. The binary exits if it cannot reach it at start-up. See [`deploy/zitadel/`](../../deploy/zitadel/CONFIGURATION.md). |
 | A Broker and an Exchange address | **Yes** | Where agent tool calls are sent. Only the addresses are needed at start-up; neither has to be answering yet. |
+| Outbound HTTPS to publishers' delivery addresses | Yes, at runtime | When an agent buys content, this service fetches the licensed content itself from the address the Exchange's answer names, and returns it inside the tool result. Those addresses are not known in advance, so the service needs general outbound HTTPS, not a fixed allow-list. |
 | A wildcard DNS record and a matching wildcard TLS certificate | Yes, at runtime | Every agent gets its own subdomain, and other parties fetch its public key from there. See §3. |
 
 It listens on **one port, `:8083`**. There is no admin port and no second listener.
@@ -31,6 +32,9 @@ Four things are worth knowing before you start, because operators often look for
 and they do not exist:
 
 - **There are no command-line flags.** Configuration is 100% environment variables.
+  The binary does accept one argument: `healthcheck`, which probes the service's own
+  `/healthz` and exits. It exists so a container health check can run the binary
+  itself — the image has no shell or `curl` to probe with.
 - **There is no `LOG_LEVEL`.** The service always writes structured JSON logs at
   `INFO` level to standard output. ("Structured" means each log line is
   machine-readable data, not free text.)
@@ -51,8 +55,13 @@ marked accordingly: the service starts happily without them and then fails every
 operation. §4 explains why.
 
 Durations are written in Go's format — `30s`, `5m`, `24h`, `2160h`. **Days are not a
-unit**: `90d` does not parse. A value that does not parse is replaced by the default
-**silently**, with nothing logged, so check your spelling against the defaults below.
+unit**: `90d` does not parse. A duration that does not parse is replaced by the
+default **silently**, with nothing logged, so check your spelling against the
+defaults below. The two byte-size settings (`IDENTITY_MCP_MAX_CONTENT_BYTES` and
+`IDENTITY_MCP_MAX_CALL_CONTENT_BYTES`) behave differently on purpose: a value that
+is not a positive whole number **stops start-up** with an error naming the
+variable, and a value above the built-in ceiling is reduced to the ceiling rather
+than replaced by the default.
 
 | Name | Required? | What it is | Example |
 |---|---|---|---|
@@ -74,12 +83,17 @@ unit**: `90d` does not parse. A value that does not parse is replaced by the def
 | `IDENTITY_SESSION_KEY` | Optional, **set it** | Encrypts the browser cookies used during sign-up, as 32 bytes in standard base64. Created automatically when unset — see below. | `<44-character base64 string>` |
 | `IDENTITY_TOKEN_SIGNING_KEY` | Optional, **set it** | Signs the access tokens agents present to the MCP endpoint, as a 32-byte Ed25519 seed in standard base64. Created automatically when unset — see below. | `<44-character base64 string>` |
 | `IDENTITY_TOKEN_AUDIENCE` | Optional | What those tokens are valid for, and what the MCP endpoint advertises as its own identifier. Defaults to `IDENTITY_AUTH_ISSUER`, which is correct for a single deployment. Leave it alone unless you know why you are changing it. | *(leave unset)* |
-| `IDENTITY_DIRECTORY_TTL` | Optional | How long a published document may be cached before it is rebuilt, and the `max-age` the service advertises to caches. Default `5m`. Also sets the longest a revocation can take to have effect ([`RUNBOOK.md`](RUNBOOK.md) §4.2). | `5m` |
+| `IDENTITY_DIRECTORY_TTL` | Optional | How long a published document may be cached before it is rebuilt, and the `max-age` the service advertises to caches. Default `5m`. It bounds how quickly **this service's own** published documents reflect a change such as a revocation. The Broker and the Exchange add their own refresh delay on top, which this setting does not control — [`RUNBOOK.md`](RUNBOOK.md) §4.2 has the full timing. | `5m` |
 | `IDENTITY_WELLKNOWN_SCHEME` | Optional | Which protocol appears in the addresses this service publishes about itself. Default `https`. **Must stay `https` in production.** | `https` |
 | `IDENTITY_OIDC_SCOPES` | Optional | What the service asks the OIDC provider for, space-separated. Default `openid profile email`. | `openid profile email` |
 | `IDENTITY_MCP_WELLKNOWN_SCHEME` | Optional | The protocol used when looking up an Exchange named in an offer. Falls back to `IDENTITY_WELLKNOWN_SCHEME`, then `https`. Leave unset. | *(leave unset)* |
 | `IDENTITY_MCP_CALL_TIMEOUT` | Optional | How long one outbound call to the Broker or an Exchange may take. Default `30s`. | `30s` |
 | `IDENTITY_MCP_SIGNATURE_TTL` | Optional | How long the signature on one of those calls stays valid. Default `30s`. Raising it widens the window in which a captured request could be replayed. | `30s` |
+| `IDENTITY_MCP_POP_TTL` | Optional | How long the proof of possession on a content fetch stays valid. When an agent buys content, this service fetches it from the publisher's delivery address, proving it holds the agent's key. Default `30s`. It is a separate setting from `IDENTITY_MCP_SIGNATURE_TTL` on purpose: the delivery edge keeps no record of past requests, so this value is the window in which a captured fetch could be replayed — raising the RAMP signature lifetime for a slow peer must not widen it by accident. | `30s` |
+| `IDENTITY_MCP_FETCH_TIMEOUT` | Optional | How long one content fetch from a publisher's delivery address may take, including reading the agent's key from Vault. Default `30s`. | `30s` |
+| `IDENTITY_MCP_MAX_CONTENT_BYTES` | Optional | The largest single content body the service accepts, in bytes. Default `8388608` (8 MiB). A larger body is reported to the agent as a failure with the delivery link intact — never cut short and delivered incomplete. Values above 1 GiB are reduced to 1 GiB. Must not exceed `IDENTITY_MCP_MAX_CALL_CONTENT_BYTES` — that pair stops start-up. | `8388608` |
+| `IDENTITY_MCP_CALL_CONTENT_TIMEOUT` | Optional | How long one `ramp_execute` call may spend fetching content in total, across all its items. Default `2m`. Items the call ran out of time for are reported as failures with their links intact, so the agent can fetch them in a later call. | `2m` |
+| `IDENTITY_MCP_MAX_CALL_CONTENT_BYTES` | Optional | The most content one `ramp_execute` call may accumulate across all its items, in bytes. Default `33554432` (32 MiB). If you raise the per-item cap above, raise this with it — otherwise every batch collapses to one item, and the service refuses to start on a pair where the per-item cap is the larger. Values above 4 GiB are reduced to 4 GiB. | `33554432` |
 | `IDENTITY_ROTATION_PERIOD` | Optional | How old an agent's key may get before it is replaced automatically. Default `2160h` (90 days). | `2160h` |
 | `IDENTITY_ROTATION_OVERLAP` | Optional | How long the outgoing key keeps working after a replacement is created. Default `24h`. | `24h` |
 | `IDENTITY_ROTATION_INTERVAL` | Optional | How often the service checks whether any agent is due. Default `1h`. | `1h` |

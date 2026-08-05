@@ -1,0 +1,9 @@
+{
+  "EXCHANGE_URL": "https://exchange.example",
+  "EXCHANGE_WBA_URL": "https://exchange.example/.well-known/http-message-signatures-directory",
+  "PROVIDER": "www.publisher.example",
+  "EXCHANGES_JSON": "[{\"domain\":\"exchange.example\",\"endpoint\":\"https://exchange.example\",\"ext\":{\"resource_owner_id\":\"<the payee id the Exchange operator assigns — fill in>\"},\"supported_profiles\":[\"ramp-news-v1\"]}]",
+  "ORIGIN_URL": "https://origin.publisher.example",
+  "CATALOG_CONTRIBUTORS_JSON": "[{\"domain\":\"catalog-contributor.example\",\"relationship\":\"operator\"}]",
+  "WBA_KEYS_JSON": "[{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"use\":\"sig\",\"alg\":\"EdDSA\",\"x\":\"REPLACE-ME-REPLACE-ME-REPLACE-ME-REPLACE-ME\",\"not_before\":\"2026-01-01T00:00:00Z\",\"not_after\":\"2027-01-01T00:00:00Z\"}]"
+}

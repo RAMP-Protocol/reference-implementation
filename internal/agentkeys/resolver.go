@@ -14,9 +14,9 @@
 // lazy-register it (service.resolveAgentLazily) keyed on the Signature-Agent
 // domain.
 //
-// The directory is cached (TTL) because a signer absent from the pre-shared
-// bootstrap key file is re-resolved here on every request — caching is what
-// keeps that from issuing one outbound fetch per request.
+// The directory is cached (TTL) because a signer's key is re-resolved here on
+// every request — caching is what keeps that from issuing one outbound fetch
+// per request.
 package agentkeys
 
 import (
@@ -49,7 +49,7 @@ type Config struct {
 	// whose HTTP option is a concrete *http.Client.
 	Client *http.Client
 	// Scheme/Port shape the WBA-directory URL for bare-host Signature-Agent
-	// origins on local/compose stacks (RAMP_MANIFEST_FETCH_{SCHEME,PORT}); empty
+	// origins on local/compose stacks (RAMP_WELLKNOWN_{SCHEME,PORT}); empty
 	// means https + default port.
 	Scheme string
 	Port   string
@@ -80,8 +80,8 @@ type Config struct {
 // keypolicy.CompositeResolver treats a miss as "not my key" and falls through
 // cleanly. That masking is deliberate app policy (the SDK surfaces
 // revoked/expired/unavailable verdicts raw and leaves the decision to the
-// caller): this resolver sits LAST in the composite, after the bootstrap-file
-// resolver, where a miss of any kind means "try lazy registration".
+// caller): this resolver sits LAST in the composite, where a miss of any kind
+// means "try lazy registration".
 //
 // ctx is the resolver's lifecycle context: New starts the SDK
 // resolver's revocation poller on it (go r.Run(ctx)) so each resolved signer's
@@ -149,10 +149,10 @@ func New(ctx context.Context, cfg Config) helpers.KeyResolver {
 
 // NewFromEnv builds the per-agent WBA key resolver from the process environment:
 // it reads the RAMP_WELLKNOWN_SCHEME + RAMP_WELLKNOWN_PORT knobs that shape
-// bare-host Signature-Agent directory URLs on local/compose stacks and threads the shared
-// fetch client + logger. Broker and Exchange share this construction; each caller
-// keeps its own enable-env gate and log line. A wiring change (a knob rename, an
-// env-defaulted TTL) now lands here once instead of drifting between services.
+// bare-host Signature-Agent directory URLs on local/compose stacks and threads
+// the shared fetch client + logger. Broker and Exchange share this
+// construction. A wiring change (a knob rename, an env-defaulted TTL) now
+// lands here once instead of drifting between services.
 func NewFromEnv(ctx context.Context, fetch *http.Client, logger *slog.Logger) helpers.KeyResolver {
 	return New(ctx, Config{
 		Client: fetch,

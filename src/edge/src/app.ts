@@ -202,6 +202,16 @@ function handlePopResult(c: Context<{ Variables: AppVariables }>, pop: PopResult
 // automatically covered; a hand-copied list in a test would drift.
 export const SIGNATURE_PARAMS = ['exp', 'sig', 'kid', 'agent_id'] as const;
 
+// Marks the "authorized, and the deployment's CDN owns the origin fetch"
+// answer (the empty 200 below). A CDN-side entry — the Lambda@Edge wrapper —
+// needs to tell that answer apart from a real generated response so it can
+// hand the request back to the CDN instead of serving the empty body; the
+// status and body alone are ambiguous (/rsl.txt with no RSL_BODY configured
+// is also an empty 200). Only the no-target branch of passToOrigin may emit
+// it: the entries with an origin mode never reach that branch, so on those
+// runtimes the header simply never appears.
+export const CDN_AUTHORIZED_HEADER = 'x-edge-authorized';
+
 // resolveOriginTarget picks where a pass-through request goes: an explicit
 // origin (keeping path + query), the incoming URL itself (same-zone mode,
 // where Cloudflare routes the subrequest to the zone's origin), or nowhere —
@@ -228,7 +238,7 @@ async function passToOrigin(
   deps: AppDeps,
 ): Promise<Response> {
   const target = resolveOriginTarget(c.req.url, deps);
-  if (!target) return c.body(null, 200);
+  if (!target) return c.body(null, 200, { [CDN_AUTHORIZED_HEADER]: 'cdn-origin-fetch' });
   const fetcher = deps.fetcher ?? fetch;
   const method = c.req.method;
   const init: RequestInit & { duplex?: 'half' } = {

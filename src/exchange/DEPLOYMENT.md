@@ -26,11 +26,13 @@ Agent ──► Broker ──► Exchange ──► (signed link) ──► CDN 
 **One dependency to know about before you start.** The Exchange treats the Broker
 as the final word on which signing keys have been withdrawn. It reads a document
 the Broker publishes, over public HTTPS, and it **refuses to start** without an
-address for that document. So on a first deployment the Exchange will start, fail
-and restart over and over — a *crash-loop* — for a few minutes, until DNS
-resolves, certificates are issued and the Broker is answering. **This is expected
-and fixes itself** (§8). Deploy with a restart policy such as
-`restart: unless-stopped` and let it keep retrying until the Broker answers.
+address for that document (`EXCHANGE_BROKER_WELLKNOWN_URL`). The boot never
+waits on the document itself: with the address set, the Exchange starts even
+while the Broker is still unreachable. Until DNS for the Broker resolves, its
+certificate is issued and the Broker process answers, every **signed** request
+is rejected and the log shows `exchange.httpsig.broker_wellknown_unavailable`
+warnings (§8). **That state clears by itself** the moment the document becomes
+reachable — no restart is needed.
 
 **And one thing to prepare before you start.** The Exchange needs **two**
 PostgreSQL databases, not one. The second holds the register of agent accounts.
@@ -50,7 +52,6 @@ not exist, is a crash that does **not** fix itself (§4, §8).
 | A public hostname for the Exchange, with TLS | `EXCHANGE_DOMAIN` | `curl -sI https://exchange.example.com` returns anything but a DNS error |
 | The address of your Broker's published document | `EXCHANGE_BROKER_WELLKNOWN_URL` | `curl -s https://broker.example.com/.well-known/ramp.json` returns JSON |
 | An internal network range for the admin port | `ADMIN_ALLOWED_CIDRS` | You can name the CIDR your operators connect from |
-| A shared public-key file, from the Broker operator | `RAMP_KEYS_FILE` | The file parses as JSON and has a non-empty `keys` array |
 | A container runtime | — | `docker version` |
 | OpenSSL (to generate keys in §5) | — | `openssl version` |
 
@@ -68,7 +69,7 @@ this is the only place this document names one, and every command below reuses
 it:
 
 ```bash
-VERSION=1.0.0-rc.1
+VERSION=1.0.0-rc.2
 docker pull ghcr.io/ramp-protocol/exchange:$VERSION
 ```
 
@@ -107,8 +108,11 @@ Facts about the image:
   be readable by that uid.
 - It publishes **port 8081** only, matching the `EXCHANGE_ADDR` default. The
   admin listener's port is deliberately not published — see §7.
-- There is no health check inside the image, because there is no shell or `curl`
-  to run one with. Probe `/healthz` from outside.
+- The image declares no health check of its own, and there is no shell or
+  `curl` inside it to write one with. The binary is its own probe instead:
+  a container health check that runs `["CMD", "/exchange", "healthcheck"]`
+  makes the binary call its own `/healthz` and exit 0 or 1. Or probe
+  `/healthz` from outside.
 
 ---
 
@@ -205,8 +209,9 @@ no extensions. Backup and tuning for the instance itself are in
 
 ## 5. Step 2 — generate the Exchange's keys
 
-The Exchange uses **two separate keypairs**, and **both are mandatory at boot**.
-They do different jobs and are not interchangeable.
+The Exchange uses **two separate keypairs**. They do different jobs and are not
+interchangeable. The Ed25519 key is mandatory at boot; the RSA key is needed
+only once a publisher uses AWS CloudFront — the callout below explains.
 
 | Keypair | What it does | Set via |
 |---|---|---|
@@ -268,7 +273,6 @@ services:
       EXCHANGE_DEFAULT_TENANT: "www.publisher.example"
       EXCHANGE_BROKER_WELLKNOWN_URL: "https://broker.example/.well-known/ramp.json"
       EXCHANGE_REVOCATION_POLL_INTERVAL: "5m"
-      RAMP_KEYS_FILE: "/keys/keys.json"
       RAMP_ED25519_PRIVATE_PEM_FILE: "/keys/ed25519-private.pem"
       RAMP_RSA_PRIVATE_PEM_FILE: "/keys/rsa-private.pem"
       ADMIN_ADDR: "127.0.0.1:8082"
@@ -293,7 +297,6 @@ docker compose logs exchange | head -20
 #   {"level":"INFO","msg":"sor adapter: postgres","cache_ttl":"30s"}
 #   {"level":"INFO","msg":"exchange.httpsig.replay_store_ready","addr":"cache.internal:6379"}
 #   {"level":"INFO","msg":"exchange.httpsig.wellknown_enabled","well_known_url":"https://broker...", ...}
-#   {"level":"INFO","msg":"exchange.httpsig.agent_wellknown_enabled"}
 #   {"level":"INFO","msg":"exchange listening","addr":":8081"}
 #   {"level":"INFO","msg":"admin listening","addr":"127.0.0.1:8082"}
 ```
@@ -324,7 +327,6 @@ absent rather than wrong when a setting is missing:
 | `billing adapter: …` | You are on the default `free` adapter: every charge is approved and nothing is recorded. |
 | `sor adapter: postgres` and the `schema_migrations_sor` line | The account registry never came up, so the Exchange is not running at all — this pair is not optional. Look for an `exchange.exit` whose `err` begins `sor:`. |
 | `admin listening` | The admin handler failed to build, almost always an unparseable `ADMIN_ALLOWED_CIDRS` — but that is fatal, so check for `exchange.exit` too. |
-| `exchange.httpsig.agent_wellknown_enabled` | `EXCHANGE_AGENT_WELLKNOWN_RESOLUTION` is off. Agents not already in `RAMP_KEYS_FILE` or the database will get `401`. |
 
 And two lines that appear only when something needs your attention:
 
@@ -376,39 +378,44 @@ one of them.
 
 ---
 
-## 8. Step 5 — expect a crash-loop on the very first boot
+## 8. Step 5 — first-boot problems, and which ones clear by themselves
 
-On a first deployment the Exchange will start, fail and restart repeatedly for a
-few minutes. This is expected, not a fault.
+A correctly configured Exchange starts on the first attempt: the boot never
+waits on reaching the Broker. Two failure shapes exist on day one, and they
+look different in the logs. Tell them apart before touching anything.
 
-The Exchange fetches the Broker's published document at boot, over public HTTPS,
-and refuses to start if it cannot read it. On day one that fetch fails until all
-three of these are true: DNS for the Broker's hostname resolves, its TLS
-certificate has been issued, and the Broker process is answering. Until then you
-will see:
+**Shape 1 — the process is up, but signed requests are rejected.** The Broker's
+document is fetched at runtime. On day one it stays unreachable
+until all three of these are true: DNS for the Broker's hostname resolves, its
+TLS certificate has been issued, and the Broker process is answering. Until
+then the Exchange runs, its health checks pass, and every signed request is
+refused — you will see WARN lines, not exits:
 
 ```bash
-docker compose logs exchange | tail -5
-# Expect (transiently, on first boot):
-#   {"level":"ERROR","msg":"exchange.exit","err":"..."}
+docker compose logs exchange | grep broker_wellknown_unavailable | tail -3
+# Expect (transiently, on day one):
+#   {"level":"WARN","msg":"exchange.httpsig.broker_wellknown_unavailable", ...}
 ```
 
-With `restart: unless-stopped` the Exchange retries until the Broker is
-reachable and then starts normally. Nothing needs to be done by hand.
+This clears by itself the moment the document becomes reachable — no restart
+is needed. If it persists after the Broker answers, confirm
+`/.well-known/ramp.json` returns JSON from the Exchange's own network, and
+that `EXCHANGE_BROKER_WELLKNOWN_URL` has no typo.
 
-It stops being expected if it is still looping after the Broker answers. At that
-point read the `err` field of the `exchange.exit` line and match it here:
+**Shape 2 — the process exits, restarts, and exits again.** A crash-loop is a
+configuration fault, and it does **not** clear by itself. Read the `err` field
+of the `exchange.exit` line and match it here:
 
 | `err` begins with | Cause | Fix |
 |---|---|---|
-| *(names the Broker document)* | DNS, TLS or the Broker itself is not ready | Confirm `/.well-known/ramp.json` returns JSON from the Exchange's own network, and that `EXCHANGE_BROKER_WELLKNOWN_URL` has no typo. Fixes itself. |
-| `sor: EXCHANGE_SOR_DSN is required …` | The variable is unset | Set it. §2, §4. Does **not** fix itself. |
-| `sor: setup database:` | The account-registry database does not exist, is unreachable, or the user cannot create a schema in it | Create the database and grant the user (§4). Does **not** fix itself. |
-| `sor: unknown RAMP_SOR_ADAPTER` | A typo in `RAMP_SOR_ADAPTER` | Remove the variable — the default is correct. Does **not** fix itself. |
+| `EXCHANGE_BROKER_WELLKNOWN_URL is required` | The variable is unset | Set it. The address is mandatory at boot, even though the document itself is only fetched at runtime. |
+| `sor: EXCHANGE_SOR_DSN is required …` | The variable is unset | Set it. §2, §4. |
+| `sor: setup database:` | The account-registry database does not exist, is unreachable, or the user cannot create a schema in it | Create the database and grant the user (§4). |
+| `sor: unknown RAMP_SOR_ADAPTER` | A typo in `RAMP_SOR_ADAPTER` | Remove the variable — the default is correct. |
 | `sor: invalid EXCHANGE_SOR_CACHE_TTL` | The value is not a duration | Use a form like `30s` or `1m`, or remove the variable. |
 
-Only the first row fixes itself. The `sor:` rows are configuration faults: the
-Exchange will restart forever until you change something.
+Every row in that table needs a change from you: the Exchange will restart
+forever until you make it.
 
 ---
 
@@ -511,17 +518,18 @@ psql "$EXCHANGE_DSN" -c \
 If `EXCHANGE_DEFAULT_TENANT` is unset, substitute `EXCHANGE_DOMAIN` — that is the
 value the Exchange falls back to.
 
-**Check G — the trusted-key file loaded.** Nothing logs how many keys were
-loaded, so count them on disk and compare against what you meant to trust:
+**Check G — key discovery reaches the Broker.** There is no trusted-key file:
+every verification key is fetched from the key owner's own published documents.
+Confirm the Broker's directory (the revocation authority and the source of the
+relay key) is reachable from the Exchange host:
 
 ```bash
-python3 -c "import json;print(len(json.load(open('./keys/keys.json'))['keys']))"
-# Expect: the number of keys you expect the Exchange to trust — a non-zero count
+curl -s "$EXCHANGE_BROKER_WELLKNOWN_URL" | python3 -c "import json,sys;json.load(sys.stdin);print('ok')"
+# Expect: ok
 ```
 
-The Exchange refuses to boot with zero usable keys, so a running one has at least
-one. Individual bad entries are skipped silently: a file with five keys of which
-two are malformed boots happily and rejects two callers.
+While that document is unreachable the Exchange rejects signed requests
+(fail closed) and logs `exchange.httpsig.broker_wellknown_unavailable`.
 
 ---
 

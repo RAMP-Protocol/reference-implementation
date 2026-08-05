@@ -42,18 +42,22 @@ import (
 // what makes the gate mean "this caller IS that agent" is the separate binding of
 // the verified KEY to the Signature-Agent directory. Where that binding holds:
 //
-//   - the WBA path (internal/agentkeys) — the key is resolved by fetching the
-//     directory the signature commits to, so a signer cannot name a directory that
-//     does not publish its key;
-//   - NOT the static path (BROKER_KEYS_FILE), which maps thumbprint to key with no
-//     identity attached and is consulted FIRST in the composite resolver
-//     (agentSig1Resolver). Any key in that file therefore satisfies this gate for
-//     any agent it cares to name.
+// the WBA path (internal/agentkeys) provides it: the key is resolved by
+// fetching the directory the signature commits to, so a signer cannot name a
+// directory that does not publish its key. This is the path EVERY inbound key
+// takes — agentSig1Resolver has no other delegate (the Broker's own-key
+// registry plays no part in it; its keys' private halves never sign an inbound
+// request). Keep it that way: a resolver delegate that mapped thumbprint to
+// key with no identity attached would satisfy this gate for any agent the
+// signer cared to name.
 //
-// The Exchange re-verifies, so content access is not reachable that way — but the
-// victim's spend counter, its selection_log row and the relayed requester.id are.
-// Stated here because this comment is where the next reader will decide the gate
-// is sufficient, and it is sufficient only on one of the two paths.
+// The Exchange re-verifies with its own equivalents of this gate: on
+// single-signature RPCs, lookupCaller (src/exchange/internal/service/authz.go)
+// proves the verified key is published by the claimed Signature-Agent
+// directory and authorizeForAgent then refuses a caller acting for another
+// agent's id; on ExecuteTransaction, the acting identity is proven by the body
+// offer-acceptance signature against the key registered for requester.id
+// (verifyAgentAcceptance), never taken from the transport chain.
 //
 // agentID arrives ALREADY canonical: validateAndCanonicalizeRequest rewrote req.AgentID in place
 // before this runs. That ordering is the point. Normalizing here and comparing a

@@ -97,7 +97,7 @@ func TestComp_MultitermTermIndex(t *testing.T) {
 		pushTerms(t, h, client, callerID, path, premium, public)
 
 		uri := "https://" + h.publisherDom + path
-		offer := discoverCompOfferScoped(t, h, uri, premiumScope)
+		offer := discoverCompOffer(t, h, uri, premiumScope)
 
 		// Headline = PREMIUM at ORIGINAL stored index 0 -> comp.id "<offer>#0",
 		// premium price $0.50.
@@ -128,7 +128,7 @@ func TestComp_MultitermTermIndex(t *testing.T) {
 		pushTerms(t, h, client, callerID, path, public, premium)
 
 		uri := "https://" + h.publisherDom + path
-		offer := discoverCompOfferScoped(t, h, uri, premiumScope)
+		offer := discoverCompOffer(t, h, uri, premiumScope)
 
 		// Headline = PUBLIC (stored first) at stored index 0 ->
 		// comp.id "<offer>#0", public price $0.05.

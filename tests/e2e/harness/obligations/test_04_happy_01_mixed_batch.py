@@ -33,6 +33,7 @@ pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 
 _DISCOVER_PATH = "/ramp.v1.ExchangeService/DiscoverResources"
 _NOT_IN_CATALOG = "OFFER_ABSENCE_REASON_NOT_IN_CATALOG"
+_EXCHANGE_METHOD = "DISCOVERY_METHOD_EXCHANGE"
 
 # socrates: FREE EUR academic/EU. heraclitus: FREE EUR (no user-type), EU.
 _KNOWN_URI_A = f"http://{DEMO_PHILOSOPHY_DOMAIN}/articles/philosophers/socrates.txt"
@@ -85,6 +86,14 @@ def test_mixed_batch_groups_known_offers_and_not_in_catalog_reason(
     payload = cast(dict[str, Any], resp.json())
     groups = cast(list[dict[str, Any]], payload.get("offer_groups") or [])
     assert groups, f"expected offerGroups in response, got {payload}"
+
+    # Every group says how its URI was found, the two hits and the miss alike.
+    # This request goes straight to the Exchange, which answers only out of its
+    # own catalog, so the answer is EXCHANGE on all three.
+    for reported in groups:
+        assert reported.get("discovery_method") == _EXCHANGE_METHOD, (
+            f"group {reported.get('uri')!r} must report {_EXCHANGE_METHOD!r}; got {reported}"
+        )
 
     # Both known URI groups carry offers.
     for uri in (_KNOWN_URI_A, _KNOWN_URI_B):

@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
@@ -51,7 +53,7 @@ func TestAppendSignatureRAMP_EmptyHeaders(t *testing.T) {
 	}
 
 	// Verify the signature validates under the canonical verifier.
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{"agent.test": pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{"agent.test": pub})
 	v, err := VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if err != nil {
 		t.Fatalf("VerifyRequest: %v", err)
@@ -302,7 +304,7 @@ func TestAppendSignatureRAMP_PreservesExistingHeaders(t *testing.T) {
 
 	// Verify sig1 still validates under the canonical verifier.
 	// VerifyRequest checks the first label, so the resolver needs only sig1's key.
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{"first.test": pub1})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{"first.test": pub1})
 	v, err := VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if err != nil {
 		t.Fatalf("VerifyRequest sig1 after append: %v", err)

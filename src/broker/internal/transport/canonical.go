@@ -99,10 +99,9 @@ func toDiscoveryResponse(r *resolve.Response) *rampv1.DiscoveryResponse {
 	}
 	// One wire OfferGroup per REQUESTED uri (the merge of the upstream exchanges'
 	// per-URI OfferGroups, keyed on OfferGroup.Uri). Each carries the ranked
-	// offers (winner first) for that uri, with Uri + DiscoveryMethod(EXCHANGE)
-	// set; a uri absent across every authorized exchange rides as an empty group
-	// with its per-URI AbsenceReason. The Broker queried Exchange(s) for all of
-	// these, so the discovery method is always EXCHANGE.
+	// offers (winner first) for that uri, with Uri + DiscoveryMethod set; a uri
+	// absent across every authorized exchange rides as an empty group with its
+	// per-URI AbsenceReason.
 	out.OfferGroups = make([]*rampv1.OfferGroup, 0, len(r.Groups))
 	for i := range r.Groups {
 		out.OfferGroups = append(out.OfferGroups, toWireOfferGroup(&r.Groups[i]))
@@ -111,13 +110,21 @@ func toDiscoveryResponse(r *resolve.Response) *rampv1.DiscoveryResponse {
 }
 
 // toWireOfferGroup maps one internal per-URI OfferGroup to the canonical wire
-// rampv1.OfferGroup: Uri echoed from the request, DiscoveryMethod always
-// EXCHANGE (v1), ranked offers when present, else the per-URI AbsenceReason.
+// rampv1.OfferGroup: Uri echoed from the request, the discovery method the
+// resolve layer recorded, ranked offers when present, else the per-URI
+// AbsenceReason. It maps and decides nothing — resolve.stampMethod is where the
+// method comes from.
+//
+// The method is written only when it is set, the same guard AbsenceReason gets
+// below. discovery_method is an optional proto field and this response is
+// served with EmitUnpopulated, so writing it unconditionally would send the
+// literal DISCOVERY_METHOD_UNSPECIFIED for a group that was never stamped. An
+// unstamped group is a bug in resolve, and it should reach the agent as a
+// missing field rather than as an answer.
 func toWireOfferGroup(g *resolve.OfferGroup) *rampv1.OfferGroup {
-	method := rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE
-	wire := &rampv1.OfferGroup{
-		Uri:             g.URI,
-		DiscoveryMethod: &method,
+	wire := &rampv1.OfferGroup{Uri: g.URI}
+	if g.DiscoveryMethod != rampv1.DiscoveryMethod_DISCOVERY_METHOD_UNSPECIFIED {
+		wire.DiscoveryMethod = g.DiscoveryMethod.Enum()
 	}
 	if len(g.Offers) == 0 {
 		if g.AbsenceReason != rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_UNSPECIFIED {

@@ -4,9 +4,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
@@ -15,7 +19,80 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/resolve"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/signing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport/transporttest"
 )
+
+// TestAgentSig1Resolver_OwnKeysNeverResolveInboundSignatures pins the
+// verification contract: the Broker's own-key registry exists only to build
+// the served WBA directory, and is NOT part of the inbound sig1 chain — its
+// keys' private halves never sign an inbound request (the relay key signs
+// outbound Broker→Exchange calls). The inbound resolver is the per-agent
+// delegate ALONE: a kid it knows resolves, and every other kid — the
+// registry's own relay thumbprint included — reports unknown, no matter what
+// the registry contains.
+func TestAgentSig1Resolver_OwnKeysNeverResolveInboundSignatures(t *testing.T) {
+	t.Parallel()
+	relayPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("relay keygen: %v", err)
+	}
+	relayThumbprint, err := helpers.Thumbprint(relayPub)
+	if err != nil {
+		t.Fatalf("thumbprint: %v", err)
+	}
+	agentPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("agent keygen: %v", err)
+	}
+
+	d := brokerMuxDeps{
+		ownKeys: transporttest.MustRegistry(t, relayPub),
+		agentResolver: helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
+			"agent-kid": agentPub,
+		}),
+	}
+
+	got, err := d.agentSig1Resolver().Resolve(context.Background(), "agent-kid")
+	if err != nil || !got.Equal(agentPub) {
+		t.Errorf("Resolve(agent-kid) = %v, %v; want the per-agent resolver's key", got, err)
+	}
+	// The registry's relay thumbprint must NOT resolve inbound, and an
+	// arbitrary kid stays unknown — the registry plays no part either way.
+	for _, kid := range []string{relayThumbprint, "unregistered-kid"} {
+		if _, err := d.agentSig1Resolver().Resolve(context.Background(), kid); !errors.Is(err, helpers.ErrUnknownKey) {
+			t.Errorf("Resolve(%q) error = %v, want helpers.ErrUnknownKey", kid, err)
+		}
+	}
+}
+
+// minimalBrokerMux builds the non-resolve mux shape the route-level tests
+// share — a fresh identity signer, an empty own-key registry, the explicit
+// never-resolves inbound resolver buildBrokerMux requires (these tests never
+// present a signature), and an empty resolveDeps — wrapped in the same
+// public-surface stack run() applies (request-id outermost + URL
+// normalization), so every route is exercised the way production serves it.
+func minimalBrokerMux(t *testing.T) http.Handler {
+	t.Helper()
+	_, identityPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("identity keygen: %v", err)
+	}
+	signer, err := signing.NewCoSigner("broker.example", "broker-1", identityPriv, nil)
+	if err != nil {
+		t.Fatalf("cosigner: %v", err)
+	}
+	mux, _, err := buildBrokerMux(brokerMuxDeps{
+		resolveDeps:   resolve.Deps{},
+		signer:        signer,
+		brokerID:      "broker-1",
+		ownKeys:       transporttest.MustRegistry(t),
+		agentResolver: transporttest.NeverResolves(),
+	})
+	if err != nil {
+		t.Fatalf("buildBrokerMux: %v", err)
+	}
+	return transport.WrapPublicSurface(testutil.DiscardLogger(), mux, runhttp.PublicSurfaceOptions{})
+}
 
 // TestBrokerMux_RequestIDCoversWellKnownRoutes asserts the root request-id wrap
 // applied in run() covers the public well-known + revocation routes — not just
@@ -24,26 +101,9 @@ import (
 // wrapped, leaving these two routes without request-id correlation.
 func TestBrokerMux_RequestIDCoversWellKnownRoutes(t *testing.T) {
 	t.Parallel()
-	_, relayPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("relay keygen: %v", err)
-	}
-	signer, err := signing.NewCoSigner("broker.example", "broker-1", relayPriv, nil)
-	if err != nil {
-		t.Fatalf("cosigner: %v", err)
-	}
-	logger := testutil.DiscardLogger()
-	mux := buildBrokerMux(brokerMuxDeps{
-		// These tests exercise non-resolve routes, so an empty resolveDeps suffices.
-		resolveDeps: resolve.Deps{},
-		signer:      signer,
-		brokerID:    "broker-1",
-		agentKeys:   transport.NewKeyRegistry(),
-	})
-	// Mirror run(): WrapPublicSurface wraps the whole mux (request-id outermost +
-	// URL normalization). The well-known routes are public (not under the
-	// BrokerService connectserver gate), so they pass through and return 200.
-	handler := transport.WrapPublicSurface(logger, mux, runhttp.PublicSurfaceOptions{})
+	// The well-known routes are public (not under the BrokerService
+	// connectserver gate), so they pass through the wrapped mux and return 200.
+	handler := minimalBrokerMux(t)
 
 	for _, path := range []string{rampwellknown.Path, rampwellknown.RevocationPath} {
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, http.NoBody)
@@ -84,25 +144,7 @@ func TestBrokerMux_RequestIDCoversWellKnownRoutes(t *testing.T) {
 // removal.
 func TestBrokerMux_BespokeResolveRouteGone(t *testing.T) {
 	t.Parallel()
-	_, relayPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("relay keygen: %v", err)
-	}
-	signer, err := signing.NewCoSigner("broker.example", "broker-1", relayPriv, nil)
-	if err != nil {
-		t.Fatalf("cosigner: %v", err)
-	}
-	logger := testutil.DiscardLogger()
-	mux := buildBrokerMux(brokerMuxDeps{
-		// These tests exercise non-resolve routes, so an empty resolveDeps suffices.
-		resolveDeps: resolve.Deps{},
-		signer:      signer,
-		brokerID:    "broker-1",
-		agentKeys:   transport.NewKeyRegistry(),
-	})
-	// Mirror run(): WrapPublicSurface wraps the whole mux (request-id + URL
-	// normalization), matching how production routes every route.
-	handler := transport.WrapPublicSurface(logger, mux, runhttp.PublicSurfaceOptions{})
+	handler := minimalBrokerMux(t)
 
 	const bespokePath = "/broker/v1/resolve"
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
@@ -113,6 +155,20 @@ func TestBrokerMux_BespokeResolveRouteGone(t *testing.T) {
 			t.Errorf("%s %s: status = %d, want 404 (bespoke route must be gone; only the Connect endpoint exists)",
 				method, bespokePath, rec.Code)
 		}
+	}
+}
+
+// TestBuildBrokerMux_NilAgentResolverIsRefused pins the composition-root
+// contract: a missing inbound resolver is a wiring bug reported as an error
+// run() can propagate, never a panic and never a mux that would nil-deref on
+// the first signed request.
+func TestBuildBrokerMux_NilAgentResolverIsRefused(t *testing.T) {
+	_, _, err := buildBrokerMux(brokerMuxDeps{})
+	if err == nil {
+		t.Fatal("buildBrokerMux with nil agentResolver returned nil error; want a refusal")
+	}
+	if !strings.Contains(err.Error(), "agentResolver is required") {
+		t.Fatalf("error %q is not the missing-resolver refusal", err)
 	}
 }
 

@@ -103,7 +103,7 @@ type VerifiedRequest struct {
 	// an RFC 7638 thumbprint (a proof of key possession) while the agent identity
 	// is the directory domain named here; authorization keys on this value and
 	// the thumbprint proves the named directory published the key. Empty when the
-	// signer set no Signature-Agent (the static bootstrap path).
+	// signer set no Signature-Agent.
 	SignatureAgent string
 }
 

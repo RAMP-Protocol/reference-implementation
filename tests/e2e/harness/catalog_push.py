@@ -24,27 +24,22 @@ that RPC + both gates still work — no separate coverage needed.
 
 Public surface
 --------------
-``generate_contributor_key(path)`` — idempotent keypair materializer.
 ``push_catalog(exchange_url, tenant_id, entries, key_path)`` — sign + POST.
 """
 
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import httpx
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from ramp_sdk.b64 import b64url_decode, b64url_nopad
+from ramp_sdk.b64 import b64url_decode
 from .httpsig_signer import load_keypair, sign_request
 
-_CONTRIBUTOR_KID = "catalog-contributor-e2e"
 _PUSH_PROCEDURE = "/ramp.v1.CatalogService/PushResources"
 
 
@@ -89,43 +84,6 @@ class CatalogEntry:
     # them through licenseterm.Select for the requester. Use :func:`license_term`
     # to build a well-formed dict. Empty = legacy single-price entry.
     terms: tuple[dict[str, Any], ...] = ()
-
-
-def generate_contributor_key(key_path: Path) -> None:
-    """Ensure ``key_path`` carries a catalog-contributor Ed25519 keypair.
-
-    The file format mirrors ``scripts/gen-demo-agent-key.sh`` so ``AgentKey``
-    can load it verbatim. Regenerating on every seed run would invalidate
-    the pre-registered pubkey in ``ramp.agents``; instead we only write
-    when the file is absent, and callers are expected to wipe it if they
-    want a fresh key. The parent directory is created on demand.
-    """
-    if key_path.is_file():
-        return
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    priv = Ed25519PrivateKey.generate()
-    seed = priv.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    pub = priv.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
-    key_path.write_text(
-        json.dumps(
-            {
-                "kid": _CONTRIBUTOR_KID,
-                "private_key": b64url_nopad(seed),
-                "public_key": b64url_nopad(pub),
-            },
-            indent=2,
-        )
-        + "\n"
-    )
-    # Key file carries secret material; lock it down.
-    os.chmod(key_path, 0o600)
 
 
 def load_public_key_bytes(key_path: Path) -> bytes:
@@ -328,7 +286,6 @@ __all__ = [
     "TERM_SEMANTICS_ENUMERATED",
     "TERM_SEMANTICS_REFERENCE_ONLY",
     "CatalogEntry",
-    "generate_contributor_key",
     "license_term",
     "load_public_key_bytes",
     "push_catalog",

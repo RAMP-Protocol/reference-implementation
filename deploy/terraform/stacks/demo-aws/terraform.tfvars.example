@@ -1,0 +1,83 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Keep the secrets
+# (registry_password, exa_api_key) in a separate gitignored
+# secrets.auto.tfvars, or export them as TF_VAR_* environment variables.
+#
+# Before the first apply (STAGING_DOMAIN is the PUBLISHER hostname here —
+# demo.<domain> — because every name in this stack nests under that label):
+#   1. STACK_DIR=$PWD STAGING_DOMAIN=demo.<domain> ../../scripts/gen-staging-keys.sh
+#      # writes ./keys/ (gitignored)
+#   2. ../../scripts/build-push-images.sh                 # builds + pushes the images
+#
+# The Lambda bundle comes LAST, because its config is rendered by this stack:
+#   3. terraform apply            # first time: set deploy_edge = false below
+#   4. terraform output -raw lambda_edge_config > lambda-edge-config.json
+#   5. ../../scripts/build-lambda-edge.sh lambda-edge-config.json
+#   6. terraform apply            # with deploy_edge back to true (the default)
+
+# AWS — the credentials must be able to create EC2/VPC/EIP resources, plus
+# Lambda/IAM/CloudFront/ACM in us-east-1 and records in the Route 53 zone.
+aws_region = "us-east-1"
+# aws_profile = "my-profile"   # omit to use your default AWS credentials
+
+ssh_public_key   = "ssh-ed25519 AAAA... operator@laptop"
+ssh_ingress_cidr = "203.0.113.7/32" # your address: curl ifconfig.me
+# Not one of your default ssh keys? Give the private-key path so the
+# ssh_command output includes -i (the key itself never leaves your machine):
+# ssh_private_key_path = "~/.ssh/ramp-demo"
+
+# Route 53 — the EXISTING hosted zone the demo hostnames live under. The
+# stack only adds records to it (and refuses to overwrite ones it does not
+# own); the zone itself is never touched.
+route53_zone_id = "Z0123456789ABCDEFGHIJ"
+domain          = "publisher.example"
+
+# Hostname layout: everything nests under ONE label — the publisher hostname
+# is demo.<domain> and the services sit below it (exchange.demo.<domain>,
+# broker.demo.<domain>, mcp.demo.<domain>, login.demo.<domain>,
+# origin.demo.<domain>). `mcp` also gets a WILDCARD record: every agent a
+# developer signs up gets its Web Bot Auth directory at
+# <agent-slug>.mcp.demo.<domain>, and those names cannot be known ahead of
+# time. Override a label only if it collides with a record you already have.
+# publisher_subdomain = "demo"
+# identity_subdomain  = "mcp"
+# zitadel_subdomain   = "login"
+
+# Images: <image_registry>/<image_prefix>/{exchange,broker,identity,publisher}:<image_tag>,
+# as pushed by ../../scripts/build-push-images.sh. Use the same values here
+# that you gave the push script as REGISTRY= and PREFIX=.
+# image_prefix must be LOWERCASE even when the GitLab group/project name is
+# not: Docker repository paths reject uppercase, and GitLab publishes the
+# registry under the lowercased project path.
+# image_registry = "registry.gitlab.com"   # default; e.g. "ghcr.io", "<acct>.dkr.ecr.<region>.amazonaws.com"
+image_prefix = "your-group/your-project"
+image_tag    = "latest"
+# Private registry? Set a read token (password in secrets.auto.tfvars):
+# registry_username = "gitlab+deploy-token-123"
+
+# Email for Let's Encrypt: Caddy on the VM mints certificates for the service
+# hostnames. The publisher hostname's certificate comes from ACM instead
+# (created by the stack, validated over DNS — no email involved).
+acme_email = "ops@example.com"
+# Iterating on apply/destroy? Use the LE staging CA (untrusted certs):
+# acme_staging = true
+
+# The smoke identities (smoke-agent.demo.<domain> and
+# catalog-contributor.demo.<domain>) need no variables: each id IS the
+# hostname its key directory is served at, derived from the labels below.
+# Override a label only together with regenerated keys — the kid inside each
+# key file must equal the hostname, and seeding/smoke verify they agree.
+# smoke_agent_subdomain         = "smoke-agent"
+# catalog_contributor_subdomain = "catalog-contributor"
+
+# FIRST apply on a fresh checkout: uncomment — the Lambda bundle cannot exist
+# yet because its config is rendered by this stack (steps 3–6 above). Remove
+# again (or set true) once the bundle is built.
+# deploy_edge = false
+
+# Agent-key proof-of-possession, baked into the Lambda bundle. Left unset
+# (as here), the worker enforces the proof — the production posture.
+# Changing this means re-rendering lambda-edge-config.json, rebuilding the
+# zip, and re-applying (steps 4–6 above).
+# ramp_enforce_binding = "false"
+
+# The secrets do NOT belong in this file — copy secrets.auto.tfvars.example to secrets.auto.tfvars.

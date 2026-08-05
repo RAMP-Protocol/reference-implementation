@@ -135,9 +135,9 @@ def _probe(exchange_url: str, agent_id: str) -> httpx.Response:
 
     The query id is fresh per call, so no two probes ever sign identical bytes
     and the replay guard cannot fire. DiscoverResources does not require the
-    signing key to match ``requester.id`` — it never resolves the caller — so the
-    throwaway key, which is registered in no agent directory, is a valid signer
-    here.
+    signing key to match ``requester.id`` — it never resolves the caller — so
+    the throwaway key, which belongs to no seeded agent and resolves only via
+    its own well-known host, is a valid signer here.
     """
     return sign_post(
         f"{exchange_url}{DISCOVER_PATH}",
@@ -227,13 +227,14 @@ def test_broker_revocation_rejects_signature_across_containers(
 ) -> None:
     """Broker revokes a throwaway thumbprint, the Exchange container rejects it.
 
-    The throwaway key is published in the Broker's WBA directory (deploy/broker/
-    keys.json), so the Exchange resolves it through the broker revocation
-    channel. A signed DiscoverResources returns 200 while the key is unrevoked;
-    once the Broker's revocation file names its thumbprint and the Exchange's
-    poller picks that up, the same call is rejected at the httpsig gate with
-    "key revoked". This is the deployment-shaped revoke, poll, reject that the
-    single-process Go test cannot exercise.
+    The throwaway key is served by its own well-known host
+    (revocation-throwaway-e2e-jwks), so the Exchange resolves it via the per-agent
+    well-known path. A signed DiscoverResources returns 200 while the key is
+    unrevoked; once the Broker's revocation file names its thumbprint and the
+    Exchange's poller picks that up, the same call is rejected at the httpsig
+    gate with "key revoked" — the revocation verdict overrides a key that its
+    own directory still publishes. This is the deployment-shaped revoke, poll,
+    reject that the single-process Go test cannot exercise.
 
     Teardown withdraws the revocation instead of deleting the file. An absent
     file makes the Broker serve the epoch-dated empty snapshot, and the

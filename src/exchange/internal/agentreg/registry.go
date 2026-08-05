@@ -35,10 +35,11 @@ var ErrUnknown = errors.New("agentreg: unknown agent")
 // covers the registry's current clock reading.
 var ErrNoValidKey = errors.New("agentreg: no currently valid key in manifest")
 
-// ErrAgentIDMismatch is returned when the manifest's domain (the agent's
-// identity anchor in the unified RAMP model) does not match the agent_id the
-// caller asserted.
-var ErrAgentIDMismatch = errors.New("agentreg: manifest domain does not match request")
+// ErrAgentIDMismatch is returned when the discovery URL's host does not match
+// the agent_id the caller asserted. Identity is anchored to the host that
+// serves the agent's key directory (see requireAnchoredHost) — no manifest
+// content is read on either side of the comparison.
+var ErrAgentIDMismatch = errors.New("agentreg: discovery host does not match the asserted agent id")
 
 // ErrMalformedManifest is returned when the manifest fails schema validation,
 // carries a non-AGENT role, or its selected key cannot be decoded.
@@ -94,7 +95,7 @@ type Config struct {
 	Timeout time.Duration
 	// Scheme/Port shape the well-known fetch URL for bare hosts, mirroring the
 	// Gate-2 publisher-manifest Cache (cmd/server newManifestCache wires the same
-	// RAMP_MANIFEST_FETCH_{SCHEME,PORT}). Empty Scheme defaults to https and the
+	// RAMP_WELLKNOWN_{SCHEME,PORT}). Empty Scheme defaults to https and the
 	// scheme-default port. Without this, self-signup (Gate-1) always fetches
 	// https:443 and cannot reach an http compose/local edge — which is exactly
 	// what forces the DB key pre-seed the well-known trust model exists to remove.
@@ -188,8 +189,8 @@ func storageKey(agentID string) (string, error) {
 
 func (r *registry) LookupPublicKey(ctx context.Context, agentID string) (ed25519.PublicKey, error) {
 	// Returned bare, like the other storageKey call sites: every sentinel it
-	// wraps already begins "agentreg:", so adding the prefix here produced
-	// "agentreg: agentreg: manifest domain does not match request: agentid: ...".
+	// wraps already begins "agentreg:", so adding the prefix here produced a
+	// doubled "agentreg: agentreg: ..." message.
 	key, err := storageKey(agentID)
 	if err != nil {
 		return nil, err

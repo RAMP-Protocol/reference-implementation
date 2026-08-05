@@ -8,9 +8,12 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -228,4 +231,44 @@ type Handlers struct {
 func (h Handlers) RegisterRoutes(mux *http.ServeMux) {
 	h.Manifest.RegisterRoutes(mux)
 	h.WBA.RegisterRoutes(mux)
+}
+
+// RebuildIntervalFor returns how often a service must re-derive its served
+// discovery documents, given the validity lifetime its published keys carry.
+// The two values are one invariant: windows are stamped at build time, so a
+// document rebuilt less often than its keys' lifetime would eventually serve
+// only lapsed windows while the process stays healthy. Deriving the interval
+// here — a quarter of the lifetime, capped at one day — keeps the result
+// below the lifetime by construction, so no service can pair a short lifetime
+// with a long interval and freeze its directory.
+func RebuildIntervalFor(keyLifetime time.Duration) time.Duration {
+	interval := keyLifetime / 4
+	if interval > 24*time.Hour {
+		interval = 24 * time.Hour
+	}
+	return interval
+}
+
+// RunRefresher rebuilds both served documents every interval until ctx ends.
+// A discovery document embeds build-time state — validity windows read from
+// the producer's clock — so a long-lived process must re-derive it
+// periodically: a document served unchanged for months would eventually
+// publish only lapsed windows while the process itself stays healthy. A
+// failed rebuild keeps the previously served bytes and logs a warning; the
+// surface never goes dark because one rebuild attempt failed.
+func (h Handlers) RunRefresher(ctx context.Context, interval time.Duration, logger *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, hd := range []*Handler{h.Manifest, h.WBA} {
+				if err := hd.Rebuild(); err != nil {
+					logger.WarnContext(ctx, "wellknown.rebuild_failed", "path", hd.path, "err", err)
+				}
+			}
+		}
+	}
 }

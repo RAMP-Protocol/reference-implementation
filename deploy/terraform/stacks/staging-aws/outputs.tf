@@ -48,6 +48,23 @@ output "publisher_hostname" {
   value       = var.deploy_edge ? local.publisher_fqdn : null
 }
 
+output "smoke_agent_hostname" {
+  # The services verify the smoke agent's signatures by fetching
+  # https://<this hostname>/.well-known/http-message-signatures-directory, and
+  # the id seeded into ramp.agents must be this exact string. seed-staging.sh
+  # and smoke.sh read it back (require_ids_match_stack) to prove the generated
+  # agent key's kid matches before signing anything with it.
+  description = "Hostname the smoke agent's public key directory is served at — also the smoke agent's identity id (the kid in agent-key.json must equal it)."
+  value       = local.smoke_agent_fqdn
+}
+
+output "catalog_contributor_hostname" {
+  # Same contract as smoke_agent_hostname, for the identity that pushes the
+  # demo catalog.
+  description = "Hostname the catalog contributor's public key directory is served at — also the contributor's identity id (the kid in contributor-key.json must equal it)."
+  value       = local.catalog_contributor_fqdn
+}
+
 output "default_tenant_domain" {
   # The Exchange resolves its default tenant under this exact domain
   # (EXCHANGE_DEFAULT_TENANT), and seed-staging.sh must create the tenant

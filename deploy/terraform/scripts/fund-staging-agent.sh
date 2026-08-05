@@ -144,7 +144,7 @@ STMTS=(
     "lookup_accounts id=${AGENT_ACC};"
 )
 
-echo "== funding the smoke agent's account (billing_ref ${BILLING_REF}) with ${AMOUNT} EUR (label: ${FUND_LABEL}) =="
+echo "== funding agent account (billing_ref ${BILLING_REF}) with ${AMOUNT} EUR (label: ${FUND_LABEL}) =="
 echo "== ledger commands (via ${SSH_CMD[*]}) =="
 printf '%s\n' "${STMTS[@]}"
 echo "=========================================================="

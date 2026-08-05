@@ -176,7 +176,7 @@ func TestComp_UnmappedConstructsFlag(t *testing.T) {
 	// POSITIVE: profile-aware discover with the term's entitlement scope so Select
 	// keeps the scope-bearing term (entitlement scopes are the only discovery
 	// eligibility filter — restriction axes do not exclude terms; ADR-014).
-	compOffer := discoverCompOfferScoped(t, h, uri, "entitlement:full")
+	compOffer := discoverCompOffer(t, h, uri, "entitlement:full")
 	assertCompRampUnmapped(t, compOffer)
 	assertUnmappedNonLoss(t, compOffer)
 

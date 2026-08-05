@@ -35,6 +35,22 @@ type TimedKey struct {
 	NotAfter   time.Time
 }
 
+// InWindow reports whether now falls inside the key's [NotBefore, NotAfter)
+// validity window. A zero bound is open on that side — a key published
+// without a window never expires by time (retiring it takes removal from the
+// key set). Callers that hold a TimedKey MUST gate use on this check;
+// carrying the bounds without consulting them would publish a window and then
+// honor keys outside it.
+func (k TimedKey) InWindow(now time.Time) bool {
+	if !k.NotBefore.IsZero() && now.Before(k.NotBefore) {
+		return false
+	}
+	if !k.NotAfter.IsZero() && !now.Before(k.NotAfter) {
+		return false
+	}
+	return true
+}
+
 // jwkWindow is the optional RAMP validity window (RFC 3339) plus the raw x
 // parameter, layered on top of a standard JWK. not_before/not_after are RAMP
 // extensions (not JWK members) and x's length must be re-checked (see below), so
@@ -81,9 +97,29 @@ func DecodeTimedJWK(entry json.RawMessage) (TimedKey, bool) {
 	if err != nil {
 		return TimedKey{}, false
 	}
-	nb, na, ok := ParseWindow(ext.NotBefore, ext.NotAfter)
+	nb, na, ok := parseWindow(ext.NotBefore, ext.NotAfter)
 	if !ok {
 		return TimedKey{}, false
 	}
 	return TimedKey{Thumbprint: tp, Public: pub, NotBefore: nb, NotAfter: na}, true
+}
+
+// parseWindow parses optional RFC 3339 not_before / not_after bounds. An empty
+// string is unbounded (zero time). A present-but-unparseable bound reports
+// ok=false so the caller skips the malformed entry rather than treating a typo
+// as unbounded — which would make an out-of-window key silently always-valid
+// (fail-closed).
+func parseWindow(notBefore, notAfter string) (nb, na time.Time, ok bool) {
+	var err error
+	if notBefore != "" {
+		if nb, err = time.Parse(time.RFC3339, notBefore); err != nil {
+			return time.Time{}, time.Time{}, false
+		}
+	}
+	if notAfter != "" {
+		if na, err = time.Parse(time.RFC3339, notAfter); err != nil {
+			return time.Time{}, time.Time{}, false
+		}
+	}
+	return nb, na, true
 }

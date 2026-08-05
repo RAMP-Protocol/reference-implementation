@@ -31,15 +31,17 @@ DEMO_CF_PUBLISHER_HOST = DEMO_PHILOSOPHY_DOMAIN
 _FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 # 3rd-party contributor identity (kid == catalog-contributor-e2e). Served via the
-# `catalog-contributor` well-known host (NOT pre-seeded in ramp.agents); the
+# `catalog-contributor-e2e-jwks` well-known host (NOT pre-seeded in ramp.agents); the
 # Exchange learns its key by fetching that host. Used by the new trust test's
 # 3rd-party leg and by the existing full-path/ingest probes that push to a
 # publisher listing it. See catalog_push.py for the keyfile format + gate details.
 CATALOG_CONTRIBUTOR_ID = "catalog-contributor-e2e"
 CONTRIBUTOR_KEY_PATH = _FIXTURES_DIR / "catalog_contributor_key.json"
 
-# ───── Buyer identities (kid == agent_id; pinned in deploy/broker/keys.json so
-# the Broker self-act gate + Exchange caller-authz admit them). The in-memory
+# ───── Buyer identities (kid == agent_id; each kid's key is served by its own
+# jwks host in docker-compose.e2e.yml. The httpsig layer resolves keys from
+# those hosts; the Broker self-act gate + Exchange caller-authz then admit the
+# already-verified caller). The in-memory
 # billing adapter authorizes a term ONLY when the buyer's balance currency
 # matches the term currency (the currency check
 # precedes the charge, so even a FREE/rate-0 term is denied on a mismatch). So

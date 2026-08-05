@@ -8,7 +8,7 @@ script run against a live, already-seeded staging deployment
     RAMP_STAGING_EXCHANGE_URL=https://exchange.<domain> \
     RAMP_STAGING_BROKER_URL=https://broker.<domain> \
     RAMP_STAGING_PUBLISHER=demo.<domain> \
-    RAMP_STAGING_AGENT_ID=agent-staging \
+    RAMP_STAGING_AGENT_ID=smoke-agent.<domain> \
     RAMP_STAGING_AGENT_KEY=deploy/terraform/stacks/staging-aws/keys/agent-key.json \
     uv run --project tests/e2e python tests/e2e/smoke_staging.py
 
@@ -29,6 +29,24 @@ DNS, the deployed edge worker):
    proof-of-possession headers (harness.edge_fetch.fetch_signed) delivers the
    origin body containing RAMP-DEMO-CANARY-8FK3J2-0418 — mint -> edge verify
    (signature + agent binding) -> origin round trip.
+3. The public surface every unlicensed caller sees. The first two legs run
+   on the same article as item 2, so a failure isolates the UA handling:
+   - a BROWSER User-Agent with no signature gets the article (200 + canary
+     marker) — the bot gate only sends AI bots to negotiate, never people;
+   - an AI-BOT User-Agent with no signature is refused (403) WITH the
+     negotiation payload: the {error, reason: "ai_bot"} JSON body, the
+     X-Content-Rules header pointing at this publisher's
+     /.well-known/ramp.json, and the X-RAMP-Exchange header naming the
+     exchange to negotiate with. (The retired demo also announced MCP
+     endpoints on this response; the current worker does not, so nothing MCP
+     is asserted here.)
+   - the site root serves the human-facing landing page to a browser
+     User-Agent (200 HTML naming the demo catalog) and still refuses an
+     AI-bot User-Agent (403) — a stakeholder demo starts in a browser, so
+     the first impression must be the catalog index, not an error page;
+   - /.well-known/ramp.json answers any User-Agent with no signature (200,
+     domain matching this publisher) — the guard against a bot being locked
+     out of the very document that tells it how to negotiate.
 
 Both legs traverse the full deployed stack: agent-signed calls -> Broker ->
 Exchange -> signed URL -> edge worker -> Caddy -> origin container. Nothing
@@ -51,6 +69,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "tests" / "e2e"))
 
 from harness.broker_client import execute_first_offer, resolve  # noqa: E402
+from harness.constants import AI_BOT_UA, BROWSER_UA  # noqa: E402
 from harness.stack_urls import StackURLs  # noqa: E402
 from harness.edge_fetch import fetch_signed  # noqa: E402
 from harness.resolve_carriers import (  # noqa: E402
@@ -118,6 +137,93 @@ def _bare_fetch_binding_leg(signed: str, *, enforce: bool) -> None:
     print("  bare fetch delivered (200) — agent binding not enforced")
 
 
+def _browser_leg(article: str) -> None:
+    """A browser User-Agent with no signature must get the article (200)."""
+    resp = httpx.get(
+        article, follow_redirects=True, timeout=30.0, headers={"User-Agent": BROWSER_UA}
+    )
+    if resp.status_code != httpx.codes.OK or CANARY_MARKER not in resp.text:
+        print(f"  browser fetch: status={resp.status_code} body={resp.text[:200]}")
+        msg = "edge did not serve the article to a browser User-Agent"
+        raise SystemExit(msg)
+    print("  browser fetch delivered (200 + canary) — people read without a license")
+
+
+def _bot_negotiation_leg(article: str, publisher: str, exchange_url: str) -> None:
+    """An AI-bot User-Agent with no signature must get 403 + how to negotiate.
+
+    The refusal alone is not enough: the bot must be TOLD where to go. The
+    payload under test is the JSON {error, reason: "ai_bot"} body, the
+    X-Content-Rules header (this publisher's ramp.json), and the
+    X-RAMP-Exchange header (the exchange to negotiate with).
+    """
+    resp = httpx.get(article, timeout=30.0, headers={"User-Agent": AI_BOT_UA})
+    if resp.status_code != httpx.codes.FORBIDDEN:
+        print(f"  bot fetch: status={resp.status_code} body={resp.text[:200]}")
+        msg = "edge did not refuse an AI-bot User-Agent without a signed URL"
+        raise SystemExit(msg)
+    body = resp.json()
+    if not isinstance(body, dict) or body.get("reason") != "ai_bot":
+        print(f"  bot fetch body={resp.text[:200]}")
+        msg = 'bot refusal body did not carry reason "ai_bot"'
+        raise SystemExit(msg)
+    rules = resp.headers.get("X-Content-Rules", "")
+    expected_rules = f"https://{publisher}/.well-known/ramp.json"
+    if rules != expected_rules:
+        print(f"  X-Content-Rules={rules!r} expected={expected_rules!r}")
+        msg = "bot refusal did not point at this publisher's ramp.json"
+        raise SystemExit(msg)
+    exchange_header = resp.headers.get("X-RAMP-Exchange", "")
+    if exchange_header != exchange_url:
+        print(f"  X-RAMP-Exchange={exchange_header!r} expected={exchange_url!r}")
+        msg = "bot refusal did not name the exchange to negotiate with"
+        raise SystemExit(msg)
+    print("  bot fetch refused (403) with ramp.json pointer + exchange header")
+
+
+def _landing_page_leg(publisher: str) -> None:
+    """The site root serves the catalog landing page to a browser (200 HTML).
+
+    A stakeholder demo starts by opening the demo hostname in a browser, so
+    the root must be an index page, not an error. The bot side of the same
+    URL is asserted too: the landing page must not open a hole in the bot
+    gate at the root.
+    """
+    url = f"https://{publisher}/"
+    resp = httpx.get(url, follow_redirects=True, timeout=30.0, headers={"User-Agent": BROWSER_UA})
+    content_type = resp.headers.get("content-type", "")
+    if resp.status_code != httpx.codes.OK or not content_type.startswith("text/html"):
+        print(f"  landing page: status={resp.status_code} content-type={content_type!r}")
+        msg = "site root did not serve the landing page to a browser User-Agent"
+        raise SystemExit(msg)
+    if "Stoa Press" not in resp.text:
+        print(f"  landing page body={resp.text[:300]}")
+        msg = "landing page does not name the demo catalog"
+        raise SystemExit(msg)
+    bot = httpx.get(url, timeout=30.0, headers={"User-Agent": AI_BOT_UA})
+    if bot.status_code != httpx.codes.FORBIDDEN:
+        print(f"  bot at root: status={bot.status_code} body={bot.text[:200]}")
+        msg = "site root did not refuse an AI-bot User-Agent"
+        raise SystemExit(msg)
+    print("  landing page served to a browser (200 HTML); bot still refused at root")
+
+
+def _well_known_leg(publisher: str) -> None:
+    """/.well-known/ramp.json must answer ANY User-Agent with no signature.
+
+    This is the guard against a lockout loop: the refusal above points bots
+    at this document, so the bot gate must never apply to it.
+    """
+    url = f"https://{publisher}/.well-known/ramp.json"
+    resp = httpx.get(url, timeout=30.0, headers={"User-Agent": AI_BOT_UA})
+    payload = _payload_of(resp, "ramp.json fetch (bot User-Agent)")
+    if not isinstance(payload, dict) or payload.get("domain") != publisher:
+        print(f"  ramp.json body={resp.text[:300]}")
+        msg = "ramp.json did not carry this publisher's domain"
+        raise SystemExit(msg)
+    print("  ramp.json served unsigned to a bot User-Agent, domain matches")
+
+
 def main() -> None:
     exchange_url = _require_env("RAMP_STAGING_EXCHANGE_URL")
     broker_url = _require_env("RAMP_STAGING_BROKER_URL")
@@ -149,6 +255,8 @@ def main() -> None:
         edge="",
         aws_edge="",
         fastly_edge="",
+        lambda_edge="",
+        lambda_edge_no_wba="",
         identity="",
         zitadel="",
     )
@@ -220,6 +328,16 @@ def main() -> None:
         msg = "edge delivery did not return the canary body"
         raise SystemExit(msg)
     print(f"  CANARY FOUND: {CANARY_MARKER}")
+
+    print("== item 3: public surface — browser, AI bot, landing page, well-known ==")
+    # The first two legs run on the same article as item 2, so a failure here
+    # isolates the UA handling: the content itself was just proven fetchable
+    # through the edge. The last two legs run on the site root and ramp.json.
+    _browser_leg(canary)
+    _bot_negotiation_leg(canary, publisher, exchange_url)
+    _landing_page_leg(publisher)
+    _well_known_leg(publisher)
+
     print("\nSTAGING SMOKE PASSED")
 
 

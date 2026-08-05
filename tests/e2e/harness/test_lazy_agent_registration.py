@@ -1,6 +1,6 @@
 """Lazy agent registration (ADR-009 D2) through the real Agent -> Broker -> Exchange chain.
 
-A fresh agent — absent from RAMP_KEYS_FILE and ramp.agents, serving only its own
+A fresh agent — absent from ramp.agents, serving only its own
 ROLE_AGENT /.well-known/ramp.json on the ``lazy-agent-e2e`` network alias (== its
 keyID/domain), billing-seeded in docker-compose.e2e.yml — discovers an offer and
 relay-executes it. Both the Broker (sig1 boundary verify) and the Exchange resolve
@@ -39,7 +39,7 @@ pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 # Fresh agent: published manifest on the `lazy-agent-e2e` alias, USD billing-seeded
-# in docker-compose.e2e.yml, but NOT in keys.json and NOT seeded into ramp.agents.
+# in docker-compose.e2e.yml, but NOT seeded into ramp.agents.
 LAZY_AGENT_ID = "lazy-agent-e2e"
 LAZY_KEY_PATH = _FIXTURES / "agent_lazy_e2e_key.json"
 
@@ -132,8 +132,9 @@ def test_unresolvable_agent_refused_before_execute(
 ) -> None:
     """Negative control: a fresh agent with NO well-known host is refused; not registered.
 
-    The ghost agent holds a valid signing key but serves no /.well-known/ramp.json
-    and is absent from the bootstrap keys file, so its key resolves NOWHERE. The
+    The ghost agent holds a valid signing key but no well-known host serves its
+    key directory — and directories are the ONLY path a verifier learns a key
+    by — so its key resolves NOWHERE. The
     Broker's httpsig middleware verifies the self-act keyID on EVERY signed
     ``/ramp.*`` call against the agent's resolvable key (resolve.go
     authorizeAgentSelfAct sits behind that middleware); with no key to resolve, the

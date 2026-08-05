@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
@@ -34,7 +36,7 @@ func TestVerifyRequest_Valid(t *testing.T) {
 	body := []byte(`{"query":"foo"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	v, err := VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if err != nil {
 		t.Fatalf("verify: %v", err)
@@ -62,7 +64,7 @@ func TestVerifyRequest_Unsigned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver)
 	if !errors.Is(err, ErrMissingSignatureInput) {
 		t.Fatalf("want ErrMissingSignatureInput, got %v", err)
@@ -82,7 +84,7 @@ func TestVerifyRequest_BadSignature(t *testing.T) {
 	body := []byte(`{"hello":"world"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: wrongPub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: wrongPub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrSignatureVerify) {
 		t.Fatalf("want ErrSignatureVerify, got %v", err)
@@ -121,7 +123,7 @@ func TestVerifyRequest_MissingCoverageComponent(t *testing.T) {
 	if err := signWithParams(req, shortCoverage, priv, sigWriteSet); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrMissingRequiredComponent) {
 		t.Fatalf("want ErrMissingRequiredComponent, got %v", err)
@@ -138,7 +140,7 @@ func TestVerifyRequest_Expired(t *testing.T) {
 	req := newRAMPSignedRequest(t, body, priv, now)
 
 	future := now.Add(5 * time.Minute)
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(future)})
 	if !errors.Is(err, ErrExpired) {
 		t.Fatalf("want ErrExpired, got %v", err)
@@ -157,7 +159,7 @@ func TestVerifyRequest_FutureCreatedRejected(t *testing.T) {
 	req := newRAMPSignedRequest(t, body, priv, signerNow)
 
 	behind := signerNow.Add(-10 * time.Minute)
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(behind)})
 	if !errors.Is(err, ErrFutureCreated) {
 		t.Fatalf("want ErrFutureCreated, got %v", err)
@@ -179,7 +181,7 @@ func TestVerifyRequest_MissingCreatedRejected(t *testing.T) {
 	inp := req.Header.Get("Signature-Input")
 	req.Header.Set("Signature-Input", regexp.MustCompile(`;created=\d+`).ReplaceAllString(inp, ""))
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrMissingCreated) {
 		t.Fatalf("want ErrMissingCreated, got %v", err)
@@ -199,7 +201,7 @@ func TestVerifyRequest_MissingExpiresRejected(t *testing.T) {
 	inp := req.Header.Get("Signature-Input")
 	req.Header.Set("Signature-Input", regexp.MustCompile(`;expires=\d+`).ReplaceAllString(inp, ""))
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrMissingExpires) {
 		t.Fatalf("want ErrMissingExpires, got %v", err)
@@ -216,7 +218,7 @@ func TestVerifyRequest_TamperedAuthorizationRejected(t *testing.T) {
 	req := newRAMPSignedRequest(t, body, priv, now)
 	req.Header.Set("Authorization", "Bearer tampered")
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrSignatureVerify) {
 		t.Fatalf("want ErrSignatureVerify, got %v", err)
@@ -266,7 +268,7 @@ func TestVerifyRequest_EntitlementHeaderCovered(t *testing.T) {
 	if !strings.Contains(inp, `"x-ramp-entitlement-biscuit"`) {
 		t.Fatalf("signer did not cover entitlement header: %s", inp)
 	}
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	if _, err := VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)}); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -285,7 +287,7 @@ func TestVerifyRequest_EntitlementHeaderPresentButUncovered(t *testing.T) {
 	// reject because coverage does not include it.
 	req.Header.Set("X-RAMP-Entitlement-Biscuit", "AAAA")
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrMissingRequiredComponent) {
 		t.Fatalf("want ErrMissingRequiredComponent, got %v", err)
@@ -310,7 +312,7 @@ func TestVerifyRequest_TamperedEntitlementHeaderRejected(t *testing.T) {
 	// Swap the biscuit after signing.
 	req.Header.Set("X-RAMP-Entitlement-Biscuit", "TAMPERED")
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrSignatureVerify) {
 		t.Fatalf("want ErrSignatureVerify, got %v", err)
@@ -326,9 +328,9 @@ func TestVerifyRequest_UnknownKeyid(t *testing.T) {
 	body := []byte(`{"q":"x"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
-	if !errors.Is(err, ErrUnknownKey) {
+	if !errors.Is(err, helpers.ErrUnknownKey) {
 		t.Fatalf("want ErrUnknownKey, got %v", err)
 	}
 }
@@ -345,7 +347,7 @@ func TestVerifyRequest_BadAlgRejected(t *testing.T) {
 	inp := req.Header.Get("Signature-Input")
 	req.Header.Set("Signature-Input", strings.Replace(inp, `alg="ed25519"`, `alg="rsa-pss-sha256"`, 1))
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	_, err = VerifyRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if !errors.Is(err, ErrUnsupportedAlgorithm) {
 		t.Fatalf("want ErrUnsupportedAlgorithm, got %v", err)

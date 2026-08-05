@@ -61,6 +61,16 @@ type offerGroup struct {
 	// nothing to sell is reported here rather than dropped, so the agent can tell
 	// "refused" from "never asked".
 	AbsenceReason string `json:"absence_reason,omitempty"`
+	// DiscoveryMethod says how the Broker found this URL: the agent named it, or
+	// the Broker chose it on the agent's behalf. The Broker decides the value,
+	// because it is the only component that knows which of those happened. This
+	// tool accepts a free-text query as well as uris, but the query path returns
+	// no groups yet, so every group an agent actually receives today came from a
+	// URL it named and reads DISCOVERY_METHOD_EXCHANGE. It is projected because
+	// that stops being true once the query path can answer, and an agent that
+	// never saw the field would have no way to tell a URL it asked for from one
+	// that was found for it.
+	DiscoveryMethod string `json:"discovery_method,omitempty"`
 }
 
 // handleDiscover runs discovery through the Broker.
@@ -128,10 +138,11 @@ func projectDiscovery(resp *rampv1.DiscoveryResponse) (discoverOutput, error) {
 			return discoverOutput{}, err
 		}
 		out.OfferGroups = append(out.OfferGroups, offerGroup{
-			URI:           group.GetUri(),
-			Licensed:      len(offers) > 0,
-			Offers:        offers,
-			AbsenceReason: rampclient.EnumName(group.GetAbsenceReason()),
+			URI:             group.GetUri(),
+			Licensed:        len(offers) > 0,
+			Offers:          offers,
+			AbsenceReason:   rampclient.EnumName(group.GetAbsenceReason()),
+			DiscoveryMethod: rampclient.EnumName(group.GetDiscoveryMethod()),
 		})
 	}
 	return out, nil

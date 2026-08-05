@@ -543,19 +543,10 @@ func TestPushResources_ContributorAdmittedSnapshotRebuilt(t *testing.T) {
 		t.Fatalf("push: %v", err)
 	}
 
-	discovered, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.publisherDom + "/articles/one"},
-		Requester: &rampv1.Requester{
-			Id: "agent-discover", Domain: "agent.example",
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
-	if err != nil {
-		t.Fatalf("discover: %v", err)
-	}
-	if len(discovered.Msg.GetOffers()) != 1 {
-		t.Fatalf("offers len = %d, want 1", len(discovered.Msg.GetOffers()))
+	offers := discoverOffersAs(t, h, "https://"+h.publisherDom+"/articles/one",
+		requesterWithScopes("agent-discover"))
+	if len(offers) != 1 {
+		t.Fatalf("offers len = %d, want 1", len(offers))
 	}
 }
 

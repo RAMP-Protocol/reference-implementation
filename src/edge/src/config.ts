@@ -143,8 +143,11 @@ export function buildDeps(env: EdgeEnv): AppDeps {
 }
 
 // parseBotPatterns compiles a JSON array of regex sources into
-// case-insensitive patterns. An invalid source throws at startup — a broken
-// pattern list must fail the deploy, not silently disable the bot gate. The
+// case-insensitive patterns. An invalid source throws rather than being
+// skipped, because a broken pattern list must not silently disable the bot
+// gate. The throw happens on the first request, not at deploy time: the entries
+// call buildDeps from inside fetch, so a bad list passes deployment and then
+// fails every request. The
 // count/length caps bound only the SIZE of the pattern set; they do NOT
 // detect catastrophic backtracking, and no runtime check can interrupt a
 // regex mid-match on Workers. These patterns are operator-authored config

@@ -34,23 +34,16 @@ Resource-metadata support makes **metadata** a first-class part of this round-tr
 
 ### Extended feed-line schema (what these fixtures exercise)
 
-The current `Record` (`parser.go`) is `domain, path, title, license,
-terms[]`. It is EXTENDED with these top-level fields, all OPTIONAL:
+**The full line format lives in `schemas/catalog-feed/v1/README.md`**, alongside a
+machine-checkable JSON Schema. The field table that used to sit here is gone on purpose —
+it was a partial second copy, and a partial copy is the thing that drifts.
 
-| Field | JSON type | Maps to (Offer) |
-|---|---|---|
-| `content_id` | string | (ResourceEntry audit field) |
-| `word_count` | int32 | (ResourceEntry audit field) |
-| `estimated_quantity` | int32 | (ResourceEntry audit field) |
-| `content_hash` | string | `Offer.identity.content_hash` |
-| `hash_method` | string | `Offer.identity.hash_method` |
-| `source` | string (full `IngestionSource` enum NAME) | (ResourceEntry audit field) |
-| `provenance_source` | string | (ResourceEntry audit field) |
-| `provenance_timestamp` | RFC3339 string | `Offer.data_as_of` |
-| `resource_mutability` | string (full `ResourceMutability` enum NAME) | `Offer.identity.resource_mutability` (enum; STATIC default when omitted) |
-| `ext` | JSON object | `Offer.ext` (minus promoted keys) |
-| `ext_critical` | string[] | `Offer.ext_critical` |
-| `attestations[]` | `{verifier,kid,attested_at,uri,claims,signature}` | `Offer.attestations[]` |
+What these fixtures exercise is the metadata extension surface: the optional top-level
+fields beyond `domain`, `path`, `title`, `license` and `terms[]` — `content_id`,
+`word_count`, `estimated_quantity`, `content_hash`, `hash_method`, `source`,
+`provenance_source`, `provenance_timestamp`, `resource_mutability`, `ext`, `ext_critical`
+and `attestations[]`. Their Offer-side projections are the subject of the scenario matrix
+below.
 
 ### CRITICAL proto fact — `resource_mutability` is a typed field; `previews` still rides INSIDE `ext`
 

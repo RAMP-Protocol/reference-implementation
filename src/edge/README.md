@@ -11,7 +11,7 @@ no separate "licensed" path or hostname. On every request the Worker decides:
 
 | Request looks like | What happens |
 |---|---|
-| Has signature params (`exp`, `sig`, `kid`) | Verify the Ed25519 signature and expiry. Valid → serve from origin. Invalid or expired → 403, content not served. |
+| Has the signature parameter `sig` | Verify the Ed25519 signature and expiry (a valid URL also carries `exp`, and `kid` selects the key; a URL with `exp` or `kid` but no `sig` is treated as unsigned). Valid → serve from origin. Invalid or expired → 403, content not served. |
 | Signature params include `agent_id` | The Worker also requires proof that the caller holds that agent's key (on by default — see [`CONFIGURATION.md`](CONFIGURATION.md) §3.6). With that check turned off, the address is a *bearer credential*: whoever holds it can read the article until it expires, protected only by its short lifetime and HTTPS. |
 | No signature, browser-like client | Pass through to origin untouched. Normal website traffic never sees a 403. |
 | No signature, AI-bot User-Agent | 403 with an `X-Content-Rules` header and a JSON body pointing at `/.well-known/ramp.json`, where the bot learns how to buy access. |
@@ -53,8 +53,8 @@ The decision uses these inputs, in priority order — the first match wins:
 
 Both pattern lists can be replaced without a code deploy: set
 `BOT_UA_ALLOW_JSON` / `BOT_UA_DENY_JSON` (JSON arrays of patterns, at most 64
-entries of 256 characters each — anything larger intentionally makes the
-deploy fail).
+entries of 256 characters each — anything larger is rejected outright rather than
+trimmed, and the rejection lands on every request rather than on the deploy).
 
 One known limitation: steps 2–4 read the User-Agent, which callers choose
 freely. They keep honest, self-identifying bots out — they are not a security
@@ -97,12 +97,15 @@ app does not change.
   that key in one of two ways:
   1. **Default**: fetch at runtime from `EXCHANGE_WBA_URL` (the Exchange's
      public-key directory). Keys are matched by the `kid` in the URL (an
-     RFC 7638 thumbprint) and cached for a limited time (a TTL, "time to
-     live"). An unknown `kid` triggers one
-     re-fetch, so key rotation on the Exchange needs no Worker redeploy.
+     RFC 7638 thumbprint) and cached in memory for one hour. A `kid` that is
+     not in the cached set is refused until the cache expires, so after a key
+     rotation on the Exchange, URLs signed with the new key can get 403s for
+     up to one hour (see `RUNBOOK.md` §4.2). No Worker redeploy is needed —
+     the next fetch picks the new key up.
   2. **Optional pinning**: set `RAMP_VERIFY_KEYS` to a JSON array of public
-     JWKs. The Worker then verifies without any network fetch and only falls
-     back to the directory when a `kid` is not in the pinned set.
+     JWKs. The Worker then verifies without any network fetch. When a `kid`
+     is not in the pinned set, the Worker makes one directory fetch to look
+     it up — so in this mode a rotation heals itself immediately.
 - Every configuration value is public, so plain Wrangler `[vars]` are enough —
   nothing needs `wrangler secret`.
 
@@ -122,9 +125,9 @@ The Worker must know how to reach the website's backend ("origin"). Two modes:
    own hostname in `Host`, so this mode only fits an origin dedicated to the
    site. The address must not resolve back to the Worker's route.
 
-On Cloudflare and Fastly the Worker refuses to start when neither mode is
-configured — a missing origin must produce a clear error, not serve empty
-pages. Fastly
+On Cloudflare and Fastly the Worker fails with a clear error on every request
+when neither mode is configured, rather than serving empty pages. The check runs
+per request, not at deploy time, so the deployment itself succeeds. Fastly
 supports only the explicit `ORIGIN_URL` mode (same-zone forwarding is a
 Cloudflare routing behavior).
 
@@ -198,8 +201,9 @@ means something is broken:
 
 ## Scripts (`scripts/`)
 
-Two small scripts let the Worker run **outside Cloudflare** — inside the
-Docker-based E2E/demo stack — on a real Workers runtime:
+Three small scripts live here. Two of them let the Worker run **outside
+Cloudflare** — inside the Docker-based E2E/demo stack — on a real Workers
+runtime:
 
 - `build-worker.mjs` — bundles the Cloudflare entry (`src/entries/
   cloudflare.ts` with all its imports) into one file, `dist/worker.mjs`,
@@ -208,23 +212,34 @@ Docker-based E2E/demo stack — on a real Workers runtime:
   substitute. Run with `npm run build:worker`; used by the build stage of
   `Dockerfile.miniflare`.
 - `serve-miniflare.mjs` — serves that pre-built bundle with Miniflare (the
-  local Workers runtime) as a plain HTTP server on port 8787, turning the
-  container's environment variables into the Worker settings `parseEnv`
-  expects. It is the entrypoint of the `edge` service in the E2E stack —
-  the `edge:8787` host the Python test harness and the demo talk to.
+  local Workers runtime) as a plain HTTP server, turning the container's
+  environment variables into the Worker settings `parseEnv` expects. The
+  port is 8787 by default; the E2E stack sets `PORT=80`, so the Python test
+  harness and the demo reach the service at `edge:80`. (The name `edge:8787`
+  still appears inside signed URLs as the public hostname the Exchange signs
+  for; the harness rewrites it to the real service address before fetching.)
 
 The chain: `Dockerfile.miniflare` → build script makes the bundle → serve
 script hosts it → the E2E harness drives the full Agent → Broker → Exchange
 → Edge → Origin flow against a real Workers runtime.
 
-Neither script is part of the production path (`wrangler deploy` bundles on
-its own), and the vitest suites do not use them either
+These two scripts are not part of the production path (`wrangler deploy`
+bundles on its own), and the vitest suites do not use them either
 (`@cloudflare/vitest-pool-workers` builds and hosts the Worker itself).
+
+The third script **is** part of a deployment path:
+
+- `build-lambda-edge.mjs` — builds the AWS Lambda@Edge bundle. Lambda@Edge
+  has no environment variables, so this script bakes a per-deployment config
+  file into the bundle and smoke-invokes the result so a broken config fails
+  the build, not the deploy. The AWS deployment tooling
+  (`deploy/terraform/scripts/build-lambda-edge.sh`) and the E2E stack's
+  `lambda-edge` service both call it.
 
 ## Development
 
 ```bash
-npm test                  # every project in vitest.config.ts (workers, binding-off, article-path, node — the node project includes the AWS Lambda and Fastly harnesses)
+npm test                  # every project in vitest.config.ts (workers, article-path, wellknown-keyless, node — the node project includes the AWS Lambda and Fastly harnesses)
 npm run test:e2e:cf       # Cloudflare-runtime E2E
 npm run test:e2e:article  # shared-URL four-outcome E2E (origin pass-through)
 npm run lint              # biome (warnings are errors) + type-aware floating-promise check

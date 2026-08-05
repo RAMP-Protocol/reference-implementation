@@ -11,6 +11,7 @@ reimplement the (now trivial) fetch-target resolution.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import httpx
@@ -35,6 +36,24 @@ def edge_fetch_target(signed: str, compose_stack: StackURLs) -> tuple[str, dict[
     # rather than silently rewriting to the wrong authority (the Host-override
     # trick is forbidden). Run the suite in-network (`make test-e2e`).
     return signed, {}
+
+
+def tamper_query_param(signed: str, param: str = "sig") -> str:
+    """Flip one base64url character in the middle of ``param``'s value.
+
+    The single home for the "corrupt a signed URL" idiom every edge runtime's
+    tamper negative needs. One character is enough — the signature covers the
+    whole URL — and changing it in the middle keeps the value's length and
+    encoding valid, so what the edge rejects is the signature itself and not a
+    malformed parameter.
+    """
+    match = re.search(rf"{param}=([^&]+)", signed)
+    assert match, f"no {param}= in {signed}"
+    value = match.group(1)
+    middle = len(value) // 2
+    replacement = "B" if value[middle] != "B" else "C"
+    tampered = value[:middle] + replacement + value[middle + 1 :]
+    return signed.replace(f"{param}={value}", f"{param}={tampered}")
 
 
 def fetch_signed(

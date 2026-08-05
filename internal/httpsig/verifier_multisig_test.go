@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
@@ -41,7 +43,7 @@ func TestVerifyMultisigRequest_BothValid(t *testing.T) {
 	req := newRAMPSignedRequest(t, body, priv1, now)
 	addMultisigSignature(t, req, "agent-demo.v2", priv2, now.Add(30*time.Second).Unix())
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:       pub1,
 		"agent-demo.v2": pub2,
 	})
@@ -78,7 +80,7 @@ func TestVerifyMultisigRequest_FirstInvalid(t *testing.T) {
 	req := newRAMPSignedRequest(t, body, priv1Wrong, now)
 	addMultisigSignature(t, req, "agent-demo.v2", priv2, now.Add(30*time.Second).Unix())
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:       pub1,
 		"agent-demo.v2": pub2,
 	})
@@ -106,7 +108,7 @@ func TestVerifyMultisigRequest_SecondInvalid(t *testing.T) {
 	req := newRAMPSignedRequest(t, body, priv1, now)
 	addMultisigSignature(t, req, "agent-demo.v2", priv2Wrong, now.Add(30*time.Second).Unix())
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:       pub1,
 		"agent-demo.v2": pub2,
 	})
@@ -137,7 +139,7 @@ func TestVerifyMultisigRequest_SecondExpired(t *testing.T) {
 	// sig2 expired one second before the verifier's clock; sig1 still valid.
 	addMultisigSignature(t, req, "agent-demo.v2", priv2, now.Add(-time.Second).Unix())
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:       pub1,
 		"agent-demo.v2": pub2,
 	})
@@ -169,7 +171,7 @@ func TestVerifyMultisigRequest_SignatureIsPerLabelReplayStable(t *testing.T) {
 	}
 	now := signNow()
 	body := []byte(`{"query":"foo"}`)
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:        pub1,
 		"broker.relay.a": pub2a,
 		"broker.relay.b": pub2b,
@@ -235,7 +237,7 @@ func TestVerifyMultisigRequest_SingleSignature(t *testing.T) {
 	body := []byte(`{"query":"single"}`)
 	req := newRAMPSignedRequest(t, body, priv, now)
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{testKeyID: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{testKeyID: pub})
 	verified, err := VerifyMultisigRequest(req, resolver, VerifyRequestOptions{Clk: clock.NewDeterministic(now)})
 	if err != nil {
 		t.Fatalf("verify: %v", err)

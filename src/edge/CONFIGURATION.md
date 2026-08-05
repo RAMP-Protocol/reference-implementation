@@ -48,9 +48,10 @@ do not exist here:
 
 ## 2. Environment variables
 
-"Required" means the Worker refuses to start without it. A missing required
-variable is not a partial failure: the Worker fails with an error on **every**
-request.
+"Required" means the Worker cannot serve without it. Nothing is checked at deploy
+time — the Worker reads its variables when the first request arrives — so a
+missing required variable passes `wrangler deploy` and then fails with an error
+on **every** request, article traffic included. It is not a partial failure.
 
 | Name | Required? | What it is | Example |
 |---|---|---|---|
@@ -72,9 +73,10 @@ request.
 
 All values are strings, including the ones that look like lists or booleans:
 Cloudflare vars are text, and the Worker parses them. A JSON value that does not
-parse, or does not match the expected shape, **intentionally fails at
-start-up** — a malformed list must break the deploy, not silently disable a
-check.
+parse, or does not match the expected shape, makes the Worker fail hard rather
+than silently disable a check — but the failure lands on the first request, not
+on `wrangler deploy`. The deploy reports success and the Worker then answers
+`500` to **every** request until you fix the value.
 
 **A name the Worker does not know is ignored, not rejected.** The check is on
 values, not on names: a variable outside the table above is simply ignored, so a
@@ -100,8 +102,10 @@ know how to reach it, and there are two ways.
 
 `SAME_ZONE_ORIGIN` is **Cloudflare-only**, by design: the Fastly adapter does
 not forward the variable at all (so setting it there does nothing), and the AWS
-Lambda@Edge adapter fails at start-up if it sees it, because forwarding to the
-incoming address on CloudFront would make the function fetch its own distribution.
+Lambda@Edge adapter throws on its first invocation if it sees it, because
+forwarding to the incoming address on CloudFront would make the function fetch
+its own distribution. As everywhere else, that failure comes when traffic
+arrives, not when the function is published.
 
 **Setting neither is the most common misconfiguration.** On Cloudflare the Worker
 does not partly work — it fails on *every* request, with this message:
@@ -161,29 +165,63 @@ list entirely — they do not extend it. If you set one, include again the
 built-in entries you still want. Each is a JSON array of regular-expression patterns, with
 hard limits:
 
-| Limit | Value | If exceeded |
+| Limit | Value | If violated |
 |---|---|---|
-| Entries per list | at most 64 | Start-up fails |
-| Characters per entry | at most 256 | Start-up fails |
-| Pattern validity | must compile as a regular expression | Start-up fails |
+| Entries per list | at least 1, at most 64 | Every request fails |
+| Characters per entry | at most 256 | Every request fails |
+| Pattern validity | must compile as a regular expression | Every request fails |
 
-The start-up failure on an invalid pattern is deliberate: a broken pattern list
-must fail the deploy, never silently disable the bot gate. Keep patterns to simple
+Note the minimum: an **empty list (`"[]"`) is refused** just like a malformed
+one. To make a list match nothing, do not set it to empty — see
+[`RUNBOOK.md`](RUNBOOK.md) §4.3 for the safe way to switch the bot gate off.
+
+Failing hard on an invalid pattern is deliberate: a broken pattern list must
+never silently disable the bot gate. Note where the failure lands. The lists are
+read when the first request arrives, not at deploy time, so `wrangler deploy`
+succeeds and the Worker then answers `500` to **every** request until you fix the
+value. Check the bot gate after deploying a change to either list. Keep patterns to simple
 name fragments like the built-ins — the size caps limit how much text is scanned,
 but they cannot save you from a badly written pattern such as `(a+)+`, which can
 take a very long time to run.
 
 ### 3.4 The optional documents — what "unset" actually serves
 
-Four addresses the Worker answers itself. Three of them behave differently when
+Five addresses the Worker answers itself. Three of them behave differently when
 their variable is unset, and the differences are easy to mistake for errors.
 
 | Address | Variable | Set | Unset |
 |---|---|---|---|
+| `/healthz` | none | — | Always `200` with the body `ok` |
 | `/.well-known/ramp.json` | `PROVIDER`, `EXCHANGES_JSON` | The discovery document | Cannot happen — both are required |
 | `/.well-known/http-message-signatures-directory` | `WBA_KEYS_JSON` | The publisher's public keys, as a JWK Set | **404** |
 | `/rsl.txt` | `RSL_BODY` | The text you supplied | **200 with an empty body** — not a 404 |
 | `/.well-known/ramp-verify/<token>` | `ACME_TOKENS_JSON` | The answer for a known token; 404 for any other | **404 for every token** |
+
+**`WBA_KEYS_JSON` has a strict shape.** It is a JSON array of 1 to 64 key
+objects, and every field below is required. A missing or different value makes
+the Worker answer `500` to every request — like the pattern lists in §3.3, the
+value is read at the first request, not at deploy time:
+
+| Field | Required value |
+|---|---|
+| `kty` | exactly `"OKP"` |
+| `crv` | exactly `"Ed25519"` |
+| `use` | exactly `"sig"` |
+| `alg` | exactly `"EdDSA"` |
+| `x` | the public key, base64url, exactly 43 characters |
+| `not_before` | RFC 3339 timestamp, e.g. `2026-01-01T00:00:00Z` |
+| `not_after` | RFC 3339 timestamp — the key stops validating at this moment |
+
+A complete one-key value:
+
+```json
+[{"kty":"OKP","crv":"Ed25519","use":"sig","alg":"EdDSA",
+  "x":"<43-char base64url public key>",
+  "not_before":"2026-01-01T00:00:00Z","not_after":"2027-01-01T00:00:00Z"}]
+```
+
+There is deliberately no `kid` field: verifiers name each key by its RFC 7638
+thumbprint, which they compute from the key itself.
 
 **A 404 on the key directory is a legitimate configuration, not a fault.** That
 directory publishes the *publisher's own* signing keys, and a publisher that
@@ -191,10 +229,14 @@ issues none has nothing to publish. It is unrelated to the keys the Worker uses 
 check signed URLs — those come from the *Exchange's* directory at
 `EXCHANGE_WBA_URL` and are never served here.
 
-Note that `/rsl.txt` sits at the top level, not under `/.well-known/`, and that
-all four addresses are answered by the Worker rather than passed to the origin. If
-the site already publishes its own document at one of these addresses, the Worker
-answers instead of the site.
+Note that `/rsl.txt` and `/healthz` sit at the top level, not under
+`/.well-known/`, and that all five addresses are answered by the Worker rather
+than passed to the origin. If the site already publishes its own document at one
+of these addresses, the Worker answers instead of the site.
+
+This table says what each address serves; §8 traces every field of the two
+discovery documents back to the setting that produces it, and names where a
+filled-in copy of each document lives.
 
 ### 3.5 `EXCHANGES_JSON` — and the payee id inside it
 
@@ -204,7 +246,7 @@ Each entry in the list takes this shape:
 |---|---|---|
 | `domain` | **Yes** | The Exchange's own canonical domain. Must match **exactly** what the Exchange calls itself, or the payee lookup below finds nothing. |
 | `endpoint` | **Yes** | Full address of the Exchange. |
-| `supported_profiles` | Optional | List of profile names; defaults to empty. |
+| `supported_profiles` | Optional | Profile names for this entry; omitting it means none. That is the input side — the served document publishes the combined list at the top level instead, and leaves the field out when no entry names one (§8.1). |
 | `ext` | **Effectively required** | Extension map. Carries `resource_owner_id`. |
 
 **`ext.resource_owner_id` is the publisher's payee id — the account that
@@ -229,7 +271,12 @@ A complete entry:
 
 Two things to confirm with the Exchange operator before you deploy: the exact
 `domain` string the Exchange identifies itself by, and the `resource_owner_id`
-value to declare. Getting either wrong produces the same silent rejection.
+value to declare. They fail differently. A wrong `domain` matches no entry, so
+every catalog push is rejected with `missing_resource_owner_id` and you see it.
+A wrong `resource_owner_id` is accepted — the Exchange checks only that it is
+non-empty and never validates it — so the content sells and the revenue is
+attributed to an account the Exchange operator does not recognise, with nothing
+rejected and nothing logged.
 
 ---
 
@@ -244,7 +291,8 @@ article until it expires, protected only by its short lifetime and HTTPS.
 **Unset means on.** The rule is "enforce wherever the Worker can run the check",
 so the safe mode needs no configuration. Set it to `"true"` anyway if you want
 the choice visible in your own config; only `"true"` and `"false"` are accepted,
-and any other value fails the deploy rather than choosing a mode for you.
+and any other value makes every request fail rather than choosing a mode for
+you. The deploy itself still succeeds — §2.
 
 Agents that sign up through a registry do not hold their own key — the registry
 keeps it and fetches the content for them, so the registry is what proves
@@ -306,7 +354,7 @@ network. Several of their values are deliberately unsuitable for production:
 | `EXCHANGE_WBA_URL: "http://…"` | Same. | Public keys fetched over unencrypted HTTP could be modified in transit. |
 | `ORIGIN_URL: "http://publisher:80"` | Same. | Same. |
 | `EXCHANGES_JSON` with `"domain":"exchange:8081"` | Matches the test Exchange's own identity, which is a container name and port. | A real deployment's `domain` is a real hostname — §3.5. |
-| `WBA_KEYS_JSON` from `deploy/edge-keys/edge.env` | Generated test keys whose private keys are stored in the repository. | Generate the publisher's own keys, or leave the variable unset. |
+| `WBA_KEYS_JSON` from `deploy/edge-keys/edge.env` | Generated test keys for the local stack. The file is created by `scripts/gen-e2e-keys.sh`, is not tracked in git, and holds public keys only. | The matching private halves are throwaway test material on a developer machine, not the publisher's real keys. Generate the publisher's own keys, or leave the variable unset. |
 
 The commented-out `[vars]` block at the top of `wrangler.toml` is likewise an
 example with `example.com` placeholders, not a starting configuration.
@@ -323,7 +371,8 @@ marked *fill in* are specific to your deployment.
 | `EXCHANGE_URL` | `https://exchange.example` |
 | `EXCHANGE_WBA_URL` | `https://exchange.example/.well-known/http-message-signatures-directory` |
 | `PROVIDER` | `www.publisher.example` |
-| `EXCHANGES_JSON` | `[{"domain":"<the Exchange's own domain — fill in>","endpoint":"https://exchange.example","supported_profiles":[],"ext":{"resource_owner_id":"<fill in>"}}]` |
+| `EXCHANGES_JSON` | `[{"domain":"exchange.example","endpoint":"https://exchange.example","supported_profiles":[]}]` — replace `exchange.example` with the Exchange's own domain, and add the `ext.resource_owner_id` field before content can be sold (§3.5) |
+| `RAMP_ENFORCE_BINDING` | `true` — set explicitly in the block; the same as the unset default (§3.6) |
 | `SAME_ZONE_ORIGIN` | `true` |
 
 Worker settings, the same for every environment:
@@ -339,10 +388,58 @@ Worker settings, the same for every environment:
 | Bindings | none |
 
 Everything not listed stays unset. In particular `RAMP_VERIFY_KEYS`,
-`WBA_KEYS_JSON`, `ACME_TOKENS_JSON`, `BOT_UA_ALLOW_JSON`, `BOT_UA_DENY_JSON`
-and `RAMP_ENFORCE_BINDING` are absent, which is the intended default in every
-case (unset `RAMP_ENFORCE_BINDING` means the proof check runs — §3.6). A name
-that is not in the §2 table is not read at all, set or unset.
+`WBA_KEYS_JSON`, `ACME_TOKENS_JSON`, `BOT_UA_ALLOW_JSON` and
+`BOT_UA_DENY_JSON` are absent, which is the intended default in every case. A
+name that is not in the §2 table is not read at all, set or unset.
 
 The `ext.resource_owner_id` field is **not** in the checked-in staging block and
 must be added before the publisher's content can be sold — §3.5.
+
+---
+
+## 8. The two documents these variables produce
+
+§2 lists the settings. This section traces each field of the two served documents
+back to the setting that produces it. Both documents are built in memory when the
+first request arrives and reused for every later one — there is no file to upload
+and none to keep in sync.
+
+**A filled-in copy of each document is in
+[`../../deploy/publisher-wellknown/`](../../deploy/publisher-wellknown/)**, along
+with the operator's procedure for the signing key, the two publisher setups, and
+the `curl` checks. That folder is the worked example for the tables below; the
+test suite requests both addresses through the Worker's routes and compares the
+responses against those files, so they cannot drift away from what the code
+serves.
+
+### 8.1 `/.well-known/ramp.json`
+
+| Field | Comes from | Notes |
+|---|---|---|
+| `ver` | nothing — fixed in the code | The protocol version. §4. |
+| `role` | nothing — fixed in the code | Always `ROLE_PUBLISHER` here. |
+| `domain` | `PROVIDER` | Copied through unchanged. |
+| `exchanges[].domain` | `EXCHANGES_JSON` | Must match the Exchange's own name exactly — §3.5. |
+| `exchanges[].endpoint` | `EXCHANGES_JSON` | |
+| `exchanges[].relationship` | nothing — fixed in the code | Always `PROVIDER_RELATIONSHIP_DIRECT`; no variable changes it. |
+| `exchanges[].ext.resource_owner_id` | `EXCHANGES_JSON` | Present only when you supply it. The payee id — §3.5. |
+| `supported_profiles` | `EXCHANGES_JSON` | **Moves.** Written inside each entry, served once at the top level. The reference folder shows the result and what an empty list produces. |
+| `catalog_contributors` | `CATALOG_CONTRIBUTORS_JSON` | Names other parties, never the publisher itself. The reference folder explains when an entry is needed and what leaving the variable unset produces. |
+
+### 8.2 `/.well-known/http-message-signatures-directory`
+
+Served with `content-type: application/jwk-set+json`, and only when
+`WBA_KEYS_JSON` is set — otherwise this address answers `404` (§3.4).
+
+| Field | Comes from | Notes |
+|---|---|---|
+| `keys[]` | `WBA_KEYS_JSON` | Copied through unchanged, in the order you wrote them. At most 64 — §4. |
+| `revocation_url` | `WBA_REVOCATION_URL` | Present only when that variable is set. Leave it unset — the reference folder explains why, and what to use instead. |
+
+A malformed `WBA_KEYS_JSON` is not caught at deploy time: nothing reads it until a
+request arrives, so `wrangler deploy` succeeds and the Worker then answers `500`
+to **every** request, article traffic included.
+
+The reference folder covers the rest for an operator: which fields every key
+carries and why a `kid` is a defect, how to generate the keypair and read out
+`x`, and the procedure for retiring a key.

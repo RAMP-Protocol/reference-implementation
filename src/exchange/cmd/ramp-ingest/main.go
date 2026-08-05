@@ -38,8 +38,8 @@ func run(args []string) (err error) {
 	tenantID := fs.String("tenant", "", "tenant_id the entries are pushed under (required)")
 	// --key has NO default: there is no committed contributor key to fall back
 	// to. An operator must supply an explicitly-generated keypair path or
-	// the ingester refuses to run. Generate one with scripts/gen-demo-agent-key.sh
-	// (or the contributor-key scheme) and pass its path here.
+	// the ingester refuses to run. Mint one with
+	// scripts/gen-contributor-key.sh <contributor-id> and pass its path here.
 	keyPath := fs.String(
 		"key",
 		"",

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 )
 
@@ -54,7 +56,7 @@ func TestChain_GoldenSignatureBehavior(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:        priv1.Public().(ed25519.PublicKey),
 		"broker.relay.a": priv2.Public().(ed25519.PublicKey),
 	})
@@ -132,7 +134,7 @@ func chainTestEnv(t *testing.T, now time.Time) (*http.Request, KeyResolver) {
 	if err := AppendSignatureRAMP(req, body, "broker.relay.a", priv2, now.Add(30*time.Second).Unix()); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:        pub1,
 		"broker.relay.a": pub2,
 	})
@@ -167,7 +169,7 @@ func TestChain_StrippedMiddleHop(t *testing.T) {
 	if err := AppendSignatureRAMP(req, body, "broker.relay.b", priv3, now.Add(30*time.Second).Unix()); err != nil {
 		t.Fatalf("append sig3: %v", err)
 	}
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:        priv1.Public().(ed25519.PublicKey),
 		"broker.relay.a": priv2.Public().(ed25519.PublicKey),
 		"broker.relay.b": priv3.Public().(ed25519.PublicKey),
@@ -254,7 +256,7 @@ func TestChain_MissingLink(t *testing.T) {
 		t.Fatalf("sign sig2: %v", err)
 	}
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:        priv1.Public().(ed25519.PublicKey),
 		"broker.relay.a": priv2.Public().(ed25519.PublicKey),
 	})
@@ -306,7 +308,7 @@ func TestChain_SubstitutedPredecessorRejected(t *testing.T) {
 	req.Header.Set("Signature-Input", replaceLabelMember(req.Header.Get("Signature-Input"), "sig1", sig1BInput))
 	req.Header.Set("Signature", replaceLabelMember(req.Header.Get("Signature"), "sig1", sig1BSig))
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:        agentPriv.Public().(ed25519.PublicKey),
 		"broker.relay.a": brokerPriv.Public().(ed25519.PublicKey),
 	})
@@ -412,7 +414,7 @@ func TestChain_HopBudgetRejectedThroughMiddleware(t *testing.T) {
 		t.Fatalf("append sig3: %v", err)
 	}
 
-	resolver := NewStaticResolver(map[string]ed25519.PublicKey{
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{
 		testKeyID:        priv1.Public().(ed25519.PublicKey),
 		"broker.relay.a": priv2.Public().(ed25519.PublicKey),
 		"broker.relay.b": priv3.Public().(ed25519.PublicKey),

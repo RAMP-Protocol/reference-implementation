@@ -58,7 +58,7 @@ AUTH_ISSUER="${IDENTITY_AUTH_ISSUER:-http://localhost:8083}"
 ALICE_PASSWORD="${ALICE_PASSWORD:-Alice12345!}"
 OUT_DIR="${OUT_DIR:-/bootstrap}"
 APP_NAME="ramp-identity"
-IDP_NAME="google"
+IDP_NAME="Google"
 SCOPES="openid profile email"
 ID_FILE="$OUT_DIR/identity_client_id"
 SECRET_FILE="$OUT_DIR/identity_client_secret"
@@ -347,10 +347,12 @@ JSON
 
 # find_google — id of an existing google IdP, or empty. Searched BEFORE creating:
 # Zitadel accepts a second provider under the same name, so a re-run would stack
-# duplicate buttons on the login page.
+# duplicate buttons on the login page. The match ignores case: earlier runs
+# registered the provider under a lower-case name, and an exact match would miss
+# those and create a second provider instead of renaming the one already there.
 find_google() {
     api POST /idps/templates/_search \
-        "{\"queries\":[{\"idpNameQuery\":{\"name\":\"$IDP_NAME\",\"method\":\"TEXT_QUERY_METHOD_EQUALS\"}}]}"
+        "{\"queries\":[{\"idpNameQuery\":{\"name\":\"$IDP_NAME\",\"method\":\"TEXT_QUERY_METHOD_EQUALS_IGNORE_CASE\"}}]}"
     field id
 }
 

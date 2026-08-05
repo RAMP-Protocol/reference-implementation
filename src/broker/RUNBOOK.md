@@ -2,10 +2,10 @@
 
 Operated by the Exchange Operator.
 
-**Escalation.** If §3 does not resolve it, contact Postindustria at
-`<support channel — fill in before handover>`. Send the `request_id` of a failing
-request together with the matching log lines from the Broker, the Exchange and the
-Edge. Postindustria has no access to your infrastructure, so that correlation ID is
+**Escalation.** If §3 does not resolve it, contact Postindustria over the
+existing communication channel. Send the `request_id` of a failing request
+together with the matching log lines from the Broker, the Exchange and the Edge.
+Postindustria has no access to your infrastructure, so that correlation ID is
 the only way the request can be traced.
 
 > This runbook assumes the Broker is already deployed. For installation,
@@ -28,9 +28,13 @@ discover or buy — but the publisher's site is unaffected and links already iss
 keep working.
 
 **The Exchange depends on it for withdrawn keys.** The Broker publishes the list of
-withdrawn keys; the Exchange polls it and **refuses to start** if it cannot read it.
-So the Broker must be up before the Exchange will boot, and withdrawing a key (§4.2)
-is a Broker procedure even though the Exchange enforces it.
+withdrawn keys, and the Exchange consults it before trusting any caller's key. The
+Exchange refuses to start only when it has no address configured for that document;
+with the address set but the Broker down, the Exchange stays up and instead rejects
+every signed request with `401` (it fails closed, logging
+`exchange.httpsig.broker_wellknown_unavailable`). So the Broker must be up before
+any agent can authenticate, and withdrawing a key (§4.2) is a Broker procedure even
+though the Exchange enforces it.
 
 ---
 
@@ -75,14 +79,17 @@ Broker and the Exchange — grep it in all three to trace one request end to end
 | `broker.revocation.unavailable` | ERROR | The withdrawn-keys file is unreadable or malformed. |
 | `broker.resolve.record` | ERROR | Could not write the audit row. The request itself succeeded. |
 | `broker.httpsig.reject` | WARN | Signature rejected. `outcome` says why: `signature`, `replay`, `broken_chain`, `hop_budget`. |
-| `broker.registry.absent` | WARN | No trusted-key file — every signed request will be rejected. |
+| `broker.registry.no_bootstrap` | WARN | No Exchange registry file — the Broker routes to no Exchange until one is registered. |
 | `broker.relay.key_absent` | WARN | No relay key — calls to the Exchange go unsigned and get 401. |
 | `broker.registry.set_health` | WARN | Could not **write** a health flag. Fires on a failed write, not on a health change — a health change itself logs nothing. |
 | `broker.discover` | WARN | An Exchange failed the discovery call. Field `exchange`. |
 | `broker.discover.offer_rejected` | WARN | An offer arrived but failed signature verification. Fields `exchange`, `uri`, `reason`. |
 | `broker.routing.resolve` | WARN | An Exchange is healthy but its `ramp.json` gave no endpoint. |
 | `broker.resolve.probe` | WARN | Could not read a publisher's `ramp.json`. Field `domain`. |
+| `broker.routing.lookup` | WARN | Reading a registered Exchange from the database failed with a real error (not "not registered"). Field `domain`. That Exchange is skipped for the current request. |
 | `broker.redis.ready` / `.disabled` | INFO | Whether replay protection is shared or per-process. |
+| `broker.exa.disabled` | INFO | `EXA_API_KEY` is unset. Logged once at start-up; free-text query requests will fail with `no domains for query`. |
+| `broker.exa.init_failed` | WARN | The key is set but the search client could not be built. Field `err`. The Broker starts anyway, and free-text query requests fail exactly as if the key were unset. |
 | `broker.relay.signing` | INFO | The relay key in use. `keyid` is a fingerprint, not the name you chose. |
 
 ### 2.3 Alerts
@@ -119,7 +126,7 @@ on duty, at any hour.**
 | Ed25519 PEM rejected at start-up | `openssl genpkey` writes a format the Broker does not accept | Use `BROKER_ED25519_SEED`: [`CONFIGURATION.md`](CONFIGURATION.md) §3. |
 | A withdrawn key still works | The published list is empty — file unset or missing, or `as_of` did not move forward | Fetch the revocations document (§2.1). Procedure: §4.2. |
 | Revocations route returns 500 | The withdrawn-keys file is malformed | **Urgent** — while broken the Exchange learns of no withdrawal. The `broker.revocation.unavailable` line carries the exact error. |
-| The budget cap stops nothing | It is a per-request price limit; spend is never added up | Working as designed — §6. |
+| An agent starts getting `NOT_AUTHORIZED` part-way through the month | Spend accumulates per agent per calendar month: every admitted discovery adds the winning offer's value to that agent's counter, and a request is refused once the counter has reached the request's budget limit. The counters live in Redis (or per process without Redis) and reset at the month boundary. | Working as designed — §6. |
 
 ### 3.2 Diagnostics
 
@@ -152,7 +159,7 @@ row**, so there is no database trail either. The reliable signal is the
 | `NOT_IN_CATALOG` | A publisher returned 404 for its `ramp.json` — or, as a fallback, everything routed nowhere. Check the Exchange list next. |
 | `TEMPORARILY_UNAVAILABLE` | Manifest fetches or Exchange calls failed. Correlate with `broker.resolve.probe` and `broker.discover`. |
 | `SCOPE_INSUFFICIENT` | The caller's credentials unlocked nothing. |
-| `NOT_AUTHORIZED` | The budget check refused — the cheapest single offer exceeded the cap. This path **does** write an audit row. |
+| `NOT_AUTHORIZED` | The budget check refused — the agent's accumulated spend this month has reached the request's limit, or the top-ranked offer would push it past. This path **does** write an audit row (`outcome=budget_exhausted`). |
 
 An `absence_reason` may also be passed through unchanged from the Exchange. When the
 Broker's logs are clean, the answer is in the Exchange's logs, same `request_id`.
@@ -171,14 +178,20 @@ No row means the discovery produced no offers. `outcome` is `discovered` or
 
 - **Redis-less mode is silent and per-process** — correct at one instance, unsafe
   above one, marked by a single `INFO` line.
-- **The Exchange will not boot without the Broker.** On a first deployment it
-  starts, fails and restarts over and over — a *crash-loop* — until DNS,
-  certificates and the Broker are live. Not a fault.
-- **Free-text search discovery is not implemented** — the `EXA_API_KEY` setting does
-  nothing, so do not obtain a key for it.
-- **The Broker and the Exchange read the same key file under different variable
-  names** (`BROKER_KEYS_FILE`, `RAMP_KEYS_FILE`). Deliberate — one shared list of
-  public keys. Update both, or the two disagree about who is trusted.
+- **The Exchange authenticates nobody while the Broker is down.** The Exchange
+  starts and stays up without the Broker (only the document address must be
+  configured), but it fails closed: every signed request is rejected with `401`
+  until the Broker's published documents are reachable again. Both processes look
+  healthy while nothing works.
+- **Free-text search needs `EXA_API_KEY` — and still returns no offers.** Without
+  the key, a request that carries only a free-text query fails at once with
+  `no domains for query`. With it, EXA supplies candidate publisher domains, but
+  the query itself is never forwarded to the Exchange: the Exchange receives a
+  call with no URLs, a compliant Exchange rejects that, and the agent sees
+  `TEMPORARILY_UNAVAILABLE`. Requests that name URLs work without the key.
+- **There is no shared key file.** The Broker learns an agent's public key by
+  fetching that agent's own published directory, and publishes its own keys
+  (identity and relay) in its own directory for the Exchange to fetch.
 
 ---
 
@@ -188,8 +201,8 @@ No row means the discovery produced no offers. `outcome` is `discovered` or
 
 **Restart.** Takes about ten seconds and loses nothing — *provided*
 `BROKER_ED25519_SEED` is set. Without it the restart silently changes the Broker's
-published identity and everyone who cached the old key stops recognising it. A
-stopped Broker also prevents the **Exchange** from starting (§1).
+published identity and everyone who cached the old key stops recognising it. While
+the Broker is stopped, the **Exchange** rejects every signed request (§1).
 
 **Everything needs a restart** except the withdrawn-keys file, which is re-read
 whenever it changes.
@@ -230,25 +243,32 @@ add the rest.
 
 ### 4.2 Key and identity procedures
 
-**Rotate the identity key.** Other parties cache it for up to 90 days, so this is not
-instant. Generate a new seed ([`DEPLOYMENT.md`](DEPLOYMENT.md) §5), set
-`BROKER_ED25519_SEED`, restart. Then **wait for that cache to expire** before
-assuming every other party has it — verify with the directory command in §2.1 from a
-machine that has not talked to the Broker before. Signatures made with the old key
-stop being recognised once the other parties refresh, so pick a quiet time. There is
-no live reload.
+**Rotate the identity key.** Other parties re-fetch the Broker's directory on their
+own cache schedule — on the Exchange that is `EXCHANGE_DIRECTORY_TTL`, one hour by
+default — so the change is not instant. Generate a new seed
+([`DEPLOYMENT.md`](DEPLOYMENT.md) §5), set `BROKER_ED25519_SEED`, restart. Then
+**wait for those caches to refresh** before assuming every other party has the new
+key — verify with the directory command in §2.1 from a machine that has not talked
+to the Broker before. Signatures made with the old key stop being recognised once
+the other parties refresh, so pick a quiet time. There is no live reload. Separately,
+every published key carries a 90-day validity window, so a key that is never
+rotated or re-published stops verifying on its own after that window.
 
 **Rotate the relay key.**
 
-1. `BROKER_RELAY_KID=broker.example.v2 scripts/gen-broker-relay-key.sh` — the
-   public half is appended to `keys.json`, the old entry stays.
-2. Give the updated `keys.json` to the Exchange operator and **confirm it is loaded
-   before you switch**, or your calls start failing with `401`.
-3. Point `BROKER_RELAY_KEY_FILE` at the new private key and restart.
-4. Check `docker compose logs broker | grep relay.signing` — the `keyid` must be the
-   new one — then run one real agent request.
-5. Once traffic is confirmed, remove the old entry from `keys.json` and have the
-   Exchange operator reload.
+1. `BROKER_RELAY_ROTATE=1 BROKER_RELAY_KID=broker.example.v2
+   scripts/gen-broker-relay-key.sh` — replaces the private keypair file.
+   Without `BROKER_RELAY_ROTATE=1` the script keeps an existing file and
+   changes nothing — a plain re-run must never rotate the live identity.
+2. Point `BROKER_RELAY_KEY_FILE` at the new private key and restart. The Broker
+   publishes the new public key in its own directory at start-up; the Exchange
+   picks it up from there on its next directory fetch — there is no file to
+   hand over.
+3. Check `docker compose logs broker | grep relay.signing` — the `keyid` must be
+   the new one — then run one real agent request. If the first request after the
+   switch fails with `401`, the Exchange is still serving its cached copy of
+   your directory; it refreshes within its directory cache lifetime
+   (`EXCHANGE_DIRECTORY_TTL` on the Exchange side).
 
 **Withdraw a key immediately.** Rotation is the planned path; withdrawal is the
 emergency one. It takes effect **without restarting either service**. There is no
@@ -352,10 +372,17 @@ PostgreSQL and Redis are covered by their own operating guides.
 - **Withdrawing a key means editing a file by hand** — no tool, and no validation
   until after you save, so a typo stops the withdrawn-keys route from working until
   it is fixed.
-- **Agent budget counters are never written**, so the monthly cap is really a
-  per-request price limit. Deliberate: the Exchange is the only component that
-  charges money, and recording spend here too would double-count.
+- **The budget cap is a discovery-side guard, not a billing record.** Every admitted
+  discovery adds the winning offer's value to the agent's counter for the current
+  calendar month (in Redis, or per process without Redis), and later discoveries
+  are refused once that counter reaches the request's limit. The counter is never
+  shown to the agent, and the Exchange remains the only component that charges
+  money — this guard bounds brokered offer value, it does not bill.
 - **No rate-limit information is returned to agents.**
-- **Discovery is always reported as coming from an Exchange** — the only discovery
-  path that is implemented.
-- **Free-text search discovery is not implemented.**
+- **The reported discovery method depends on the path.** Offers for requests that
+  name URLs are reported as `EXCHANGE`; offers for free-text query requests are
+  reported as `SEARCH`. On the relay surface the Broker passes through whatever
+  method the queried Exchange stated.
+- **Free-text search discovery is incomplete.** With `EXA_API_KEY` set, EXA supplies
+  candidate publisher domains, but the query is never forwarded to the Exchange, so
+  a compliant Exchange returns no offers for a free-text request (§3.3).

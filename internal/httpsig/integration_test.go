@@ -56,7 +56,7 @@ func TestIntegration_ExchangeRejectsUnsigned(t *testing.T) {
 	if tperr != nil {
 		t.Fatalf("thumbprint: %v", tperr)
 	}
-	resolver := httpsig.NewStaticResolver(map[string]ed25519.PublicKey{tp: pub})
+	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{tp: pub})
 	replay := httpsig.NewRedisReplayStore(redisCli, "httpsig:integ:replay:")
 
 	handler := httpsig.Middleware(resolver, replay, httpsig.InterceptorOptions{}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

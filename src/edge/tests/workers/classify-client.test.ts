@@ -32,6 +32,15 @@ describe('classifyClient', () => {
     expect(classifyClient(ua)).toBe(expected);
   });
 
+  it.each(['python-httpx/0.28.1', 'python-httpx/0.27.0'])('lets %s through as human', (ua) => {
+    // The E2E harness drives every edge with httpx, which sends this UA. If a
+    // deny pattern ever matched it — /python/i is the obvious candidate — the
+    // whole harness would start getting 403s on requests that were never about
+    // bots, and the failures would look like broken signing rather than a
+    // classification change. Pinned so that change fails here first.
+    expect(classifyClient(ua)).toBe('human');
+  });
+
   it('classifies a normal browser as human', () => {
     const ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15';
     expect(classifyClient(ua)).toBe('human');

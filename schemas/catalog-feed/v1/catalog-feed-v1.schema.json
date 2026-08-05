@@ -1,0 +1,501 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ramp-protocol.org/schemas/catalog-feed/v1/catalog-feed-v1.schema.json",
+  "title": "RAMP catalog feed v1 — one feed line",
+  "description": "JSON Schema (Draft 2020-12) for ONE LINE of a RAMP catalog feed. A feed is a JSON-Lines file: one resource per line, and the file as a whole is not a JSON document, so this schema is applied per line rather than to the file. It describes the line shape the reference ingester accepts — the union of what the parser decodes and what the mapper then validates — plus the per-line shape rules protovalidate applies at the CatalogService.PushResources boundary. Registry membership (function / user-type / geography / metering / quota tokens) and every stateful server gate are deliberately outside this schema; see the sidecar README. The parser is authoritative: this schema is a derived view and no automated check currently holds the two together.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "domain",
+    "path"
+  ],
+  "properties": {
+    "domain": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Publisher domain. The Exchange derives the owning tenant from this value via the UNIQUE tenants.domain mapping; a caller-supplied tenant_id that disagrees is rejected, never honored.",
+      "examples": [
+        "publisher.example"
+      ]
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Resource path, including the leading slash. The catalog URI is scheme://domain+path.",
+      "examples": [
+        "/article/how-photosynthesis-works"
+      ]
+    },
+    "title": {
+      "type": "string",
+      "description": "Human-readable title. Surfaces on the offer."
+    },
+    "license": {
+      "$ref": "#/$defs/License",
+      "description": "The governing license document shared by every term on this line."
+    },
+    "terms": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/Term"
+      },
+      "description": "Declared licensing offers. Each element becomes one ramp.v1.LicenseTerm. A line carrying no terms is ACCEPTED and stored, but produces no offer at discovery. More than 32 terms rejects the entry with reason too_many_terms."
+    },
+    "content_id": {
+      "type": "string",
+      "description": "Stable publisher-side identifier. When present it is the upsert key, so two lines sharing a content_id collapse to one catalog row (last write wins). When absent the URI is the key."
+    },
+    "word_count": {
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647,
+      "description": "Word count. Carried as ResourceEntry audit metadata; never an input to term or price selection."
+    },
+    "estimated_quantity": {
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647,
+      "description": "Estimated quantity in the metering unit. For text this is roughly word_count * 1.32."
+    },
+    "content_hash": {
+      "type": "string",
+      "description": "Digest of the resource body. Surfaces as Offer.identity.content_hash. No format constraint is applied — it is pass-through metadata."
+    },
+    "hash_method": {
+      "type": "string",
+      "description": "Algorithm that produced content_hash. Surfaces as Offer.identity.hash_method."
+    },
+    "source": {
+      "type": "string",
+      "description": "How the entry was discovered, as the FULL uppercase proto enum name. CASE-SENSITIVE — unlike the term-level enums, this one is matched exactly, so a lowercase spelling is rejected. The UNSPECIFIED sentinel is rejected too.",
+      "enum": [
+        "INGESTION_SOURCE_RAMP_SITEMAP",
+        "INGESTION_SOURCE_RSL",
+        "INGESTION_SOURCE_SITEMAP",
+        "INGESTION_SOURCE_HTML_CRAWL",
+        "INGESTION_SOURCE_CMS_API",
+        "INGESTION_SOURCE_MANUAL",
+        "INGESTION_SOURCE_CATALOG_API"
+      ]
+    },
+    "provenance_source": {
+      "type": "string",
+      "description": "Free-text origin of the metadata, e.g. a CMS plugin or an upstream aggregator."
+    },
+    "provenance_timestamp": {
+      "$ref": "#/$defs/Rfc3339Timestamp",
+      "description": "When the metadata was collected. Surfaces as Offer.data_as_of. Parsed with Go's strict RFC3339, so the 'T' separator and a 'Z' or numeric offset are both required."
+    },
+    "resource_mutability": {
+      "type": "string",
+      "description": "How volatile the resource is, as the FULL uppercase proto enum name. CASE-SENSITIVE — matched exactly, so a lowercase spelling is rejected. The UNSPECIFIED sentinel is rejected too. Omitting the field defaults the offer to RESOURCE_MUTABILITY_STATIC. This is a typed top-level field: a value placed in ext is NOT read.",
+      "enum": [
+        "RESOURCE_MUTABILITY_STATIC",
+        "RESOURCE_MUTABILITY_DYNAMIC",
+        "RESOURCE_MUTABILITY_LIVE"
+      ]
+    },
+    "ext": {
+      "type": "object",
+      "description": "Open extension object, carried verbatim onto Offer.ext. MUST be a JSON object; a string, array or number fails the line. Previews ride here under the 'previews' key — ResourceEntry has no typed previews field."
+    },
+    "ext_critical": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Names of ext keys a consumer MUST understand to use the offer safely."
+    },
+    "attestations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Attestation"
+      },
+      "description": "Third-party or self attestations about the resource. Carried through opaquely — the ingester verifies no signature."
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "A REFERENCE_ONLY term delegates to its license document, so that document must be identified. protovalidate CEL licenseterm.reference_only.requires_license_uri.",
+      "if": {
+        "required": [
+          "terms"
+        ],
+        "properties": {
+          "terms": {
+            "type": "array",
+            "contains": {
+              "type": "object",
+              "required": [
+                "semantics"
+              ],
+              "properties": {
+                "semantics": {
+                  "pattern": "^[Rr][Ee][Ff][Ee][Rr][Ee][Nn][Cc][Ee]_[Oo][Nn][Ll][Yy]$"
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "license"
+        ],
+        "properties": {
+          "license": {
+            "required": [
+              "uri"
+            ],
+            "properties": {
+              "uri": {
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Rfc3339Timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$",
+      "description": "RFC3339 date-time. Expressed as a pattern rather than \"format\": \"date-time\" because most validators treat format as an annotation unless assertions are switched on, so a format rule can silently never fire."
+    },
+    "License": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The governing license document. Shared by every term on the line.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Stable short identifier — an SPDX short-id such as \"CC-BY-4.0\", or a publisher catalog doc-id."
+        },
+        "uri": {
+          "type": "string",
+          "description": "Canonical identity of the license document (RFC 3986). Not URL-validated: non-URL schemes are legitimate."
+        },
+        "uri_digest": {
+          "type": "string",
+          "pattern": "^(sha256:[0-9a-f]{64}|sha384:[0-9a-f]{96}|sha512:[0-9a-f]{128})?$",
+          "description": "Digest of the document at uri, in method:hexdigest form. Only sha256, sha384 and sha512 are accepted — a forgeable digest would defeat the document-swap protection this field exists for."
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable license name."
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "Without a pinned digest the referenced document can be swapped after the offer is signed. protovalidate CEL license.digest_required_with_uri.",
+          "if": {
+            "required": [
+              "uri"
+            ],
+            "properties": {
+              "uri": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "uri_digest"
+            ],
+            "properties": {
+              "uri_digest": {
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Term": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantics",
+        "pricing"
+      ],
+      "description": "One declared licensing offer, mapping 1:1 to a ramp.v1.LicenseTerm.",
+      "properties": {
+        "semantics": {
+          "type": "string",
+          "pattern": "^(?:[Ee][Nn][Uu][Mm][Ee][Rr][Aa][Tt][Ee][Dd]|[Rr][Ee][Ff][Ee][Rr][Ee][Nn][Cc][Ee]_[Oo][Nn][Ll][Yy])$",
+          "$comment": "Case-insensitive: the mapper lowercases before matching, so \"ENUMERATED\" and \"Enumerated\" are both accepted. Written as character classes because ECMA-262 patterns have no inline (?i) flag. Surrounding whitespace is also tolerated by the mapper but is not permitted here — it is a feed defect worth surfacing, and it never changes meaning.",
+          "description": "enumerated — the machine fields below are authoritative. reference_only — the license document is authoritative and the machine fields, if present, are an advisory readable summary of it. Matched case-insensitively; lowercase is the canonical spelling."
+        },
+        "functions": {
+          "$ref": "#/$defs/TokenList",
+          "description": "Permitted function tokens, e.g. ai-input, ai-train, ai-index, search. Training, inference and retrieval are distinguished here, not by a separate field."
+        },
+        "prohibited_functions": {
+          "$ref": "#/$defs/TokenList",
+          "description": "Prohibited function tokens. Must not intersect functions."
+        },
+        "user_types": {
+          "$ref": "#/$defs/TokenList",
+          "description": "Permitted user-type tokens, e.g. academic, commercial_entity."
+        },
+        "geos": {
+          "$ref": "#/$defs/TokenList",
+          "description": "Permitted geography tokens: ISO 3166-1 alpha-2 codes, or one of the specials *, EU, EEA."
+        },
+        "pricing": {
+          "$ref": "#/$defs/Pricing",
+          "description": "Required on every term. An absent pricing block is not the same as free."
+        },
+        "quotas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Quota"
+          },
+          "description": "Usage caps. These are not billing quantities."
+        },
+        "obligations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Obligation"
+          },
+          "description": "Post-use behavioral requirements such as attribution."
+        },
+        "scopes": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string"
+          },
+          "description": "Delegation scopes a requester must cover to see this term, e.g. \"subscription:premium\". Scopes are the ONLY input to term selection; metadata never affects which term or price is chosen."
+        }
+      }
+    },
+    "TokenList": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9._:*-]+$"
+      },
+      "$comment": "Per-token length and character rules mirror the proto constraints on Restriction.permitted/prohibited: min_len 1, max_len 64, pattern ^[A-Za-z0-9._:*-]+$. A token carrying a space or an accent passes JSON but is refused at the RPC boundary, so checking it here moves the failure back to the publisher's own validation run. Registry MEMBERSHIP is deliberately not checked -- see the README."
+    },
+    "Pricing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model"
+      ],
+      "description": "The term's charging declaration.",
+      "properties": {
+        "model": {
+          "type": "string",
+          "pattern": "^(?:[Ff][Rr][Ee][Ee]|[Pp][Ee][Rr]_[Uu][Nn][Ii][Tt]|[Ff][Ll][Aa][Tt])$",
+          "$comment": "Case-insensitive, like semantics. The cross-field conditionals below match case-insensitively too — a lowercase-only const there would let \"FREE\" skip its own zero-rate rule, which is a check that silently never fires.",
+          "description": "The charging structure: free, per_unit or flat. Deliberately closed and small. A subscription is not a model — it is model free plus scopes. Matched case-insensitively; lowercase is the canonical spelling."
+        },
+        "rate": {
+          "type": "string",
+          "pattern": "^([0-9]+([.][0-9]+)?)?$",
+          "maxLength": 32,
+          "description": "Price as an exact decimal STRING, never a JSON number: 0.02 fails, \"0.02\" passes. No sign, no exponent, no leading dot. Insignificant trailing zeros are stripped on ingest, so \"0.050\" is stored as \"0.05\"."
+        },
+        "unit": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^([a-z0-9-]+|[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)?$",
+          "description": "Metering basis for per_unit pricing, e.g. accesses, tokens, fetches. A bare token must be registered; a vendor:token value is a deliberate custom unit and is not membership-checked. Ignored for free and flat."
+        },
+        "currency": {
+          "type": "string",
+          "description": "ISO 4217 currency code, e.g. \"EUR\"."
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "free requires a zero rate. An omitted rate means zero; a declared rate must literally be zero.",
+          "if": {
+            "required": [
+              "model"
+            ],
+            "properties": {
+              "model": {
+                "pattern": "^[Ff][Rr][Ee][Ee]$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "rate": {
+                "pattern": "^(0+([.]0+)?)?$"
+              }
+            }
+          }
+        },
+        {
+          "$comment": "per_unit requires both a unit and an explicit non-empty rate.",
+          "if": {
+            "required": [
+              "model"
+            ],
+            "properties": {
+              "model": {
+                "pattern": "^[Pp][Ee][Rr]_[Uu][Nn][Ii][Tt]$"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "unit",
+              "rate"
+            ],
+            "properties": {
+              "unit": {
+                "minLength": 1
+              },
+              "rate": {
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "$comment": "flat requires an explicit non-empty rate.",
+          "if": {
+            "required": [
+              "model"
+            ],
+            "properties": {
+              "model": {
+                "pattern": "^[Ff][Ll][Aa][Tt]$"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "rate"
+            ],
+            "properties": {
+              "rate": {
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Quota": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "limit",
+        "window"
+      ],
+      "description": "A usage cap over a time window.",
+      "properties": {
+        "metric": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^([a-z0-9-]+|[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)$",
+          "description": "What is being counted, e.g. accesses, tokens, impressions. A bare token must be registered; a vendor:token value is a deliberate custom metric."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum allowed value in the window. A limit of zero would grant nothing, so it is rejected."
+        },
+        "window": {
+          "type": "string",
+          "pattern": "^(?:[Hh][Oo][Uu][Rr][Ll][Yy]|[Dd][Aa][Ii][Ll][Yy]|[Mm][Oo][Nn][Tt][Hh][Ll][Yy]|[Tt][Oo][Tt][Aa][Ll])$",
+          "description": "The window the limit accumulates over: hourly, daily, monthly or total. Matched case-insensitively; lowercase is the canonical spelling."
+        }
+      }
+    },
+    "Obligation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "trigger"
+      ],
+      "description": "A behavioral requirement the agent takes on by accepting the term.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "pattern": "^(?:[Aa][Tt][Tt][Rr][Ii][Bb][Uu][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Rr][Ii][Bb][Uu][Tt][Ii][Oo][Nn]|[Ss][Hh][Aa][Rr][Ee]_[Aa][Ll][Ii][Kk][Ee]|[Nn][Ee][Tt][Ww][Oo][Rr][Kk]_[Cc][Oo][Pp][Yy][Ll][Ee][Ff][Tt]|[Nn][Oo][Tt][Ii][Cc][Ee]|[Oo][Tt][Hh][Ee][Rr])$",
+          "description": "What the agent must do: attribution, contribution, share_alike, network_copyleft, notice or other. Matched case-insensitively; lowercase is the canonical spelling."
+        },
+        "trigger": {
+          "type": "string",
+          "pattern": "^(?:[Oo][Nn]_[Uu][Ss][Ee]|[Oo][Nn]_[Dd][Ii][Ss][Tt][Rr][Ii][Bb][Uu][Tt][Ii][Oo][Nn]|[Oo][Nn]_[Nn][Ee][Tt][Ww][Oo][Rr][Kk]_[Ss][Ee][Rr][Vv][Ii][Cc][Ee]|[Oo][Nn]_[Dd][Ee][Rr][Ii][Vv][Aa][Tt][Ii][Vv][Ee])$",
+          "description": "When the obligation applies: on_use, on_distribution, on_network_service or on_derivative. Required — an empty or omitted trigger fails the line. Matched case-insensitively; lowercase is the canonical spelling."
+        },
+        "scope_license": {
+          "type": "string",
+          "minLength": 1,
+          "description": "SPDX short-id of the license a derivative must carry. Required by share_alike."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Human-readable specifics, e.g. the wording of an attribution credit."
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "A share_alike obligation must name the license a derivative has to carry, otherwise it states an obligation nobody can satisfy. Mirrors protovalidate CEL obligation.share_alike.requires_scope_license.",
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "pattern": "^[Ss][Hh][Aa][Rr][Ee]_[Aa][Ll][Ii][Kk][Ee]$"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "scope_license"
+            ]
+          }
+        }
+      ]
+    },
+    "Attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A signed claim about the resource, from the publisher itself or a third party. The ingester carries it through without verifying the signature.",
+      "properties": {
+        "verifier": {
+          "type": "string",
+          "description": "Domain of the attesting party."
+        },
+        "kid": {
+          "type": "string",
+          "description": "Key identifier — an RFC 7638 JWK thumbprint."
+        },
+        "attested_at": {
+          "$ref": "#/$defs/Rfc3339Timestamp",
+          "description": "When the attestation was made."
+        },
+        "uri": {
+          "type": "string",
+          "description": "The resource the claims are about."
+        },
+        "claims": {
+          "type": "object",
+          "description": "The asserted facts, e.g. word_count, language, iab_categories. MUST be a JSON object; a string, array or number fails the line."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Ed25519 signature over the other fields."
+        }
+      }
+    }
+  }
+}

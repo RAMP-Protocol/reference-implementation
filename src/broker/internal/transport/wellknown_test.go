@@ -5,33 +5,42 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/server"
 	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/signing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport/transporttest"
 )
 
 // brokerDiscovery builds a broker well-known handler pair (keyless manifest +
-// WBA directory) for keys + revURL, serves both routes over httptest, and
-// returns the server plus the relay signer's public key so callers can assert
-// on thumbprints. The relay signer is freshly generated per call.
-func brokerDiscovery(t *testing.T, keys *transport.KeyRegistry, revURL string) (*httptest.Server, ed25519.PublicKey) {
+// WBA directory) for keys + revURL on clk (nil → system clock), serves both
+// routes over httptest, and returns the server, the co-signing IDENTITY key's
+// public half so callers can assert on thumbprints, and the handler pair so
+// callers can drive the periodic refresher. The identity signer is freshly
+// generated per call; the RELAY key, when a test needs one, goes into keys —
+// the registry the served directory publishes alongside the identity key.
+func brokerDiscovery(t *testing.T, clk clock.Clock, keys *transport.KeyRegistry, revURL string,
+) (*httptest.Server, ed25519.PublicKey, server.Handlers) {
 	t.Helper()
-	relayPub, relayPriv, err := ed25519.GenerateKey(rand.Reader)
+	identityPub, identityPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("relay keygen: %v", err)
+		t.Fatalf("identity keygen: %v", err)
 	}
-	signer, err := signing.NewCoSigner("broker.example", "broker-1", relayPriv, nil)
+	signer, err := signing.NewCoSigner("broker.example", "broker-1", identityPriv, clk)
 	if err != nil {
 		t.Fatalf("cosigner: %v", err)
 	}
@@ -45,7 +54,26 @@ func brokerDiscovery(t *testing.T, keys *transport.KeyRegistry, revURL string) (
 	h.RegisterRoutes(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, relayPub
+	return srv, identityPub, h
+}
+
+// keyWindow extracts one key's parsed validity window from a served WBA
+// directory, failing the test on an absent thumbprint or a malformed bound.
+func keyWindow(t *testing.T, f *rampv1.WBAFile, tp string) (time.Time, time.Time) {
+	t.Helper()
+	k, ok := rampwellknown.KeyByThumbprint(f, tp)
+	if !ok {
+		t.Fatalf("WBA directory missing thumbprint %q", tp)
+	}
+	nb, err := time.Parse(time.RFC3339, k.GetNotBefore())
+	if err != nil {
+		t.Fatalf("not_before %q: %v", k.GetNotBefore(), err)
+	}
+	na, err := time.Parse(time.RFC3339, k.GetNotAfter())
+	if err != nil {
+		t.Fatalf("not_after %q: %v", k.GetNotAfter(), err)
+	}
+	return nb, na
 }
 
 func getBody(t *testing.T, url string) []byte {
@@ -65,17 +93,17 @@ func getBody(t *testing.T, url string) []byte {
 
 // TestWellKnownHandler_ServesBrokerDiscovery asserts the Broker serves a
 // schema-valid keyless role=ROLE_BROKER overlay manifest AND a WBA directory
-// carrying both the relay key and every key folded in from the agent registry.
+// carrying both the co-signing identity key and every own-key-registry key
+// (the relay key).
 func TestWellKnownHandler_ServesBrokerDiscovery(t *testing.T) {
 	t.Parallel()
-	reg := transport.NewKeyRegistry()
-	agentPub, _, err := ed25519.GenerateKey(rand.Reader)
+	relayPub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("agent keygen: %v", err)
+		t.Fatalf("relay keygen: %v", err)
 	}
-	reg.PutPublicKey(agentPub)
+	reg := transporttest.MustRegistry(t, relayPub)
 
-	srv, relayPub := brokerDiscovery(t, reg, "")
+	srv, identityPub, _ := brokerDiscovery(t, nil, reg, "")
 
 	m, err := rampwellknown.ParseManifest(getBody(t, srv.URL+rampwellknown.Path), rampwellknown.RoleBroker)
 	if err != nil {
@@ -89,7 +117,7 @@ func TestWellKnownHandler_ServesBrokerDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("served WBA directory invalid: %v", err)
 	}
-	for _, tp := range []string{rwtestutil.MustThumbprint(t, relayPub), rwtestutil.MustThumbprint(t, agentPub)} {
+	for _, tp := range []string{rwtestutil.MustThumbprint(t, identityPub), rwtestutil.MustThumbprint(t, relayPub)} {
 		if _, ok := rampwellknown.KeyByThumbprint(f, tp); !ok {
 			t.Errorf("WBA directory missing expected thumbprint %q", tp)
 		}
@@ -100,13 +128,105 @@ func TestWellKnownHandler_ServesBrokerDiscovery(t *testing.T) {
 	}
 }
 
+// TestWellKnownHandler_KeysCarryBoundedWindows asserts every key in the served
+// WBA directory carries a bounded validity window anchored to the signer clock
+// at document build — exactly [now - 1h, now + 90 days) for the identity key
+// and the registry key alike. The one-hour backdate is the clock-skew
+// allowance: a verifier slightly behind the Broker's clock must accept a
+// just-built document. This is the guard against a placeholder window
+// (2020→2099 or similar) returning: with no static key file anywhere, the
+// published window is the only automatic expiry a verifier gets on a
+// rotated-out relay key it still holds in a stale cached directory.
+func TestWellKnownHandler_KeysCarryBoundedWindows(t *testing.T) {
+	t.Parallel()
+	const (
+		lifetime = 90 * 24 * time.Hour
+		skew     = time.Hour
+	)
+	buildTime := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewDeterministic(buildTime)
+
+	relayPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("relay keygen: %v", err)
+	}
+	reg := transporttest.MustRegistry(t, relayPub)
+
+	srv, identityPub, _ := brokerDiscovery(t, clk, reg, "")
+	f, err := rampwellknown.ParseWBA(getBody(t, srv.URL+rampwellknown.WBAPath))
+	if err != nil {
+		t.Fatalf("served WBA directory invalid: %v", err)
+	}
+
+	for name, tp := range map[string]string{
+		"identity": rwtestutil.MustThumbprint(t, identityPub),
+		"relay":    rwtestutil.MustThumbprint(t, relayPub),
+	} {
+		nb, na := keyWindow(t, f, tp)
+		if !nb.Equal(buildTime.Add(-skew)) || !na.Equal(buildTime.Add(lifetime)) {
+			t.Errorf("%s key window = [%s, %s), want [%s, %s)",
+				name, nb, na, buildTime.Add(-skew), buildTime.Add(lifetime))
+		}
+	}
+}
+
+// TestWellKnownHandler_RefresherKeepsWindowsFresh is the regression guard for
+// the frozen-directory defect: the served WBA document is marshaled at build
+// and the windows inside it come from the clock at that moment, so a process
+// that never rebuilds eventually serves only lapsed windows while staying
+// healthy — every relayed request then fails signature verification until a
+// restart. The test builds the directory on a deterministic clock, advances
+// the clock most of the way through the 90-day lifetime, runs the production
+// refresher, and asserts THROUGH THE SERVED ROUTE that the published window
+// re-anchors to the advanced clock. If the refresher stops rebuilding, or a
+// rebuild stops re-reading the clock, the poll below times out.
+func TestWellKnownHandler_RefresherKeepsWindowsFresh(t *testing.T) {
+	t.Parallel()
+	buildTime := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewDeterministic(buildTime)
+	srv, identityPub, h := brokerDiscovery(t, clk, transporttest.MustRegistry(t), "")
+	tp := rwtestutil.MustThumbprint(t, identityPub)
+
+	f, err := rampwellknown.ParseWBA(getBody(t, srv.URL+rampwellknown.WBAPath))
+	if err != nil {
+		t.Fatalf("served WBA directory invalid: %v", err)
+	}
+	if nb, _ := keyWindow(t, f, tp); !nb.Equal(buildTime.Add(-time.Hour)) {
+		t.Fatalf("initial not_before = %s, want %s (build time minus the clock-skew allowance)", nb, buildTime.Add(-time.Hour))
+	}
+
+	advanced := buildTime.Add(60 * 24 * time.Hour)
+	clk.SetNow(advanced)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.RunRefresher(ctx, time.Millisecond, slog.New(slog.DiscardHandler))
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		f, err := rampwellknown.ParseWBA(getBody(t, srv.URL+rampwellknown.WBAPath))
+		if err != nil {
+			t.Fatalf("served WBA directory invalid: %v", err)
+		}
+		if nb, na := keyWindow(t, f, tp); nb.Equal(advanced.Add(-time.Hour)) {
+			if want := advanced.Add(90 * 24 * time.Hour); !na.Equal(want) {
+				t.Fatalf("refreshed not_after = %s, want %s", na, want)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("served window never re-anchored to the advanced clock: the refresher is not rebuilding the document")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestWellKnownHandler_AdvertisesRevocationURL asserts a configured revocation
 // URL is published in the WBA directory so verifiers learn where to poll the
 // Broker's KeyRevocationList.
 func TestWellKnownHandler_AdvertisesRevocationURL(t *testing.T) {
 	t.Parallel()
 	const revURL = "https://broker.example/.well-known/ramp-key-revocations.json"
-	srv, _ := brokerDiscovery(t, transport.NewKeyRegistry(), revURL)
+	srv, _, _ := brokerDiscovery(t, nil, transporttest.MustRegistry(t), revURL)
 	f, err := rampwellknown.ParseWBA(getBody(t, srv.URL+rampwellknown.WBAPath))
 	if err != nil {
 		t.Fatalf("served WBA directory invalid: %v", err)

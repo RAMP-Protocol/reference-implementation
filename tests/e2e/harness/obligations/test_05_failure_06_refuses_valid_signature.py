@@ -13,10 +13,10 @@ signature from a registered ``kid`` whose ``created``/``expires``
 window is current and whose ``Content-Digest`` matches the body.
 
 The test signs a ``DiscoverResources`` POST with the registered
-catalog-contributor keypair (a kid that IS in the resolver's static
-map by virtue of the catalog-bootstrap path) and asserts the
-response is NOT a Connect-Unauthenticated 401 carrying any of the
-known httpsig refusal tokens.
+catalog-contributor keypair (a kid whose key its own well-known host
+serves, so the verifier resolves it via per-agent discovery) and
+asserts the response is NOT a Connect-Unauthenticated 401 carrying
+any of the known httpsig refusal tokens.
 
 A 401 with one of those tokens against a request the obligation
 considers valid would be the precise defect this guard catches.
