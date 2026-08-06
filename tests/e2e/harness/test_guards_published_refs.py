@@ -13,15 +13,21 @@ The same shape had already cost the publish tool two broken gates, one of which
 returned success at the exact moment it found a stray file.
 
 A guard that can go blind needs a test that watches it, and this is that test.
-The four cases below are one per failure mode the gate has to survive:
+The four outcomes it has to get right, each driven by one or more cases below:
 
     clean tree           -> PASS          (it does not cry wolf)
     planted violation    -> FAIL          (it can still see)
     missing search root  -> FAIL loudly   (it refuses to guess)
     waiver on the line   -> PASS          (the documented escape hatch works)
 
-The third is the one that matters. The other three could all pass while the gate
-scanned an empty tree.
+The third row is the one that matters, and the reason is narrower than it looks:
+none of the other three ever removes a search root, so the gate could be blind to
+a missing one and every case in those rows would still pass. Only the third
+builds the tree that makes the blindness visible.
+
+The planted-violation row carries several cases, because the gate has more than
+one pattern family and more than one search root, and a case is added whenever
+either set grows.
 
 Unlike its sibling guards, the subject here is a shell script rather than Python
 source, so there is no pure detector function to feed inline snippets to. The
@@ -43,6 +49,7 @@ from pathlib import Path
 
 from .conftest import REPO_ROOT
 from .guard_harness import guard_marks, run_gate
+from .published_paths import first_entry as _first_entry
 from .published_paths import shared_array as _shared_array
 
 # REPO_ROOT rather than a parents[N] walk: inside the runner container the
@@ -81,14 +88,20 @@ _WAIVED_VIOLATION = (
 # A doc the publish tool puts ON the public tree even though this repo does not
 # build it. Citing one is resolvable and must NOT be rejected.
 _INHERITED_CITATION = "# the deployment walkthrough is in docs/HANDOFF-aws-demo.md\n"
+# There is deliberately NO constant here for the doc the publish stages out of
+# this tree, unlike the inherited one above. The two cases that need it read it
+# from the shared definition inside their own bodies, and both halves of that
+# matter: transcribing the name would keep the cases passing after the entry had
+# been renamed, and reading it at module scope would fail at import wherever
+# scripts/ is absent, which pytest answers by aborting the whole session.
 
 
 def _build_tree(root: Path) -> None:
     """Materialise the minimum tree the gate considers a complete search set.
 
-    Every directory, root file and allowlisted script named by the shared
-    definition has to exist, because a missing one is itself a failure the gate
-    reports — that is the behaviour the missing-root case asserts.
+    Every directory, docs/ file, root file and allowlisted script named by the
+    shared definition has to exist, because a missing one is itself a failure the
+    gate reports — that is the behaviour the missing-root case asserts.
 
     The unpublished doc is not decoration. The gate derives the bare-basename
     half of its pattern set from whatever ``docs/*.md`` exists outside
@@ -98,6 +111,9 @@ def _build_tree(root: Path) -> None:
     """
     for directory in _shared_array("ALLOW_DIRS"):
         (root / directory).mkdir(parents=True, exist_ok=True)
+    for doc in _shared_array("ALLOW_DOC_FILES"):
+        (root / doc).parent.mkdir(parents=True, exist_ok=True)
+        (root / doc).touch()
     for name in _shared_array("ALLOW_ROOT_FILES"):
         (root / name).touch()
     for script in _shared_array("ALLOW_SCRIPTS"):
@@ -198,6 +214,43 @@ def test_gate_accepts_a_citation_of_an_inherited_doc(tmp_path: Path) -> None:
     proc = _run_gate(tmp_path)
 
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+
+def test_gate_accepts_a_citation_of_an_allowlisted_doc(tmp_path: Path) -> None:
+    """A docs/ file the publish stages out of this tree is resolvable too.
+
+    The basename derivation sweeps in every ``docs/*.md`` outside
+    ``docs/architecture``, and an ALLOW_DOC_FILES entry is one of them — it lives
+    here and travels, unlike the design notes around it. Subtracting that array
+    as well as the inherited one is what keeps citing it legal. Without this case
+    the ALLOW_DOC_FILES half of the subtraction can be deleted and the suite
+    still passes, because the inherited case covers only the other half.
+    """
+    _build_tree(tmp_path)
+    allowlisted_doc = _first_entry("ALLOW_DOC_FILES")
+    (tmp_path / "docker-compose.yml").write_text(f"# the operator guide is in {allowlisted_doc}\n")
+
+    proc = _run_gate(tmp_path)
+
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+
+def test_gate_scans_allowlisted_docs(tmp_path: Path) -> None:
+    """A violation inside a published docs/ file is caught.
+
+    Those files travel, so they are search roots like any published script. A
+    docs/ entry that was published but never scanned would carry pointers into
+    the design notes it was extracted from, which is the likeliest way one of
+    these documents goes wrong.
+    """
+    _build_tree(tmp_path)
+    allowlisted_doc = _first_entry("ALLOW_DOC_FILES")
+    (tmp_path / allowlisted_doc).write_text(_FULL_PATH_VIOLATION)
+
+    proc = _run_gate(tmp_path)
+
+    assert proc.returncode == 1, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert f"{allowlisted_doc}:1:" in proc.stdout, proc.stdout
 
 
 def test_gate_flags_a_reference_to_the_conventions_file(tmp_path: Path) -> None:

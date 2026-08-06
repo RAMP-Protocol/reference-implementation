@@ -51,9 +51,10 @@ both processes look healthy.
 | Python 3 (to generate keys in §5) | — | `python3 --version` |
 
 **Check your TLS arrangement now, before anything else.** Read
-[`CONFIGURATION.md`](CONFIGURATION.md) §4. The Broker cannot sit behind a proxy that
-accepts HTTPS and forwards plain HTTP — every signed request would fail. If that is
-your plan, sort it out before deploying.
+[`CONFIGURATION.md`](CONFIGURATION.md) §4. Behind a proxy that accepts HTTPS and
+forwards plain HTTP, the Broker needs `RAMP_TRUST_PROXY_HEADERS=true` — without
+it, every signed request fails. Never set the flag on a directly exposed service.
+Decide which case yours is before deploying.
 
 ---
 

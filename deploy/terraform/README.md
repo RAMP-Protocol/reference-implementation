@@ -3,7 +3,7 @@
 Everything needed to run the full RAMP stack on AWS for staging, plus the one
 piece a publisher applies themselves: the Cloudflare edge worker module.
 
-Two ways to use this package:
+Three ways to use this package:
 
 1. **All-inclusive staging** (`stacks/staging-aws`) — one EC2 VM runs the
    whole stack with Docker Compose (Postgres, Redis, TigerBeetle, Exchange,
@@ -11,7 +11,12 @@ Two ways to use this package:
    for TLS, and a demo publisher origin). Cloudflare provides DNS and runs the
    edge worker in front of the demo publisher hostname. This is what we use to
    test the complete flow before handing anything to a publisher.
-2. **Standalone edge** (`stacks/edge`) — ONLY the Cloudflare edge worker,
+2. **All-AWS demo** (`stacks/demo-aws`) — the all-AWS sibling of staging:
+   the same backend VM, but DNS lives in Route 53 and the publisher hostname
+   is fronted by CloudFront + Lambda@Edge running the same Ed25519 edge
+   worker. No Cloudflare account, zone, or token is involved anywhere. See
+   `docs/deploy-demo-aws.md`.
+3. **Standalone edge** (`stacks/edge`) — ONLY the Cloudflare edge worker,
    applied by a publisher against their own Cloudflare
    account. It needs nothing else from this package. See
    `docs/deploy-edge-standalone.md`.
@@ -28,9 +33,13 @@ modules/                 reusable building blocks (flat, purpose-named)
   compose-stack/         renders compose file + Caddyfile + cloud-init (no cloud provider)
   aws-vm/                VPC + EC2 + Elastic IP for the staging VM
   cloudflare-dns/        A records for the service hostnames
+  route53-dns/           the Route 53 counterpart of cloudflare-dns
   cloudflare-edge/       the edge worker (the publisher handoff module)
+  aws-cloudfront-edge/   the CloudFront + Lambda@Edge counterpart of cloudflare-edge
+  publisher-manifest/    renders the publisher-manifest env values both edge modules consume
 stacks/                  root configurations you actually apply
   staging-aws/           the all-inclusive staging environment
+  demo-aws/              the all-AWS demo environment (Route 53 + CloudFront/Lambda@Edge)
   edge/                  standalone edge worker (publisher-facing)
 scripts/                 build, key-generation, bootstrap, seed, and smoke helpers
 docs/                    step-by-step guides + variables reference
@@ -51,10 +60,15 @@ the guides are the single home of the procedures, nothing is repeated here:
 - **Staging on AWS** (`stacks/staging-aws`):
   [docs/deploy-staging-aws.md](docs/deploy-staging-aws.md) — keys → images →
   worker bundle → apply → bootstrap identity → seed + smoke.
+- **All-AWS demo** (`stacks/demo-aws`):
+  [docs/deploy-demo-aws.md](docs/deploy-demo-aws.md) — covers what differs
+  from staging (Route 53, CloudFront + Lambda@Edge) and points at the staging
+  guide for everything shared; the operator scripts select this stack via
+  `STACK_DIR`.
 - **Standalone edge worker** (`stacks/edge`, what a publisher applies):
   [docs/deploy-edge-standalone.md](docs/deploy-edge-standalone.md) — needs
   only a Cloudflare account, no AWS, no registry.
-- **Variables reference** for both stacks:
+- **Variables reference**:
   [docs/variables.md](docs/variables.md).
 - **Removing everything**: [docs/teardown.md](docs/teardown.md).
 

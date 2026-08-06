@@ -289,9 +289,10 @@ Whatever terminates TLS must **pass the `Host` header through unchanged**. The s
 works out which agent is being asked about from that header alone; a proxy that
 rewrites it makes every agent's documents return `404`.
 
-Unlike the Exchange and the Broker, this service is happy behind a proxy that
-terminates HTTPS — [`CONFIGURATION.md`](CONFIGURATION.md) §5 explains why the rule
-differs here.
+This service runs behind a TLS-terminating proxy with no special setting — unlike
+the Exchange and the Broker, which need `RAMP_TRUST_PROXY_HEADERS=true` in that
+position. [`CONFIGURATION.md`](CONFIGURATION.md) §5 explains why this service is
+different.
 
 ---
 

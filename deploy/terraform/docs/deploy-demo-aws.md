@@ -109,7 +109,8 @@ id check until the two key files are deleted and regenerated.
 ## Step 2 — build and push images
 
 Identical to the staging guide's step 2 (same script, same registry rules,
-same registry-switching table). The four images serve both stacks.
+same registry-switching table — including the note that prebuilt images
+let you skip the build entirely). The four images serve both stacks.
 
 ## Step 3 — first apply, without the edge
 

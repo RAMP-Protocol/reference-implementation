@@ -4,14 +4,17 @@
 # Structural guard against unresolvable cross-references in the published tree.
 #
 # src/, internal/, tests/, testdata/, deploy/, schemas/, docs/architecture/, the
-# root build files and a curated scripts/ set are published verbatim to the
-# public reference implementation. A file inside that set must not point at
-# anything outside it: the reader cannot open it.
+# root build files, a curated scripts/ set and a curated set of individual docs/
+# files are published verbatim to the public reference implementation. A file
+# inside that set must not point at anything outside it: the reader cannot open
+# it.
 #
 # What this catches:
-#   - any docs/ path outside docs/architecture/, WITH or WITHOUT the docs/ prefix
+#   - any docs/ path that does not travel, WITH or WITHOUT the docs/ prefix
 #     (a bare `design-exchange.md §4` is the same violation, and is the form a
-#     naive `grep docs/` misses)
+#     naive `grep docs/` misses). docs/architecture/ travels as a subtree; the
+#     files named in ALLOW_DOC_FILES and INHERIT_FROM_MAIN travel one by one, and
+#     citing any of those is legal
 #   - CLAUDE.md, AGENTS.md, .claude/, .beads/, .gitlab-ci.yml
 #   - the beads tracker and GitLab merge requests (MR !2)
 #   - other repositories (currently the piarch pattern only; the pi-terraform
@@ -71,8 +74,8 @@ source "${script_dir}/published-paths.sh"
 # violation.
 CONFIG_NOT_CITATIONS=( .gitignore .dockerignore )
 
-# The search roots ARE the published set: the directories, the root build files,
-# and every allowlisted script by name.
+# The search roots ARE the published set: the directories, every allowlisted
+# docs/ file, the root build files, and every allowlisted script by name.
 #
 # Naming the scripts individually rather than scanning scripts/ wholesale is what
 # retires the prefix denylist that used to stand in for "not published". That
@@ -85,7 +88,7 @@ CONFIG_NOT_CITATIONS=( .gitignore .dockerignore )
 # root, so deleting one without updating published-paths.sh fails this gate. That
 # is the intent — the publish would otherwise ship a tree missing a file it
 # promises.
-SEARCH_ROOTS=( "${ALLOW_DIRS[@]}" )
+SEARCH_ROOTS=( "${ALLOW_DIRS[@]}" "${ALLOW_DOC_FILES[@]}" )
 for f in "${ALLOW_ROOT_FILES[@]}"; do
   skip=0
   for c in "${CONFIG_NOT_CITATIONS[@]}"; do [ "$f" = "$c" ] && skip=1; done
@@ -121,18 +124,24 @@ PATTERNS=(
 # basename comes from sed instead: on BSD find the whole assignment failed under
 # `set -e` with stderr muted, taking `make quality` down with no output at all.
 #
-# INHERIT_FROM_MAIN is subtracted. Those docs are not built from this tree, but
-# the publish tool puts them ON the public tree, so citing one is resolvable —
-# without this, referencing docs/HANDOFF-aws-demo.md was rejected as dangling.
+# ALLOW_DOC_FILES and INHERIT_FROM_MAIN are both subtracted, because both end up
+# on the public tree and citing either is therefore resolvable. They get there by
+# different routes — the publish stages an ALLOW_DOC_FILES entry out of this tree
+# and takes an INHERIT_FROM_MAIN entry from the public base — but the find below
+# sweeps in every docs/*.md outside docs/architecture regardless of route, so
+# without this subtraction it would reject a citation of a file it just shipped.
+# That is exactly what happened to docs/HANDOFF-aws-demo.md before the inherited
+# half of this was added.
 bare_docs=""
 if [ -d "${repo_root}/docs" ]; then
-  inherited="$(printf '%s\n' "${INHERIT_FROM_MAIN[@]}" | sed 's#.*/##; s/\.md$//' | sort -u)"
+  published_docs="$(printf '%s\n' "${ALLOW_DOC_FILES[@]}" "${INHERIT_FROM_MAIN[@]}" \
+      | sed 's#.*/##; s/\.md$//' | sort -u)"
   # `grep -v` exits 1 when nothing survives the filter, which here is the ordinary
   # "no unpublished docs" case (a public clone) rather than an error — tolerate it
   # explicitly instead of letting `set -e` abort the whole gate.
   bare_docs="$(find "${repo_root}/docs" -name '*.md' -not -path '*/docs/architecture/*' \
       | sed 's#.*/##; s/\.md$//' | sort -u \
-      | { grep -vxF "${inherited}" || true; } | paste -sd'|' -)"
+      | { grep -vxF "${published_docs}" || true; } | paste -sd'|' -)"
 fi
 if [ -n "${bare_docs}" ]; then
   PATTERNS+=("\\b(${bare_docs})\\.md\\b")

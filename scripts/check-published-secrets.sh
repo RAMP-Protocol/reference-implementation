@@ -4,9 +4,10 @@
 # Secret scan over exactly the files the publish ships.
 #
 # src/, internal/, tests/, testdata/, deploy/, schemas/, docs/architecture/, the
-# root build files and a curated scripts/ set are published verbatim to the
-# public reference implementation. A secret that reaches one of those paths is
-# public the moment the next snapshot is pushed, and a push cannot be taken back.
+# root build files, a curated scripts/ set and a curated set of individual docs/
+# files are published verbatim to the public reference implementation. A secret
+# that reaches one of those paths is public the moment the next snapshot is
+# pushed, and a push cannot be taken back.
 #
 # The publish tool runs the same scanner over the curated tree it is about to
 # push. That run is the last line of defence, and it is too late to be the only
@@ -73,11 +74,11 @@ done
 # shellcheck source=scripts/published-paths.sh
 source "${script_dir}/published-paths.sh"
 
-# The search roots ARE the published set: the directories, every root build file,
-# and every allowlisted script by name. Unlike the reference gate, .gitignore and
-# .dockerignore are included — they are published files like any other, and a
-# secret in one is a secret either way.
-SEARCH_ROOTS=( "${ALLOW_DIRS[@]}" "${ALLOW_ROOT_FILES[@]}" "${ALLOW_SCRIPTS[@]}" )
+# The search roots ARE the published set: the directories, every allowlisted
+# docs/ file, every root build file, and every allowlisted script by name. Unlike
+# the reference gate, .gitignore and .dockerignore are included — they are
+# published files like any other, and a secret in one is a secret either way.
+SEARCH_ROOTS=( "${ALLOW_DIRS[@]}" "${ALLOW_DOC_FILES[@]}" "${ALLOW_ROOT_FILES[@]}" "${ALLOW_SCRIPTS[@]}" )
 
 command -v gitleaks >/dev/null 2>&1 \
   || die "gitleaks not installed — install it (https://github.com/gitleaks/gitleaks) or run 'make install-tools'.

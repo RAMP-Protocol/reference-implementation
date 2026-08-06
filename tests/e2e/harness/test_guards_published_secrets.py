@@ -59,7 +59,7 @@ from .guard_harness import (
     run_gate,
     run_git,
 )
-from .published_paths import shared_array
+from .published_paths import first_entry, shared_array
 
 # REPO_ROOT rather than a parents[N] walk: inside the runner container the
 # harness sits at /runner/harness, which has fewer parents than the host layout,
@@ -83,16 +83,20 @@ pytestmark = [*guard_marks(skip_when=not _GATE.is_file()), GITLEAKS_ABSENT]
 def _build_repo(root: Path) -> None:
     """Materialise a committed miniature of the published set.
 
-    Every directory, root file and allowlisted script the shared definition names
-    has to exist, because the gate treats a missing search root as a failure
-    rather than as nothing to scan — that is the behaviour the missing-root case
-    asserts.
+    Every directory, docs/ file, root file and allowlisted script the shared
+    definition names has to exist, because the gate treats a missing search root
+    as a failure rather than as nothing to scan — that is the behaviour the
+    missing-root case asserts.
     """
     init_scratch_repo(root, branch="main", committer="published secrets guard")
 
     for directory in shared_array("ALLOW_DIRS"):
         (root / directory).mkdir(parents=True, exist_ok=True)
         (root / directory / ".keep").write_text("")
+
+    for doc in shared_array("ALLOW_DOC_FILES"):
+        (root / doc).parent.mkdir(parents=True, exist_ok=True)
+        (root / doc).write_text(f"# {doc}\n")
 
     for name in shared_array("ALLOW_ROOT_FILES"):
         if name == SECRET_SCAN_CONFIG:
@@ -184,20 +188,38 @@ def test_clean_run_reports_how_much_it_read(published_repo: Path) -> None:
         "deploy/planted.pem",
         _UNEXEMPT_SIBLING,
         "scripts/check-published-refs.sh",
+        "sqlc.yaml",
     ],
-    ids=["src", "internal", "deploy", "terraform-sibling", "inside-an-allowlisted-script"],
+    ids=[
+        "src",
+        "internal",
+        "deploy",
+        "terraform-sibling",
+        "inside-an-allowlisted-script",
+        "inside-a-root-build-file",
+    ],
 )
 def test_a_key_on_a_published_path_is_rejected(published_repo: Path, relative: str) -> None:
     """Every published root is actually scanned, not just the first one.
 
     The parametrisation is one case per root class rather than a single planted
-    key, because the roots are assembled from three separate arrays and a bug
-    that dropped one of them would still be caught by a single-path test aimed at
-    the surviving array.
+    key, because the roots are assembled from four separate arrays and a bug that
+    dropped one of them would SLIP PAST a single-path test aimed at a surviving
+    array: that test's key is still found, the gate still exits non-zero, and the
+    dropped array is never missed. The first four paths cover ALLOW_DIRS, the
+    fifth ALLOW_SCRIPTS and the sixth ALLOW_ROOT_FILES; ALLOW_DOC_FILES has its
+    own case below, for a reason that case explains.
 
-    The last case overwrites an allowlisted script instead of adding a new file:
-    an unlisted path under scripts/ is never published, so a key there is
-    correctly ignored, and only a key inside a script that ships is a finding.
+    Two of them are array ENTRIES written out here rather than read from the
+    shared definition — the script and the root build file. Neither needs a drift
+    guard: an entry that leaves its array stops being a search root, so the gate
+    finds nothing, the run exits 0 and the case goes red on its own. That is the
+    same signal a renamed entry would give. The other four name a file planted
+    under an allowlisted directory, so only the directory has to still be listed.
+
+    The last two overwrite a file the fixture already created instead of adding a
+    new one: an unlisted path under scripts/ is never published, so a key there
+    is correctly ignored, and only a key inside a file that ships is a finding.
     """
     _plant(published_repo, relative, commit=True)
 
@@ -212,8 +234,43 @@ def test_a_key_on_a_published_path_is_rejected(published_repo: Path, relative: s
     assert "PASS" not in proc.stdout, proc.stdout
 
 
+def test_a_key_in_an_allowlisted_doc_is_rejected(published_repo: Path) -> None:
+    """The ALLOW_DOC_FILES root is read, not merely listed.
+
+    Those files sit under no other root — ALLOW_DIRS carries docs/architecture
+    and nothing else beneath docs/ — so that array is the only reason any of them
+    is scanned at all. Remove it from the gate's SEARCH_ROOTS and the scan set
+    shrinks by exactly those files while every other case here still passes. Only
+    this one goes red.
+
+    It is a case of its own rather than a seventh parameter above, and the
+    distinction is not cosmetic. A parametrize list is evaluated when the module
+    is imported, so resolving the path there would fail at import wherever
+    scripts/ is absent — the runner container — and pytest answers an import
+    failure by aborting the whole session rather than skipping the module. That
+    regression is what the sibling collection guard exists to catch; there is no
+    sense re-introducing it in the file that closes this gap.
+    """
+    doc = first_entry("ALLOW_DOC_FILES")
+    _plant(published_repo, doc, commit=True)
+
+    proc = _run_gate(published_repo)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, combined
+    # As above: the gate's own wording, since several other paths also exit
+    # non-zero without having scanned anything.
+    assert "potential secrets in the published tree" in combined, combined
+    assert "PASS" not in proc.stdout, proc.stdout
+
+
 def test_a_key_in_an_unpublished_path_is_ignored(published_repo: Path) -> None:
-    """docs/ outside docs/architecture never ships, so it is not this gate's business.
+    """A docs/ path that no allowlist names never ships, so it is not this gate's business.
+
+    Most of docs/ is in that position. Two things travel: docs/architecture as a
+    subtree, and the files named one by one in ALLOW_DOC_FILES, by their own
+    array. Everything else stays behind. The case above plants a key in one of
+    the files that ship; this one plants it on a path that does not.
 
     The design docs quote key material in places. Reporting them would make the
     gate noisy enough to be disabled, and would say nothing about what the public

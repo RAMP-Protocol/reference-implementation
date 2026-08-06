@@ -56,9 +56,10 @@ not exist, is a crash that does **not** fix itself (§4, §8).
 | OpenSSL (to generate keys in §5) | — | `openssl version` |
 
 **Check your TLS arrangement now, before anything else.** Read
-[`CONFIGURATION.md`](CONFIGURATION.md) §4. The Exchange cannot sit behind a proxy
-that accepts HTTPS and forwards plain HTTP — every signed request would fail. If
-that is your plan, sort it out before deploying.
+[`CONFIGURATION.md`](CONFIGURATION.md) §4. Behind a proxy that accepts HTTPS and
+forwards plain HTTP, the Exchange needs `RAMP_TRUST_PROXY_HEADERS=true` — without
+it, every signed request fails. Never set the flag on a directly exposed service.
+Decide which case yours is before deploying.
 
 ---
 

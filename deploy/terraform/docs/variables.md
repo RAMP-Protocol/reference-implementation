@@ -53,6 +53,28 @@ and the demo ingest sign with them directly. Their PUBLIC halves travel as
 the stack reads at apply time and serves via Caddy at each identity's
 hostname, so the services can verify the smoke and ingest signatures.
 
+## stacks/demo-aws
+
+Same variable set as `stacks/staging-aws`, with the differences below —
+the stack swaps the Cloudflare edge for Route 53 + CloudFront/Lambda@Edge.
+Key material follows the staging shape: the stack reads the same `keys/`
+files, written by `gen-staging-keys.sh` with `STACK_DIR` pointing here.
+
+### Changed
+
+| Variable | Default | Notes |
+|---|---|---|
+| `route53_zone_id` | — (required) | Id of the EXISTING Route 53 hosted zone of `domain`; replaces the three `cloudflare_*` variables. The zone may be shared with other projects — the stack only adds its own records and refuses to overwrite records it did not create |
+| `lambda_zip_path` | in-repo `src/edge/dist/lambda-edge.zip` | Replaces `worker_bundle_path`. Build the zip with `scripts/build-lambda-edge.sh` from the config the stack renders (see the `lambda_edge_config` output) |
+| `name_prefix` | `ramp-demo` | AWS resource naming |
+| `resource_owner_id` | `demo-resource-owner` | Settlement payee in the publisher manifest |
+
+### Not present
+
+`cloudflare_api_token`, `cloudflare_account_id`, `cloudflare_zone_id`, and
+`create_waf_skip_rule` (no Cloudflare involvement), and
+`default_tenant_domain` (staging-only).
+
 ## stacks/edge
 
 ### Required

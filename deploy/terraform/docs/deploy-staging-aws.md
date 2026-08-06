@@ -55,9 +55,9 @@ environment variables, if you prefer.
     GitLab, a deploy token (Settings → Repository → Deploy tokens) with
     ONLY the `read_registry` scope. Username goes into
     `registry_username`; the password goes into `registry_password` in
-    `secrets.auto.tfvars`. Pushing the images from your machine is a
-    separate, write-capable credential — see step 2; the VM never gets
-    that one.
+    `secrets.auto.tfvars`. Pushing the images from your machine — only
+    needed if you build them from source — is a separate, write-capable
+    credential; see step 2. The VM never gets that one.
 - **TLS certificates**
   - An email address for Let's Encrypt registration. Goes into:
     `acme_email`.
@@ -107,6 +107,14 @@ the VM as root-owned key files and no value is ever typed into
 VM, both survive the VM recreates described at the end of this guide.
 
 ## Step 2 — build and push images
+
+**Received prebuilt images? Skip this step.** If the RAMP images are
+already published in a registry you can pull from, there is nothing to
+build: point the stack at them with `image_registry`, `image_prefix`,
+and `image_tag` in `terraform.tfvars`, and — for a private registry —
+set the pull credentials `registry_username` and `registry_password`
+(see the prerequisites). The rest of this step is only for building
+the images from this repository's source.
 
 ```bash
 # GitLab login: your username + a Personal Access Token with the

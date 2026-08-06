@@ -212,15 +212,17 @@ you must back up are in
 
 ## 5. Putting TLS in front of it
 
-**Unlike the Exchange and the Broker, the Identity Service can sit behind a proxy that
-terminates HTTPS.** If you have read the Broker's configuration document, this is the
-question you are about to ask, and the answer is different here.
+**The Identity Service can sit behind a proxy that terminates HTTPS, and needs no
+special setting for it.** If you have read the Broker's configuration document, this
+is the question you are about to ask, and the answer is simpler here.
 
-The reason those two cannot is that they *verify* signatures over the request URL, so
-a proxy that changes `https` to `http` breaks every one. The Identity Service verifies
-no such signatures — the documents it publishes are public, and the MCP endpoint is
-protected by a token rather than a signature. It only ever *makes* signed requests,
-never checks them.
+The Exchange and the Broker *verify* signatures over the request URL, so behind a
+proxy that changes `https` to `http` they need `RAMP_TRUST_PROXY_HEADERS=true` to
+recover the original scheme (§4 of each of their configuration documents explains
+the conditions). The Identity Service verifies no such signatures — the documents it
+publishes are public, and the MCP endpoint is protected by a token rather than a
+signature. It only ever *makes* signed requests, never checks them, so there is no
+flag to set here.
 
 What does matter: whatever sits in front must serve the whole wildcard zone on a
 certificate that covers it, and must pass the `Host` header through unchanged. The

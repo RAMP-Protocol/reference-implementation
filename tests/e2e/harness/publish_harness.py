@@ -37,6 +37,7 @@ guards.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -71,17 +72,32 @@ PUBLISH_GUARD_MARKS = [
 ]
 
 
+# A docs/ file no allowlist names. It gives the reference gate a bare basename to
+# derive a pattern from, and it gives the docs/ allowlist a negative case: the
+# snapshot must leave it behind. Exported so the case that asserts that reads the
+# same name the fixture writes.
+UNPUBLISHED_DOC = "docs/unpublished-note.md"
+
+
 def make_source_repo(root: Path) -> None:
     """A miniature of the published set, committed on a branch named ``source``.
 
     Every allowlisted path exists because the publish checks each one out of the
     source ref by name; a missing one aborts the run before any gate is reached.
+    The allowlisted docs/ files are materialised for a second reason too: the
+    publish asserts each one reached the staged tree, so an absent one fails even
+    if the checkout somehow succeeded without it.
     """
     init_scratch_repo(root, branch="source", committer="publish guard")
 
     for directory in _shared_array("ALLOW_DIRS"):
         (root / directory).mkdir(parents=True, exist_ok=True)
         (root / directory / ".keep").write_text("")
+
+    for doc in _shared_array("ALLOW_DOC_FILES"):
+        dest = root / doc
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(f"# {doc} in the fixture source tree\n")
 
     # Root files are materialised per-file, not uniformly, and each case has a
     # reason. Do not collapse this back into a blanket empty write.
@@ -113,8 +129,37 @@ def make_source_repo(root: Path) -> None:
 
     # The gate derives bare-name patterns from unpublished docs, and the publish
     # inherits this one onto the public branch rather than building it here.
-    (root / "docs" / "unpublished-note.md").write_text("# not published\n")
+    (root / UNPUBLISHED_DOC).write_text("# not published\n")
     commit_all(root, "fixture source tree")
+
+
+def edit_fixture_definition(source: Path, pattern: str, replacement: str, message: str) -> None:
+    """Rewrite one line of the fixture's own copy of the shared definition.
+
+    This is the seam that makes the publish tool's allowlist gates reachable at
+    all. The tool derives its repository root from the directory it is invoked in
+    and sources ``scripts/published-paths.sh`` from there, ``run_publish`` invokes
+    it inside ``source``, and ``make_source_repo`` copies the real file in because
+    it is an ALLOW_SCRIPTS entry — so editing that copy changes the arrays the
+    tool actually reads, without touching this repository's own definition.
+
+    ``pattern`` is a multiline regex and is expected to match exactly one array
+    entry. A miss is raised rather than ignored: the comments in that file mention
+    the same paths the arrays do, so a pattern that was meant to match an entry
+    and matched nothing would leave the definition untouched and the case would
+    pass against an unmodified tool, proving nothing.
+    """
+    paths_file = source / "scripts" / "published-paths.sh"
+    before = paths_file.read_text()
+    after = re.sub(pattern, replacement, before, count=1, flags=re.MULTILINE)
+    if after == before:
+        raise AssertionError(
+            f"the pattern {pattern!r} matched no line of the fixture's published-paths.sh, "
+            "so this case would run against an unmodified allowlist and assert nothing. "
+            "Check the array's formatting in scripts/published-paths.sh."
+        )
+    paths_file.write_text(after)
+    commit_all(source, message)
 
 
 def make_public_remote(bare: Path, source: Path) -> None:

@@ -80,4 +80,5 @@ test-fast:
 	uv run pytest -q harness/test_rampsig.py harness/test_acceptance.py \
 		harness/test_guards_published_refs.py harness/test_guards_published_secrets.py \
 		harness/test_guards_publish_gates.py harness/test_guards_publish_worktree.py \
-		harness/test_guards_image_version.py harness/test_guards_workflow_scripts.py
+		harness/test_guards_image_version.py harness/test_guards_workflow_scripts.py \
+		harness/test_guards_harness_collection.py

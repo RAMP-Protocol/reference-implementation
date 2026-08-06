@@ -15,15 +15,31 @@ the snapshot. The scaffolding it runs against lives in ``publish_harness``, and
 the ownership of the staging worktree has its own suite in
 ``test_guards_publish_worktree.py``.
 
-**Two of the nine gates are not driven here, because nothing can reach them.**
-The staged tree is built by checking out exactly the allowlisted paths, so a
-stray root document or an unlisted ``scripts/`` entry in the source can never
-appear in it — the root-doc and scripts-allowlist gates only fire if the
-allowlist itself is widened, which is the defence-in-depth role their own
-comment claims. The forbidden-path gate IS reachable, but only for the two
-entries that live *under* an allowlisted directory: the local dev-keys folder
-and the e2e key fixtures. Those are the cases below. Writing a test that
-appeared to drive the other two would assert a path the tool cannot take.
+**Four refusals are reachable through the fixture, and none of them has a case.**
+Three are allowlist gates: the tool rejects a stray root document, an unlisted
+``scripts/`` entry and an unlisted ``docs/`` file. None can appear in the staged
+tree while the allowlists say what they say now, because the tree is built by
+checking out exactly the allowlisted paths, so all three fire only when an
+allowlist is widened. A case here can widen one. The publish derives its
+repository root from the directory it is invoked in and sources
+``scripts/published-paths.sh`` from there, ``run_publish`` invokes it inside the
+fixture source repository, and ``make_source_repo`` copies the real file in
+because it is an ALLOW_SCRIPTS entry — so a case that rewrites the fixture's own
+copy changes the arrays the tool actually reads.
+``test_workflow_is_dropped_when_its_directory_leaves_the_allowlist`` already
+works that way.
+
+The fourth is the assertion beside the ``docs/`` gate: every ALLOW_DOC_FILES
+entry must have reached the staged tree. Two of the four were driven through the
+seam by hand and both fire — adding ``docs`` to the fixture's ALLOW_DIRS produces
+``non-allowlisted docs/ file(s) in staged tree``, and pointing ALLOW_DOC_FILES at
+a directory produces ``is allowlisted but missing from the staged tree``. What is
+covered for ``docs/`` is the other side of the array instead: an allowlisted doc
+travels and the doc beside it does not.
+
+The forbidden-path gate is reachable without touching an allowlist at all, but
+only for the two entries that live *under* an allowlisted directory: the local
+dev-keys folder and the e2e key fixtures. Those are the cases below.
 """
 
 from __future__ import annotations
@@ -32,9 +48,11 @@ import re
 from pathlib import Path
 
 from .guard_harness import commit_all, git, private_key_pem, run_git
-from .published_paths import shared_array
+from .published_paths import first_entry, shared_array
 from .publish_harness import (
     PUBLISH_GUARD_MARKS,
+    UNPUBLISHED_DOC,
+    edit_fixture_definition,
     make_public_remote,
     make_source_repo,
     run_publish,
@@ -63,6 +81,47 @@ _WORKFLOW_DIR_ENTRY = ".github"
 # other case in this module touches, so removing it cannot interact with one of
 # them.
 _ALLOW_DIR_ON_SOURCE = "schemas"
+
+# The documents the public branch owns, each with the reason its local copy is
+# not the one to publish. All three exist in this tree too, and the two reasons
+# are different — the message a failure prints has to say which one applies, so
+# they are carried per path rather than asserted once for the group.
+#
+# Written out rather than derived, because what needs pinning IS the membership:
+# a derived list would follow the arrays wherever they were edited and agree with
+# every edit, including the one this guards against. LICENSE is deliberately
+# absent — it exists only on the public branch, so it cannot be published from
+# here by mistake.
+#
+# The secret scan is not a dependable second line of defence here, and it must
+# not be treated as one. Measured on the private copies: the runbook and the
+# README scan completely clean, and the handoff produces two findings — both from
+# the default generic-api-key rule, on key-shaped material, not on the
+# identifiers this list exists to hold back. Account numbers, endpoint hostnames,
+# credential-profile names and user names match no rule at all.
+_PUBLIC_BRANCH_OWNS = {
+    "README.md": (
+        "the public copy is a different document, written for a reader arriving at the "
+        "reference implementation; this tree's is an internal working README"
+    ),
+    "RUNBOOK-aws-demo.md": (
+        "this tree's copy carries identifiers of a live deployment that the public copy does not"
+    ),
+    "docs/HANDOFF-aws-demo.md": (
+        "this tree's copy carries identifiers of a live deployment that the public copy does not"
+    ),
+}
+
+# The publish arrays whose entries are staged FROM THIS TREE, as opposed to
+# INHERIT_FROM_MAIN, whose entries come from the public base.
+_PUBLISH_ARRAYS = ("ALLOW_DIRS", "ALLOW_DOC_FILES", "ALLOW_ROOT_FILES", "ALLOW_SCRIPTS")
+
+# docs/ is not an ALLOW_DIRS entry, so the only docs/ paths that travel are
+# docs/architecture, the files named one by one in ALLOW_DOC_FILES, and the docs
+# inherited from the public base. The cases below read the sample doc from the
+# shared definition rather than writing its name here — inside their own bodies,
+# because a call at module scope is an import-time failure in the runner
+# container and pytest answers that by aborting the whole session.
 
 
 def test_clean_tree_reaches_the_dry_run_summary(publish_fixture: tuple[Path, Path, Path]) -> None:
@@ -124,24 +183,146 @@ def test_workflow_is_dropped_when_its_directory_leaves_the_allowlist(
     source, bare, worktree = publish_fixture
     _plant_workflow(source)
 
-    # Edit the fixture's own copy of the shared definition, which the publish
-    # sources from its working directory. The comments in that file also mention
-    # the directory, so the array entry is matched as a whole line.
-    paths_file = source / "scripts" / "published-paths.sh"
-    before = paths_file.read_text()
-    after = re.sub(rf"^  {re.escape(_WORKFLOW_DIR_ENTRY)}$\n", "", before, flags=re.MULTILINE)
-    assert after != before, (
-        f"{_WORKFLOW_DIR_ENTRY} was not found as an ALLOW_DIRS entry, so this case would "
-        "assert nothing. Check the array's formatting in scripts/published-paths.sh."
+    # The comments in that file also mention the directory, so the array entry is
+    # matched as a whole line.
+    edit_fixture_definition(
+        source,
+        rf"^  {re.escape(_WORKFLOW_DIR_ENTRY)}$\n",
+        "",
+        "drop the workflow directory from the allowlist",
     )
-    paths_file.write_text(after)
-    commit_all(source, "drop the workflow directory from the allowlist")
 
     proc = run_publish(source, bare, worktree)
 
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert not (worktree / _WORKFLOW_PATH).exists(), proc.stdout
     assert f"+ {_WORKFLOW_PATH}" not in proc.stdout, proc.stdout
+
+
+def test_only_the_allowlisted_docs_reach_the_staged_tree(
+    publish_fixture: tuple[Path, Path, Path],
+) -> None:
+    """An ALLOW_DOC_FILES entry travels and the doc beside it does not.
+
+    The first assertion proves the array is read at all. The snapshot puts back
+    only the allowlisted paths, so an entry the checkout missed would simply be
+    absent from the staged tree. The tool does report that now — it asserts every
+    ALLOW_DOC_FILES entry arrived — and this is the independent check on the same
+    property, from outside the tool rather than inside it.
+
+    The second proves the snapshot is assembled from that array rather than by
+    copying ``docs`` wholesale. Today it is not the first line of defence — if
+    ``docs`` became an ALLOW_DIRS entry, the docs allowlist gate would reject the
+    unpublished note, the run would exit non-zero, and this case would fail on
+    the return code above before reaching it. The assertion is what still catches
+    a wholesale copy if that gate is ever removed.
+    """
+    source, bare, worktree = publish_fixture
+    allowlisted_doc = first_entry("ALLOW_DOC_FILES")
+
+    proc = run_publish(source, bare, worktree)
+
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert (worktree / allowlisted_doc).is_file(), proc.stdout
+    assert not (worktree / UNPUBLISHED_DOC).exists(), proc.stdout
+    # The operator has to see it arrive: the additions listing is the only place
+    # a file that is new on the public repo shows up during review.
+    assert f"+ {allowlisted_doc}" in proc.stdout, proc.stdout
+
+
+def test_a_source_ref_missing_an_allowlisted_doc_is_rejected(
+    publish_fixture: tuple[Path, Path, Path],
+) -> None:
+    """A doc on the array but absent from the source ref stops the run.
+
+    ``test_a_source_ref_missing_an_allowlisted_directory_is_rejected`` further
+    down covers the same precondition for a directory, and one loop checks all
+    four arrays — but only this case pins that ALLOW_DOC_FILES is one of the
+    four. Drop it from that loop and the directory case still passes, while a
+    missing doc surfaces as git's raw pathspec error partway through the build
+    instead of as a decision someone has to make. Hence the assertion on the
+    tool's own wording rather than on the exit code alone.
+    """
+    source, bare, worktree = publish_fixture
+    allowlisted_doc = first_entry("ALLOW_DOC_FILES")
+    run_git(source, "rm", "-rq", "--", allowlisted_doc)
+    commit_all(source, f"drop {allowlisted_doc} from the source ref")
+
+    proc = run_publish(source, bare, worktree)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, combined
+    assert allowlisted_doc in combined, combined
+    assert "allowlisted but absent on" in combined, combined
+
+
+def test_the_documents_the_public_branch_owns_stay_inherited() -> None:
+    """These three are taken from the public base and never published from here.
+
+    Moving one into a publish allowlist is a single edit, it looks like tidying —
+    the file does live in this tree, after all — and it replaces the public
+    branch's copy with the local one on the next snapshot. Each entry above says
+    what would be lost.
+
+    The publish tool refuses a path that sits in INHERIT_FROM_MAIN and in an allow
+    array at once, and that check cannot see this: after the move the arrays are
+    disjoint again. Nothing derived from the arrays can see it either, because a
+    derived expectation follows whatever edit was made. Only a written-out
+    membership statement fails, which is what this is.
+
+    Reads the shared definition rather than the publish tool, so it holds however
+    the tool is refactored.
+    """
+    inherited = shared_array("INHERIT_FROM_MAIN")
+    published: list[str] = []
+    for array in _PUBLISH_ARRAYS:
+        published.extend(shared_array(array))
+
+    for path, reason in _PUBLIC_BRANCH_OWNS.items():
+        assert path in inherited, (
+            f"{path} left INHERIT_FROM_MAIN. The public branch's copy is the one that "
+            f"should reach the public repository, because {reason}. Without this entry "
+            "the publish stops fetching it from the base. Put it back, or — if the public "
+            "copy is genuinely no longer the one to keep — update this list and say why "
+            "in the commit."
+        )
+        assert path not in published, (
+            f"{path} is in a publish allowlist. That stages THIS tree's copy, and "
+            f"{reason} — on a push that cannot be undone. Publish it from here only once "
+            "the local copy is the one the public repository should carry, and update "
+            "this list in the same commit."
+        )
+
+
+def test_an_inherited_file_in_a_publish_allowlist_is_rejected(
+    publish_fixture: tuple[Path, Path, Path],
+) -> None:
+    """A path on both routes onto the public tree aborts the run.
+
+    Which copy would survive is decided by statement order — the allowlist
+    checkout runs first and the inherit loop overwrites it — so the tree that
+    gets pushed depends on a detail neither array mentions. The tool refuses
+    rather than relying on that order holding.
+
+    The precondition runs before the remote is contacted, so a run stopped here
+    did no work at all; that is asserted too.
+    """
+    source, bare, worktree = publish_fixture
+    inherited_doc = next(f for f in shared_array("INHERIT_FROM_MAIN") if f.startswith("docs/"))
+    edit_fixture_definition(
+        source,
+        rf"^  {re.escape(first_entry('ALLOW_DOC_FILES'))}$",
+        f"  {first_entry('ALLOW_DOC_FILES')}\n  {inherited_doc}",
+        "put an inherited doc in a publish allowlist",
+    )
+
+    proc = run_publish(source, bare, worktree)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, combined
+    assert inherited_doc in combined, combined
+    assert "in a publish allowlist at the same time" in combined, combined
+    assert not worktree.exists(), combined
 
 
 def test_forbidden_path_is_rejected(publish_fixture: tuple[Path, Path, Path]) -> None:

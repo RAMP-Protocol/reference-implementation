@@ -2,7 +2,7 @@
 # published-paths.sh — the single definition of what ships to the public
 # reference implementation.
 #
-# Sourced, never executed. Defines four arrays and nothing else: no side
+# Sourced, never executed. Defines the path arrays and nothing else: no side
 # effects, no output, no `set` changes. Both the publish tool and the
 # unresolvable-reference gate read this file, so the set they enforce and the
 # set they publish cannot drift apart.
@@ -36,9 +36,10 @@ ALLOW_DIRS=(
 # reads schemas/comp/v1/comp-v1.schema.json and carries NO build tag, so its absence fails
 # `make test-fast` and `make test-integration` alike.
 #
-# docs/architecture is the ONLY docs/ path published, by owner decision. Cross-references
-# from published files into the rest of docs/ are cleaned in the citing file rather than
-# resolved by widening this list.
+# docs/architecture is the only docs/ SUBTREE published, by owner decision. Individual
+# docs/ files outside it are published one at a time through ALLOW_DOC_FILES below.
+# Cross-references from published files into the rest of docs/ are cleaned in the citing
+# file rather than resolved by widening either list.
 #
 # .github holds the workflow that builds and publishes the service container images. It
 # has to be authored HERE rather than on the public repository, because the publish
@@ -50,6 +51,24 @@ ALLOW_DIRS=(
 # publish with no further decision. ALLOW_SCRIPTS below is per-file and this array is not,
 # so if .github/ ever needs to hold something that must stay private, the granularity has
 # to be built first.
+
+# --- Individual docs/ files published outside docs/architecture ---
+#
+# Per-file, never a directory, and deliberately so: ALLOW_DIRS copies a whole subtree, so
+# a `docs` entry there would ship every working note in it on the next publish with no
+# further decision. Naming each file is what keeps that decision explicit.
+#
+# Every entry is BUILT FROM THIS TREE, unlike INHERIT_FROM_MAIN below, whose files exist
+# only on the public branch. Both sets end up on the public tree, so both are resolvable
+# targets for a citation and the reference gate must subtract both from the bare-basename
+# patterns it derives from the unpublished docs on disk.
+ALLOW_DOC_FILES=(
+  # The operator-facing setup guide: what the platform is made of, what to prepare, how
+  # the network must be laid out, and where each component's own deployment guide is. It
+  # cites published paths throughout (src/*/CONFIGURATION.md, deploy/**, tests/e2e/), so
+  # a public reader without it is left with per-component guides and no entry point.
+  docs/HANDOFF-operator.md
+)
 
 # --- Root-level build/config files (required to build/test) ---
 ALLOW_ROOT_FILES=(
@@ -117,11 +136,29 @@ ALLOW_SCRIPTS=(
   scripts/wire-secrets.sh
 )
 
-# --- Public-only scaffolding inherited from the existing public snapshot
-#     (these do not exist on the private branch) ---
+# --- Scaffolding taken from the existing public snapshot, not from this tree ---
 #
-# These land on the public tree even though no allowlist above produces them, so
-# the reference gate must NOT treat a citation of one as unresolvable.
+# The publish checks each of these out of the PUBLIC base after the allowlists above have
+# been staged, so the public branch's copy is what ships. LICENSE exists only there. The
+# other three are tracked here as well, and taking the public copy rather than this one is
+# deliberate for all three, for two different reasons. This tree's aws-demo runbook and
+# handoff carry identifiers of a live deployment where the public copies carry redacted
+# ones, so inheriting is what stops every snapshot undoing that redaction. The public
+# README is a different document altogether, written for a reader arriving at the reference
+# implementation, where this tree's is an internal working README.
+#
+# They land on the public tree all the same, so the reference gate must NOT treat a
+# citation of one as unresolvable — the same subtraction it applies to ALLOW_DOC_FILES.
+#
+# An entry here must NOT also appear in an allow array above: that would stage the path
+# from this tree and then again from the public base, and which copy survives would depend
+# on the order of two statements in the publish tool. The publish tool refuses that
+# combination outright.
+#
+# Moving an entry from here INTO an allow array is the edit to be careful with. The arrays
+# stay disjoint afterwards, so no check that DERIVES its expectation from them can see it.
+# That is why tests/e2e/harness/test_guards_publish_gates.py writes out which documents
+# have to stay inherited, and why that list is maintained by hand rather than derived.
 INHERIT_FROM_MAIN=( LICENSE README.md RUNBOOK-aws-demo.md docs/HANDOFF-aws-demo.md )
 
 # --- docs/ subtrees that are NOT published ---
