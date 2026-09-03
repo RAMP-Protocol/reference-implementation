@@ -41,7 +41,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .conftest import REPO_ROOT
+from ._compose import REPO_ROOT
 from .guard_harness import (
     GITLEAKS_ABSENT,
     SECRET_SCAN_CONFIG,

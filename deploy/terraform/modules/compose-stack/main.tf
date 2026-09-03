@@ -40,6 +40,20 @@ resource "random_password" "postgres" {
       )
       error_message = "registry_server, registry_username, and registry_password must be set together (or all left null)."
     }
+
+    # Outbound mail needs all four together. Every relay this bundle is
+    # deployed against authenticates, and Zitadel refuses to store a provider
+    # with no sender address. A partial set renders a provider that fails on
+    # its first send — which happens when a developer first tries to register,
+    # not at apply time, and by then correcting it means rebuilding the VM.
+    precondition {
+      condition = (
+        (var.smtp_host == null) == (var.smtp_user == null) &&
+        (var.smtp_host == null) == (var.smtp_password == null) &&
+        (var.smtp_host == null) == (var.smtp_from == null)
+      )
+      error_message = "smtp_host, smtp_user, smtp_password, and smtp_from must be set together (or all left null)."
+    }
   }
 }
 
@@ -126,6 +140,28 @@ locals {
 
   tigerbeetle_enabled = var.billing_adapter == "tigerbeetle"
   publisher_enabled   = var.origin_hostname != null
+  terms_enabled       = length(var.exchange_terms_documents) > 0
+
+  # The registration schema crosses TWO encoding layers before it reaches the
+  # Exchange, and each needs a different escape.
+  #
+  # jsonencode renders the schema as a quoted, escaped scalar so the quotes a
+  # JSON Schema is full of survive YAML parsing.
+  #
+  # Doubling the dollars is Compose's own escape, and it is the layer that is
+  # easy to miss: docker compose interpolates $VAR in the compose file itself,
+  # and a JSON Schema opens with "$schema". Left unescaped, Compose warns that
+  # `schema` is not set, substitutes an empty string, and the Exchange receives
+  # a schema whose first key is "" — silent corruption of the one value the
+  # service refuses to boot without understanding. No other value in this
+  # bundle needs it: every generated secret avoids $ by construction (special
+  # = false, and the override_special set above omits it), so the schema is the
+  # first value here that must carry one.
+  exchange_registration_schema_env = (
+    var.exchange_registration_schema == null
+    ? null
+    : replace(jsonencode(var.exchange_registration_schema), "$", "$$")
+  )
 
   compose_yaml = templatefile("${path.module}/templates/docker-compose.yml.tftpl", {
     exchange_hostname = var.exchange_hostname
@@ -151,12 +187,30 @@ locals {
     network_subnet             = var.network_subnet
     broker_id                  = var.broker_id
     default_tenant_domain      = var.default_tenant_domain
+    default_agent_credit       = var.default_agent_credit
     exa_api_key                = var.exa_api_key
     rsa_enabled                = var.rsa_private_pem != null
     wba_enabled                = length(var.static_wba_directories) > 0
+    terms_enabled              = local.terms_enabled
+
+    registration_schema_env = local.exchange_registration_schema_env
+    terms_uri               = var.exchange_terms_uri
+    terms_digest            = var.exchange_terms_digest
+
+    # The precondition above guarantees the other three are set whenever the
+    # host is, so one flag gates the whole block. The sender name is the only
+    # optional member: Zitadel wants a non-empty string, so a null becomes a
+    # neutral default rather than an empty display name.
+    smtp_enabled   = var.smtp_host != null
+    smtp_host      = var.smtp_host
+    smtp_user      = var.smtp_user
+    smtp_password  = var.smtp_password
+    smtp_from      = var.smtp_from
+    smtp_from_name = coalesce(var.smtp_from_name, "RAMP")
   })
 
   caddyfile = templatefile("${path.module}/templates/Caddyfile.tftpl", {
+    terms_enabled     = local.terms_enabled
     exchange_hostname = var.exchange_hostname
     broker_hostname   = var.broker_hostname
     identity_hostname = var.identity_hostname
@@ -191,6 +245,7 @@ locals {
     broker_relay_key_json   = var.broker_relay_key_json
     broker_identity_key_pem = var.broker_identity_key_pem
     static_wba_directories  = var.static_wba_directories
+    terms_documents         = var.exchange_terms_documents
     registry_server         = var.registry_server
     registry_username       = var.registry_username
     registry_password       = var.registry_password

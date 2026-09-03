@@ -67,10 +67,13 @@ var movedDownSymbols = map[string]string{
 	"resolveExchangeEndpoint": "batch fan-out",
 }
 
-// goSourceFilesUnder yields every non-test, non-generated .go file under
-// rel (repo-root-relative), as repo-root-relative paths. A missing
-// directory yields nil without failing — existence is asserted separately.
-func goSourceFilesUnder(t *testing.T, root, rel string) []string {
+// goSourceFilesUnder yields every non-generated .go file under rel
+// (repo-root-relative), as repo-root-relative paths. Test files are included
+// only when includeTests is set: most guards here bind production code and would
+// misfire on fixtures, while the ver guard has to read fixtures because that is
+// where its defect lived. A missing directory yields nil without failing —
+// existence is asserted separately.
+func goSourceFilesUnder(t *testing.T, root, rel string, includeTests bool) []string {
 	t.Helper()
 	dir := filepath.Join(root, rel)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -82,7 +85,8 @@ func goSourceFilesUnder(t *testing.T, root, rel string) []string {
 			return err
 		}
 		name := d.Name()
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") ||
+		if !strings.HasSuffix(name, ".go") ||
+			(!includeTests && strings.HasSuffix(name, "_test.go")) ||
 			strings.HasSuffix(name, ".pb.go") || strings.HasSuffix(name, "connect.go") ||
 			strings.Contains(path, string(filepath.Separator)+"sqlc"+string(filepath.Separator)) {
 			return nil
@@ -160,7 +164,7 @@ func astReferencesIdent(f *ast.File, name string) bool {
 func TestBrokerRelayServiceLayerExists(t *testing.T) {
 	t.Parallel()
 	root := repoRoot(t)
-	files := goSourceFilesUnder(t, root, relayPackageDir)
+	files := goSourceFilesUnder(t, root, relayPackageDir, false)
 	if len(files) == 0 {
 		t.Errorf("%s has no non-test Go source files — the broker relay service layer "+
 			"(relay security pipeline + batch fan-out) must live there, mirroring "+
@@ -176,7 +180,7 @@ func TestBrokerRelayServiceLayerExists(t *testing.T) {
 func TestRelayPipelineSymbolsLeftTransport(t *testing.T) {
 	t.Parallel()
 	root := repoRoot(t)
-	for _, rel := range goSourceFilesUnder(t, root, brokerTransportDir) {
+	for _, rel := range goSourceFilesUnder(t, root, brokerTransportDir, false) {
 		decls := topLevelDeclNames(parseGoFile(t, root, rel))
 		for sym, group := range movedDownSymbols {
 			if decls[sym] {
@@ -198,7 +202,7 @@ func TestRelayPipelineSymbolsLeftTransport(t *testing.T) {
 func TestRelayPackagePurity(t *testing.T) {
 	t.Parallel()
 	root := repoRoot(t)
-	for _, rel := range goSourceFilesUnder(t, root, relayPackageDir) {
+	for _, rel := range goSourceFilesUnder(t, root, relayPackageDir, false) {
 		f := parseGoFile(t, root, rel)
 		for _, imp := range f.Imports {
 			if strings.Trim(imp.Path.Value, `"`) == brokerTransportImport {
@@ -226,7 +230,7 @@ func TestWellKnownComposeLivesBelowServices(t *testing.T) {
 	t.Parallel()
 	root := repoRoot(t)
 	for _, top := range []string{"src/broker", "src/exchange"} {
-		for _, rel := range goSourceFilesUnder(t, root, top) {
+		for _, rel := range goSourceFilesUnder(t, root, top, false) {
 			if astReferencesIdent(parseGoFile(t, root, rel), "NewWBAHandler") {
 				t.Errorf("%s composes the well-known WBA handler inline — compose "+
 					"manifest+WBA once in the shared builder under root internal/ "+

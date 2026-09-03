@@ -26,34 +26,23 @@ func TestTransactionReadSurface_ByID(t *testing.T) {
 	ctx := h.ctx
 
 	unit := "accesses"
-	if _, err := h.catalogClient.PushResources(ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.tenantDomain,
-			Path:   "/articles/read-surface",
-			Terms: []*rampv1.LicenseTerm{{
-				Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
-				Pricing: &rampv1.Pricing{
-					Model:    rampv1.PricingModel_PRICING_MODEL_PER_UNIT,
-					Rate:     "0.05",
-					Currency: "USD",
-					Unit:     &unit,
-				},
-			}},
+	if _, err := h.catalogClient.PushResources(ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{{
+		Domain: h.tenantDomain,
+		Path:   "/articles/read-surface",
+		Terms: []*rampv1.LicenseTerm{{
+			Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
+			Pricing: &rampv1.Pricing{
+				Model:    rampv1.PricingModel_PRICING_MODEL_PER_UNIT,
+				Rate:     "0.05",
+				Currency: "USD",
+				Unit:     &unit,
+			},
 		}},
-	})); err != nil {
+	}}))); err != nil {
 		t.Fatalf("push: %v", err)
 	}
 
-	discovered, err := h.exchangeClient.DiscoverResources(ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.tenantDomain + "/articles/read-surface"},
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example",
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	discovered, err := h.exchangeClient.DiscoverResources(ctx, connect.NewRequest(newResourceQuery(newRequester("agent-test", "agent.example"), []string{"https://" + h.tenantDomain + "/articles/read-surface"})))
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}

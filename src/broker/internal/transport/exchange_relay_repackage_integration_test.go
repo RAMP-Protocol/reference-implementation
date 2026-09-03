@@ -51,25 +51,6 @@ import (
 //   - it routes from the registry endpoint column, not from the offer.exchange
 //     well-known manifest.
 
-// startEndpointManifestProvider serves /.well-known/ramp.json with a TOP-LEVEL
-// "endpoint" field (the shape resolvers.WellKnownEndpointResolver reads — see SDK
-// endpointresolver.go wellKnownDoc.Endpoint). The existing startProviderFixture
-// emits exchanges[].endpoint, which the endpoint resolver does NOT read; the
-// re-package router needs the manifest's own endpoint. Test-only helper added for
-// the re-package contract.
-func startEndpointManifestProvider(tb testing.TB, exchangeEndpoint string) *httptest.Server {
-	tb.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/.well-known/ramp.json" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		_, _ = io.WriteString(w, `{"ver":"1.0","role":"ROLE_EXCHANGE","endpoint":"`+exchangeEndpoint+`"}`)
-	}))
-	tb.Cleanup(srv.Close)
-	return srv
-}
-
 // signedSig1OverBrokerRoute signs sig1 over the BROKER relay route URL (the
 // actual POST target) using the SDK signer — the option-(a) contract. It is the
 // re-package successor to signedRelayRequestForEndpoint, which signs over the
@@ -140,12 +121,11 @@ func TestExchangeRelay_RePackagesFromWellKnownEndpoint(t *testing.T) {
 	// Upstream Exchange (captures the transport signatures + body it receives).
 	mockExch, captured, exchangeURL := startCapturingExchange(t)
 
-	// The Exchange advertises its OWN endpoint via /.well-known/ramp.json. The
-	// offer.exchange canonical domain is this provider's host:port, so the broker's
-	// well-known resolver fetches http://<host:port>/.well-known/ramp.json with no
-	// host rewrite (Scheme="http" in the docker/test profile).
-	provider := startEndpointManifestProvider(t, exchangeURL)
-	exchangeDom := strings.TrimPrefix(provider.URL, "http://") // host:port
+	// The Exchange advertises its OWN endpoint via its OWN /.well-known/ramp.json.
+	// The offer.exchange canonical domain is that server's host:port, so the
+	// broker's well-known resolver fetches http://<host:port>/.well-known/ramp.json
+	// with no host rewrite (Scheme="http" in the docker/test profile).
+	exchangeDom := strings.TrimPrefix(exchangeURL, "http://") // host:port
 
 	// Registry is a TRUST ALLOWLIST only: it must contain the resolved endpoint so
 	// the post-resolve SSRF gate passes, seeded via the production repo surface.
@@ -221,7 +201,7 @@ func TestExchangeRelay_RePackagesFromWellKnownEndpoint(t *testing.T) {
 		t.Fatalf("sign offer acceptance: %v", err)
 	}
 	txReq := &rampv1.TransactionRequest{
-		Ver:            "0.3",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: idemKey,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{{
@@ -232,7 +212,7 @@ func TestExchangeRelay_RePackagesFromWellKnownEndpoint(t *testing.T) {
 			},
 		}},
 	}
-	body, err := protojson.Marshal(txReq)
+	body, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(txReq)
 	if err != nil {
 		t.Fatalf("marshal TransactionRequest: %v", err)
 	}
@@ -257,9 +237,13 @@ func TestExchangeRelay_RePackagesFromWellKnownEndpoint(t *testing.T) {
 		t.Fatalf("Exchange.ExecuteTransaction called %d times, want 1", mockExch.executeCalls)
 	}
 
-	// (2) Routing derived from offer.exchange well-known manifest, not the registry
-	// endpoint column. (Implicit: the upstream that fired is the one the manifest
-	// advertised; mockExch is reached only via the resolved endpoint.)
+	// (2) Routing derived from the offer.exchange well-known manifest, not the
+	// registry endpoint column. Both name one origin, so reaching the upstream
+	// proves nothing on its own — what separates the two is whether the manifest
+	// was read at all. A broker routing from the registry column never fetches it.
+	if got := captured.manifestFetches(); got == 0 {
+		t.Error("broker never fetched /.well-known/ramp.json — it routed from the registry endpoint column")
+	}
 
 	// (3) The upstream must carry EXACTLY ONE transport signature (the broker's),
 	// not the agent-sig1 + broker-sig2 chain.

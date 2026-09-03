@@ -81,6 +81,7 @@ module "compose_stack" {
   exa_api_key     = var.exa_api_key
 
   default_tenant_domain = local.default_tenant_domain
+  default_agent_credit  = var.default_agent_credit
 
   ed25519_private_pem     = file("${local.keys_dir}/ed25519-private.pem")
   rsa_private_pem         = local.rsa_private_pem
@@ -113,11 +114,10 @@ module "manifest" {
 module "vm" {
   source = "../../modules/aws-vm"
 
-  name_prefix      = var.name_prefix
-  instance_type    = var.instance_type
-  ssh_public_key   = var.ssh_public_key
-  ssh_ingress_cidr = var.ssh_ingress_cidr
-  user_data        = module.compose_stack.user_data
+  name_prefix   = var.name_prefix
+  instance_type = var.instance_type
+  ssh_operators = var.ssh_operators
+  user_data     = module.compose_stack.user_data
 }
 
 module "dns" {

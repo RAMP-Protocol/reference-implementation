@@ -128,6 +128,18 @@ module "compose_stack" {
   exa_api_key     = var.exa_api_key
 
   default_tenant_domain = local.publisher_fqdn
+  default_agent_credit  = var.default_agent_credit
+
+  # Outbound mail through the SES identity in ses.tf, so developer
+  # self-registration can send its confirmation code. Zitadel stores these
+  # when it first creates its instance, so they reach it through the VM's
+  # user data — which means changing any of them replaces the VM and rebuilds
+  # the deployment from empty.
+  smtp_host      = local.zitadel_smtp_host
+  smtp_user      = aws_iam_access_key.zitadel_smtp.id
+  smtp_password  = aws_iam_access_key.zitadel_smtp.ses_smtp_password_v4
+  smtp_from      = local.zitadel_smtp_from
+  smtp_from_name = local.zitadel_smtp_from_name
 
   # There is no keys.json / static key file: every verification key is
   # learned via well-known discovery — the Broker publishes its own keys, an
@@ -146,16 +158,64 @@ module "compose_stack" {
     (local.smoke_agent_fqdn)         = file("${local.keys_dir}/smoke-agent-wba.json")
     (local.catalog_contributor_fqdn) = file("${local.keys_dir}/catalog-contributor-wba.json")
   }
+
+  # What this Exchange asks of an agent opening an account, and the terms that
+  # agent accepts by registering. Set here rather than in tfvars because a
+  # tfvars file holds literal values only — no function calls, no path.module —
+  # so the digest below could not be derived there at all. These are deployment
+  # behaviour, not operator choices.
+  #
+  # Publishing the schema IS the enforcement switch: from the moment it is set,
+  # a registration missing legal_entity, or carrying a member the schema does
+  # not name, is refused. Publishing the digest refuses any client that does not
+  # echo it. Both breaks are real and land together — the harness change that
+  # keeps registration working ships in the same commit.
+  #
+  # One required member and one optional, on purpose. A schema whose members are
+  # all required never shows an agent the difference between must-send and
+  # may-send, which is the reasoning a published schema exists to drive.
+  #
+  # The member names are the System of Record's own typed fields, so the demo
+  # exercises the reference implementation's typed mapping rather than dropping
+  # everything into its untyped extra blob.
+  #
+  # No "format": "email" on the address: the deployed validator does not assert
+  # format, so declaring it would describe a constraint that never fires — worse
+  # than declaring nothing, because it stops the next reader checking.
+  exchange_registration_schema = jsonencode({
+    "$schema"            = "https://json-schema.org/draft/2020-12/schema"
+    type                 = "object"
+    additionalProperties = false
+    required             = ["legal_entity"]
+    properties = {
+      legal_entity = { type = "string", minLength = 1, maxLength = 200 }
+      email        = { type = "string", maxLength = 254 }
+    }
+  })
+
+  exchange_terms_uri = "https://${local.exchange_fqdn}/terms/revision-1.txt"
+
+  # Derived from the tracked file, never written by hand: the published digest
+  # has to equal the digest of the bytes actually SERVED, and the only way to
+  # keep those two in step is to compute one from the other.
+  exchange_terms_digest = "sha256:${filesha256("${path.module}/terms/revision-1.txt")}"
+
+  # Every revision ever published stays in this map. A digest identifies a
+  # document, so removing an old revision leaves the registrations accepted
+  # under it pointing at nothing. Adding revision 2 is one entry here and one
+  # digest line above.
+  exchange_terms_documents = {
+    "revision-1.txt" = file("${path.module}/terms/revision-1.txt")
+  }
 }
 
 module "vm" {
   source = "../../modules/aws-vm"
 
-  name_prefix      = var.name_prefix
-  instance_type    = var.instance_type
-  ssh_public_key   = var.ssh_public_key
-  ssh_ingress_cidr = var.ssh_ingress_cidr
-  user_data        = module.compose_stack.user_data
+  name_prefix   = var.name_prefix
+  instance_type = var.instance_type
+  ssh_operators = var.ssh_operators
+  user_data     = module.compose_stack.user_data
 }
 
 module "dns" {

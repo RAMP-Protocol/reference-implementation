@@ -8,22 +8,26 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	connect "connectrpc.com/connect"
-	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
-	"google.golang.org/protobuf/types/known/structpb"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 	rwktestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/regschema"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/sor"
 )
@@ -38,20 +42,71 @@ import (
 // tenant Register reads its activation policy from.
 type registerHarness struct {
 	ctx           context.Context
+	pool          *pgxpool.Pool
 	queries       *sqlc.Queries
 	server        string
 	baseTransport http.RoundTripper
 	resolver      *helpers.StaticKeyResolver
 	sorAdapter    *sor.InMemoryAdapter
-	billing       *billing.InMemoryAdapter
+	billing       billing.Adapter
 	rewriteMu     *sync.Mutex
 	rewrite       map[string]string
 	tenantID      string
 	tenantDomain  string
+	// logs captures the server's structured output when the harness was built
+	// with a capturing logger; nil under the default discard logger.
+	logs *safeBuffer
+	// deps is the exact dependency set this harness's server was started with,
+	// kept so a test can stand up a SECOND Exchange over the SAME database with
+	// one setting changed. See republishingTerms.
+	deps exchangeServerDeps
 }
 
 func newRegisterHarness(t *testing.T) *registerHarness {
 	t.Helper()
+	return newRegisterHarnessWith(t, registerHarnessOptions{billing: billing.NewInMemoryAdapter(billing.InMemoryOptions{})})
+}
+
+// registerHarnessOptions is the configurable wiring for newRegisterHarnessWith,
+// following the package's newXHarnessWith(t, opts) constructor convention.
+// billing selects the adapter the Exchange server calls (nil → the in-memory
+// demo adapter via newRegisterHarness).
+type registerHarnessOptions struct {
+	billing billing.Adapter
+	// logs, when non-nil, receives the server's structured log output through a
+	// JSON handler, so a test can assert on an audit line the RPC verdict alone
+	// does not carry. nil leaves the fixture's discard logger in place. Same
+	// seam as harnessOptions.logger on the main transport harness.
+	logs *safeBuffer
+	// regSchema is the registration schema the Exchange publishes and therefore
+	// enforces. nil → nothing published, which is the pass-through case.
+	regSchema *regschema.Schema
+	// termsDigest is the terms digest the Exchange publishes. Empty → no terms
+	// versioning.
+	termsDigest string
+	// billingRefGen overrides the deterministic candidate generator. The gate
+	// tests use it as a barrier: it is called inside firstRegister, after the
+	// fast-path check, so a generator that blocks there puts two concurrent
+	// callers past the fast path by construction.
+	billingRefGen service.BillingRefGen
+	// txRunnerWrap decorates the real pool runner instead of replacing it, so a
+	// test runner can delegate to a working transaction and start failing only
+	// when it is armed. It is handed the pool runner and returns what the
+	// service gets; nil leaves the plain pool runner in place. Same seam as
+	// harnessOptions.txRunnerWrap on the main transport harness.
+	txRunnerWrap func(sharedb.TxRunner) sharedb.TxRunner
+	// auditWrap decorates the audit repo the same way, so a test can fail the
+	// audit append from INSIDE the registration transaction. nil leaves the real
+	// repo in place.
+	auditWrap func(repo.AuditRepo) repo.AuditRepo
+}
+
+// newRegisterHarnessWith is newRegisterHarness with explicit options, so the
+// default-credit registration flows run against both the in-memory demo
+// adapter and a real TigerBeetle ledger through the same harness.
+func newRegisterHarnessWith(t *testing.T, opts registerHarnessOptions) *registerHarness {
+	t.Helper()
+	billingAdapter := opts.billing
 	fx := setupExchangeTestDB(t, "unused-register-agent")
 
 	rewriteMu := &sync.Mutex{}
@@ -71,34 +126,96 @@ func newRegisterHarness(t *testing.T) *registerHarness {
 	}
 
 	sorAdapter := sor.NewInMemoryAdapter()
-	billingAdapter := billing.NewInMemoryAdapter(billing.InMemoryOptions{})
 
 	// Deterministic candidate ids ("billing-ref-1", "billing-ref-2", ...) so a
 	// test can both name the expected id and prove the fast path consumed no new
 	// candidate.
 	var genCounter atomic.Int64
-	gen := func() string { return fmt.Sprintf("billing-ref-%d", genCounter.Add(1)) }
+	var gen service.BillingRefGen = func() string {
+		return fmt.Sprintf("billing-ref-%d", genCounter.Add(1))
+	}
+	if opts.billingRefGen != nil {
+		gen = opts.billingRefGen
+	}
 
-	srv := startExchangeServer(t, exchangeServerDeps{
+	var txRunner sharedb.TxRunner
+	if opts.txRunnerWrap != nil {
+		txRunner = opts.txRunnerWrap(sharedb.PoolRunner{Pool: fx.pool})
+	}
+
+	deps := exchangeServerDeps{
 		pool: fx.pool, queries: fx.queries, registry: registry,
+		txRunner:            txRunner,
 		manifests:           newAllowAllManifestCache("unused-register-agent"),
 		bill:                billingAdapter,
 		signer:              offerSigner,
 		keystore:            fx.keystore,
-		logger:              fx.logger,
+		logger:              harnessLogger(fx.logger, opts.logs),
 		httpsigKeys:         map[string]ed25519.PublicKey{},
 		sor:                 sorAdapter,
 		defaultTenantDomain: fx.tenantDomain,
 		billingRefGen:       gen,
-	})
+		regSchema:           opts.regSchema,
+		termsDigest:         opts.termsDigest,
+		auditWrap:           opts.auditWrap,
+	}
+	srv := startExchangeServer(t, deps)
 
 	return &registerHarness{
-		ctx: fx.ctx, queries: fx.queries, server: srv.server.URL,
+		ctx: fx.ctx, pool: fx.pool, queries: fx.queries, server: srv.server.URL,
 		baseTransport: srv.baseTransport, resolver: srv.resolver,
 		sorAdapter: sorAdapter, billing: billingAdapter,
 		rewriteMu: rewriteMu, rewrite: rewrite,
 		tenantID: fx.tenantID, tenantDomain: fx.tenantDomain,
+		logs: opts.logs, deps: deps,
 	}
+}
+
+// republishingTerms starts a SECOND Exchange over the SAME database, identical to
+// this one except for the terms digest it publishes. It is how a test spells "the
+// operator revised its terms": the accounts and their recorded acceptances stay
+// exactly where the first Exchange left them, and only what the manifest
+// advertises changes.
+//
+// It cannot be done by rebuilding the harness. newRegisterHarnessWith acquires a
+// database and resets it to the post-migration baseline, so a second harness
+// would start with no accounts at all — which is the state that makes this
+// question unaskable.
+//
+// The returned harness shares the database and differs in its server URL, its
+// signing transport and its key resolver. An agent registered against the first
+// Exchange therefore needs its key put into the second's resolver before it can
+// be heard; clientOn does that.
+func (h *registerHarness) republishingTerms(t *testing.T, digest string) *registerHarness {
+	t.Helper()
+	deps := h.deps
+	deps.termsDigest = digest
+	srv := startExchangeServer(t, deps)
+
+	revised := *h
+	revised.server = srv.server.URL
+	revised.baseTransport = srv.baseTransport
+	revised.resolver = srv.resolver
+	revised.deps = deps
+	return &revised
+}
+
+// clientOn builds a client for an EXISTING agent against this harness's server,
+// registering the agent's key with this harness's resolver first. It is what lets
+// an agent created on one Exchange be heard by another over the same database.
+func (h *registerHarness) clientOn(a *registerAgent) rampconnect.ExchangeServiceClient {
+	h.resolver.Put(rwktestutil.MustThumbprintPriv(a.priv), a.pub)
+	return h.clientFor(a.id, a.priv)
+}
+
+// harnessLogger returns a JSON logger over logs when a test asked to capture
+// them, and the fixture's own logger otherwise. Written here rather than at the
+// call site so "capturing" is one decision the constructor makes.
+func harnessLogger(fallback *slog.Logger, logs *safeBuffer) *slog.Logger {
+	if logs == nil {
+		return fallback
+	}
+	return slog.New(slog.NewJSONHandler(logs, nil))
 }
 
 func (h *registerHarness) registerHost(host, target string) {
@@ -109,7 +226,11 @@ func (h *registerHarness) registerHost(host, target string) {
 
 // registerAgent is a fresh, unregistered agent plus a client that signs with its
 // directory key. On its first signed Register the Exchange self-signs it up
-// (lazy registration) from origin, then runs the account flow.
+// (lazy registration) from origin, then runs the account flow. client is built
+// ONCE and reused for every self-signed call: each signing transport seeds its
+// uniqueness counter from the wall clock, so two transports for the same key
+// built in the same second would produce colliding signatures the replay store
+// rejects.
 type registerAgent struct {
 	id     string
 	pub    ed25519.PublicKey
@@ -118,30 +239,70 @@ type registerAgent struct {
 	client rampconnect.ExchangeServiceClient
 }
 
-// newAgent stands up a fresh agent whose WBA directory serves the given key. The
-// agents row is NOT pre-seeded — the first Register triggers lazy self-signup.
-func (h *registerHarness) newAgent(t *testing.T, agentID string) *registerAgent {
+// newSignupAgent is the one self-signup agent fixture both harnesses build
+// theirs from: generate a keypair, publish the agent's WBA directory origin
+// (the agents row is NOT pre-seeded — the first Register triggers lazy
+// self-signup), register the key thumbprint with the global httpsig gate so
+// the signature reaches resolveCaller, and build the signing client.
+func newSignupAgent(
+	t *testing.T, agentID string,
+	publish func(*testing.T, string, ed25519.PublicKey) *pushAgentOrigin,
+	resolver *helpers.StaticKeyResolver,
+	clientFor func(string, ed25519.PrivateKey) rampconnect.ExchangeServiceClient,
+) *registerAgent {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("agent keypair: %v", err)
 	}
-	origin := newPushAgentOrigin(t, agentID, pub)
-	h.registerHost(agentID, origin.server.URL)
-	// The global httpsig gate keys by the RFC 7638 thumbprint; register the
-	// signing key there so the signature clears the gate and reaches resolveCaller.
-	h.resolver.Put(rwktestutil.MustThumbprintPriv(priv), pub)
+	origin := publish(t, agentID, pub)
+	resolver.Put(rwktestutil.MustThumbprintPriv(priv), pub)
 	return &registerAgent{
 		id: agentID, pub: pub, priv: priv, origin: origin,
-		client: h.clientFor(agentID, priv),
+		client: clientFor(agentID, priv),
 	}
+}
+
+// publishAgentOrigin stands up a fresh fixture origin serving the agent's WBA
+// directory and wires host rewriting through the given harness registerHost —
+// the one publish operation both harnesses' publishAgent methods delegate to,
+// and the shape of the publish closure newSignupAgent takes.
+func publishAgentOrigin(
+	t *testing.T, registerHost func(host, target string), agentID string, pub ed25519.PublicKey,
+) *pushAgentOrigin {
+	t.Helper()
+	origin := newPushAgentOrigin(t, agentID, pub)
+	registerHost(agentID, origin.server.URL)
+	return origin
+}
+
+// publishAgent runs the shared publishAgentOrigin operation on this harness's
+// rewrite table.
+func (h *registerHarness) publishAgent(t *testing.T, agentID string, pub ed25519.PublicKey) *pushAgentOrigin {
+	return publishAgentOrigin(t, h.registerHost, agentID, pub)
+}
+
+// newAgent stands up a fresh agent whose WBA directory serves the given key.
+func (h *registerHarness) newAgent(t *testing.T, agentID string) *registerAgent {
+	t.Helper()
+	return newSignupAgent(t, agentID, h.publishAgent, h.resolver, h.clientFor)
 }
 
 // clientFor builds an ExchangeService client signing with keyID/priv.
 func (h *registerHarness) clientFor(keyID string, priv ed25519.PrivateKey) rampconnect.ExchangeServiceClient {
+	return h.clientWith(keyID, priv)
+}
+
+// clientWith is clientFor with extra client options, for a test that needs the
+// same signing client to speak differently on the wire — gzip, for one. It is a
+// separate method rather than a variadic clientFor because clientFor is passed
+// by value where a two-argument function is expected.
+func (h *registerHarness) clientWith(
+	keyID string, priv ed25519.PrivateKey, opts ...connect.ClientOption,
+) rampconnect.ExchangeServiceClient {
 	return rampconnect.NewExchangeServiceClient(
 		&http.Client{Transport: newSigningTransport(h.baseTransport, keyID, priv)},
-		h.server, connect.WithGRPC(),
+		h.server, append([]connect.ClientOption{connect.WithGRPC()}, opts...)...,
 	)
 }
 
@@ -166,15 +327,6 @@ func (h *registerHarness) newBrokerCaller(t *testing.T, agentID string) rampconn
 	return h.clientFor(agentID, priv)
 }
 
-func mustRegistrationStruct(t *testing.T, m map[string]any) *structpb.Struct {
-	t.Helper()
-	s, err := structpb.NewStruct(m)
-	if err != nil {
-		t.Fatalf("structpb.NewStruct: %v", err)
-	}
-	return s
-}
-
 // TestExchangeRegister_HappyPath drives a signed Register through the real
 // Connect-Go router + httpsig gate: the agent self-signs up, an account is
 // created, and the reply carries billing_ref + active. Round-trip: the write goes
@@ -185,13 +337,10 @@ func TestExchangeRegister_HappyPath(t *testing.T) {
 	h := newRegisterHarness(t)
 	a := h.newAgent(t, "reg-agent.example")
 
-	resp, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{
-		Ver: "1.0",
-		RegistrationData: mustRegistrationStruct(t, map[string]any{
-			"legal_entity": "Acme AI Ltd",
-			"email":        "ops@acme.example",
-		}),
-	}))
+	resp, err := a.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(testutil.RegistrationStruct(t, map[string]any{
+		"legal_entity": "Acme AI Ltd",
+		"email":        "ops@acme.example",
+	}))))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -207,7 +356,7 @@ func TestExchangeRegister_HappyPath(t *testing.T) {
 	// GetAccountStatus RPC — driven through the same signed client. This is
 	// strictly stronger than reading the agents row directly: it also proves the
 	// handler resolves the stored ref back out and reports it as active.
-	status, err := a.client.GetAccountStatus(h.ctx, connect.NewRequest(&rampv1.GetAccountStatusRequest{Ver: "1.0"}))
+	status, err := a.client.GetAccountStatus(h.ctx, connect.NewRequest(newAccountStatusRequest()))
 	if err != nil {
 		t.Fatalf("GetAccountStatus: %v", err)
 	}
@@ -248,10 +397,7 @@ func TestExchangeRegister_IdempotentRepeat(t *testing.T) {
 	h := newRegisterHarness(t)
 	a := h.newAgent(t, "reg-agent.example")
 
-	resp1, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{
-		Ver:              "1.0",
-		RegistrationData: mustRegistrationStruct(t, map[string]any{"legal_entity": "Acme AI Ltd"}),
-	}))
+	resp1, err := a.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(testutil.RegistrationStruct(t, map[string]any{"legal_entity": "Acme AI Ltd"}))))
 	if err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
@@ -259,10 +405,7 @@ func TestExchangeRegister_IdempotentRepeat(t *testing.T) {
 		t.Fatalf("first billing_ref = %q, want billing-ref-1", resp1.Msg.GetBillingRef())
 	}
 
-	resp2, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{
-		Ver:              "1.0",
-		RegistrationData: mustRegistrationStruct(t, map[string]any{"legal_entity": "Acme AI GmbH (changed)"}),
-	}))
+	resp2, err := a.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(testutil.RegistrationStruct(t, map[string]any{"legal_entity": "Acme AI GmbH (changed)"}))))
 	if err != nil {
 		t.Fatalf("repeat Register: %v", err)
 	}
@@ -277,7 +420,7 @@ func TestExchangeRegister_IdempotentRepeat(t *testing.T) {
 	// distinct agent gets the NEXT counter value (billing-ref-2), which holds only
 	// if the repeat above consumed no candidate.
 	b := h.newAgent(t, "other-agent.example")
-	respB, err := b.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+	respB, err := b.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 	if err != nil {
 		t.Fatalf("second agent Register: %v", err)
 	}
@@ -295,7 +438,7 @@ func TestExchangeRegister_KeyRotationSameRef(t *testing.T) {
 	h := newRegisterHarness(t)
 	a := h.newAgent(t, "reg-agent.example")
 
-	resp1, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+	resp1, err := a.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 	if err != nil {
 		t.Fatalf("initial Register: %v", err)
 	}
@@ -311,7 +454,7 @@ func TestExchangeRegister_KeyRotationSameRef(t *testing.T) {
 	h.registerHost(a.id, originB.server.URL)
 	h.resolver.Put(rwktestutil.MustThumbprintPriv(keyBPriv), keyBPub)
 
-	resp2, err := h.clientFor(a.id, keyBPriv).Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+	resp2, err := h.clientFor(a.id, keyBPriv).Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 	if err != nil {
 		t.Fatalf("post-rotation Register: %v", err)
 	}
@@ -326,17 +469,10 @@ func TestExchangeRegister_KeyRotationSameRef(t *testing.T) {
 // off makes a fresh registration start inactive.
 func TestExchangeRegister_TenantActivationDefaultOff(t *testing.T) {
 	h := newRegisterHarness(t)
-	// Flip the single default tenant's activation policy off. This mutates tenant
-	// configuration, which has no production write path (set out of band), so the
-	// sqlc fixture mutator is the sanctioned arrange surface (see repo.TenantRepo).
-	if err := h.queries.SetTenantActivateNewAgentsByDefault(h.ctx, sqlc.SetTenantActivateNewAgentsByDefaultParams{
-		TenantID: h.tenantID, ActivateNewAgentsByDefault: false,
-	}); err != nil {
-		t.Fatalf("flip activation default off: %v", err)
-	}
+	setTenantActivationDefault(t, h.arrange(), false)
 
 	a := h.newAgent(t, "reg-agent.example")
-	resp, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+	resp, err := a.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -363,7 +499,7 @@ func TestExchangeRegister_Negatives(t *testing.T) {
 		unsigned := rampconnect.NewExchangeServiceClient(
 			&http.Client{Transport: h.baseTransport}, h.server, connect.WithGRPC(),
 		)
-		_, err := unsigned.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+		_, err := unsigned.Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 		if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
 			t.Fatalf("code = %v, want Unauthenticated (err=%v)", got, err)
 		}
@@ -387,7 +523,7 @@ func TestExchangeRegister_Negatives(t *testing.T) {
 		h.registerHost(agentID, origin.server.URL)
 		h.resolver.Put(rwktestutil.MustThumbprintPriv(signPriv), signPub)
 
-		_, err = h.clientFor(agentID, signPriv).Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+		_, err = h.clientFor(agentID, signPriv).Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 		if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
 			t.Fatalf("code = %v, want Unauthenticated (err=%v)", got, err)
 		}
@@ -404,7 +540,7 @@ func TestExchangeRegister_Negatives(t *testing.T) {
 		client := h.newBrokerCaller(t, brokerID)
 		// A broker carries no agent identity of its own, so it has nothing to
 		// register: Register refuses it before any account write.
-		_, err := client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+		_, err := client.Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 		if got := connect.CodeOf(err); got != connect.CodePermissionDenied {
 			t.Fatalf("code = %v, want PermissionDenied (err=%v)", got, err)
 		}
@@ -427,7 +563,7 @@ func TestExchangeRegister_Negatives(t *testing.T) {
 		a.origin.unavailable = true
 		a.origin.mu.Unlock()
 
-		_, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+		_, err := a.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 		if got := connect.CodeOf(err); got != connect.CodeUnavailable {
 			t.Fatalf("code = %v, want Unavailable (err=%v)", got, err)
 		}

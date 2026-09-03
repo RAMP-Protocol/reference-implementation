@@ -87,6 +87,15 @@ func TestAdminRoutesReturn404(t *testing.T) {
 			path:   "/ramp.admin.v1.AdminService/SetReportingPolicy",
 			body:   strings.NewReader(`{"ver":"1.0","policy":{"tenant_id":"t_test"}}`),
 		},
+		// The operator evidence read is cross-tenant and unauthenticated, gated
+		// only by the internal listener's network allowlist. On the public mux it
+		// would serve one tenant's signatures and keys to anyone who asks.
+		{
+			name:   "GET /ops/transaction-evidence",
+			method: http.MethodGet,
+			path:   "/ops/transaction-evidence?tx=00000000-0000-4000-8000-000000000000",
+			body:   nil,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

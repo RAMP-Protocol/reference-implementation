@@ -1,7 +1,9 @@
-// Package directory builds the two documents an agent publishes on its per-user
-// subdomain: the Web Bot Auth key directory (a pure RFC 7517 JWK Set at
-// /.well-known/http-message-signatures-directory) and the Signature Agent Card
-// (a small JSON description at /.well-known/signature-agent-card.json).
+// Package directory builds the standards-shaped documents an agent publishes on its
+// per-user subdomain: the Web Bot Auth key directory (a pure RFC 7517 JWK Set at
+// /.well-known/http-message-signatures-directory), the Signature Agent Card
+// (a small JSON description at /.well-known/signature-agent-card.json), and the
+// key-revocation list. The RAMP commercial overlay is built elsewhere — see the
+// note below.
 //
 // The package is deliberately pure — it depends on the key domain type
 // (keystore.Key) and the shared schema guard, but on no I/O (no Vault, no
@@ -14,10 +16,16 @@
 // The directory is a standards-owned artifact: any Web Bot Auth verifier on the
 // open internet reads it, and those verifiers implement RFC 7517 / the WBA draft,
 // not RAMP's protobuf. So it is assembled with go-jose as a real JWK Set rather
-// than marshalled from the rampv1.WBAFile proto — the identity core stays
-// RAMP-agnostic (ADR-017 D1). The only RAMP-specific members are the per-key
-// not_before / not_after validity bounds, which a generic verifier ignores; the
-// shared ramp-wba-directory.json schema still validates the result.
+// than marshalled from the rampv1.WBAFile proto. The only RAMP-specific members are
+// the per-key not_before / not_after validity bounds, which a generic verifier
+// ignores; the shared ramp-wba-directory.json schema still validates the result.
+//
+// The rule is about who reads the document, not about keeping RAMP out of the
+// service. A registered agent also publishes the RAMP commercial overlay at
+// /.well-known/ramp.json, which is RAMP's own document with no standards audience
+// outside RAMP; the publisher builds that one straight from the proto through the
+// shared rampwellknown/server library. Only the documents a generic WBA verifier
+// consumes are held to the standards-native construction above.
 package directory
 
 import "context"

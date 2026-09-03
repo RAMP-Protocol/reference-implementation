@@ -65,7 +65,7 @@ this is the only place this document names one, and every command below reuses
 it:
 
 ```bash
-VERSION=1.0.0-rc.2
+VERSION=1.0.0-rc.3
 docker pull ghcr.io/ramp-protocol/broker:$VERSION
 ```
 
@@ -256,12 +256,32 @@ exchanges:
       - ramp-news-v1
 ```
 
-`trust_level` is one of `DISCOVERED`, `VERIFIED`, `PREFERRED`, `BLOCKED`. The
-Broker considers **any** listed Exchange that is healthy and not `BLOCKED`. When
-more than one has an offer, they are ranked by `trust_level` first (`PREFERRED`,
-then `VERIFIED`, then `DISCOVERED`), then by the lower price, and `priority` only
-breaks a remaining tie. Use `BLOCKED` to take an Exchange out of service without
-deleting it.
+`trust_level` is one of `DISCOVERED`, `VERIFIED`, `PREFERRED`, `BLOCKED`, and it
+decides which operations an Exchange may take part in:
+
+| `trust_level` | Discovery | Transactions |
+|---|---|---|
+| `DISCOVERED` | yes | **no** |
+| `VERIFIED` | yes | yes |
+| `PREFERRED` | yes | yes, and ranked first |
+| `BLOCKED` | no | no |
+
+`DISCOVERED` is the level an Exchange gets when the Broker finds it named in some
+publisher's `ramp.json` and nobody has reviewed it. It may be asked for prices,
+which costs nothing, and it may not be paid: anyone who can edit a publisher's
+`ramp.json` could otherwise write themselves into the payment path. Promote to
+`VERIFIED` once you have checked who runs the Exchange. Until then a transaction
+naming it is refused with a settled `invalid_argument`, and no request reaches
+it.
+
+**`trust_level` is effectively required.** Omit it and the entry loads as
+`DISCOVERED`, so the Exchange answers discovery and silently takes no
+transactions. Write the level you mean for every entry.
+
+Among the Exchanges allowed on an operation, the ones with an offer are ranked by
+`trust_level` first (`PREFERRED`, then `VERIFIED`, then `DISCOVERED`), then by the
+lower price, and `priority` only breaks a remaining tie. Use `BLOCKED` to take an
+Exchange out of service without deleting it.
 
 Nothing else fills this list. With `BROKER_REGISTRY_FILE` unset the Broker starts
 with no Exchanges at all — it logs `broker.registry.no_bootstrap` once and every
@@ -348,15 +368,23 @@ psql "$BROKER_DSN" -c \
 # means §7 was not completed.
 ```
 
-**If `healthy` is `f`, stop and fix it now.** A new row starts healthy; it flips to
-`f` only after a failed health probe, which means the Broker could not reach that
-Exchange's `/healthz` at the moment it checked. That is a genuine misconfiguration —
-a wrong `endpoint`, DNS not resolving yet, or the Exchange not up.
+**If `healthy` is `f`, find out why before you go further.** A new row starts
+healthy; it flips to `f` after a failed health probe, which means the Broker could
+not reach that Exchange's `/healthz` at the moment it checked. During a first
+bring-up that is usually a genuine misconfiguration — DNS not resolving yet, the
+Exchange not up, or a `ramp.json` advertising an address that does not answer.
 
-It matters more than it looks: **once an Exchange is marked unhealthy the Broker
-stops probing it altogether**, so it will not recover when the Exchange comes back,
-and it will not recover when you restart the Broker. Fix the cause, then clear the
-flag by hand — the procedure is in [`RUNBOOK.md`](RUNBOOK.md) §4.1.
+The flag corrects itself. The Broker re-probes every Exchange it has not `BLOCKED`
+once per 30-second cycle and clears the flag on the first pass where `/healthz`
+answers 200, so a row that is still `f` a couple of minutes later is reporting a
+live problem rather than a stuck value. Do not edit the column by hand; fix the
+Exchange. Diagnosis is in [`RUNBOOK.md`](RUNBOOK.md) §4.1.
+
+Note which address is probed: the one the Exchange advertises in its **own**
+`/.well-known/ramp.json`, not the `endpoint` you wrote in the registry file. That
+column is a bootstrap seed the Broker keeps current from the same well-known, so a
+value that was wrong from the start shows up as a `broker.registry.endpoint_changed`
+line rather than as a permanent outage.
 
 ---
 
@@ -389,7 +417,7 @@ afterwards lives in [`RUNBOOK.md`](RUNBOOK.md):
 | Withdrawing a compromised key immediately | `RUNBOOK.md` §4.2 |
 | Upgrading and rolling back | `RUNBOOK.md` §4.3 |
 | Adding, removing or quarantining an Exchange | `RUNBOOK.md` §4.1 |
-| Bringing an Exchange back after it was marked unhealthy | `RUNBOOK.md` §4.1 |
+| Diagnosing an Exchange whose health probe keeps failing | `RUNBOOK.md` §4.1 |
 | Running more than one instance | `RUNBOOK.md` §4.1 |
 | What to alert on, and what to ignore | `RUNBOOK.md` §2.3 |
 | Something is broken and you need to know why | `RUNBOOK.md` §3 |

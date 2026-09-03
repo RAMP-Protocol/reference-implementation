@@ -86,9 +86,9 @@ func TestFetch_Errors(t *testing.T) {
 		wantErr error
 	}{
 		{
-			name:    "404 yields ErrNoManifest",
+			name:    "404 yields ErrNoDocument",
 			arrange: func(o *testutil.Origin) { o.SetManifestStatus(http.StatusNotFound) },
-			wantErr: rampwellknown.ErrNoManifest,
+			wantErr: rampwellknown.ErrNoDocument,
 		},
 		{
 			name:    "garbage body yields ErrSchemaInvalid",

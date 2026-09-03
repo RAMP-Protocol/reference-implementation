@@ -29,7 +29,7 @@ func TestCatalogMetadataPersists(t *testing.T) {
 	// tenant prerequisite is seeded via the sqlc InsertTenant query (the same
 	// surface sibling Exchange tests use), not a raw SQL string.
 	if _, err := sqlc.New(pool).InsertTenant(ctx, sqlc.InsertTenantParams{
-		TenantID: "t1", Domain: "publisher.example", HmacSecretRef: "h", Ed25519KeyRef: "k",
+		TenantID: "t1", Domain: "publisher.example", Ed25519KeyRef: "k",
 		ReportingPolicy: []byte(`{}`), SigningScheme: sqlc.RampSigningSchemeED25519,
 	}); err != nil {
 		t.Fatalf("seed tenant: %v", err)

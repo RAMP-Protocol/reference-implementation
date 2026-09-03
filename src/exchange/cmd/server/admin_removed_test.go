@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	audiencetest "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 )
 
@@ -70,6 +71,7 @@ func TestAdminRoutesReturn404(t *testing.T) {
 		catalog:       nil,
 		agentRegistry: noopRegistry{},
 		offerSigner:   offerSigner,
+		audience:      audiencetest.MustInterceptor(t, "exchange.example"),
 	})
 	if err != nil {
 		t.Fatalf("build mux: %v", err)
@@ -92,6 +94,10 @@ func TestAdminRoutesReturn404(t *testing.T) {
 		// IP-allowlist) should serve them.
 		{http.MethodPost, "/ramp.admin.v1.AdminService/SetTenantFeeRate", strings.NewReader(`{"ver":"1.0","rate":{"tenant_id":"t_test","fee_rate_bps":100}}`)},
 		{http.MethodPost, "/ramp.admin.v1.AdminService/SetReportingPolicy", strings.NewReader(`{"ver":"1.0","policy":{"tenant_id":"t_test"}}`)},
+		// The operator evidence read is cross-tenant and unauthenticated, gated
+		// only by the internal listener's network allowlist. On the public mux it
+		// would serve one tenant's signatures and keys to anyone who asks.
+		{http.MethodGet, "/ops/transaction-evidence?tx=00000000-0000-4000-8000-000000000000", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
@@ -133,6 +139,7 @@ func TestHealthzStillRegistered(t *testing.T) {
 		pool:          nil,
 		agentRegistry: noopRegistry{},
 		offerSigner:   mustSigner(t),
+		audience:      audiencetest.MustInterceptor(t, "exchange.example"),
 	})
 	if err != nil {
 		t.Fatalf("build mux: %v", err)

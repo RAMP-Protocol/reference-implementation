@@ -33,6 +33,46 @@ func TestFreeAdapter_EnsureAgentAccountNoOp(t *testing.T) {
 	}
 }
 
+// TestFreeAdapter_CreditNoOp proves Credit succeeds (repeatably) without a
+// ledger, while the shared argument gate — empty ref, empty key, non-positive
+// amount, reserved key namespace, wrong currency — still rejects, per the
+// interface contract.
+//
+// The wrong-currency case is here rather than in the shared conformance suite
+// because that suite does not cover this adapter: its factory list carries the
+// in-memory adapter, and TigerBeetle supplies its own factory separately. The
+// free tier takes no exemption from the currency rule even though it keeps no
+// balances, so the rule needs a case that exercises this adapter directly.
+func TestFreeAdapter_CreditNoOp(t *testing.T) {
+	t.Parallel()
+	a := billing.FreeAdapter{}
+	one := billing.Amount{Value: big.NewRat(1, 1), Currency: billing.DemoCurrency}
+	for i := 0; i < 2; i++ {
+		if err := a.Credit(context.Background(), "billing-ref-1", one, billing.WelcomeCreditKey("billing-ref-1")); err != nil {
+			t.Errorf("Credit call %d = %v, want nil", i+1, err)
+		}
+	}
+	zero := billing.Amount{Value: new(big.Rat), Currency: billing.DemoCurrency}
+	otherCurrency := billing.Amount{Value: big.NewRat(1, 1), Currency: "EUR"}
+	for name, call := range map[string]func() error{
+		"empty ref":      func() error { return a.Credit(context.Background(), "", one, "k") },
+		"empty key":      func() error { return a.Credit(context.Background(), "billing-ref-1", one, "") },
+		"zero amount":    func() error { return a.Credit(context.Background(), "billing-ref-1", zero, "k") },
+		"reserved key":   func() error { return a.Credit(context.Background(), "billing-ref-1", one, "pending:x") },
+		"wrong currency": func() error { return a.Credit(context.Background(), "billing-ref-1", otherCurrency, "k") },
+	} {
+		if err := call(); err == nil {
+			t.Errorf("Credit %s: expected an error", name)
+		}
+	}
+	// The currency mismatch maps to a 4xx, not a 500, so it reports the same
+	// sentinel a mismatched refund amount does.
+	err := a.Credit(context.Background(), "billing-ref-1", otherCurrency, "k")
+	if !errors.Is(err, billing.ErrInvalidAmount) {
+		t.Errorf("Credit wrong currency = %v, want ErrInvalidAmount", err)
+	}
+}
+
 // TestFreeAdapter_ReleaseNoOp proves Release is a no-op for the free tier.
 func TestFreeAdapter_ReleaseNoOp(t *testing.T) {
 	t.Parallel()

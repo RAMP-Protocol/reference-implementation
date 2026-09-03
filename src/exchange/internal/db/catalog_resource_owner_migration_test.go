@@ -5,6 +5,8 @@ package db_test
 import (
 	"context"
 	"testing"
+
+	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 )
 
 // TestCatalogResourceOwnerMigration verifies the additive 000018 migration that
@@ -19,13 +21,12 @@ import (
 func TestCatalogResourceOwnerMigration(t *testing.T) {
 	ctx := context.Background()
 	// Up to head — resource_owner_id added (000018).
-	dsn := migratedDSN(t, ctx)
+	dsn := sharedb.AcquireTestDSN(t, ctx, sharedPG)
 	if !hasColumn(t, ctx, dsn, "resource_owner_id") {
 		t.Fatal("after up: ramp.catalog is missing the resource_owner_id column")
 	}
 
-	m := migrator(t, dsn)
-	defer m.Close()
+	m := schemaProbe.Migrator(t, dsn)
 
 	// Migrate(17) reverses the 000018 ADD: the resource_owner_id column is removed.
 	if err := m.Migrate(17); err != nil {

@@ -9,9 +9,9 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/RAMP-Protocol/protocol/sdk/go/core"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/broker"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/budget"
@@ -276,14 +276,17 @@ func (h *Service) exchangesFor(
 	ctx context.Context, manifests map[string]probe.Manifest,
 ) ([]repo.Exchange, bool) {
 	seen := make(map[string]bool)
-	healthy := make(map[string]repo.Exchange)
+	// This path answers a batch with no usable exchange via
+	// noHealthyExchangeResponse, so it needs the memo but not the scan's
+	// transient-decline flag.
+	scan := newRouteScan()
 	var out []repo.Exchange
 	for _, manifest := range manifests {
 		for _, ex := range manifest.Exchanges {
 			if seen[ex.Domain] {
 				continue
 			}
-			m, ok := h.registeredHealthy(ctx, ex.Domain, healthy)
+			m, ok := h.registeredHealthy(ctx, ex.Domain, scan)
 			if !ok {
 				continue
 			}
@@ -345,11 +348,20 @@ func (h *Service) auditSelection(
 // target exchange (NOT the full batch); the broadcast-query caller passes nil
 // (the free-text query rides on req.Query, no uris). This is the single point
 // where the per-exchange URL subset is stamped onto the wire.
+//
+// recipient is the registered domain of the exchange this one query is going to.
+// The Broker authors these fan-out legs as the sender, so the Broker is who
+// states the recipient: the agent asked for URLs, and choosing which exchanges
+// see them is the Broker's job. The value is signed with the rest of the query,
+// so an exchange that receives a leg meant for a sibling refuses it — which the
+// dialled URL alone cannot establish, because that URL comes from a fetched and
+// cached manifest.
 func buildResourceQuery(
-	ctx context.Context, req Request, clk clock.Clock, uris []string,
+	ctx context.Context, req Request, clk clock.Clock, recipient string, uris []string,
 ) *rampv1.ResourceQuery {
 	q := &rampv1.ResourceQuery{
-		Ver:       rampproto.Ver,
+		Ver:       helpers.ProtocolVersion,
+		Exchange:  recipient,
 		Requester: buildRequester(ctx, req, clk),
 	}
 	// uris and acceptable_restrictions ride on the ResourceQuery message itself

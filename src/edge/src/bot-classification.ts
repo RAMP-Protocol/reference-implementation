@@ -15,6 +15,22 @@ export const BOT_UA_PATTERNS: readonly RegExp[] = Object.freeze([
   /PerplexityBot/i,
   /Bytespider/i,
   /Google-Extended/i,
+  /Meta-ExternalAgent/i,
+  // User-initiated assistant fetchers. A human asked for the page, which
+  // makes these a distinct class from the autonomous crawlers above — but the
+  // publisher stance is the same: AI access to paid content is licensed,
+  // regardless of who initiated the fetch. The identifying tokens carry no
+  // "bot" marker, so without a dedicated pattern classification depends on
+  // incidental text elsewhere in the UA: ChatGPT-User's documented full UA
+  // ends in a "+https://openai.com/bot" URL that /bot\b/ catches, and
+  // Meta-ExternalFetcher's ends in a "…/webmasters/crawler" docs URL that
+  // /crawler/i catches — but the bare forms, which plain clients send, fall
+  // through to 'human', and a direct assistant fetch then reads paid content
+  // free, bypassing the purchase flow. The dedicated entries close that.
+  /Claude-User/i,
+  /ChatGPT-User/i,
+  /Perplexity-User/i,
+  /Meta-ExternalFetcher/i,
 ]);
 
 // Search-engine crawlers read for free: the publisher wants indexing (and the

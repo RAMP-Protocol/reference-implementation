@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from ramp_sdk import ProtocolVersion
 
 from ..conftest import StackURLs
 from ..httpsig_signer import load_keypair
@@ -159,7 +160,11 @@ def test_covered_header_mismatch_is_refused_with_specific_reason(
     2. The refusal reason names the covered-component mismatch
        (a token from the COVERED_MISMATCH bucket).
     """
-    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/covered-mismatch.html"]}
+    body_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/covered-mismatch.html"],
+    }
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)

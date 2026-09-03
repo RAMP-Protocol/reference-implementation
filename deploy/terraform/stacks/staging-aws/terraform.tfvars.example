@@ -11,11 +11,31 @@
 aws_region = "us-east-1"
 # aws_profile = "my-profile"   # omit to use your default AWS credentials
 
-ssh_public_key   = "ssh-ed25519 AAAA... operator@laptop"
-ssh_ingress_cidr = "203.0.113.7/32" # your address: curl ifconfig.me
-# Not one of your default ssh keys? Give the private-key path so the
-# ssh_command output includes -i (the key itself never leaves your machine):
-# ssh_private_key_path = "~/.ssh/ramp-staging"
+# WARNING: EDITING THIS MAP REPLACES THE VM AND DESTROYS ITS DATA. Adding or
+# removing an operator changes the user data, and the instance is recreated to
+# match it. Do not add an operator on the morning of a demo.
+#
+# public_key is the ONE-LINE CONTENTS of the operator's .pub file, not a path to
+# it: paste the output of `cat ~/.ssh/id_ed25519.pub`. Terraform variable files
+# cannot call functions, so file("~/.ssh/id_ed25519.pub") does not work here.
+#
+# source_cidrs are that operator's own addresses, each a single host as /32
+# (curl ifconfig.me). Each key is installed with an OpenSSH from= restriction
+# holding only its own addresses, so one operator's key cannot be used from
+# another operator's address. The security group opens the union.
+#
+# To select a private key when you connect, set RAMP_SSH_IDENTITY_FILE locally —
+# it is not a Terraform input.
+ssh_operators = {
+  alice = {
+    public_key   = "ssh-ed25519 AAAA... alice@laptop"
+    source_cidrs = ["203.0.113.7/32"]
+  }
+  bob = {
+    public_key   = "ssh-ed25519 AAAA... bob@laptop"
+    source_cidrs = ["198.51.100.24/32", "198.51.100.25/32"]
+  }
+}
 
 # Cloudflare — the zone the staging hostnames live under.
 cloudflare_account_id = "0123456789abcdef0123456789abcdef"

@@ -12,7 +12,7 @@ import (
 )
 
 const getAgent = `-- name: GetAgent :one
-SELECT agent_id, public_key, discovery_url, requester_type, registered_at, billing_ref FROM ramp.agents WHERE agent_id = $1
+SELECT agent_id, public_key, discovery_url, requester_type, registered_at, billing_ref, accepted_terms_digest FROM ramp.agents WHERE agent_id = $1
 `
 
 func (q *Queries) GetAgent(ctx context.Context, agentID string) (RampAgent, error) {
@@ -25,30 +25,40 @@ func (q *Queries) GetAgent(ctx context.Context, agentID string) (RampAgent, erro
 		&i.RequesterType,
 		&i.RegisteredAt,
 		&i.BillingRef,
+		&i.AcceptedTermsDigest,
 	)
 	return i, err
 }
 
 const setAgentBillingRef = `-- name: SetAgentBillingRef :one
 UPDATE ramp.agents
-   SET billing_ref = $2
+   SET billing_ref = $2,
+       accepted_terms_digest = $3
  WHERE agent_id = $1
    AND billing_ref IS NULL
-RETURNING agent_id, public_key, discovery_url, requester_type, registered_at, billing_ref
+RETURNING agent_id, public_key, discovery_url, requester_type, registered_at, billing_ref, accepted_terms_digest
 `
 
 type SetAgentBillingRefParams struct {
-	AgentID    string      `json:"agent_id"`
-	BillingRef pgtype.Text `json:"billing_ref"`
+	AgentID             string      `json:"agent_id"`
+	BillingRef          pgtype.Text `json:"billing_ref"`
+	AcceptedTermsDigest pgtype.Text `json:"accepted_terms_digest"`
 }
 
-// Stores the billing account id for an agent, first write wins. The
-// billing_ref IS NULL guard makes a repeat call a no-op (zero rows →
-// pgx.ErrNoRows), so a stored ref is never overwritten (ADR-021 D4). The
-// column is deliberately absent from UpsertAgent's update list: a key
-// rotation re-upsert must leave billing_ref intact (ADR-021 D3).
+// Stores the billing account id for an agent, plus the digest of the licensing
+// terms the registration accepted, first write wins. The billing_ref IS NULL
+// guard makes a repeat call a no-op (zero rows → pgx.ErrNoRows), so a stored ref
+// is never overwritten (ADR-021 D4).
+//
+// Both columns are written by this ONE guarded statement, so first-write-wins
+// covers them together and the account can never end up carrying a billing_ref
+// from one registration and an accepted digest from another. The digest is NULL
+// when the Exchange published none at the time.
+//
+// Neither column appears in UpsertAgent's update list: a key rotation re-upsert
+// must leave both intact (ADR-021 D3).
 func (q *Queries) SetAgentBillingRef(ctx context.Context, arg SetAgentBillingRefParams) (RampAgent, error) {
-	row := q.db.QueryRow(ctx, setAgentBillingRef, arg.AgentID, arg.BillingRef)
+	row := q.db.QueryRow(ctx, setAgentBillingRef, arg.AgentID, arg.BillingRef, arg.AcceptedTermsDigest)
 	var i RampAgent
 	err := row.Scan(
 		&i.AgentID,
@@ -57,6 +67,7 @@ func (q *Queries) SetAgentBillingRef(ctx context.Context, arg SetAgentBillingRef
 		&i.RequesterType,
 		&i.RegisteredAt,
 		&i.BillingRef,
+		&i.AcceptedTermsDigest,
 	)
 	return i, err
 }
@@ -68,7 +79,7 @@ ON CONFLICT (agent_id) DO UPDATE
     SET public_key = EXCLUDED.public_key,
         discovery_url = EXCLUDED.discovery_url,
         requester_type = EXCLUDED.requester_type
-RETURNING agent_id, public_key, discovery_url, requester_type, registered_at, billing_ref
+RETURNING agent_id, public_key, discovery_url, requester_type, registered_at, billing_ref, accepted_terms_digest
 `
 
 type UpsertAgentParams struct {
@@ -93,6 +104,7 @@ func (q *Queries) UpsertAgent(ctx context.Context, arg UpsertAgentParams) (RampA
 		&i.RequesterType,
 		&i.RegisteredAt,
 		&i.BillingRef,
+		&i.AcceptedTermsDigest,
 	)
 	return i, err
 }

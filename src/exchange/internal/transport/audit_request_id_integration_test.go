@@ -5,15 +5,14 @@ package transport_test
 import (
 	"context"
 	"crypto/ed25519"
-	"encoding/json"
 	"log/slog"
 	"net/http"
-	"strings"
 	"testing"
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
@@ -48,12 +47,9 @@ func TestExecuteTransaction_AuditLogCarriesRequestID(t *testing.T) {
 
 	offer := h.seedAndDiscover(t)
 
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example",
-		Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-test", "agent.example")
 	req := connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", IdempotencyKey: "tx-audit",
+		Ver: helpers.ProtocolVersion, IdempotencyKey: "tx-audit",
 		Requester: requester,
 		Items: []*rampv1.TransactionItem{
 			{Offer: offer, AgentAcceptance: signAcceptanceFor(t, h.callerPriv, offer, requester, "tx-audit")},
@@ -74,28 +70,6 @@ func TestExecuteTransaction_AuditLogCarriesRequestID(t *testing.T) {
 	if got := line["outcome"]; got != "VALIDATED" {
 		t.Fatalf("execute_transaction audit line outcome = %v, want VALIDATED", got)
 	}
-}
-
-// findLogLine scans newline-delimited JSON log records for the first record
-// whose "msg" equals wantMsg and returns it decoded. Fails the test if no such
-// record exists — that absence is itself the pre-fix symptom (the outcome line
-// never reached this sink), so a missing line is a real failure, not a skip.
-func findLogLine(t *testing.T, logged, wantMsg string) map[string]any {
-	t.Helper()
-	for _, raw := range strings.Split(strings.TrimSpace(logged), "\n") {
-		if raw == "" {
-			continue
-		}
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(raw), &rec); err != nil {
-			continue
-		}
-		if rec["msg"] == wantMsg {
-			return rec
-		}
-	}
-	t.Fatalf("no log record with msg=%q; got:\n%s", wantMsg, logged)
-	return nil
 }
 
 // auditHarness is a minimal transport-layer fixture whose middleware AND
@@ -170,25 +144,14 @@ func newAuditHarness(t *testing.T, logger *slog.Logger) *auditHarness {
 // harness's clients (the shared helpers take *testHarness).
 func (h *auditHarness) seedAndDiscover(t *testing.T) *rampv1.Offer {
 	t.Helper()
-	if _, err := h.catalog.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.tenantDomain,
-			Path:   "/articles/hello",
-			Terms:  []*rampv1.LicenseTerm{seedPricedTerm()},
-		}},
-	})); err != nil {
+	if _, err := h.catalog.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{{
+		Domain: h.tenantDomain,
+		Path:   "/articles/hello",
+		Terms:  []*rampv1.LicenseTerm{seedPricedTerm()},
+	}}))); err != nil {
 		t.Fatalf("seed push: %v", err)
 	}
-	resp, err := h.client.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.tenantDomain + "/articles/hello"},
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example",
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	resp, err := h.client.DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(newRequester("agent-test", "agent.example"), []string{"https://" + h.tenantDomain + "/articles/hello"})))
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}

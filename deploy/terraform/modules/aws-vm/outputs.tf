@@ -18,6 +18,13 @@ output "vpc_id" {
   value       = aws_vpc.this.id
 }
 
+output "ssh_authorized_keys" {
+  # "Rendered for installation", not "installed": Terraform knows what it put
+  # in the user data, but it cannot know what cloud-init wrote to disk.
+  description = "The authorized_keys lines rendered for installation, by operator name: who is configured to SSH in, and from where. Public keys only — nothing here is secret."
+  value       = local.ssh_authorized_keys
+}
+
 output "ssh_command" {
   description = "Ready-made SSH command for the operator."
   value       = "ssh ubuntu@${aws_eip.this.public_ip}"

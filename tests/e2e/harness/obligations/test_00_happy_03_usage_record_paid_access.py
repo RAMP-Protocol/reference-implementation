@@ -25,7 +25,6 @@ datastore, not an in-process layer bypass (see the read site below).
 
 from __future__ import annotations
 
-import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -33,6 +32,8 @@ import httpx
 import psycopg
 import pytest
 
+from ..exchanges import recipient_of
+from ..reporting import REPORT_USAGE_PATH, report_body
 from ..conftest import COMPOSE_FILE, StackURLs
 from ..edge_fetch import fetch_signed
 from ..resolve_carriers import first_item_of, retrieval_endpoint_of
@@ -54,7 +55,6 @@ _OBLIGATION_TEXT = (
     "URI, price, currency, and timestamp."
 )
 
-_REPORT_USAGE_PATH = "/ramp.v1.ExchangeService/ReportUsage"
 
 # epicurus: PER_UNIT 0.0001/characters USD, individual, US/GB.
 _RESOURCE_URI = f"http://{DEMO_PHILOSOPHY_DOMAIN}/articles/philosophers/epicurus.txt"
@@ -119,19 +119,14 @@ def test_paid_usage_record_shows_uri_price_currency_and_timestamp(
     # quantity is reported as 0 (the validator strict-rejects a positive
     # quantity against a zero-estimate obligation).
     report_resp = _post(
-        f"{compose_stack.exchange}{_REPORT_USAGE_PATH}",
-        {
-            "ver": "0.3",
-            "idempotency_key": f"report-{uuid.uuid4().hex}",
-            "transaction_id": transaction_id,
-            "billing_id": billing_id,
-            "usage": {"consumed_quantity": 0, "function": ["ai_input"]},
-            "requester": {
-                "id": USD_AGENT_ID,
-                "domain": DEMO_PHILOSOPHY_DOMAIN,
-                "type": "REQUESTER_TYPE_AGENT",
-            },
-        },
+        f"{compose_stack.exchange}{REPORT_USAGE_PATH}",
+        report_body(
+            exchange=recipient_of(compose_stack.exchange),
+            transaction_id=str(transaction_id),
+            agent_id=USD_AGENT_ID,
+            domain=DEMO_PHILOSOPHY_DOMAIN,
+            billing_id=str(billing_id or ""),
+        ),
     )
     assert report_resp.status_code == httpx.codes.OK, (
         f"ReportUsage refused for transaction {transaction_id}: "

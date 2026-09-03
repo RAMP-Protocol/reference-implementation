@@ -87,12 +87,25 @@ func (h *DiscoverRelayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		writeBrokerError(w, requestID, berr)
 		return
 	}
-	if aerr := h.core.AdmitEndpoint(ctx, h, endpoint); aerr != nil {
-		writeBrokerError(w, requestID, aerr)
-		return
-	}
+	// Verify BEFORE admitting, so no caller learns anything about the registry
+	// without first proving who it is. The admission answer distinguishes an
+	// endpoint nobody registered from one that is registered and failing its
+	// health check, and it says which in words. Answered pre-verification, that
+	// lets anyone sort address guesses into registered and unregistered, and poll
+	// a registered one for its outage windows. The projection onto the caller
+	// hides the blocked-versus-unregistered split for exactly this reason; health
+	// reports the same fact on a different axis.
+	//
+	// The swap costs nothing. The endpoint comes from the header and is already
+	// resolved above, and BoundaryTargetURL rebuilds the signature base from that
+	// same value, so verification never depended on the admission result. A
+	// verified agent still gets the retryable-versus-settled distinction.
 	if verr := h.core.VerifyAndGuardReplay(h, r, endpoint, body); verr != nil {
 		writeBrokerError(w, requestID, verr)
+		return
+	}
+	if aerr := h.core.AdmitEndpoint(ctx, h, endpoint); aerr != nil {
+		writeBrokerError(w, requestID, aerr)
 		return
 	}
 	h.forward(w, r, endpoint, body, requestID)

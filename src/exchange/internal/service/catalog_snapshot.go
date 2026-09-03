@@ -16,13 +16,17 @@ import (
 // CatalogSnapshot is the published, read-only view consumed by the
 // Exchange service. Built by the CatalogService and swapped atomically.
 type CatalogSnapshot struct {
-	trie   *radix.Tree
-	byID   map[string]repo.CatalogEntry
+	trie *radix.Tree
+	// byURI is the execute-time binding index: exact-match on the stored
+	// catalog.uri (globally UNIQUE), keyed by the signed offer's
+	// Identity.canonical_url. Distinct from the trie, which keys on URIPrefix
+	// and serves discovery's longest-prefix lookup.
+	byURI  map[string]repo.CatalogEntry
 	tenant map[string]string // resource_id -> tenant_id (redundant, for readability)
 	// terms caches each row's protojson-decoded license terms, decoded ONCE at
-	// rebuild rather than on every discovery/billing read. Keyed by
-	// resource_id (== offer_id). DecodedTerms is the read accessor; nothing on the
-	// hot path calls unmarshalTerms per request anymore.
+	// rebuild rather than on every discovery/billing read. Keyed by resource_id.
+	// DecodedTerms is the read accessor; nothing on the hot path calls
+	// unmarshalTerms per request anymore.
 	terms map[string][]*rampv1.LicenseTerm
 	// metadata caches each row's protojson-decoded resource extension metadata,
 	// decoded ONCE at rebuild() rather than per discovery read (mirrors terms).
@@ -41,7 +45,7 @@ type CatalogSnapshot struct {
 func newEmptySnapshot() *CatalogSnapshot {
 	return &CatalogSnapshot{
 		trie:     radix.New(),
-		byID:     map[string]repo.CatalogEntry{},
+		byURI:    map[string]repo.CatalogEntry{},
 		tenant:   map[string]string{},
 		terms:    map[string][]*rampv1.LicenseTerm{},
 		metadata: map[string]*rampv1.ResourceEntry{},
@@ -116,40 +120,6 @@ func renderRowProfiles(ctx context.Context, snap *CatalogSnapshot, resourceID st
 	if len(byIndex) > 0 {
 		snap.rendered[resourceID] = byIndex
 	}
-}
-
-// MaxTermsPerEntry caps the number of license terms a single ResourceEntry may
-// carry. The terms[] array length is contributor-controlled at
-// PushResources and every stored term is protojson-decoded on the discovery read
-// path; an unbounded array would let one contributor impose unbounded per-read
-// decode CPU. Capping at INGEST bounds the array size that can ever be stored,
-// which in turn bounds the per-read decode cost.
-//
-// 32 is a deliberately generous bound: the realistic canonical feed carries ≤2
-// terms per entry, so 32 leaves ~16x headroom for legitimate multi-variant
-// pricing while keeping the decode cost a small constant. It is a length cap,
-// not a per-term validity rule — each individual term is still validated by
-// validateEntryTerms.
-const MaxTermsPerEntry = 32
-
-// RejectionReasonTooManyTerms is the machine-readable reason emitted when an
-// entry carries more than MaxTermsPerEntry license terms. Like the
-// other RejectionReason* constants it is a PER-ENTRY verdict — the over-cap
-// entry is dropped from the batch and never persisted, so the batch's other
-// entries still upsert — surfaced today only in the structured rejection log
-// because the canonical PushResourcesResponse carries counts, not per-entry
-// detail.
-const RejectionReasonTooManyTerms = "too_many_terms"
-
-// rejectIfTooManyTerms enforces the terms[] cardinality cap as a
-// per-entry gate. It returns a rejection when the entry carries more than
-// MaxTermsPerEntry terms and nil otherwise. Length-only — per-term validity is
-// validateEntryTerms' job.
-func rejectIfTooManyTerms(e *rampv1.ResourceEntry) *CatalogPushRejection {
-	if len(e.GetTerms()) > MaxTermsPerEntry {
-		return reject(uriFromEntry(e), RejectionReasonTooManyTerms)
-	}
-	return nil
 }
 
 // decodeRowTerms decodes one catalog row's persisted terms JSONB ONCE at

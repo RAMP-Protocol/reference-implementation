@@ -35,6 +35,7 @@ from typing import Any
 
 import httpx
 import pytest
+from ramp_sdk import ProtocolVersion
 
 from ..conftest import StackURLs
 from ..httpsig_signer import load_keypair, sign_request
@@ -114,7 +115,11 @@ def test_replayed_signature_is_refused_with_specific_reason(
     2. ``says the signature was replayed`` — the refusal reason names
        the replay with a token from the REPLAY bucket.
     """
-    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/replay.html"]}
+    body_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/replay.html"],
+    }
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)

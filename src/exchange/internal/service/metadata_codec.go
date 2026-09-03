@@ -46,8 +46,8 @@ func marshalResourceMetadata(e *rampv1.ResourceEntry) ([]byte, error) {
 // applyMetadata projects a row's decoded resource extension metadata onto the
 // Offer. It must be called BEFORE the offer is signed so every field
 // is signature-covered, and it derives ONLY from the stored metadata (no clock,
-// no requester state) so the tx-reconstruction path (verifyOffer -> buildOffer)
-// reproduces identical bytes. resource_mutability is sourced from the typed
+// no requester state), so a snapshot rebuild renders the same projection for
+// the same stored row. resource_mutability is sourced from the typed
 // ingest field; previews is still promoted from ext (its typed promotion is a
 // separate follow-up); the full ext is also carried verbatim.
 func applyMetadata(offer *rampv1.Offer, md *rampv1.ResourceEntry) {

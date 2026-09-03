@@ -9,6 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 )
 
 // raiseExceptionSQLState is what a plpgsql RAISE EXCEPTION without an explicit
@@ -42,8 +44,8 @@ const raiseExceptionSQLState = "P0001"
 //     the regression that would otherwise survive the entire suite.
 func TestTransactionEvidenceSchema(t *testing.T) {
 	ctx := context.Background()
-	dsn := migratedDSN(t, ctx)
-	if !hasTable(t, ctx, dsn, "transaction_evidence") {
+	dsn := sharedb.AcquireTestDSN(t, ctx, sharedPG)
+	if !schemaProbe.HasTable(t, ctx, dsn, "transaction_evidence") {
 		t.Fatal("after up: ramp.transaction_evidence is missing")
 	}
 
@@ -55,15 +57,14 @@ func TestTransactionEvidenceSchema(t *testing.T) {
 
 	// The down migration must leave no orphaned trigger function behind. It runs
 	// last because it drops the table every assertion above reads.
-	m := migrator(t, dsn)
-	defer m.Close()
+	m := schemaProbe.Migrator(t, dsn)
 	if err := m.Migrate(23); err != nil {
 		t.Fatalf("migrate to version 23 (reverse 000024): %v", err)
 	}
-	if hasTable(t, ctx, dsn, "transaction_evidence") {
+	if schemaProbe.HasTable(t, ctx, dsn, "transaction_evidence") {
 		t.Fatal("after down 000024: ramp.transaction_evidence still exists")
 	}
-	if hasFunction(t, ctx, dsn, "prevent_evidence_mutation") {
+	if schemaProbe.HasFunction(t, ctx, dsn, "prevent_evidence_mutation") {
 		t.Fatal("after down 000024: ramp.prevent_evidence_mutation() was left behind")
 	}
 }
@@ -111,7 +112,7 @@ func assertRowMutationTriggerCovers(t *testing.T, ctx context.Context, dsn strin
 			  AND (tgtype & 2)  = 2    -- BEFORE
 			  AND tgfoid = 'ramp.prevent_evidence_mutation()'::regprocedure
 		)`
-	if !existsProbe(t, ctx, dsn, q) {
+	if !schemaProbe.Exists(t, ctx, dsn, q) {
 		t.Fatal("trg_transaction_evidence_no_row_mutation is not a BEFORE UPDATE OR DELETE row " +
 			"trigger bound to ramp.prevent_evidence_mutation()")
 	}
@@ -142,7 +143,7 @@ func assertEvidenceBoundToTransactionLog(t *testing.T, ctx context.Context, dsn 
 			  AND confrelid = 'ramp.transaction_log'::regclass
 			  AND pg_get_constraintdef(oid) LIKE 'FOREIGN KEY (transaction_id) REFERENCES%'
 		)`
-	if !existsProbe(t, ctx, dsn, fk) {
+	if !schemaProbe.Exists(t, ctx, dsn, fk) {
 		t.Fatal("transaction_evidence.transaction_id has no foreign key into ramp.transaction_log; " +
 			"an evidence row could outlive or precede its transaction")
 	}
@@ -153,7 +154,7 @@ func assertEvidenceBoundToTransactionLog(t *testing.T, ctx context.Context, dsn 
 			  AND contype  = 'p'
 			  AND pg_get_constraintdef(oid) = 'PRIMARY KEY (transaction_id)'
 		)`
-	if !existsProbe(t, ctx, dsn, pk) {
+	if !schemaProbe.Exists(t, ctx, dsn, pk) {
 		t.Fatal("transaction_evidence is not keyed 1:1 on transaction_id")
 	}
 }
@@ -177,19 +178,8 @@ func assertCorrelationKeyIndexed(t *testing.T, ctx context.Context, dsn string) 
 			  AND c.relname = 'transaction_evidence_request_idx'
 			  AND pg_get_indexdef(i.indexrelid) LIKE '%(request_id, created_at DESC)'
 		)`
-	if !existsProbe(t, ctx, dsn, q) {
+	if !schemaProbe.Exists(t, ctx, dsn, q) {
 		t.Fatal("transaction_evidence has no (request_id, created_at DESC) index; " +
 			"the correlation sweep the column exists for would seq-scan a never-pruned table")
 	}
-}
-
-// hasFunction reports whether the ramp schema has the given function.
-func hasFunction(t *testing.T, ctx context.Context, dsn, name string) bool {
-	t.Helper()
-	return existsProbe(t, ctx, dsn, `
-		SELECT EXISTS (
-			SELECT 1 FROM pg_proc p
-			JOIN pg_namespace n ON n.oid = p.pronamespace
-			WHERE n.nspname = 'ramp' AND p.proname = $1
-		)`, name)
 }

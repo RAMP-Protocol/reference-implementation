@@ -20,6 +20,45 @@ x-wildcard-dns: &wildcard-dns
 # to miss when it changes.
 x-identity-issuer: &identity-issuer "http://identity"
 
+# A throwaway Postgres cluster, as one unit. `make e2e-down` runs `down -v` and
+# every stack-up re-inits from scratch, so nothing in PGDATA has to survive.
+# Keeping the data directory in RAM with the durability work switched off takes
+# the stack's Postgres write traffic off the host disk entirely — on a laptop
+# that traffic is what makes the machine unresponsive during a run. size= is a
+# cap, not a reservation: tmpfs allocates only the pages actually written.
+#
+# Anchored rather than repeated, for the same reason as everything else here:
+# two services want it, and the second copy was coupled to the first by a
+# comment saying "same reasoning as above", which nothing enforces.
+x-ephemeral-postgres: &ephemeral-postgres
+  command:
+    ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off",
+     "-c", "full_page_writes=off"]
+  tmpfs:
+    - /var/lib/postgresql/data:rw,size=2g
+
+# What an Exchange asks a registration to carry, published in its manifest.
+#
+# One value, two publishers: exchange-b is where the account suite registers,
+# and exchange-c publishes the SAME schema so a refusal can be observed against
+# an exchange no test ever opens an account at. Deliberately identical — the
+# refusal under test is about a payload missing a published member, not about
+# which members a given exchange asks for — and anchored so "identical" is a
+# fact rather than a comment. The value is 269 characters as written here, 267
+# once compose un-escapes the two $$ pairs; edit one copy of that and the suite
+# does not notice, because the test that drives the refusal reads the schema from
+# exchange-c's own manifest.
+#
+# $$schema, not $schema: compose interpolates $NAME in a value, so the
+# single-dollar form is read as an unset variable and the member is served with
+# an EMPTY key. The schema still compiles that way, which is what makes the
+# mistake quiet — the document is simply not the one configured. $$ is compose's
+# escape for a literal dollar. The trailing $ in the email pattern needs no
+# escape: compose only interpolates $ followed by a name or a brace. Both
+# escapes are now written once instead of twice each, which is exactly what a
+# copy-edit gets wrong.
+x-registration-schema: &registration-schema '{"$$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["company_name","billing_email"],"properties":{"company_name":{"type":"string","minLength":1},"billing_email":{"type":"string","pattern":"^[^@]+@[^@]+$$"},"vat_id":{"type":"string"}}}'
+
 # The bearer-token issuer and signing seed, as one unit. Both the identity service
 # (which MINTS and verifies bearers) and the runner (whose harness mints its own,
 # in tests/e2e/harness/test_mcp_endpoint.py) must agree on them exactly. Anchored
@@ -62,6 +101,7 @@ x-jwks-host: &jwks-host
 services:
   postgres:
     image: postgres:16-alpine
+    <<: *ephemeral-postgres
     environment:
       POSTGRES_USER: ramp
       POSTGRES_PASSWORD: ramp
@@ -344,6 +384,12 @@ services:
       # the broker's registered exchange endpoint (EXCHANGES_JSON) for the
       # post-resolve SSRF equality gate.
       EXCHANGE_DOMAIN: "exchange:8081"
+      # The tenant whose "activate new agents automatically" policy a registration
+      # reads. It defaults to EXCHANGE_DOMAIN, which no tenant row is ever named
+      # after, so leaving it unset makes every ramp_register fail — the exchange
+      # warns about exactly that at boot. Each exchange here fronts one
+      # publisher's catalog, so it names that publisher's tenant.
+      EXCHANGE_DEFAULT_TENANT: "demo.ramp-protocol.org"
       EXCHANGE_PUBLIC_ORIGIN: "http://exchange:8081"
       # Inmemory billing adapter so the seeded agent-e2e balance is the
       # authoritative bound for AcceptOffer's billing gate. Defaults to
@@ -433,6 +479,8 @@ services:
       EXCHANGE_SOR_DSN: "postgres://ramp:ramp@postgres:5432/ramp_sor_b?sslmode=disable"
       EXCHANGE_ADDR: ":8081"
       EXCHANGE_DOMAIN: "exchange-b:8081"
+      # This exchange's own publisher tenant (see exchange-a).
+      EXCHANGE_DEFAULT_TENANT: "music.demo.ramp-protocol.org"
       EXCHANGE_PUBLIC_ORIGIN: "http://exchange-b:8081"
       RAMP_BILLING_ADAPTER: "inmemory"
       EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"},"agent-demo-eur":{"value":"1000.00","currency":"EUR"}}'
@@ -441,6 +489,27 @@ services:
       ALLOW_INSECURE: "true"
       EXCHANGE_BROKER_WELLKNOWN_URL: "http://broker:8082/.well-known/ramp.json"
       EXCHANGE_CATALOG_URI_SCHEME: "http"
+      # One of the two exchanges in this stack that ask for registration details,
+      # so the suites cover both contracts against something real: this one and
+      # exchange-c publish a schema and a terms revision, exchange-a publishes
+      # neither and keeps the pass-through behaviour every exchange had before
+      # the block existed. exchange-a is left bare deliberately — it is what
+      # every other suite transacts against, and changing it would change tests
+      # this has nothing to do with.
+      #
+      # This one is where the account suite REGISTERS. exchange-c publishes the
+      # same schema so a refusal can be observed against an exchange no test ever
+      # opens an account at; see the note there.
+      #
+      # NOTE: publishing the schema is what turns enforcement on, so this exchange
+      # refuses a payload that does not match it. The identity adapter also
+      # pre-checks against the same schema before it signs, so in practice a
+      # non-conforming payload is stopped there first and never reaches here.
+      EXCHANGE_REGISTRATION_SCHEMA: *registration-schema
+      EXCHANGE_TERMS_URI: "http://exchange-b:8081/terms/2026-04"
+      # SHA-256 of the string "test" — a real digest of a real input, so it can
+      # be reproduced rather than trusted.
+      EXCHANGE_TERMS_DIGEST: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
       # Distinct ed25519 + RSA key MATERIAL (per exchange) so the well-known
       # serves a distinct offer key. Key REF names are kept identical to
       # exchange-a so the per-DB tenant rows (seeded with the same refs) resolve.
@@ -479,6 +548,8 @@ services:
       EXCHANGE_SOR_DSN: "postgres://ramp:ramp@postgres:5432/ramp_sor_c?sslmode=disable"
       EXCHANGE_ADDR: ":8081"
       EXCHANGE_DOMAIN: "exchange-c:8081"
+      # This exchange's own publisher tenant (see exchange-a).
+      EXCHANGE_DEFAULT_TENANT: "sfx.demo.ramp-protocol.org"
       EXCHANGE_PUBLIC_ORIGIN: "http://exchange-c:8081"
       RAMP_BILLING_ADAPTER: "inmemory"
       EXCHANGE_BILLING_SEED: '{"agent-e2e":{"value":"100.00","currency":"USD"},"agent-demo-eur":{"value":"1000.00","currency":"EUR"}}'
@@ -487,6 +558,26 @@ services:
       ALLOW_INSECURE: "true"
       EXCHANGE_BROKER_WELLKNOWN_URL: "http://broker:8082/.well-known/ramp.json"
       EXCHANGE_CATALOG_URI_SCHEME: "http"
+      # THIS EXCHANGE IS NEVER REGISTERED AT. It is the account suite's reserved
+      # never-registered target, and that reservation is what lets a refusal be
+      # asserted as a TOTAL — "no account exists here" — instead of as a
+      # before-and-after comparison that cannot fail.
+      #
+      # It cannot fail against an exchange the suite already holds an account at,
+      # because Register is idempotent: a row that already carries a billing
+      # reference takes a fast path and returns the same handle whether or not
+      # the pre-check let the request through. So the comparison stays equal
+      # either way, and the assertion proves nothing.
+      #
+      # The same schema exchange-b publishes; see the anchor for why one value
+      # serves both. Publishing it turns enforcement on here too, but the identity
+      # adapter pre-checks against the same schema before signing, so a
+      # non-conforming payload is stopped there and never reaches this exchange.
+      EXCHANGE_REGISTRATION_SCHEMA: *registration-schema
+      EXCHANGE_TERMS_URI: "http://exchange-c:8081/terms/2026-04"
+      # SHA-256 of the single byte "b", so this exchange's terms revision is a
+      # different real digest from exchange-b's rather than a copy of it.
+      EXCHANGE_TERMS_DIGEST: "sha256:3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
       RAMP_RSA_PRIVATE_PEM_FILE: "/rsa-keys/rsa-c-private.pem"
       RAMP_ED25519_PRIVATE_PEM_FILE: "/rsa-keys/ed25519-c-private.pem"
     volumes:
@@ -588,9 +679,10 @@ services:
     build:
       context: src/edge
       dockerfile: Dockerfile.miniflare
-      # The edge consumes @ramp-protocol/sdk-l1 as a git dependency
-      # (git+https://…/protocol#<sha>); npm ci clones it during the image build,
-      # so no sibling build-context is mirrored in.
+      # The edge consumes @ramp-protocol/sdk-l1 pinned to a commit on GitHub
+      # (git+https://…/protocol#<sha>), fetched during the image build, so no
+      # sibling build-context is mirrored in. How it is fetched is the
+      # Dockerfile's business and is explained there.
     # WBA_KEYS_JSON for this publisher's self-publish key (no kid; named by
     # thumbprint) is generated by scripts/gen-e2e-keys.sh into this env_file (the
     # served JWK is derived from the same private fixture the demo ingest signs
@@ -663,8 +755,8 @@ services:
       dockerfile: tests/e2e/fastly-edge/Dockerfile
       platforms:
         - linux/amd64
-      # Same git-dependency SDK source as the edge service (npm clones
-      # @ramp-protocol/sdk-l1 from git during the build; no sibling context).
+      # Same SDK source as the edge service: @ramp-protocol/sdk-l1 pinned to a
+      # commit on GitHub and fetched during the build, no sibling context.
     # WBA_KEYS_JSON for the music publisher's self-publish key (no kid; named by
     # thumbprint), generated by scripts/gen-e2e-keys.sh. The Fastly entrypoint
     # hoists it into the ramp_edge config_store so the WASM worker serves it in
@@ -826,9 +918,15 @@ services:
     depends_on:
       exchange:
         condition: service_started
-    # The emulator exposes only the invoke route, so readiness is an actual
-    # function invocation (a viewer-request event for /healthz) rather than a
-    # GET. The image ships node but no curl.
+    # The probe opens a TCP connection to the emulator's invoke port and closes
+    # it. It deliberately does NOT invoke the function: the emulator serves one
+    # invocation at a time, and a probe that lands on top of the harness's
+    # invocation makes the emulator abort that request and exit, taking the
+    # container down in the middle of a suite. Docker runs this every few
+    # seconds for the container's whole life, so an invoking probe collides
+    # eventually. That the bundle actually answers is proven at image build
+    # (each bundle is smoke-invoked) and once per service by the harness before
+    # any test runs; the probe script says more about what that leaves open.
     healthcheck:
       test: ["CMD", "node", "/opt/healthcheck.mjs"]
       interval: 3s
@@ -917,6 +1015,9 @@ services:
 
   zitadel-db:
     image: postgres:17-alpine
+    # It matters more here than for the `postgres` service: Zitadel's event store
+    # writes hard through start-from-init, and none of it outlives the stack.
+    <<: *ephemeral-postgres
     environment:
       POSTGRES_USER: zitadel
       POSTGRES_PASSWORD: zitadel
@@ -1005,7 +1106,13 @@ services:
       IDENTITY_OIDC_SCOPES: "openid profile email"
       <<: *identity-auth
       IDENTITY_MCP_BROKER_URL: "http://broker:8082"
-      IDENTITY_MCP_EXCHANGE_URL: "http://exchange:8081"
+      # No Exchange is configured, deliberately: the account tools take the
+      # target per call and resolve its endpoint from that Exchange's own
+      # manifest. What IS set is the policy — which Exchanges this deployment
+      # will speak to at all. It names all three in this stack, so the lever is
+      # exercised in its production posture rather than left empty; a fourth
+      # Exchange added to this file has to be added here too.
+      IDENTITY_MCP_EXCHANGE_ALLOWLIST: "exchange:8081,exchange-b:8081,exchange-c:8081"
       IDENTITY_MCP_WELLKNOWN_SCHEME: "http"
       # The report leg fetches the offer's exchange well-known over the private
       # compose network, so allow private targets (as the exchanges/broker do).
@@ -1037,10 +1144,22 @@ services:
     build:
       context: .
       dockerfile: tests/e2e/Dockerfile
-      # Both the harness and the shim it installs editable resolve
-      # ramp-protocol-sdk off-commit from git (subdirectory=sdk/python), so no
-      # sibling build-context is mirrored in.
+      # The harness resolves ramp-protocol and ramp-protocol-sdk off-commit from
+      # git (subdirectories gen/python and sdk/python), so no sibling
+      # build-context is mirrored in.
     environment:
+      # The harness now drives some paths through the SDK's own RAMP client, and
+      # that client refuses to dial anything the rule below does not permit.
+      # SKIP_SSRF drops the dial-time address guard, which would otherwise refuse
+      # this network's private addresses; ALLOW_INSECURE permits plaintext http,
+      # which is all this stack speaks. The Go RAMP services that dial out already
+      # set both for the same reason — exchange, exchange-b, exchange-c, broker and
+      # identity. The runner did not, because its calls used to bypass the guard
+      # entirely by not going through the SDK. Those six are the whole set: a
+      # reader auditing which containers run with the address guard off should not
+      # have to take "all of them" on trust.
+      SKIP_SSRF: "true"
+      ALLOW_INSECURE: "true"
       # The harness mints its own bearer for the MCP-endpoint test, so it needs the
       # SAME issuer and seed the identity service verifies with.
       <<: *identity-auth

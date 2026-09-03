@@ -80,10 +80,12 @@
 -- offer_json duplicates offer_canonical_bytes on purpose: JSONB is queryable and
 -- human-auditable, BYTEA is neither. The canonical bytes remain the arbiter.
 --
--- offer_id is the signed Offer.offer_id, which IS the catalog resource_id (the
--- Exchange mints offers with offer_id = resource_id and resolves a presented
--- offer through that same key), so it always equals transaction_log.offer_id. It
--- is duplicated here so an evidence row reads standalone, without a join.
+-- offer_id is the presented signed Offer.offer_id — an opaque per-offer UUID
+-- minted at discovery, carrying no resource identity (resource identity lives
+-- in transaction_log.resource_id; execute binds the offer to its catalog row
+-- via the signed Identity.canonical_url). It always equals
+-- transaction_log.offer_id and is duplicated here so an evidence row reads
+-- standalone, without a join.
 --
 -- requester_id is the signed Requester.id VERBATIM — the bytes the agent put its
 -- signature over, which is why the column keeps the signed field's name rather

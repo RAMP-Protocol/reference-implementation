@@ -199,7 +199,7 @@ carried into production:
 | `RAMP_WELLKNOWN_SCHEME: "http"` | The test network has no certificates. | Public documents would be fetched unencrypted and could be tampered with in transit. |
 | `SKIP_SSRF: "true"` | Test services live on private addresses the guard blocks. | Removes the protection against the Broker being steered into your internal network. |
 | `ALLOW_INSECURE: "true"` | Same reason. | Same consequence. |
-| `sslmode=disable` in the DSN | The database is on the same private bridge. | Database traffic, including credentials, in the clear. |
+| `sslmode=disable` in the DSN | The database is on the same private bridge. | Correct only while the connection stays on one host. On a network you do not control exclusively TLS is required: without it every row travels in the clear, and what the login exposes depends on the cluster's authentication method ([`deploy/storage/postgres/CONFIGURATION.md`](../../deploy/storage/postgres/CONFIGURATION.md) §2.3). |
 | `BROKER_ALLOW_EPHEMERAL_KEY: "true"` | Tests are torn down between runs, so nothing caches the Broker's identity. | Every restart changes the identity the Broker publishes, and everyone who cached it is left holding a key that no longer verifies. |
 
 ---

@@ -72,6 +72,7 @@ called out in §3 and §5.
 | `RAMP_SOR_ADAPTER` | Optional | Which account registry to use. Only `postgres` exists, and it is the default. **Any other value stops the boot** — see §2.6. | *(leave unset)* |
 | `EXCHANGE_SOR_CACHE_TTL` | Optional | How long the Exchange reuses an account's on/off status before re-reading it. Default `30s`. A value it cannot parse stops the boot. | `30s` |
 | `EXCHANGE_DEFAULT_TENANT` | Optional, **set it** | The publisher whose "activate new agents automatically" policy applies when an agent registers. Falls back to `EXCHANGE_DOMAIN` when unset. **If no tenant row matches this name, every agent registration fails** — the Exchange warns about it at boot (§2.6). | `www.publisher.example` |
+| `EXCHANGE_DEFAULT_AGENT_CREDIT` | Optional | One-time credit granted to each newly registered agent, in **whole units** of the deployment ledger currency — `100` on an EUR ledger grants €100.00 per agent, not 100 cents. This variable is the **sole owner** of the default tenant's `default_agent_credit` column: every boot replaces the stored value with it, and unset (or `0`) disables the grant on the next restart — there is no admin RPC, and a value edited into the database by hand does not survive a restart. A plain decimal only — digits with an optional fraction, at most 8 decimal places. **Anything else stops the boot.** | `100` |
 | `EXCHANGE_ADDR` | Optional | Address the public listener binds to. Default `:8081`. The image publishes 8081, so change the published port too if you change this. | `:8081` |
 | `ADMIN_ADDR` | Optional | Address the internal admin listener binds to. Default `:8082`. Bind it to an internal interface — see [`DEPLOYMENT.md`](DEPLOYMENT.md) §7. | `127.0.0.1:8082` |
 | `ADMIN_ALLOWED_CIDRS` | Optional, **set it** | Comma-separated IPs and CIDR ranges permitted to call the admin listener. **Empty means deny everything.** An unparseable entry stops the Exchange booting, naming the token. | `10.0.4.0/24,10.0.5.17` |
@@ -213,12 +214,116 @@ than risk accepting a withdrawn key. See [`RUNBOOK.md`](RUNBOOK.md) §2.3.
 | `RAMP_WELLKNOWN_PORT` | Optional | Appends a port when fetching those documents. Only needed inside a local test network. Leave unset. | *(leave unset)* |
 | `SKIP_SSRF` | Optional — **leave unset** | Setting this removes the guard that stops the Exchange being tricked into calling internal addresses. Development only. | *(leave unset)* |
 | `ALLOW_INSECURE` | Optional — **leave unset** | Setting this allows plain unencrypted `http` for those same calls. Development only. | *(leave unset)* |
+| `EXCHANGE_REGISTRATION_SCHEMA` | Optional | A JSON Schema describing the registration details this Exchange expects. Published in its `/.well-known/ramp.json`. A schema the Exchange cannot use stops the boot. See below. | *(leave unset)* |
+| `EXCHANGE_TERMS_URI` | Optional | The address of your terms of service document. Published in the same place. See below. | *(leave unset)* |
+| `EXCHANGE_TERMS_DIGEST` | Optional | The digest pinning which revision of that document. Requires `EXCHANGE_TERMS_URI`. See below. | *(leave unset)* |
 
 `SKIP_SSRF` and `ALLOW_INSECURE` follow the same strict rule as every other
 on/off setting (§1): they are on only for exactly `true` (any case) or `1`.
 Every other value — including `yes`, `on`, and a typo like `ture` — leaves the
 guard in place. For these two switches the rule matters most: each one removes
 a protection, so a typo must leave the protection on.
+
+#### What agents must send to open an account, and which terms they accept
+
+Three optional settings are published in the Exchange's own
+`/.well-known/ramp.json`. All three are unset by default, and unset means the
+Exchange behaves exactly as it does without them: it accepts whatever
+registration details an agent sends, and it names no terms document.
+
+| Name | Required? | What it is | Example |
+|---|---|---|---|
+| `EXCHANGE_REGISTRATION_SCHEMA` | Optional | A JSON Schema describing the registration details this Exchange expects, written inline. Published as `account_registration.data_schema`. Agents read it and check their details against it before they send, so setting it is how you tell them what you need. Unset means no schema is published and agents send whatever they hold. A schema the Exchange cannot use **stops the boot** — see below. | `{"type":"object","required":["company_name"],"properties":{"company_name":{"type":"string","minLength":1}}}` |
+| `EXCHANGE_TERMS_URI` | Optional | The address of your terms of service document. Published as `terms_uri`. | `https://exchange.example/terms/2026-04` |
+| `EXCHANGE_TERMS_DIGEST` | Optional | The digest of the document served at `EXCHANGE_TERMS_URI`, written as the method, a colon, then lowercase hex: `sha256:` and 64 characters, `sha384:` and 96, or `sha512:` and 128. Published as `terms_digest`. Use SHA-256 unless you have a reason not to. Setting it **without** `EXCHANGE_TERMS_URI` stops the boot, and so does a value in any other shape. | `sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08` |
+
+Produce the digest from the file you actually serve:
+
+```
+printf 'sha256:%s\n' "$(sha256sum terms-2026-04.html | cut -d' ' -f1)"
+```
+
+**Why the digest and not just the URL.** A URL says where your terms are, not
+which version an operator agreed to. Its content changes, so after your first
+revision every earlier registration points at a document that no longer says
+what was agreed. The digest names one exact revision. A registering agent reads
+it from your manifest and echoes it back in its request, where the agent's own
+signature covers it — so the request states which document its operator
+accepted. That only holds while the document is still retrievable, so **keep
+every terms revision you have published online**; a digest of a deleted
+document identifies nothing.
+
+**Publishing the digest turns the check on.** A registration must then name this
+exact digest. One that names a different digest is refused, and so is one that
+names none at all — the caller would be claiming acceptance of terms it never
+identified. Both refusals carry the same reason, `TERMS_DIGEST_STALE`, because
+both have the same remedy: fetch the terms document this Exchange publishes, hash
+it, and register again. The accepted digest is then stored with the account, so
+you can answer later which revision an account agreed to.
+
+The check runs on FIRST registration only. An account that already exists gets
+its stored `billing_ref` back unchanged, and nothing is accepted a second time —
+publishing a new terms revision does not break the replay that repeat Register
+calls rely on.
+
+**Leave `EXCHANGE_TERMS_DIGEST` unset and none of that happens.** No digest is
+published, so a value an agent sends is ignored and none is recorded.
+
+**Plan on changing the digest being coordinated rather than free.** Agents echo
+the value they last read from your manifest, so every agent holding the old value
+is refused until it re-reads your manifest. Publish the new terms document first
+and change the variable second, so the value you advertise always names a
+document that is actually being served.
+
+**Publishing the schema is what turns enforcement on.** A payload that does not
+match it is refused, and the refusal names every member that failed and why, so
+an agent can fix them all in one go rather than one per round trip. Leave the
+variable unset and a payload reaches the system of record uninspected, exactly as
+before the field existed.
+
+The bounds on registration data apply either way, and they come from the protocol
+rather than from this Exchange: at most 64 top-level members, at most 32 levels of
+nesting, and at most 16 KB once the payload is written in its canonical (RFC 8785)
+form. A payload over a bound is refused as a malformed request, which is a
+different answer from "does not match your schema" — an agent that reads the
+distinction knows whether to shrink the payload or to correct it.
+
+**A schema the Exchange cannot use stops the boot**, naming what is wrong. It
+is not dropped with a warning: an Exchange that silently published nothing
+would leave every agent unable to learn what you require while you believed the
+requirement was published, and the first evidence would be a registration
+arriving without the details you asked for. The rules a published schema must
+satisfy come from the protocol, because the agent checking its details against
+your schema applies exactly the same ones:
+
+- **JSON Schema draft 2020-12 only.** A `$schema` naming any other draft is refused.
+- **Self-contained.** Every `$ref` must point inside the same document, and must
+  start with `#`. A reference to another host is refused: an Exchange's manifest
+  is read by strangers, and a reference that leaves the document turns every
+  reader into a fetcher aimed at an address the schema's author chose.
+- **Bounded.** At most 16 KB, at most 32 levels of nesting, and a limit on how
+  much work checking one registration against it may cost. A reference chain
+  may not loop back on itself. The 16 KB is measured on the schema as it is
+  published, not as you wrote it, so indentation and line breaks in the value
+  you set do not count against it.
+- **Portable patterns.** A `pattern` may only use the regular-expression
+  features all three protocol SDKs express identically, so your schema means the
+  same thing to every agent that reads it.
+
+A schema describing a business — a company name, a billing email, a tax id —
+sits far inside all of these.
+
+**A value that is only whitespace counts as unset.** All three settings are read
+with surrounding whitespace removed, so a template that rendered to a blank line
+leaves the setting unconfigured rather than publishing the blank. The boot log
+line `registration settings resolved` reports what each one resolved to, which
+is where to look when a value you set does not appear in the served document.
+
+**`{}` is a published schema, not an absent one.** An empty JSON object is a
+valid schema that accepts every payload, so setting the variable to `{}` — or
+to a template that rendered empty — publishes the block and tells agents this
+Exchange has requirements, while requiring nothing. To publish no schema, leave
+the variable unset or empty.
 
 ### 2.5 Billing
 
@@ -228,7 +333,7 @@ settings all live under the `EXCHANGE_BILLING_` prefix.
 | Name | Required? | What it is | Example |
 |---|---|---|---|
 | `RAMP_BILLING_ADAPTER` | Optional | One of `free`, `inmemory`, `tigerbeetle`. Default `free` — every charge is approved and nothing is recorded. An **unrecognised value logs a warning and falls back to `free`**, so a typo here means you are not billing at all. | `tigerbeetle` |
-| `EXCHANGE_BILLING_SEED` | `inmemory` only | JSON object of starting balances, `{"agent-id": {"value": "100.00", "currency": "USD"}}`. Malformed entries are logged and skipped. | *(leave unset)* |
+| `EXCHANGE_BILLING_SEED` | `inmemory` only | JSON object of starting balances, `{"agent-id": {"value": "100.00", "currency": "USD"}}`. **`USD` is the only accepted currency** — the `inmemory` tier denominates every balance in it, and a balance in another currency can neither receive the Register welcome credit nor be spent safely. Entries that are malformed, or in any other currency, are logged and skipped; that agent simply starts with no balance. | *(leave unset)* |
 | `EXCHANGE_BILLING_LEDGER` | **Required** for `tigerbeetle` | The ISO 4217 **numeric** currency code, which is also the ledger id. Only `978` (EUR) and `840` (USD) are supported; anything else is a boot failure. | `978` |
 | `EXCHANGE_BILLING_TB_ADDRESS` | **Required** for `tigerbeetle` | TigerBeetle address as `IP:port`. **Hostnames are rejected** — supply an IP. | `10.0.6.20:3000` |
 | `EXCHANGE_BILLING_TB_CLUSTER_ID` | Optional | TigerBeetle cluster id. Default `0`. A non-numeric value is a boot failure. | `0` |
@@ -284,6 +389,35 @@ you may create tenants after the process starts:
 
 Take the warning seriously. Until that tenant row exists, **every** agent
 registration is refused, so no agent can buy anything.
+
+---
+
+### 2.7 Request-size limits (fixed, not configurable)
+
+Two limits are compiled in rather than read from the environment, so there is
+nothing to set — but they decide what a caller may send, and a refusal that
+names neither is hard to place. Both are **1 MiB**, one number applied to both
+quantities on the two mounts an agent or a publisher reaches: the
+ExchangeService RPCs and the catalog push.
+
+The admin listener is not one of them and carries neither bound. Its protection
+is reachability — a separate port, bound to an internal interface, behind an
+IP allowlist that denies by default — and an operator who can reach it can
+already call every setter. Closing that gap is tracked separately; it is
+recorded here rather than left for a reader to infer from a table that does not
+mention the mount.
+
+| Bounded quantity | Refusal a caller sees | Why it is bounded |
+|---|---|---|
+| The raw HTTP body, buffered before the caller is known | HTTP 413 with a `resource_exhausted` Connect body, logged as `outcome=body_too_large` | An RFC 9421 signature is checked over the exact bytes, so the body must be read before it can be verified. Without the bound an unauthenticated caller could spend the Exchange's memory. |
+| The decompressed Connect message the handler decodes | `resource_exhausted` | A compressed request inflates at a ratio the caller picks, and the protocol's own list bounds do not limit the work of checking one. |
+
+Consequences worth knowing. A catalog push carries at most 256 entries by
+protocol rule, and this size limit applies on top of that — a feed of unusually
+large entries can produce a submission that satisfies the count bound and
+crosses this one, which the ingest RUNBOOK's §3.1 covers. The `Register` RPC
+adds a tighter, semantic bound on `registration_data` itself; this is the outer
+wall, that is the inner one.
 
 ---
 
@@ -359,7 +493,7 @@ carried into production:
 | `SKIP_SSRF: "true"` | Test services live on private addresses the guard blocks. | Removes the protection against the Exchange being steered into your internal network. |
 | `ALLOW_INSECURE: "true"` | Same reason. | Same consequence. |
 | `EXCHANGE_CATALOG_URI_SCHEME: "http"` | Compose traffic is http-only. | Every catalog URL would be stored as plaintext `http`. |
-| `sslmode=disable` in the DSN | The database is on the same private bridge. | Database traffic, including credentials, in the clear. |
+| `sslmode=disable` in the DSN | The database is on the same private bridge. | Correct only while the connection stays on one host. On a network you do not control exclusively TLS is required: without it every row travels in the clear, and what the login exposes depends on the cluster's authentication method ([`deploy/storage/postgres/CONFIGURATION.md`](../../deploy/storage/postgres/CONFIGURATION.md) §2.3). |
 | `RAMP_BILLING_ADAPTER: "inmemory"` | The test suite needs a deny path without a real ledger. | Balances live in process memory and vanish on restart. Nothing is ever settled. |
 
 ---

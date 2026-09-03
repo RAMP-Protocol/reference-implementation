@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing/tigerbeetle"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/money"
 )
 
 // These tests drive the split at a non-zero fee (the shared conformance suite runs at
@@ -65,9 +65,9 @@ func assertSplit(t *testing.T, a billing.Adapter, ns string, agentBal, owner, pl
 	if err != nil {
 		t.Fatalf("GetBalance(agent): %v", err)
 	}
-	agentMinor, err := tigerbeetle.MinorUnits(bal.Value, tbConfScale)
+	agentMinor, err := money.MinorUnits(bal.Value)
 	if err != nil {
-		t.Fatalf("agent balance %s not representable at scale %d: %v", bal.Value, tbConfScale, err)
+		t.Fatalf("agent balance %s not representable at the asset scale: %v", bal.Value, err)
 	}
 	if agentMinor.Int64() != agentBal {
 		t.Errorf("agent balance = %d, want %d", agentMinor.Int64(), agentBal)

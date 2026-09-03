@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/delivery"
 )
 
 // DefaultMaxCallContentBytes caps what ONE ramp_execute may accumulate across its
@@ -90,21 +90,52 @@ func (t *toolset) deliver(
 	ctx, cancel := context.WithTimeout(ctx, t.callTimeout)
 	defer cancel()
 
-	resources := make([]mcpsdk.Content, 0, len(out.Items))
+	// Nothing licensed, nothing to fetch. Checked BEFORE the session is opened,
+	// because opening one resolves the agent's key from custody — a round trip to
+	// Vault for a purchase where every item was refused, which is an ordinary
+	// outcome rather than an edge case: an expired offer or an exhausted balance
+	// produces exactly this. The early return changes what the call COSTS and not
+	// what it answers.
+	licensed := licensedItems(out.Items)
+	if len(licensed) == 0 {
+		return structuredFallback(*out)
+	}
+
+	// The agent's key is resolved ONCE, here, and every item of the batch fetches
+	// over the client bound to it. Opening one per item would also open one
+	// connection pool per item, because the SSRF guard is composed by cloning the
+	// transport underneath it — so a ten-item purchase would pay ten handshakes
+	// against the one edge that serves it.
+	fetch, err := t.content.ContentSession(ctx)
+	if err != nil {
+		// The reason is computed ONCE and shared with the failure records below,
+		// so the log line and what the agent receives cannot come apart. This is
+		// the batch-wide case — nothing was fetched for the whole purchase, the
+		// more serious of the two — and it used to carry no reason at all, so an
+		// operator query filtered on the token found every per-item failure and
+		// none of the total ones.
+		reason, message := deliveryReason(err)
+		// licensed_items, not items: the tool's own record already logs items as
+		// the whole result set, and this number is the licensed subset of it. One
+		// key answering two questions on two records of the same call is worse
+		// than two keys, because nothing on either line says which one it is.
+		log.WarnContext(ctx, "identity.mcp.delivery_unavailable",
+			"subdomain", who.subdomain, "licensed_items", len(licensed), "reason", reason,
+			"err", deliveryCause(err))
+		return failEveryDelivery(out, licensed, reason, message)
+	}
+
+	resources := make([]mcpsdk.Content, 0, len(licensed))
 	var spent int64
-	for _, item := range out.Items {
-		endpoint, _ := stringField(item, "retrieval_endpoint")
-		if endpoint == "" {
-			continue // a REFUSED item: nothing was licensed, so there is nothing to fetch
-		}
-		offerID, _ := stringField(item, "offer_id")
+	for _, item := range licensed {
+		offerID, endpoint := item.offerID, item.endpoint
 		if reason, message := t.skipReason(ctx, spent); reason != "" {
 			out.DeliveryFailures = append(out.DeliveryFailures, deliveryFailure{
 				OfferID: offerID, URL: endpoint, Reason: reason, Message: message,
 			})
 			continue
 		}
-		content, err := t.content.Fetch(ctx, endpoint)
+		content, err := fetch(ctx, endpoint)
 		if err != nil {
 			reason, message := deliveryReason(err)
 			out.DeliveryFailures = append(out.DeliveryFailures, deliveryFailure{
@@ -117,7 +148,7 @@ func (t *toolset) deliver(
 			// edge applies to the same value on its own side.
 			log.WarnContext(ctx, "identity.mcp.delivery_failed",
 				"subdomain", who.subdomain, "offer_id", offerID, "reason", reason,
-				"url", delivery.RedactURL(endpoint), "err", deliveryCause(err))
+				"url", helpers.RedactURL(endpoint), "err", deliveryCause(err))
 			continue
 		}
 		spent += int64(len(content.Body))
@@ -126,6 +157,59 @@ func (t *toolset) deliver(
 	// The fallback goes FIRST so a client reading content[0].text still finds the
 	// structured output where it has always been.
 	return append(structuredFallback(*out), resources...)
+}
+
+// licensedItem is one result item that has content to collect: the offer it
+// answers and the URL that content comes from.
+type licensedItem struct {
+	offerID  string
+	endpoint string
+}
+
+// licensedItems reads the result items ONCE and answers which of them were
+// licensed, in order.
+//
+// "Licensed" is one rule — a non-empty retrieval_endpoint — and it lives here
+// rather than at each place that needs it. It was written three times: the fetch
+// loop, the cheap check that decides whether to resolve a key at all, and the
+// whole-batch failure path. A second condition on that rule would have to land
+// in all three, and the one that was missed would either fetch an item it should
+// skip or report a failure for an item nothing was ever licensed for.
+//
+// The items are the protocol's own encoding decoded loosely, so this is also the
+// only place that reaches into them by field name for this purpose.
+func licensedItems(items []map[string]any) []licensedItem {
+	out := make([]licensedItem, 0, len(items))
+	for _, item := range items {
+		endpoint, _ := stringField(item, "retrieval_endpoint")
+		if endpoint == "" {
+			continue // a REFUSED item: nothing was licensed, so there is nothing to fetch
+		}
+		offerID, _ := stringField(item, "offer_id")
+		out = append(out, licensedItem{offerID: offerID, endpoint: endpoint})
+	}
+	return out
+}
+
+// failEveryDelivery records one cause against every licensed item, for the case
+// where the batch could not be opened at all.
+//
+// The call still cannot fail — the same invariant deliver runs under, and it
+// binds hardest here: nothing was fetched, so refusing the result would leave
+// the agent charged with neither the bytes nor the URLs. Each failure carries
+// its URL intact, which is what the agent retries with.
+//
+// The reason and message are passed in rather than derived, so the record the
+// agent receives and the line the operator reads are one computation.
+func failEveryDelivery(
+	out *executeOutput, licensed []licensedItem, reason, message string,
+) []mcpsdk.Content {
+	for _, item := range licensed {
+		out.DeliveryFailures = append(out.DeliveryFailures, deliveryFailure{
+			OfferID: item.offerID, URL: item.endpoint, Reason: reason, Message: message,
+		})
+	}
+	return structuredFallback(*out)
 }
 
 // skipReason names why an item will not be fetched at all, or "" to go ahead.
@@ -182,7 +266,7 @@ func structuredFallback(out executeOutput) []mcpsdk.Content {
 // with no signal that anything happened. The media type rides along, so a client
 // that wants characters decodes the blob with its own charset handling, which is
 // where that decision belongs.
-func embeddedResource(uri string, content delivery.Content) mcpsdk.Content {
+func embeddedResource(uri string, content resolvers.Content) mcpsdk.Content {
 	return &mcpsdk.EmbeddedResource{Resource: &mcpsdk.ResourceContents{
 		URI:      uri,
 		MIMEType: content.MIMEType,
@@ -205,7 +289,7 @@ func embeddedResource(uri string, content delivery.Content) mcpsdk.Content {
 // offer_id; the result item does not carry one. When the offer names none, the
 // delivery URL stripped of its query is the content's true location and carries
 // no credential.
-func assetURI(in executeInput, offerID string, content delivery.Content) string {
+func assetURI(in executeInput, offerID string, content resolvers.Content) string {
 	if canonical := canonicalURLOf(in, offerID); canonical != "" {
 		return canonical
 	}
@@ -213,7 +297,7 @@ func assetURI(in executeInput, offerID string, content delivery.Content) string 
 	// diverged — this one left userinfo in — and a weaker strip here is the worse
 	// place for it: an embedded resource's uri is cached, displayed and cited by
 	// clients, so anything it carries lives far longer than a log line.
-	if stripped := delivery.RedactURL(content.URL); stripped != "" {
+	if stripped := helpers.RedactURL(content.URL); stripped != "" {
 		return stripped
 	}
 	// Last resort: name the purchase rather than emit a URL we could not sanitize.

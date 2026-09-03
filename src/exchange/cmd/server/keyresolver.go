@@ -14,6 +14,7 @@ import (
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentkeys"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/keypolicy"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/replay"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 )
@@ -189,4 +190,41 @@ func brokerRevocationResolver(
 			return nil, err
 		}
 	})
+}
+
+// admissionDeps are the checks a request clears before a handler sees it: who
+// signed it, whether that signature has been seen before, how many hops it may
+// carry, and whether it names this Exchange at all. They travel together
+// because they are one decision — admit this request or refuse it — and because
+// building them in one place keeps run() linear.
+type admissionDeps struct {
+	resolver      helpers.KeyResolver
+	replay        *replay.CoreAdapter
+	maxSignatures int
+	audience      *rampaudience.Interceptor
+}
+
+// buildAdmissionDeps wires them from the environment.
+//
+// The recipient interceptor is built HERE, at boot, rather than per request: a
+// misconfigured EXCHANGE_DOMAIN then stops the process, instead of refusing
+// honest callers with an internal error that names nothing an operator can act
+// on.
+func buildAdmissionDeps(
+	ctx context.Context, logger *slog.Logger, fetchClient *http.Client,
+) (admissionDeps, error) {
+	resolver, replayAdapter, err := buildHTTPSigDeps(ctx, logger, fetchClient)
+	if err != nil {
+		return admissionDeps{}, err
+	}
+	audience, err := rampaudience.NewInterceptor(exchangeDomain())
+	if err != nil {
+		return admissionDeps{}, err
+	}
+	return admissionDeps{
+		resolver:      resolver,
+		replay:        replayAdapter,
+		maxSignatures: int(exchangeMaxIntermediaryHops()) + 1,
+		audience:      audience,
+	}, nil
 }

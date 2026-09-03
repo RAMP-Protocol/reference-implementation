@@ -19,11 +19,31 @@
 aws_region = "us-east-1"
 # aws_profile = "my-profile"   # omit to use your default AWS credentials
 
-ssh_public_key   = "ssh-ed25519 AAAA... operator@laptop"
-ssh_ingress_cidr = "203.0.113.7/32" # your address: curl ifconfig.me
-# Not one of your default ssh keys? Give the private-key path so the
-# ssh_command output includes -i (the key itself never leaves your machine):
-# ssh_private_key_path = "~/.ssh/ramp-demo"
+# WARNING: EDITING THIS MAP REPLACES THE VM AND DESTROYS ITS DATA. Adding or
+# removing an operator changes the user data, and the instance is recreated to
+# match it. Do not add an operator on the morning of a demo.
+#
+# public_key is the ONE-LINE CONTENTS of the operator's .pub file, not a path to
+# it: paste the output of `cat ~/.ssh/id_ed25519.pub`. Terraform variable files
+# cannot call functions, so file("~/.ssh/id_ed25519.pub") does not work here.
+#
+# source_cidrs are that operator's own addresses, each a single host as /32
+# (curl ifconfig.me). Each key is installed with an OpenSSH from= restriction
+# holding only its own addresses, so one operator's key cannot be used from
+# another operator's address. The security group opens the union.
+#
+# To select a private key when you connect, set RAMP_SSH_IDENTITY_FILE locally —
+# it is not a Terraform input.
+ssh_operators = {
+  alice = {
+    public_key   = "ssh-ed25519 AAAA... alice@laptop"
+    source_cidrs = ["203.0.113.7/32"]
+  }
+  bob = {
+    public_key   = "ssh-ed25519 AAAA... bob@laptop"
+    source_cidrs = ["198.51.100.24/32", "198.51.100.25/32"]
+  }
+}
 
 # Route 53 — the EXISTING hosted zone the demo hostnames live under. The
 # stack only adds records to it (and refuses to overwrite ones it does not
@@ -53,6 +73,10 @@ image_prefix = "your-group/your-project"
 image_tag    = "latest"
 # Private registry? Set a read token (password in secrets.auto.tfvars):
 # registry_username = "gitlab+deploy-token-123"
+
+# One-time welcome credit for each newly registered agent, in whole ledger
+# currency units. "100" grants EUR 100.00; "0" disables the credit.
+# default_agent_credit = "100"
 
 # Email for Let's Encrypt: Caddy on the VM mints certificates for the service
 # hostnames. The publisher hostname's certificate comes from ACM instead

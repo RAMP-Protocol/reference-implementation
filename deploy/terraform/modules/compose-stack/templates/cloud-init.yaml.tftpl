@@ -70,6 +70,24 @@ write_files:
     encoding: b64
     content: ${base64encode(wba_document)}
 %{ endfor }
+%{ for terms_filename, terms_document in terms_documents ~}
+  # Terms revisions served by Caddy under /terms/. Base64-delivered for the
+  # same reason as the documents above, and for one more that is specific to
+  # these: the Exchange publishes a digest of this file, and a client refuses
+  # the registration when the bytes it fetches do not hash to that digest. A
+  # YAML block scalar could re-wrap a long line or normalize the trailing
+  # newline, and the resulting mismatch would look like a stale digest rather
+  # than a delivery problem. Base64 makes the served bytes exactly the bytes
+  # filesha256() measured.
+  #
+  # Every published revision stays here: a digest of a deleted document
+  # identifies nothing, so registrations accepted under an old revision must
+  # still resolve.
+  - path: /opt/ramp/exchange-terms/${terms_filename}
+    permissions: "0644"
+    encoding: b64
+    content: ${base64encode(terms_document)}
+%{ endfor ~}
 %{ if registry_server != null }
   # Base64-delivered so the secret is never interpolated into a shell
   # command line — any byte in the token is safe. Root-only, removed after

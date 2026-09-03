@@ -9,12 +9,19 @@ output "vm_public_ip" {
 }
 
 output "ssh_command" {
-  description = "SSH command for the operator. Includes -i when ssh_private_key_path is set."
-  value = (
-    var.ssh_private_key_path == null
-    ? module.vm.ssh_command
-    : "ssh -i ${var.ssh_private_key_path} ubuntu@${module.vm.public_ip}"
-  )
+  # No -i here on purpose. Terraform owns the remote endpoint; the operator owns
+  # their credential. State is local and gets copied between machines, and
+  # terraform output replays a value the last apply stored — so a private-key
+  # path baked in here would point at the last applier's workstation and be
+  # wrong for everyone else. Select your key locally, with RAMP_SSH_IDENTITY_FILE
+  # or an ssh_config Host entry.
+  description = "SSH command for the operator. Selects no identity file: your ssh client chooses the key."
+  value       = module.vm.ssh_command
+}
+
+output "ssh_authorized_keys" {
+  description = "The authorized_keys lines rendered for installation, by operator name: who is configured to SSH in, and from where. Public keys only — nothing here is secret."
+  value       = module.vm.ssh_authorized_keys
 }
 
 output "exchange_url" {
@@ -120,4 +127,35 @@ output "cloudfront_distribution_id" {
 output "lambda_qualified_arn" {
   description = "Published (versioned) ARN of the edge function — what CloudFront runs, and the name to search CloudWatch for (as /aws/lambda/us-east-1.<function-name>, in the region that served the request). Null while deploy_edge = false."
   value       = var.deploy_edge ? module.edge[0].lambda_qualified_arn : null
+}
+
+# ── Zitadel outbound mail (SES) ──────────────────────────────────────────────
+# What the running Zitadel instance was configured with at first boot, so an
+# operator can compare it against the provider stored in Zitadel's console
+# without reading the state JSON. Changing any of them here does NOT
+# reconfigure a running instance — see ses.tf.
+
+output "zitadel_smtp_host" {
+  description = "SMTP relay Zitadel was configured to send through, as host:port."
+  value       = local.zitadel_smtp_host
+}
+
+output "zitadel_smtp_from" {
+  description = "Sender address Zitadel sends notification mail as. SES rejects any send whose From differs from this."
+  value       = local.zitadel_smtp_from
+}
+
+output "zitadel_smtp_username" {
+  description = "SMTP username — the IAM access key id of the send-only SES user."
+  value       = aws_iam_access_key.zitadel_smtp.id
+}
+
+output "zitadel_smtp_password" {
+  # sensitive only redacts normal CLI output. The secret access key and this
+  # derived password are both stored in plain text in the local state file,
+  # and the password is also in the VM's user data — the same posture as every
+  # other secret this stack generates.
+  description = "SMTP password — the region-derived SES password, not the raw secret access key."
+  value       = aws_iam_access_key.zitadel_smtp.ses_smtp_password_v4
+  sensitive   = true
 }

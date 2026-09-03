@@ -73,8 +73,7 @@ func publisherShadowExt(t *testing.T) *structpb.Struct {
 //	  at a canonical CoMP path.
 //
 //	PARITY: ExecuteTransaction on the merged-comp-bearing offer succeeds — the
-//	  signed merged ext is reproduced byte-identically at tx-reconstruction
-//	  (the deterministic merge renders identical bytes on both paths).
+//	  presented signed bytes (the merged ext included) verify at execute.
 //
 // It FAILS on current HEAD: applyCompProfile (comp_render.go) replaces the whole
 // "comp" key WHOLESALE via withField, so the publisher's comp.ext.publisher_note
@@ -102,11 +101,7 @@ func TestComp_TermShadowsPublisherExt(t *testing.T) {
 	}
 
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  []*rampv1.ResourceEntry{entry},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{entry})))
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -121,7 +116,7 @@ func TestComp_TermShadowsPublisherExt(t *testing.T) {
 	compOffer := discoverCompOffer(t, h, uri)
 	assertCompTermShadow(t, compOffer)
 
-	// PARITY: the signed merged comp ext survives tx-reconstruction byte-identically.
+	// PARITY: the signed merged comp ext verifies unchanged at execute.
 	assertTransactParity(t, h, compOffer)
 }
 

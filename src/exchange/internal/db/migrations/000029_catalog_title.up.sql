@@ -1,0 +1,22 @@
+-- Give the catalog a home for the resource's human-readable title.
+--
+-- PushResources has always accepted ResourceEntry.title and the ingest mapper
+-- has always populated it from the feed, but there was nowhere to put it: the
+-- row had no column, so entryFromProto dropped the value and every offer built
+-- from a stored row carried an empty Offer.title. The transaction result then
+-- substituted the resource id, which is how a bare content URL ended up in
+-- resource_title -- a field agents read as a label.
+--
+-- The column belongs here rather than inside the catalog.metadata JSONB
+-- document. That document is deliberately narrow: marshalResourceMetadata
+-- projects only the extension-metadata fields and excludes domain, path, title
+-- and terms because those have their own columns. This migration supplies the
+-- one column that sentence promised and never had.
+--
+-- Nullable with no default, and the NULL is meaningful: it says the push
+-- carried no title, which is a different state from a title that is the empty
+-- string. It maps straight through to the optional Offer.title -- NULL yields a
+-- nil *string yields an unset proto field, with no sentinel anywhere along the
+-- chain. Nothing substitutes a resource id or a URI when it is absent.
+ALTER TABLE ramp.catalog
+    ADD COLUMN title TEXT;

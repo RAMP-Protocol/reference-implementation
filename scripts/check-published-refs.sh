@@ -130,8 +130,8 @@ PATTERNS=(
 # and takes an INHERIT_FROM_MAIN entry from the public base — but the find below
 # sweeps in every docs/*.md outside docs/architecture regardless of route, so
 # without this subtraction it would reject a citation of a file it just shipped.
-# That is exactly what happened to docs/HANDOFF-aws-demo.md before the inherited
-# half of this was added.
+# That is exactly what once happened to an inherited handoff doc (since retired)
+# before the inherited half of this was added.
 bare_docs=""
 if [ -d "${repo_root}/docs" ]; then
   published_docs="$(printf '%s\n' "${ALLOW_DOC_FILES[@]}" "${INHERIT_FROM_MAIN[@]}" \

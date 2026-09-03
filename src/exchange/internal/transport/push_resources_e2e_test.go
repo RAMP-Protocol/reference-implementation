@@ -20,7 +20,7 @@ import (
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -217,12 +217,20 @@ type pushHarness struct {
 	// 9421 signing on top of. Sibling harnesses (e.g. agent self-signup)
 	// reuse it to avoid duplicating the full bring-up.
 	baseTransport http.RoundTripper
-	queries       *sqlc.Queries
-	rewriteMu     *sync.Mutex
-	rewrite       map[string]string
-	unsignedCat   rampconnect.CatalogServiceClient
-	signedCat     func(id string, priv ed25519.PrivateKey) rampconnect.CatalogServiceClient
-	exchange      rampconnect.ExchangeServiceClient
+	// billing is retained for the flows that observe money: the default-credit
+	// e2e reads balances through the billing adapter surface.
+	billing billing.Adapter
+	pool    *pgxpool.Pool
+	queries *sqlc.Queries
+	// keystore holds the Ed25519 offer-signing key of every publisher tenant the
+	// harness seeds, under the tenant row's key ref; addPublisher seeds into it
+	// the way the constructor does for the default publisher.
+	keystore    *signing.InMemoryKeyStore
+	rewriteMu   *sync.Mutex
+	rewrite     map[string]string
+	unsignedCat rampconnect.CatalogServiceClient
+	signedCat   func(id string, priv ed25519.PrivateKey) rampconnect.CatalogServiceClient
+	exchange    rampconnect.ExchangeServiceClient
 	// discoverKeyID + discoverPriv are the keypair the harness's `exchange`
 	// client signs every outbound /ramp.v1.ExchangeService/* call with.
 	// Sibling harnesses (agent self-signup) that rewrap the transport must
@@ -260,15 +268,33 @@ func (h *pushHarness) selfActingExchangeClient(
 
 func newPushHarness(t *testing.T) *pushHarness {
 	t.Helper()
-	return newPushHarnessShaped(t, false)
+	return newPushHarnessWith(t, pushHarnessOptions{})
 }
 
-// newPushHarnessShaped is newPushHarness with an explicit deployment shape:
-// trustProxyHeaders wires the forwarded-header rewrite into WrapPublicSurface,
-// the proxied topology where a TLS-terminating proxy fronts the Exchange (see
-// proxy_trust_integration_test.go).
-func newPushHarnessShaped(t *testing.T, trustProxyHeaders bool) *pushHarness {
+// pushHarnessOptions is the deployment shape newPushHarnessWith wires:
+// trustProxyHeaders selects the proxied topology (forwarded-header rewrite in
+// WrapPublicSurface — see proxy_trust_integration_test.go); billing selects the
+// billing adapter (nil → the FreeAdapter, whose flows never assert money
+// movement; the default-credit e2e passes a balance-bearing InMemoryAdapter);
+// publisherDomain names the default publisher tenant the harness seeds and
+// serves a manifest for (empty → a fresh random .example host, so sibling
+// tests never collide on tenants.domain; a test that must host a specific
+// name, such as a corpus vector's domain, sets it).
+type pushHarnessOptions struct {
+	trustProxyHeaders bool
+	billing           billing.Adapter
+	publisherDomain   string
+}
+
+// newPushHarnessWith is newPushHarness with explicit options, following the
+// package's newXHarnessWith(t, opts) constructor convention.
+func newPushHarnessWith(t *testing.T, opts pushHarnessOptions) *pushHarness {
 	t.Helper()
+	trustProxyHeaders := opts.trustProxyHeaders
+	bill := opts.billing
+	if bill == nil {
+		bill = billing.FreeAdapter{}
+	}
 	fx := setupExchangeTestDB(t, "unused-agent")
 	ctx, pool, queries, keystore := fx.ctx, fx.pool, fx.queries, fx.keystore
 	// Capture the server's log output instead of discarding it, so tests can
@@ -276,24 +302,11 @@ func newPushHarnessShaped(t *testing.T, trustProxyHeaders bool) *pushHarness {
 	logBuf := &safeBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logBuf, nil))
 
-	publisherDomain := "pub-" + uuid.NewString() + ".example"
-	tenantID := "t_" + uuid.NewString()
-	if _, err := queries.InsertTenant(ctx, sqlc.InsertTenantParams{
-		TenantID:        tenantID,
-		Domain:          publisherDomain,
-		HmacSecretRef:   "unused",
-		Ed25519KeyRef:   "secret://ed25519/" + tenantID,
-		ReportingPolicy: []byte(`{}`),
-		SigningScheme:   sqlc.RampSigningSchemeED25519,
-		RsaKeyRef:       pgtype.Text{},
-	}); err != nil {
-		t.Fatalf("insert publisher tenant: %v", err)
+	publisherDomain := opts.publisherDomain
+	if publisherDomain == "" {
+		publisherDomain = "pub-" + uuid.NewString() + ".example"
 	}
-	pubOfferPub, pubOfferPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("publisher ed25519: %v", err)
-	}
-	keystore.PutEd25519("secret://ed25519/"+tenantID, pubOfferPub, pubOfferPriv)
+	tenantID, pubOfferPub, pubOfferPriv := seedPublisherTenant(t, ctx, queries, keystore, publisherDomain)
 
 	publisher := newPublisherOrigin(t, publisherDomain)
 
@@ -332,7 +345,7 @@ func newPushHarnessShaped(t *testing.T, trustProxyHeaders bool) *pushHarness {
 
 	srv := startExchangeServer(t, exchangeServerDeps{
 		pool: pool, queries: queries, registry: registry, manifests: manifests,
-		bill: billing.FreeAdapter{}, signer: offerSigner, keystore: keystore, logger: logger,
+		bill: bill, signer: offerSigner, keystore: keystore, logger: logger,
 		// Per-contributor signers registered for individual Catalog tests
 		// install themselves dynamically (each test generates its own
 		// caller keypair and pushes via publishAgent → ramp.json self-signup).
@@ -354,15 +367,9 @@ func newPushHarnessShaped(t *testing.T, trustProxyHeaders bool) *pushHarness {
 	// and onboarding e2e flows sign Execute/Report calls with this key
 	// while naming a freshly-registered AGENT in requester.id — the
 	// broker-on-behalf shape the new caller-identity authorization
-	// supports. The publisher tenant gets allow_broker_relay=true so the
-	// broker is accepted.
+	// supports. Every publisher tenant the harness seeds carries
+	// allow_broker_relay=true (seedPublisherTenant) so the broker is accepted.
 	seedAgentAs(t, ctx, queries, discoverKeyID, discoverPub, string(sqlc.RampRequesterTypeBROKER))
-	if err := queries.SetTenantAllowBrokerRelay(ctx, sqlc.SetTenantAllowBrokerRelayParams{
-		TenantID:         tenantID,
-		AllowBrokerRelay: true,
-	}); err != nil {
-		t.Fatalf("enable publisher broker relay: %v", err)
-	}
 
 	signedFactory := func(id string, priv ed25519.PrivateKey) rampconnect.CatalogServiceClient {
 		c := &http.Client{Transport: newSigningTransport(srv.baseTransport, id, priv)}
@@ -378,7 +385,10 @@ func newPushHarnessShaped(t *testing.T, trustProxyHeaders bool) *pushHarness {
 		publisherDom:  publisherDomain,
 		server:        srv.server,
 		baseTransport: srv.baseTransport,
+		billing:       bill,
+		pool:          pool,
 		queries:       queries,
+		keystore:      keystore,
 		rewriteMu:     rewriteMu,
 		rewrite:       rewrite,
 		resolver:      srv.resolver,
@@ -399,11 +409,12 @@ func (h *pushHarness) registerHost(host, target string) {
 }
 
 // registerForBilling gives an already-directory-registered agent a billing_ref
-// through the public Register RPC — the precondition for a paid
-// transaction. The agent signs for itself (Register keys on the verified caller
-// identity, and a broker is refused), so its key is registered with the global
-// httpsig gate first. Used by the self-signup and onboarding e2e flows, whose
-// agent transacts a priced offer via the FreeAdapter.
+// through the public Register RPC — the precondition for a paid transaction
+// against whatever billing adapter the harness was built with. The agent signs
+// for itself (Register keys on the verified caller identity, and a broker is
+// refused), so its key is registered with the global httpsig gate first. Used
+// by the self-signup and onboarding e2e flows; callers that need the minted
+// ref use registerCaller with an agent client directly.
 func (h *pushHarness) registerForBilling(t *testing.T, agentID string, pub ed25519.PublicKey, priv ed25519.PrivateKey) {
 	t.Helper()
 	h.resolver.Put(testutil.MustThumbprintPriv(priv), pub)
@@ -411,9 +422,7 @@ func (h *pushHarness) registerForBilling(t *testing.T, agentID string, pub ed255
 }
 
 func (h *pushHarness) publishAgent(t *testing.T, agentID string, pub ed25519.PublicKey) *pushAgentOrigin {
-	origin := newPushAgentOrigin(t, agentID, pub)
-	h.registerHost(agentID, origin.server.URL)
-	return origin
+	return publishAgentOrigin(t, h.registerHost, agentID, pub)
 }
 
 func (h *pushHarness) publishPublisher(t *testing.T, domain string, contributors ...string) *publisherOrigin {
@@ -423,17 +432,33 @@ func (h *pushHarness) publishPublisher(t *testing.T, domain string, contributors
 	return origin
 }
 
+// hostedPublisher is a publisher the harness serves beyond its default one: the
+// tenant its domain resolves to, and the origin serving its manifest.
+type hostedPublisher struct {
+	tenantID string
+	origin   *publisherOrigin
+}
+
+// addPublisher hosts a second publisher under domain: it seeds the tenant row
+// exactly as the constructor seeds the default publisher (seedPublisherTenant)
+// and serves the domain's manifest, listing contributors, from a fresh origin
+// the rewriting transport routes the domain's well-known fetch to. The domain
+// is taken verbatim, so a host:port such as "edge:8787" is served under that
+// authority: ManifestURL keeps a port the host carries, and the rewrite keys on
+// the request URL's host, which keeps it too.
+func (h *pushHarness) addPublisher(t *testing.T, domain string, contributors ...string) hostedPublisher {
+	t.Helper()
+	tenantID, _, _ := seedPublisherTenant(t, h.ctx, h.queries, h.keystore, domain)
+	return hostedPublisher{tenantID: tenantID, origin: h.publishPublisher(t, domain, contributors...)}
+}
+
 // TestPushResources_UnsignedRequestRejected proves Gate 1 rejects a push that
 // lacks the RFC 9421 signature headers.
 func TestPushResources_UnsignedRequestRejected(t *testing.T) {
 	h := newPushHarness(t)
 	h.publisher.setContributors("caller.example")
 
-	_, err := h.unsignedCat.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "caller.example",
-		Entries:  []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}},
-	}))
+	_, err := h.unsignedCat.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "caller.example", []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}})))
 	assertConnectCode(t, err, connect.CodeUnauthenticated)
 }
 
@@ -453,11 +478,7 @@ func TestPushResources_UnknownCallerManifestMissing(t *testing.T) {
 	origin.mu.Unlock()
 
 	client := h.signedCat("caller.example", priv)
-	_, err = client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "caller.example",
-		Entries:  []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}},
-	}))
+	_, err = client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "caller.example", []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}})))
 	assertConnectCode(t, err, connect.CodeUnauthenticated)
 }
 
@@ -479,11 +500,7 @@ func TestPushResources_UnknownCallerManifestUnavailable(t *testing.T) {
 	origin.mu.Unlock()
 
 	client := h.signedCat("caller.example", priv)
-	_, err = client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "caller.example",
-		Entries:  []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}},
-	}))
+	_, err = client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "caller.example", []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}})))
 	assertConnectCode(t, err, connect.CodeUnavailable)
 }
 
@@ -503,11 +520,7 @@ func TestPushResources_UnknownCallerAutoRegisteredAndAdmitted(t *testing.T) {
 	h.publishAgent(t, callerID, pub)
 
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: "/articles/one"}})))
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -531,15 +544,10 @@ func TestPushResources_ContributorAdmittedSnapshotRebuilt(t *testing.T) {
 	h.publishAgent(t, callerID, pub)
 
 	client := h.signedCat(callerID, priv)
-	if _, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		// A priced term is required for the entry to yield an offer.
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.publisherDom, Path: "/articles/one",
-			Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
-		}},
-	})); err != nil {
+	if _, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+		Domain: h.publisherDom, Path: "/articles/one",
+		Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
+	}}))); err != nil {
 		t.Fatalf("push: %v", err)
 	}
 
@@ -577,14 +585,10 @@ func TestPushResources_SchemedCallerIDAuthorizesAsItsHost(t *testing.T) {
 	// The caller spells itself as a full origin, on the wire and in the message.
 	const callerAsSpelled = "https://" + callerHost
 	client := h.signedCat(callerAsSpelled, priv)
-	if _, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerAsSpelled,
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.publisherDom, Path: "/articles/schemed",
-			Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
-		}},
-	})); err != nil {
+	if _, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerAsSpelled, []*rampv1.ResourceEntry{{
+		Domain: h.publisherDom, Path: "/articles/schemed",
+		Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
+	}}))); err != nil {
 		t.Fatalf("push with caller_id %q: %v — the caller authenticates as %q, so it must "+
 			"also authorize as %q", callerAsSpelled, err, callerHost, callerHost)
 	}
@@ -627,14 +631,10 @@ func TestPushResources_ManifestSpellingsAuthorizeOneContributor(t *testing.T) {
 
 			// The caller sends the bare host, as the transport canonicalizes it.
 			client := h.signedCat(callerHost, priv)
-			if _, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-				TenantId: h.tenantID,
-				CallerId: callerHost,
-				Entries: []*rampv1.ResourceEntry{{
-					Domain: h.publisherDom, Path: "/articles/mirror",
-					Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
-				}},
-			})); err != nil {
+			if _, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerHost, []*rampv1.ResourceEntry{{
+				Domain: h.publisherDom, Path: "/articles/mirror",
+				Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
+			}}))); err != nil {
 				t.Fatalf("push: %v", err)
 			}
 			// The RPC answers 200 whether or not the entry was authorized, so the
@@ -672,14 +672,10 @@ func TestPushResources_CallerIDNamingNoHostIsInvalidArgument(t *testing.T) {
 
 	// Authenticates as the host; sends a caller_id that names none.
 	client := h.signedCat(callerHost, priv)
-	_, err = client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: `agent2="https://` + callerHost + `"`,
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.publisherDom, Path: "/articles/nohost",
-			Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
-		}},
-	}))
+	_, err = client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, `agent2="https://`+callerHost+`"`, []*rampv1.ResourceEntry{{
+		Domain: h.publisherDom, Path: "/articles/nohost",
+		Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
+	}})))
 	if err == nil {
 		t.Fatal("push accepted a caller_id that names no host; want InvalidArgument")
 	}
@@ -726,14 +722,10 @@ func TestPushResources_CallerNotInContributorsRejectedPerEntry(t *testing.T) {
 	h.publishAgent(t, callerID, pub)
 
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries: []*rampv1.ResourceEntry{
-			{Domain: h.publisherDom, Path: "/articles/ok"},
-			{Domain: deniedDomain, Path: "/articles/denied"},
-		},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{
+		{Domain: h.publisherDom, Path: "/articles/ok"},
+		{Domain: deniedDomain, Path: "/articles/denied"},
+	})))
 	// All-or-nothing: one entry on a domain the caller is not a
 	// contributor for rejects the WHOLE push (InvalidArgument); the error message
 	// enumerates the offending URI + reason. No partial acceptance — neither the

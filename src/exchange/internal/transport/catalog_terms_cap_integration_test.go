@@ -8,50 +8,55 @@ import (
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"google.golang.org/protobuf/proto"
-
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
 )
 
-// maxTermsPerEntryUnderTest pins the boundary the cap test drives to the
-// production constant, so the test moves in lockstep with any future cap change
-// rather than silently diverging from it.
-const maxTermsPerEntryUnderTest = service.MaxTermsPerEntry
+// maxTermsPerEntry is the terms cap the wire carries:
+// ResourceEntry.terms holds (buf.validate.field).repeated.max_items, and the
+// number there is the only copy. The Exchange used to hold a second copy as a
+// service constant and enforce it per entry, after the wire tier had already
+// admitted the request. A second copy of a wire rule is a drift point, and the
+// per-entry path it guarded became unreachable once the rule moved onto the
+// field, so both were deleted; a test anchored on the constant would have kept
+// passing against a cap the wire no longer carried.
+func maxTermsPerEntry(t *testing.T) int {
+	t.Helper()
+	return wireBound(t, "ResourceEntry", "terms")
+}
 
-// TestPushResources_TermsCardinalityCap proves the terms-cardinality cap wired end-to-end through
-// the public Connect surface: the terms[] array length on a single ResourceEntry
-// is contributor-controlled at PushResources, and an entry carrying MORE than the
-// cap is rejected as a PER-ENTRY verdict — never persisted — so the stored JSONB
-// the discovery read path decodes can never grow without bound. A contributor
-// cannot make one entry impose unbounded per-read decode CPU.
+// pricedTerms builds n copies of the minimal valid ENUMERATED term. Every
+// element is identical and individually valid, so the only axis a cap test
+// exercises is the array LENGTH, not per-term validity.
+func pricedTerms(n int) []*rampv1.LicenseTerm {
+	out := make([]*rampv1.LicenseTerm, 0, n)
+	for range n {
+		out = append(out, &rampv1.LicenseTerm{
+			Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
+			Pricing:   &rampv1.Pricing{Model: rampv1.PricingModel_PRICING_MODEL_PER_UNIT, Rate: "0.07", Currency: "USD", Unit: proto.String("accesses")},
+		})
+	}
+	return out
+}
+
+// TestPushResources_TermsCardinalityCap proves the terms cap as the wire tier
+// enforces it, through the public Connect surface. ResourceEntry.terms is
+// bounded on the wire so every implementation refuses the same size; here the
+// validate interceptor refuses the WHOLE submission at the RPC boundary, before
+// any per-entry classification runs, and nothing is persisted. An entry at the
+// cap is accepted and stored; one term over is refused.
 //
-// The cap (service.MaxTermsPerEntry == 32) is the largest terms[] length an entry
-// may carry; cap+1 is the smallest rejected size. Both the boundary-accept and
-// boundary-reject cases are asserted entirely through the public surface:
-// PushResources counts for the verdict, DiscoverResources offer-count for the
-// persistence side effect (one offer ⇒ the entry reached the catalog, zero ⇒ it
-// did not). No DB/repo/sqlc access (Testing Doctrine pt 9) — full protocol
-// round-trip, push-RPC to read-RPC.
+// Both legs assert only through public surfaces: the PushResources verdict, and
+// the DiscoverResources offer count as the persistence probe (one offer ⇒ the
+// entry reached the catalog, zero ⇒ it did not) — a protocol round-trip on both
+// legs, no DB/repo/sqlc access. The refusal additionally has to name WHICH tier
+// refused: the buf.validate.Violations detail the interceptor attaches, with a
+// violation on entries[0].terms under repeated.max_items. Without that check a
+// refusal from any later gate would also read as InvalidArgument with zero
+// offers, and the test would pass while the cap had silently moved.
 func TestPushResources_TermsCardinalityCap(t *testing.T) {
 	h := newPushHarness(t)
 	callerID := "caller.example"
 	client := setupTermContributor(t, h, callerID)
-
-	// pricedEnumerated is the minimal valid term (passes licenseterm.Validate): each element of
-	// the terms[] array is identical and individually valid, so the ONLY axis the
-	// cap test exercises is array LENGTH, not per-term validity.
-	pricedEnumerated := func() *rampv1.LicenseTerm {
-		return &rampv1.LicenseTerm{
-			Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
-			Pricing:   &rampv1.Pricing{Model: rampv1.PricingModel_PRICING_MODEL_PER_UNIT, Rate: "0.07", Currency: "USD", Unit: proto.String("accesses")},
-		}
-	}
-	terms := func(n int) []*rampv1.LicenseTerm {
-		out := make([]*rampv1.LicenseTerm, 0, n)
-		for range n {
-			out = append(out, pricedEnumerated())
-		}
-		return out
-	}
+	capacity := maxTermsPerEntry(t)
 
 	cases := []struct {
 		name       string
@@ -63,34 +68,30 @@ func TestPushResources_TermsCardinalityCap(t *testing.T) {
 		{
 			name:       "exactly at the cap is accepted and persisted",
 			path:       "/cap/at-limit",
-			count:      maxTermsPerEntryUnderTest,
+			count:      capacity,
 			wantOffers: 1,
 		},
 		{
-			name:    "one over the cap is rejected and not persisted",
+			name:    "one over the cap is refused at the wire and not persisted",
 			path:    "/cap/over-limit",
-			count:   maxTermsPerEntryUnderTest + 1,
+			count:   capacity + 1,
 			wantErr: true,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-				TenantId: h.tenantID,
-				CallerId: callerID,
-				Entries: []*rampv1.ResourceEntry{{
-					Domain: h.publisherDom,
-					Path:   tc.path,
-					Terms:  terms(tc.count),
-				}},
-			}))
-			// All-or-nothing: an over-cap entry rejects the whole push.
+			resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+				Domain: h.publisherDom,
+				Path:   tc.path,
+				Terms:  pricedTerms(tc.count),
+			}})))
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("want rejection, got accepted=%d (terms count=%d)", resp.Msg.GetAccepted(), tc.count)
+					t.Fatalf("want refusal, got accepted=%d (terms count=%d)", resp.Msg.GetAccepted(), tc.count)
 				}
 				assertConnectCode(t, err, connect.CodeInvalidArgument)
+				assertWireViolation(t, err, "entries[0].terms", "repeated.max_items")
 			} else {
 				if err != nil {
 					t.Fatalf("push: %v", err)
@@ -106,36 +107,25 @@ func TestPushResources_TermsCardinalityCap(t *testing.T) {
 	}
 }
 
-// TestPushResources_TermsCapMixedBatch proves the cap reject is PER-ENTRY: a
-// single push carrying one within-cap entry and one over-cap entry accepts
-// exactly the within-cap one, and only its URI becomes discoverable. The
-// over-cap entry rejecting must not abort the batch.
+// TestPushResources_TermsCapMixedBatch proves the refusal is whole-submission,
+// not per-entry: a push carrying one within-cap entry and one over-cap entry is
+// refused as a unit, and NEITHER URI becomes discoverable. The success leg
+// pushes a within-cap entry alone first, so the zero offers on the failure leg
+// are a refusal and not an entry that could never have stored. The violation
+// names the second entry — entries[1].terms — which is the sibling that sank
+// the batch; the within-cap first entry carries no violation of its own.
 func TestPushResources_TermsCapMixedBatch(t *testing.T) {
 	h := newPushHarness(t)
 	callerID := "caller.example"
 	client := setupTermContributor(t, h, callerID)
+	capacity := maxTermsPerEntry(t)
 
 	const soloPath = "/cap/mixed-solo-valid"
 	const validPath = "/cap/mixed-valid"
 	const invalidPath = "/cap/mixed-over"
 
-	priced := func(n int) []*rampv1.LicenseTerm {
-		out := make([]*rampv1.LicenseTerm, 0, n)
-		for range n {
-			out = append(out, &rampv1.LicenseTerm{
-				Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
-				Pricing:   &rampv1.Pricing{Model: rampv1.PricingModel_PRICING_MODEL_PER_UNIT, Rate: "0.07", Currency: "USD", Unit: proto.String("accesses")},
-			})
-		}
-		return out
-	}
-
 	// SUCCESS leg: the within-cap entry pushed ALONE is accepted + discoverable.
-	solo, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: soloPath, Terms: priced(2)}},
-	}))
+	solo, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: soloPath, Terms: pricedTerms(2)}})))
 	if err != nil {
 		t.Fatalf("solo within-cap push: %v", err)
 	}
@@ -146,21 +136,19 @@ func TestPushResources_TermsCapMixedBatch(t *testing.T) {
 		t.Fatalf("solo within-cap offers = %d, want 1", got)
 	}
 
-	// FAILURE leg: within-cap + over-cap sibling → whole push rejected; NEITHER persists.
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries: []*rampv1.ResourceEntry{
-			{Domain: h.publisherDom, Path: validPath, Terms: priced(2)},
-			{Domain: h.publisherDom, Path: invalidPath, Terms: priced(maxTermsPerEntryUnderTest + 1)},
-		},
-	}))
+	// FAILURE leg: within-cap + over-cap sibling → the whole submission is
+	// refused at the wire; NEITHER persists.
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{
+		{Domain: h.publisherDom, Path: validPath, Terms: pricedTerms(2)},
+		{Domain: h.publisherDom, Path: invalidPath, Terms: pricedTerms(capacity + 1)},
+	})))
 	if err == nil {
-		t.Fatalf("want whole-request rejection, got accepted=%d", resp.Msg.GetAccepted())
+		t.Fatalf("want whole-submission refusal, got accepted=%d", resp.Msg.GetAccepted())
 	}
 	assertConnectCode(t, err, connect.CodeInvalidArgument)
+	assertWireViolation(t, err, "entries[1].terms", "repeated.max_items")
 	if got := discoverOfferCount(t, h, "https://"+h.publisherDom+validPath); got != 0 {
-		t.Fatalf("within-cap sibling offers = %d, want 0 (over-cap sibling sinks the batch)", got)
+		t.Fatalf("within-cap sibling offers = %d, want 0 (over-cap sibling sinks the submission)", got)
 	}
 	if got := discoverOfferCount(t, h, "https://"+h.publisherDom+invalidPath); got != 0 {
 		t.Fatalf("over-cap entry offers = %d, want 0", got)

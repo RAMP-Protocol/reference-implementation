@@ -16,14 +16,32 @@
 # Build context is the repo root (see docker-compose.e2e.yml) so both src/edge/
 # and this directory are reachable.
 
-# The full node image rather than -slim: @ramp-protocol/sdk-l1 is a git
-# dependency (git+https://…/protocol#<sha>) that npm ci clones, and this image
-# ships git already. The slim base would need an apt install for it, which is
-# one more thing that can fail in a build that only needs a bundler.
+# @ramp-protocol/sdk-l1 is pinned by full commit SHA on GitHub
+# (git+https://…/protocol#<sha>), resolved off-commit like the Go and Python pins,
+# so no sibling checkout is mirrored in and any shallow workdir works.
+#
+# npm does NOT clone it: for a GitHub-hosted spec pinned to a SHA it fetches a
+# codeload tarball over plain HTTPS, and a clone is pacote's fallback when that
+# fetch fails. Written out once, with the evidence, in
+# src/edge/Dockerfile.miniflare — three copies of it is how the correction
+# reached three sites of eight last time.
+#
+# The full node image rather than -slim so git is present for that fallback
+# without an apt install — one less thing to fail in a build that only needs a
+# bundler. The slim base would work on the normal path either way.
 FROM node:22 AS builder
 WORKDIR /app
 COPY src/edge/package.json src/edge/package-lock.json ./
-RUN npm ci --include=dev
+# Persist npm's download cache across builds — the slowest two stages of a cold
+# stack build. The codeload response above lands in it with every registry
+# tarball this step downloads. The mount lives with the builder, so nothing here
+# reaches a layer.
+#
+# id, because BuildKit otherwise names a cache mount after its target and all
+# three npm mounts in this stack would be one cache under one lock, serializing
+# images compose builds concurrently. Per image, one writer each.
+RUN --mount=type=cache,id=npm-lambda-edge,target=/root/.npm,sharing=locked \
+    npm ci --include=dev
 COPY src/edge/ ./
 COPY tests/e2e/lambda-edge/write-configs.mjs /build/write-configs.mjs
 RUN node /build/write-configs.mjs --out-dir /build/config

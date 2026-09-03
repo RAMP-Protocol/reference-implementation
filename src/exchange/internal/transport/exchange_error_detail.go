@@ -90,29 +90,74 @@ func faultEnvelope(err error, domain string) error {
 // reason; field metadata rides only the generic path) and attached via the shared
 // SDK connectserver.AttachDetail; a non-denial failure routes through
 // genericFaultError so it still carries Domain.
-func executeTxError(err error) error {
+//
+// The denial also NAMES the Exchange that refused. TransactionDenial.exchange is
+// the field the proto reserves for it, and helpers.TransactionDenialDetail does
+// not take it, so it is set on the returned message. exchangeHost is this
+// Exchange's published identity, read from the service so the denial names the
+// same Exchange the refused offers carry.
+//
+// It is called a HOST, not a domain, because the body below hands two unrelated
+// values to the same detail one line apart. The protocol defines
+// TransactionDenial.exchange as the bare host of the Exchange that produced the
+// denial — an address an agent may dial once it has checked the value against
+// one it already trusts. exchangeServiceDomain is the ADR-019 fault-attribution
+// key "ramp.v1.ExchangeService". Naming both "domain" is how an RPC service
+// name ends up where a caller expects an address.
+//
+// NO CLIENT RECEIVES THAT TODAY, and the denial branch below is unreachable from
+// the RPC. ExecuteTransaction has one pipeline: every request, including a
+// single-offer one, is handled as a batch, and the batch loop folds each denial
+// kind into an in-body TransactionResultItem instead of returning it. Only a
+// NON-denial error reaches this function, so txDenialReason answers ok=false and
+// the generic path runs. The denial branch and its Exchange assignment are kept
+// wired and unit-tested against the day the batch shape can carry the value.
+//
+// What would make it reachable is a per-item exchange field on
+// TransactionResultItem, which the protocol does not define — that is a change
+// to github.com/RAMP-Protocol/protocol, not something to work around here by
+// inventing a second carrier. It matters most for a broker request fanned out
+// across several Exchanges, where the results arrive together and nothing in the
+// body says which Exchange refused which offer.
+func executeTxError(err error, exchangeHost string) error {
 	reason, ok := txDenialReason(err)
 	if !ok {
 		return genericFaultError(err)
 	}
 	d := helpers.TransactionDenialDetail(exchangeServiceDomain, err.Error(), reason)
+	d.GetTransactionDenial().Exchange = &exchangeHost
 	return connectserver.AttachDetail(exchange.ToConnect(err), d)
 }
 
-// registerError maps a Register service error to its connect.Error. Register
-// carries no machine-readable denial-reason oneof (unlike ExecuteTransaction), so
-// it routes through genericFaultError — the shared fault shape that still stamps
-// Domain + the non-authoritative Message so every ExchangeService fault
-// attributes via ErrorDetail.Domain (ADR-019).
+// registerError maps a Register service error to its connect.Error. A refused
+// registration — a payload that does not conform to the published data_schema, or
+// a terms_digest that is not the published one — attaches the typed proto
+// ErrorDetail carrying the canonical RegistrationFailureReason, the same
+// mechanism executeTxError uses for a denial. A schema refusal also carries the
+// per-field list the SDK validator produced; a stale digest carries none, because
+// the proto allows field_errors only alongside INVALID_REGISTRATION_DATA.
+//
+// Every OTHER Register failure carries no reason and must still attribute via
+// ErrorDetail.Domain (ADR-019), so it routes through genericFaultError: the
+// registration_data bounds check (a malformed request, not a schema failure), an
+// unseeded default tenant, a non-agent caller, and every SoR, ledger and internal
+// fault.
 func registerError(err error) error {
-	return genericFaultError(err)
+	reason, fields, ok := service.RegistrationFailureForError(err)
+	if !ok {
+		return genericFaultError(err)
+	}
+	d := helpers.RegistrationFailureDetail(exchangeServiceDomain, err.Error(), reason, fields...)
+	return connectserver.AttachDetail(exchange.ToConnect(err), d)
 }
 
 // accountStatusError maps a GetAccountStatus service error to its connect.Error.
-// Like Register, the status read carries no machine-readable denial-reason oneof,
-// so it routes through the same shared fault shape (genericFaultError) that
-// stamps Domain + the non-authoritative Message. It stays a distinct per-RPC
-// mapper (mirroring registerError) to keep the file's one-mapper-per-RPC
+// The status read has no machine-readable reason oneof of its own, so it routes
+// through the same shared fault shape (genericFaultError) that stamps Domain +
+// the non-authoritative Message. Its reasonless sibling is reportUsageError
+// below, NOT registerError above: Register now attaches a typed
+// RegistrationFailureReason whenever the schema or the terms gate refuses. It
+// stays a distinct per-RPC mapper to keep the file's one-mapper-per-RPC
 // convention intact rather than sharing a single name across two RPCs.
 func accountStatusError(err error) error {
 	return genericFaultError(err)

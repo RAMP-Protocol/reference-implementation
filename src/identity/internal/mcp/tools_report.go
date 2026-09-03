@@ -2,14 +2,11 @@ package mcp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
-
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 )
 
 // reportInput describes one usage report.
@@ -69,16 +66,22 @@ type reportOutput struct {
 func (t *toolset) handleReport(
 	ctx context.Context, req *mcpsdk.CallToolRequest, in reportInput,
 ) (*mcpsdk.CallToolResult, reportOutput, error) {
+	const tool = "ramp_report"
 	who, err := callerFrom(ctx, req)
 	if err != nil {
 		return nil, reportOutput{}, err
 	}
-	if err = in.validate(); err != nil {
+	if in.Exchange, err = t.checkExchangeArg(tool, in.Exchange); err != nil {
 		return nil, reportOutput{}, err
 	}
-	resp, err := t.ramp.ReportUsage(who.outbound(ctx), in.Exchange, in.usageReport())
+	if err = in.validate(tool); err != nil {
+		return nil, reportOutput{}, err
+	}
+	// The exchange rides on the report itself rather than beside it: the field is
+	// the one the offer signed, and the leg below reads the destination from it.
+	resp, err := t.reports.ReportUsage(t.callCtx(ctx, who), in.usageReport())
 	if err != nil {
-		return nil, reportOutput{}, rampError("ramp_report", err)
+		return nil, reportOutput{}, t.failed(ctx, who, tool, err)
 	}
 	t.logger(ctx, who).InfoContext(ctx, "identity.mcp.report",
 		"subdomain", who.subdomain, "exchange", in.Exchange,
@@ -86,47 +89,25 @@ func (t *toolset) handleReport(
 	return nil, reportOutput{ReportID: resp.GetReportId(), RequestID: who.requestID}, nil
 }
 
-// validate rejects a report that cannot be routed or attributed. The
-// idempotency key is required by the protocol, and required here rather than
-// minted for the caller: a key we invent per call makes every retry look like a
-// fresh report, which is exactly the double-counting the field exists to prevent.
-func (in reportInput) validate() error {
+// validate rejects a report that cannot be attributed. The idempotency key is
+// required by the protocol, and required here rather than minted for the caller:
+// a key we invent per call makes every retry look like a fresh report, which is
+// exactly the double-counting the field exists to prevent.
+//
+// The exchange argument is not checked here. It is checked by the shared pair
+// every tool taking one runs, before this, so the rule has one home rather than
+// one per tool.
+//
+// tool is passed in for the same reason checkExchangeArg takes it: every message
+// on this surface opens with the tool's name, and a literal per message is a
+// place for one of them to be spelled differently from the rest.
+func (in reportInput) validate(tool string) error {
 	switch {
-	case in.Exchange == "":
-		return errors.New("ramp_report needs the offer's exchange domain")
 	case in.TransactionID == "":
-		return errors.New("ramp_report needs the transaction_id being reported")
+		return fmt.Errorf("%s needs the transaction_id being reported", tool)
 	case in.IdempotencyKey == "":
-		return errors.New("ramp_report needs an idempotency_key — reuse it when retrying the same report")
-	}
-	return validateExchangeDomain(in.Exchange)
-}
-
-// validateExchangeDomain enforces the one thing the Exchange field's contract
-// already claimed: it is a DOMAIN, not a URL.
-//
-// The value is routing input that reaches URL construction downstream — the
-// well-known endpoint resolver builds {scheme}://{exchange}/.well-known/ramp.json
-// by concatenation — so a caller that can smuggle a path, query, or fragment past
-// this point picks the URL this service fetches rather than merely the host it
-// fetches from. Checking the value against its own normalized host is what makes
-// that structural: anything HostOf had to strip is something a domain never had.
-//
-// Refused rather than narrowed to the host, deliberately. Narrowing would let a
-// caller send a request this service silently rewrote, and the report is a
-// billing artifact — the agent should learn its input was wrong here, not have it
-// quietly reinterpreted.
-func validateExchangeDomain(exchange string) error {
-	bare, err := rampwellknown.IsBareHost(exchange)
-	if err != nil {
-		return fmt.Errorf("ramp_report: exchange %q is not a usable domain: %w", exchange, err)
-	}
-	if !bare {
 		return fmt.Errorf(
-			"ramp_report: exchange must be the offer's bare domain (\"exchange.example\" or "+
-				"\"exchange.example:8081\"), not %q — a scheme, path, query or fragment is not part of it",
-			exchange,
-		)
+			"%s needs an idempotency_key — reuse it when retrying the same report", tool)
 	}
 	return nil
 }
@@ -135,10 +116,16 @@ func validateExchangeDomain(exchange string) error {
 // the Exchange takes that from the request signature, as it does everywhere else.
 func (in reportInput) usageReport() *rampv1.UsageReport {
 	report := &rampv1.UsageReport{
-		Ver:            rampproto.Ver,
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: in.IdempotencyKey,
 		TransactionId:  in.TransactionID,
 		BillingId:      in.BillingID,
+		// The recipient the agent means to report to. Required on the wire, and
+		// set unconditionally: checkExchangeArg has already refused an empty or
+		// non-bare value and canonicalised what survived, so there is no case
+		// left where omitting it would be the honest thing to do. The Exchange
+		// that receives it refuses a report naming somebody else.
+		Exchange: in.Exchange,
 		Usage: &rampv1.Usage{
 			Function:         in.Function,
 			ConsumedQuantity: in.ConsumedQuantity,
@@ -147,9 +134,6 @@ func (in reportInput) usageReport() *rampv1.UsageReport {
 	}
 	if in.ConsumedUnit != "" {
 		report.Usage.ConsumedUnit = &in.ConsumedUnit
-	}
-	if in.Exchange != "" {
-		report.Exchange = &in.Exchange
 	}
 	return report
 }

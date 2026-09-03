@@ -23,6 +23,7 @@ import (
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
@@ -65,8 +66,8 @@ type Caller struct {
 // Unauthenticated; everything else returns a populated Caller.
 //
 // Unknown keyID triggers ADR-009 D2 lazy registration: the service pulls the
-// caller's own /.well-known/ramp.json (keyID IS the agent's domain anchor per
-// ADR-009 D3/D4), verifies the asserted key is published there, persists the
+// caller's own Web Bot Auth key directory (keyID IS the agent's domain anchor
+// per ADR-009 D3/D4), pins the currently-valid key published there, persists the
 // ramp.agents row, and re-reads it. A keyID that does not resolve to a
 // published key stays Unauthenticated. The fetch uses agentreg's SSRF-guarded
 // client. When no registry is wired (s.agentReg == nil) the unknown-keyID path
@@ -200,9 +201,9 @@ func (s *ExchangeService) repinAndReload(ctx context.Context, callerHost string,
 
 // resolveAgentLazily looks the keyID up in the agents repo and, on a miss,
 // runs the ADR-009 D2 pull -> verify -> persist sequence before re-reading.
-// The agent's identity anchors discovery: the manifest is fetched from the
-// keyID's own domain and the registry refuses a key the manifest does not
-// publish, so a forged keyID cannot self-register.
+// The agent's identity anchors discovery: the key directory is fetched from the
+// keyID's own domain and the registry pins only a key published there, so a
+// forged keyID cannot self-register.
 func (s *ExchangeService) resolveAgentLazily(ctx context.Context, callerHost string) (repo.Agent, error) {
 	agent, err := s.agents.ByID(ctx, callerHost)
 	if err == nil {
@@ -244,18 +245,24 @@ func (s *ExchangeService) resolveAgentLazily(ctx context.Context, callerHost str
 }
 
 // mapLazyRegisterError classifies an agentreg failure. A caller fault (per
-// agentreg.IsCallerFault — the manifest is absent (404), does not anchor the
+// agentreg.IsCallerFault — the key directory is absent (404), does not anchor the
 // keyID, is malformed, or publishes no currently-valid key) resolves to
 // Unauthenticated: the keyID is simply not a registrable identity. A genuinely
 // transient transport/upstream failure (ErrFetch: connection refused, non-2xx
-// other than 404) is Unavailable so the caller can retry once the manifest host
+// other than 404) is Unavailable so the caller can retry once the directory host
 // is reachable.
+//
+// The message names the Web Bot Auth key directory because that is the only
+// document this path fetches. Naming ramp.json instead told an operator to
+// publish a key in a document that carries none, so the repair it described
+// could not have cleared the 401.
 func mapLazyRegisterError(keyID string, err error) error {
 	if agentreg.IsCallerFault(err) {
 		return exchange.Newf(exchange.KindUnauthenticated,
-			"caller keyID %q is not published at its own /.well-known/ramp.json", keyID)
+			"caller keyID %q publishes no currently valid key at its own %s",
+			keyID, rampwellknown.WBAPath)
 	}
-	return exchange.Wrap(exchange.KindUnavailable, err, "fetch caller manifest")
+	return exchange.Wrap(exchange.KindUnavailable, err, "fetch caller key directory")
 }
 
 // authorizeForAgent enforces the caller-identity rule for a given

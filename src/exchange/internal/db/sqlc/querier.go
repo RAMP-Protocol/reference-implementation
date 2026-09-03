@@ -16,6 +16,27 @@ type Querier interface {
 	// Returns the audit trail for a tenant, most recent first. Read path for admin
 	// change reconstruction and the integration tests' side-effect assertions.
 	AuditLogByTenant(ctx context.Context, tenantID string) ([]RampAuditLog, error)
+	// The reporting-compliance fact table for one (tenant_id, agent_id): how many
+	// obligations sit in each state, split by whether their deadline had already
+	// passed at as_of. It returns at most four rows (two states x two dueness
+	// values) whatever the agent's history, but that bounds the result, not the
+	// work: the join is served by reporting_obligations_transaction_idx, so the
+	// rows READ are the agent's own obligations rather than the whole table. Drop
+	// that index and this becomes a sequential scan of every tenant's obligations,
+	// once per executed item, in front of fund reservation.
+	//
+	// It counts and classifies nothing. Which bucket means "overdue", which ones
+	// form the denominator, and where the thresholds sit are the Exchange's
+	// reporting policy, and that policy is applied in the service so a future
+	// per-tenant rule reads these same numbers differently without a new query.
+	//
+	// Joins to transaction_log because reporting_obligations carries no tenant_id /
+	// agent_id column of its own. as_of is the service clock's instant: the deadline
+	// it is compared against was written from that same clock.
+	//
+	// The ::boolean cast pins the generated Go field to bool. deadline is NOT NULL,
+	// so the comparison is never null.
+	CountObligationsByStateAndDueness(ctx context.Context, arg CountObligationsByStateAndDuenessParams) ([]CountObligationsByStateAndDuenessRow, error)
 	// Writes the append-once evidence row for a successfully executed transaction
 	// item: the full signed offer + both-party signatures + both verifying public
 	// keys + the delivered URL. Written inside the same transaction as the
@@ -26,11 +47,22 @@ type Querier interface {
 	// Writes the full transaction row. The handler MUST await this commit before
 	// returning the signed URL to the caller (write-before-sign invariant).
 	CreateTransaction(ctx context.Context, arg CreateTransactionParams) (RampTransactionLog, error)
+	FinalizeTransactionRequestClaim(ctx context.Context, arg FinalizeTransactionRequestClaimParams) (int64, error)
 	// Idempotent-retry probe for ReportUsage: returns the obligation row whose
-	// (transaction_id, source_report_id) pair was already recorded. A non-empty
-	// hit means the caller is replaying a prior UsageReport and the service must
-	// return the original issued_report_id without re-running validation.
-	FindObligationBySourceReportID(ctx context.Context, arg FindObligationBySourceReportIDParams) (RampReportingObligation, error)
+	// (transaction_id, source_report_id) pair was already recorded AND ACCEPTED.
+	// "Accepted" is in the name because it is in the predicate: a caller wanting the
+	// row for a key that was only ever rejected will not find it here. A
+	// hit means the caller is replaying a report this Exchange already validated,
+	// so the service returns the original issued_report_id without re-running
+	// validation.
+	//
+	// issued_report_id IS NOT NULL is what makes "accepted" the condition rather
+	// than "seen". A rejected report also persists source_report_id, so without
+	// this predicate a retry carrying the same key would match, return 200 with an
+	// empty report_id, and never re-validate -- the obligation would stay PENDING
+	// while the agent believed it had reported. issued_report_id is written only on
+	// acceptance, so it already means exactly "there is a result to replay".
+	FindAcceptedObligationBySourceReportID(ctx context.Context, arg FindAcceptedObligationBySourceReportIDParams) (RampReportingObligation, error)
 	GetAgent(ctx context.Context, agentID string) (RampAgent, error)
 	GetCatalogEntry(ctx context.Context, resourceID string) (RampCatalog, error)
 	// Reads one tenant's evidence row. This is the DEFAULT read: transaction_id is
@@ -73,21 +105,33 @@ type Querier interface {
 	GetTransactionByID(ctx context.Context, transactionID string) (RampTransactionLog, error)
 	// Idempotency lookup: return a prior transaction for the same idempotency_key.
 	GetTransactionByIdempotencyKey(ctx context.Context, idempotencyKey string) (RampTransactionLog, error)
+	GetTransactionRequestClaim(ctx context.Context, arg GetTransactionRequestClaimParams) (RampTransactionRequestClaim, error)
 	InsertCatalogEntry(ctx context.Context, arg InsertCatalogEntryParams) (RampCatalog, error)
 	InsertTenant(ctx context.Context, arg InsertTenantParams) (RampTenant, error)
+	InsertTransactionRequestClaim(ctx context.Context, arg InsertTransactionRequestClaimParams) (int64, error)
 	ListAllCatalog(ctx context.Context) ([]RampCatalog, error)
 	ListCatalogByTenant(ctx context.Context, tenantID string) ([]RampCatalog, error)
-	// Returns reporting obligations whose deadline has passed but which still
-	// sit in PENDING for a specific (tenant_id, agent_id). Joins to
-	// transaction_log because reporting_obligations does not carry tenant_id /
-	// agent_id columns directly. The result drives the ExecuteTransaction
-	// reporting-overdue refusal: a non-empty list refuses the agent's next
-	// transaction with FailedPrecondition until it files the missing report.
-	ListOutstandingObligations(ctx context.Context, arg ListOutstandingObligationsParams) ([]RampReportingObligation, error)
-	// Records the rejection outcome without changing obligation state. The audit
-	// row is written for every rejection so disputes have a trail, but the
-	// obligation stays PENDING and the caller may retry with a corrected report
-	// until the deadline expires.
+	// Records the rejection outcome for an obligation that is still PENDING. An
+	// audit row is written for every rejection against a PENDING obligation, so
+	// disputes have a trail; a report against an obligation that has already
+	// settled matches zero rows and writes nothing, and the service logs the
+	// refusal instead. The state is left alone so the caller may retry with a
+	// corrected report. The
+	// retry may reuse the same source_report_id: the replay probe above fires only
+	// on an accepted result, so a corrected retry under the original key is
+	// validated afresh rather than short-circuited.
+	//
+	// The state predicate matches the accept statement above, and for a stronger
+	// reason than symmetry. Without it a second, invalid report against an
+	// obligation already in RECEIVED would commit over the settled row: the outcome
+	// would walk back from VALIDATED to a rejection, and source_report_id would move
+	// off the accepted key, so a later replay of that key would miss the probe and
+	// be refused as already-reported. Zero rows updated means the obligation was not
+	// PENDING, and the caller surfaces FailedPrecondition.
+	//
+	// validated_at comes from the caller for the same reason as the accept
+	// statement above: the obligation's three report timestamps all come from the
+	// service clock, so they can be compared against the deadline written from it.
 	MarkValidationRejected(ctx context.Context, arg MarkValidationRejectedParams) (RampReportingObligation, error)
 	// Sets validation_outcome=VALIDATED, transitions state PENDING→RECEIVED, and
 	// writes the consumed quantity + idempotency anchors. The state predicate is
@@ -95,22 +139,44 @@ type Querier interface {
 	// in RECEIVED matches zero rows and the caller surfaces FailedPrecondition.
 	// The partial unique index on (transaction_id, source_report_id) prevents
 	// two concurrent "same-id" writes from both succeeding.
+	//
+	// received_at and validated_at come from the caller, not NOW(). The deadline
+	// they are compared against was written from the service clock, so reading the
+	// database clock here would compare two different clocks: received_at > deadline
+	// would not be a sound lateness check, and a test could not drive the comparison
+	// deterministically.
 	MarkValidationValidated(ctx context.Context, arg MarkValidationValidatedParams) (RampReportingObligation, error)
-	// Stores the billing account id for an agent, first write wins. The
-	// billing_ref IS NULL guard makes a repeat call a no-op (zero rows →
-	// pgx.ErrNoRows), so a stored ref is never overwritten (ADR-021 D4). The
-	// column is deliberately absent from UpsertAgent's update list: a key
-	// rotation re-upsert must leave billing_ref intact (ADR-021 D3).
+	// Stores the billing account id for an agent, plus the digest of the licensing
+	// terms the registration accepted, first write wins. The billing_ref IS NULL
+	// guard makes a repeat call a no-op (zero rows → pgx.ErrNoRows), so a stored ref
+	// is never overwritten (ADR-021 D4).
+	//
+	// Both columns are written by this ONE guarded statement, so first-write-wins
+	// covers them together and the account can never end up carrying a billing_ref
+	// from one registration and an accepted digest from another. The digest is NULL
+	// when the Exchange published none at the time.
+	//
+	// Neither column appears in UpsertAgent's update list: a key rotation re-upsert
+	// must leave both intact (ADR-021 D3).
 	SetAgentBillingRef(ctx context.Context, arg SetAgentBillingRefParams) (RampAgent, error)
 	// Flips the per-tenant policy for whether a newly registered agent starts
 	// active in the billing system-of-record. Admin / fixture path; the column
 	// defaults to TRUE on insert, so this is only needed to opt a tenant out.
 	// Mirrors SetTenantAllowBrokerRelay.
-	SetTenantActivateNewAgentsByDefault(ctx context.Context, arg SetTenantActivateNewAgentsByDefaultParams) error
+	// Returns rows-affected so a call for a missing tenant is a detectable no-op
+	// rather than a silent success.
+	SetTenantActivateNewAgentsByDefault(ctx context.Context, arg SetTenantActivateNewAgentsByDefaultParams) (int64, error)
 	// Flips the broker-relay opt-in for a tenant. Admin / fixture path; the
 	// column defaults to FALSE on insert so this is only needed when a tenant
 	// explicitly opts into broker-on-behalf reporting.
 	SetTenantAllowBrokerRelay(ctx context.Context, arg SetTenantAllowBrokerRelayParams) error
+	// Replaces the per-tenant default credit granted to a newly registered agent
+	// (deployment ledger currency; 0 disables the grant). Written by the boot-time
+	// env seeding (EXCHANGE_DEFAULT_AGENT_CREDIT); otherwise set out of band like
+	// activate_new_agents_by_default — there is no admin RPC.
+	// Returns rows-affected so a call for a missing tenant is a detectable no-op
+	// rather than a silent success.
+	SetTenantDefaultAgentCredit(ctx context.Context, arg SetTenantDefaultAgentCreditParams) (int64, error)
 	// Replaces the tenant-level default commission rate (basis points) and the
 	// operator note in one write. The admin SetTenantFeeRate RPC write path (also a
 	// fixture mutator). Full replace: fee_rate_notes is set to $3, which is NULL

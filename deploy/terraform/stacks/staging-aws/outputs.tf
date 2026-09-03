@@ -4,12 +4,19 @@ output "vm_public_ip" {
 }
 
 output "ssh_command" {
-  description = "SSH command for the operator. Includes -i when ssh_private_key_path is set."
-  value = (
-    var.ssh_private_key_path == null
-    ? module.vm.ssh_command
-    : "ssh -i ${var.ssh_private_key_path} ubuntu@${module.vm.public_ip}"
-  )
+  # No -i here on purpose. Terraform owns the remote endpoint; the operator owns
+  # their credential. State is local and gets copied between machines, and
+  # terraform output replays a value the last apply stored — so a private-key
+  # path baked in here would point at the last applier's workstation and be
+  # wrong for everyone else. Select your key locally, with RAMP_SSH_IDENTITY_FILE
+  # or an ssh_config Host entry.
+  description = "SSH command for the operator. Selects no identity file: your ssh client chooses the key."
+  value       = module.vm.ssh_command
+}
+
+output "ssh_authorized_keys" {
+  description = "The authorized_keys lines rendered for installation, by operator name: who is configured to SSH in, and from where. Public keys only — nothing here is secret."
+  value       = module.vm.ssh_authorized_keys
 }
 
 output "exchange_url" {

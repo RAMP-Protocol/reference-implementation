@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const recordSelection = `-- name: RecordSelection :one
@@ -55,6 +57,71 @@ ORDER BY created_at DESC
 
 func (q *Queries) SelectionsByRequestID(ctx context.Context, requestID string) ([]BrokerSelectionLog, error) {
 	rows, err := q.db.Query(ctx, selectionsByRequestID, requestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BrokerSelectionLog{}
+	for rows.Next() {
+		var i BrokerSelectionLog
+		if err := rows.Scan(
+			&i.LogID,
+			&i.RequestID,
+			&i.AgentID,
+			&i.Query,
+			&i.CandidateOffers,
+			&i.Rationale,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const selectionsOfferingOffer = `-- name: SelectionsOfferingOffer :many
+SELECT log_id, request_id, agent_id, query, candidate_offers, rationale, created_at FROM broker.selection_log
+WHERE agent_id = $1
+  AND candidate_offers @> $2::jsonb
+  AND created_at <= $3
+  AND created_at >= $4
+ORDER BY created_at DESC
+LIMIT $5
+`
+
+type SelectionsOfferingOfferParams struct {
+	AgentID     string             `json:"agent_id"`
+	OfferMember []byte             `json:"offer_member"`
+	NotAfter    pgtype.Timestamptz `json:"not_after"`
+	NotBefore   pgtype.Timestamptz `json:"not_before"`
+	MaxRows     int32              `json:"max_rows"`
+}
+
+// Selections that offered one particular offer to one agent, most recent
+// first. The caller wants the newest row in a bounded window, so the window
+// bounds are parameters and the LIMIT is the caller's, not this query's.
+//
+// The offer test is JSONB containment against a one-element array, which is
+// how a `[{"offer_id": ...}, ...]` array is asked "does it hold this member".
+// Equality against the whole column would require reproducing every candidate
+// the broker returned, which the caller does not know.
+//
+// selection_log_agent_idx (agent_id, created_at DESC) serves the agent and
+// range predicates; the containment test filters the rows that survive them.
+// Offered-in-window is a handful of rows per agent, so no JSONB index is
+// needed to keep this cheap.
+func (q *Queries) SelectionsOfferingOffer(ctx context.Context, arg SelectionsOfferingOfferParams) ([]BrokerSelectionLog, error) {
+	rows, err := q.db.Query(ctx, selectionsOfferingOffer,
+		arg.AgentID,
+		arg.OfferMember,
+		arg.NotAfter,
+		arg.NotBefore,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}

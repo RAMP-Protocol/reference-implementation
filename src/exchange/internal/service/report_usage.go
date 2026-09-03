@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -19,16 +20,23 @@ import (
 )
 
 // ReportUsage validates and records a usage report against the obligation
-// created at ExecuteTransaction time. The five RAMP §3.2 #4 + L6-remainder
-// checks (required fields, window, quantity tolerance, billing_id,
-// timestamp, exchange) run inside the same transaction as the persist so
-// audit and state stay consistent.
+// created at ExecuteTransaction time. The four RAMP §3.2 #4 checks (required
+// fields, quantity tolerance, billing_id, timestamp) run inside the same
+// transaction as the persist so audit and state stay consistent. A report filed
+// after its deadline is accepted like any other — see ValidateUsageReport for
+// why the window is not a check. Whether the report is addressed to this
+// Exchange is decided earlier and elsewhere, by the recipient interceptor on the
+// Connect surface, so a report meant for somebody else never opens a transaction
+// at all.
 //
-// Idempotency: UsageReport.id is the caller-supplied idempotency anchor.
-// Replays with the same id return the original UsageReportResponse.report_id
-// without re-running validation. Two different UsageReport.id values against
-// the same obligation are rejected on the second call (the state guard on
-// MarkValidationValidated fires).
+// Idempotency: UsageReport.id is the caller-supplied idempotency anchor. A
+// replay of an ACCEPTED report returns the original
+// UsageReportResponse.report_id without re-running validation. A retry under a
+// key that was only ever rejected is validated afresh, because there is no
+// accepted result to return and the caller is correcting its report rather than
+// replaying one. Two different UsageReport.id values against the same obligation
+// are rejected on the second call (the state guard on MarkValidationValidated
+// fires).
 //
 // Authz: the verified httpsig keyID must equal the obligation's agent_id
 // (or be a registered BROKER caller against a tenant with allow_broker_relay
@@ -56,9 +64,12 @@ func (s *ExchangeService) ReportUsage(
 	}
 
 	// Idempotent-retry probe outside any transaction — cheap point lookup.
-	// A hit means we already processed this exact UsageReport.id and must
-	// return the same response without writing again.
-	if existing, lookupErr := s.obligations.FindBySourceReportID(
+	// A hit means we already ACCEPTED this exact UsageReport.id and must return
+	// the same response without writing again. The probe keys on a prior
+	// accepted result, not on a bare key match: our own MCP tool tells agents to
+	// reuse the key when retrying, so a retry correcting a rejected report
+	// arrives under the original key and has to be re-validated.
+	if existing, lookupErr := s.obligations.FindAcceptedBySourceReportID(
 		ctx, req.GetTransactionId(), req.GetIdempotencyKey(),
 	); lookupErr == nil {
 		return s.buildReplayResponse(ctx, caller, existing), nil
@@ -68,10 +79,12 @@ func (s *ExchangeService) ReportUsage(
 	}
 
 	// validationErr survives the tx so the audit-row commit can flush
-	// before we return the validation failure to the caller. Without this
-	// dance, returning the error from BeginFunc rolls back the audit row
-	// MarkValidationRejected just wrote — the rejection becomes invisible
-	// to operators and to /list-outstanding queries.
+	// before we return the validation failure to the caller. Without this,
+	// returning the error from BeginFunc rolls back the row
+	// MarkValidationRejected just wrote, and the rejection becomes invisible
+	// to everything that reads it: the operator evidence route renders
+	// validation_outcome and validated_at from that row, and it is the only
+	// record of which check refused the report.
 	var (
 		out           *rampv1.UsageReportResponse
 		validationErr *exchange.Error
@@ -118,7 +131,6 @@ func (s *ExchangeService) runReportUsageTx(
 		CreatedAt:     rc.CreatedAt,
 		Report:        req,
 		Now:           s.clk.Now(),
-		Exchange:      s.cfg.Exchange,
 	})
 	if vErr != nil {
 		return s.persistRejection(ctx, tx, caller, req, rc, outcome, vErr, validationErr)
@@ -126,14 +138,48 @@ func (s *ExchangeService) runReportUsageTx(
 	return s.persistValidation(ctx, tx, caller, req, rc, out)
 }
 
+// refuseAlreadyReported answers a report filed against an obligation that has
+// already settled. Both persist paths reach it, because the accept statement
+// and the reject statement carry the same AND state = 'PENDING' predicate and
+// so match zero rows for the same reason.
+//
+// The line is logged before returning. Returning the error rolls the
+// transaction back, so nothing is written to the obligation row, and without
+// the line the attempt would leave no trace at all — on the one request shape
+// worth an operator's attention, an agent filing a second report over a settled
+// one to move validation_outcome and source_report_id off the accepted key, on
+// the surface a dispute would be settled from. The authorization refusal takes
+// the same shape: it deliberately writes no row and still logs first.
+func (s *ExchangeService) refuseAlreadyReported(
+	ctx context.Context, caller Caller, rc repo.ReportValidationContext,
+) *exchange.Error {
+	rerr := exchange.Newf(exchange.KindFailedPrecondition, "obligation already reported")
+	s.logOutcome(ctx, "report_usage", "REJECTED_ALREADY_REPORTED", caller,
+		&repo.Tenant{ID: rc.TenantID}, rc.AgentID, rc.TransactionID, rerr)
+	return rerr
+}
+
 func (s *ExchangeService) persistRejection(
 	ctx context.Context, tx pgx.Tx, caller Caller, req *rampv1.UsageReport,
 	rc repo.ReportValidationContext, outcome repo.ValidationOutcome,
 	vErr *exchange.Error, validationErr **exchange.Error,
 ) error {
-	if _, mErr := s.obligations.MarkValidationRejected(
-		ctx, tx, rc.Obligation.ID, outcome, req.GetIdempotencyKey(),
-	); mErr != nil {
+	if _, mErr := s.obligations.MarkValidationRejected(ctx, tx, repo.RejectReport{
+		ObligationID:   rc.Obligation.ID,
+		Outcome:        outcome,
+		SourceReportID: req.GetIdempotencyKey(),
+		Now:            s.clk.Now(),
+	}); mErr != nil {
+		if errors.Is(mErr, repo.ErrObligationAlreadyReported) {
+			// The obligation was already settled, so this rejection has nothing
+			// to record against it. Returning the error rolls the transaction
+			// back, which is wanted: writing the outcome here would walk a
+			// VALIDATED row back to a rejection and move source_report_id off
+			// the accepted key, breaking the replay of that key. Same answer the
+			// accept path gives for a second report against a settled
+			// obligation.
+			return s.refuseAlreadyReported(ctx, caller, rc)
+		}
 		return exchange.Wrap(exchange.KindInternal, mErr, "persist validation rejection")
 	}
 	s.logOutcome(ctx, "report_usage", string(outcome), caller,
@@ -153,17 +199,21 @@ func (s *ExchangeService) persistValidation(
 		return exchange.Wrap(exchange.KindInternal, err, "encode consumed quantity")
 	}
 	issuedReportID := uuid.NewString()
-	updated, mErr := s.obligations.MarkValidationValidated(
-		ctx, tx, rc.Obligation.ID, req.GetIdempotencyKey(), issuedReportID, consumed,
-	)
+	updated, mErr := s.obligations.MarkValidationValidated(ctx, tx, repo.AcceptReport{
+		ObligationID:   rc.Obligation.ID,
+		SourceReportID: req.GetIdempotencyKey(),
+		IssuedReportID: issuedReportID,
+		Consumed:       consumed,
+		Now:            s.clk.Now(),
+	})
 	if mErr != nil {
 		if errors.Is(mErr, repo.ErrObligationAlreadyReported) {
-			return exchange.Newf(exchange.KindFailedPrecondition,
-				"obligation already reported")
+			return s.refuseAlreadyReported(ctx, caller, rc)
 		}
 		return exchange.Wrap(exchange.KindInternal, mErr, "persist validation outcome")
 	}
 	*out = &rampv1.UsageReportResponse{
+		Ver:      helpers.ProtocolVersion,
 		ReportId: updated.IssuedReportID,
 	}
 	s.logOutcome(ctx, "report_usage", "VALIDATED", caller,
@@ -171,17 +221,18 @@ func (s *ExchangeService) persistValidation(
 	return nil
 }
 
-// buildReplayResponse mirrors the response we returned on the first call for
-// this UsageReport.idempotency_key. The replay path does not re-run validation;
-// the idempotent contract is "same input → same output." Acceptance/rejection
-// is no longer an in-body flag (ADR-019 §2: a rejected report is a transport
-// error); the success replay returns the issued report id. Precise error-replay
-// semantics for a non-received obligation are wired under the idempotency work.
+// buildReplayResponse mirrors the response we returned when this
+// UsageReport.idempotency_key was ACCEPTED. The replay path does not re-run
+// validation; the idempotent contract is "same input → same output." Acceptance
+// and rejection are not an in-body flag (ADR-019 §2: a rejected report is a
+// transport error), so a replay reaching here always has an issued report id to
+// return — the probe that selected this row required one.
 func (s *ExchangeService) buildReplayResponse(
 	ctx context.Context, caller Caller, existing repo.Obligation,
 ) *rampv1.UsageReportResponse {
 	s.logOutcome(ctx, "report_usage", "REPLAY", caller, nil, "", existing.TransactionID, nil)
 	return &rampv1.UsageReportResponse{
+		Ver:      helpers.ProtocolVersion,
 		ReportId: existing.IssuedReportID,
 	}
 }

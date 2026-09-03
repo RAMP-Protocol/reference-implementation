@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	connect "connectrpc.com/connect"
-	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
@@ -65,14 +64,7 @@ func captureSignedDiscover(t *testing.T, h *pushHarness, httpsBase string) *capt
 	client := rampconnect.NewExchangeServiceClient(&http.Client{Transport: signing}, httpsBase)
 	// The call is intercepted by captured before any bytes leave; the error from the
 	// dummy 200 (empty body) is irrelevant — we only need the signed request.
-	_, _ = client.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.publisherDom + "/articles/any"},
-		Requester: &rampv1.Requester{
-			Id: h.discoverKeyID, Domain: "agent.example",
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	_, _ = client.DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(newRequester(h.discoverKeyID, "agent.example"), []string{"https://" + h.publisherDom + "/articles/any"})))
 	if captured.req == nil {
 		t.Fatal("signing transport produced no request")
 	}

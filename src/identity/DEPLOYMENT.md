@@ -63,7 +63,7 @@ is down will not come back up. Plan restarts accordingly.
 | A public hostname for this service, with TLS | `IDENTITY_AUTH_ISSUER` | `curl -sI https://id.example.com` returns anything but a DNS error |
 | A wildcard DNS record for the identity zone | `IDENTITY_BASE_DOMAIN` | `dig +short anything.agents.example.com` returns your address |
 | A wildcard TLS certificate matching that zone | your proxy or load balancer | `openssl s_client -connect anything.agents.example.com:443` shows a `*.agents.example.com` certificate |
-| The address of your Broker and your Exchange | `IDENTITY_MCP_*_URL` | Neither has to be answering yet |
+| The address of your Broker | `IDENTITY_MCP_BROKER_URL` | It does not have to be answering yet. No Exchange address is configured — an agent names the Exchange per call. |
 | A container runtime | — | `docker version` |
 | Python 3 (to generate keys in §7) | — | `python3 --version` |
 
@@ -88,7 +88,7 @@ this is the only place this document names one, and every command below reuses
 it:
 
 ```bash
-VERSION=1.0.0-rc.2
+VERSION=1.0.0-rc.3
 docker pull ghcr.io/ramp-protocol/identity:$VERSION
 ```
 
@@ -320,7 +320,9 @@ services:
       IDENTITY_SESSION_KEY: "${IDENTITY_SESSION_KEY}"
       IDENTITY_TOKEN_SIGNING_KEY: "${IDENTITY_TOKEN_SIGNING_KEY}"
       IDENTITY_MCP_BROKER_URL: "https://broker.example"
-      IDENTITY_MCP_EXCHANGE_URL: "https://exchange.example"
+      # Optional. Unset means agents may name any Exchange; set it to confine
+      # this deployment to the ones its operator chose.
+      IDENTITY_MCP_EXCHANGE_ALLOWLIST: "exchange.example"
       VAULT_ADDR: "https://vault.internal:8200"
       VAULT_TOKEN: "${VAULT_TOKEN}"
       IDENTITY_KV_MOUNT: "ramp-agents"
@@ -349,7 +351,7 @@ If it exited instead, the `identity.exit` line names the cause:
 | `sign-up config: oidc upstream: oidcup: discover` | The OIDC provider did not answer. Check the address and that it is reachable from this container. |
 | `sign-up config: IDENTITY_SESSION_KEY must decode to` | The key is not 32 bytes of standard base64 (§7). |
 | `keystore:` | The Vault client could not be built — usually a `VAULT_ADDR` that is not a valid address at all. |
-| `mcp config: both IDENTITY_MCP_` | One or both peer addresses are missing. |
+| `mcp config: IDENTITY_MCP_BROKER_URL is required` | The Broker address is unset. |
 | `mcp config: IDENTITY_MCP_MAX_` | One of the two content byte caps is not a positive whole number. |
 | `build server:` | The server could not be assembled from the settings — for example a per-item content cap larger than the per-call cap. The rest of the message names the exact cause. |
 
@@ -433,18 +435,23 @@ curl -s -i -X POST https://id.example/mcp \
 **Check F — the identity zone answers, and does not leak.**
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' \
-  https://nosuch.agents.example/.well-known/http-message-signatures-directory
-# Expect: 404
+for doc in http-message-signatures-directory ramp.json; do
+  curl -s -o /dev/null -w "$doc %{http_code}\n" \
+    "https://nosuch.agents.example/.well-known/$doc"
+done
+# Expect: 404 for both
 ```
 
-A `404` for an agent that does not exist is correct. A `503` means Vault is
-unreachable (Check C). A connection or certificate error means the wildcard DNS record
+A `404` for an agent that does not exist is correct. A `503` means a backend is
+unreachable — Vault for the key directory (Check C), Postgres for `ramp.json`
+(Check B). A connection or certificate error means the wildcard DNS record
 or the certificate does not cover the zone (§8).
 
-Once a developer has signed up, the same address under **their** subdomain returns
-their public key as a JSON key set, and that is what the Broker and the Exchange
-fetch. The end-to-end sign-up walkthrough is in [`RUNBOOK.md`](RUNBOOK.md) §4.2.
+Once a developer has signed up, the same addresses under **their** subdomain answer:
+the key directory returns their public key as a JSON key set, which is what the Broker
+and the Exchange fetch, and `ramp.json` returns the RAMP commercial overlay naming that
+subdomain with `role: ROLE_AGENT`. The end-to-end sign-up walkthrough is in
+[`RUNBOOK.md`](RUNBOOK.md) §4.2.
 
 ---
 

@@ -57,14 +57,25 @@ SELECT ro.obligation_id, ro.transaction_id, ro.state, ro.window_seconds, ro.dead
  LIMIT 1
  FOR UPDATE OF ro;
 
--- name: FindObligationBySourceReportID :one
+-- name: FindAcceptedObligationBySourceReportID :one
 -- Idempotent-retry probe for ReportUsage: returns the obligation row whose
--- (transaction_id, source_report_id) pair was already recorded. A non-empty
--- hit means the caller is replaying a prior UsageReport and the service must
--- return the original issued_report_id without re-running validation.
+-- (transaction_id, source_report_id) pair was already recorded AND ACCEPTED.
+-- "Accepted" is in the name because it is in the predicate: a caller wanting the
+-- row for a key that was only ever rejected will not find it here. A
+-- hit means the caller is replaying a report this Exchange already validated,
+-- so the service returns the original issued_report_id without re-running
+-- validation.
+--
+-- issued_report_id IS NOT NULL is what makes "accepted" the condition rather
+-- than "seen". A rejected report also persists source_report_id, so without
+-- this predicate a retry carrying the same key would match, return 200 with an
+-- empty report_id, and never re-validate -- the obligation would stay PENDING
+-- while the agent believed it had reported. issued_report_id is written only on
+-- acceptance, so it already means exactly "there is a result to replay".
 SELECT * FROM ramp.reporting_obligations
  WHERE transaction_id = $1
    AND source_report_id = $2
+   AND issued_report_id IS NOT NULL
  LIMIT 1;
 
 -- name: MarkValidationValidated :one
@@ -74,46 +85,80 @@ SELECT * FROM ramp.reporting_obligations
 -- in RECEIVED matches zero rows and the caller surfaces FailedPrecondition.
 -- The partial unique index on (transaction_id, source_report_id) prevents
 -- two concurrent "same-id" writes from both succeeding.
+--
+-- received_at and validated_at come from the caller, not NOW(). The deadline
+-- they are compared against was written from the service clock, so reading the
+-- database clock here would compare two different clocks: received_at > deadline
+-- would not be a sound lateness check, and a test could not drive the comparison
+-- deterministically.
 UPDATE ramp.reporting_obligations
    SET state              = 'RECEIVED',
-       consumed_quantity  = $2,
-       received_at        = NOW(),
+       consumed_quantity  = sqlc.arg(consumed_quantity),
+       received_at        = sqlc.arg(now),
        validation_outcome = 'VALIDATED',
-       validated_at       = NOW(),
-       source_report_id   = $3,
-       issued_report_id   = $4
- WHERE obligation_id = $1
+       validated_at       = sqlc.arg(now),
+       source_report_id   = sqlc.arg(source_report_id),
+       issued_report_id   = sqlc.arg(issued_report_id)
+ WHERE obligation_id = sqlc.arg(obligation_id)
    AND state         = 'PENDING'
 RETURNING *;
 
 -- name: MarkValidationRejected :one
--- Records the rejection outcome without changing obligation state. The audit
--- row is written for every rejection so disputes have a trail, but the
--- obligation stays PENDING and the caller may retry with a corrected report
--- until the deadline expires.
+-- Records the rejection outcome for an obligation that is still PENDING. An
+-- audit row is written for every rejection against a PENDING obligation, so
+-- disputes have a trail; a report against an obligation that has already
+-- settled matches zero rows and writes nothing, and the service logs the
+-- refusal instead. The state is left alone so the caller may retry with a
+-- corrected report. The
+-- retry may reuse the same source_report_id: the replay probe above fires only
+-- on an accepted result, so a corrected retry under the original key is
+-- validated afresh rather than short-circuited.
+--
+-- The state predicate matches the accept statement above, and for a stronger
+-- reason than symmetry. Without it a second, invalid report against an
+-- obligation already in RECEIVED would commit over the settled row: the outcome
+-- would walk back from VALIDATED to a rejection, and source_report_id would move
+-- off the accepted key, so a later replay of that key would miss the probe and
+-- be refused as already-reported. Zero rows updated means the obligation was not
+-- PENDING, and the caller surfaces FailedPrecondition.
+--
+-- validated_at comes from the caller for the same reason as the accept
+-- statement above: the obligation's three report timestamps all come from the
+-- service clock, so they can be compared against the deadline written from it.
 UPDATE ramp.reporting_obligations
-   SET validation_outcome = $2,
-       validated_at       = NOW(),
-       source_report_id   = COALESCE($3, source_report_id)
- WHERE obligation_id = $1
+   SET validation_outcome = sqlc.arg(validation_outcome),
+       validated_at       = sqlc.arg(now),
+       source_report_id   = COALESCE(sqlc.narg(source_report_id), source_report_id)
+ WHERE obligation_id = sqlc.arg(obligation_id)
+   AND state         = 'PENDING'
 RETURNING *;
 
--- name: ListOutstandingObligations :many
--- Returns reporting obligations whose deadline has passed but which still
--- sit in PENDING for a specific (tenant_id, agent_id). Joins to
--- transaction_log because reporting_obligations does not carry tenant_id /
--- agent_id columns directly. The result drives the ExecuteTransaction
--- reporting-overdue refusal: a non-empty list refuses the agent's next
--- transaction with FailedPrecondition until it files the missing report.
-SELECT ro.obligation_id, ro.transaction_id, ro.state, ro.window_seconds,
-       ro.deadline, ro.consumed_quantity, ro.received_at, ro.created_at,
-       ro.required_fields, ro.estimated_quantity, ro.quantity_tolerance,
-       ro.validation_outcome, ro.validated_at,
-       ro.source_report_id, ro.issued_report_id
+-- name: CountObligationsByStateAndDueness :many
+-- The reporting-compliance fact table for one (tenant_id, agent_id): how many
+-- obligations sit in each state, split by whether their deadline had already
+-- passed at as_of. It returns at most four rows (two states x two dueness
+-- values) whatever the agent's history, but that bounds the result, not the
+-- work: the join is served by reporting_obligations_transaction_idx, so the
+-- rows READ are the agent's own obligations rather than the whole table. Drop
+-- that index and this becomes a sequential scan of every tenant's obligations,
+-- once per executed item, in front of fund reservation.
+--
+-- It counts and classifies nothing. Which bucket means "overdue", which ones
+-- form the denominator, and where the thresholds sit are the Exchange's
+-- reporting policy, and that policy is applied in the service so a future
+-- per-tenant rule reads these same numbers differently without a new query.
+--
+-- Joins to transaction_log because reporting_obligations carries no tenant_id /
+-- agent_id column of its own. as_of is the service clock's instant: the deadline
+-- it is compared against was written from that same clock.
+--
+-- The ::boolean cast pins the generated Go field to bool. deadline is NOT NULL,
+-- so the comparison is never null.
+SELECT ro.state,
+       (ro.deadline < sqlc.arg(as_of))::boolean AS past_deadline,
+       COUNT(*)                                 AS n
   FROM ramp.reporting_obligations AS ro
   JOIN ramp.transaction_log AS tl ON tl.transaction_id = ro.transaction_id
- WHERE tl.tenant_id = $1
-   AND tl.agent_id = $2
-   AND ro.state = 'PENDING'
-   AND ro.deadline < NOW()
- ORDER BY ro.deadline ASC;
+ WHERE tl.tenant_id = sqlc.arg(tenant_id)
+   AND tl.agent_id  = sqlc.arg(agent_id)
+ GROUP BY ro.state, past_deadline;

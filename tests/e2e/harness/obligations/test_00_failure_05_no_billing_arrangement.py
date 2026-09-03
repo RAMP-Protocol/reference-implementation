@@ -37,6 +37,9 @@ import psycopg
 import pytest
 
 from ramp_sdk.core import sign_offer_acceptance_jcs
+from ramp_sdk import ProtocolVersion
+from ..exchanges import recipient_of
+from ..discovery import discover_body
 from ..conftest import COMPOSE_FILE, StackURLs
 from ..httpsig_signer import load_keypair
 from ..resolve_carriers import first_item_of, retrieval_endpoint_of
@@ -89,18 +92,14 @@ def _transaction_log_row_count_for_agent(dsn: str, agent_id: str) -> int:
 def _discover_first_offer(exchange_url: str) -> dict[str, Any]:
     resp = sign_post(
         f"{exchange_url}{_DISCOVER_PATH}",
-        body={
-            "id": f"q-{uuid.uuid4().hex}",
-            "requester": {
-                "id": NOBILLING_AGENT_ID,
-                "domain": DEMO_PHILOSOPHY_DOMAIN,
-                # Proto requires Requester.type != UNSPECIFIED on the discover path.
-                "type": "REQUESTER_TYPE_AGENT",
-                "user_type": "individual",
-                "geography": "US",
-            },
-            "uris": [_RESOURCE_URI],
-        },
+        body=discover_body(
+            agent_id=NOBILLING_AGENT_ID,
+            uris=[_RESOURCE_URI],
+            exchange=recipient_of(exchange_url),
+            domain=DEMO_PHILOSOPHY_DOMAIN,
+            user_type="individual",
+            geography="US",
+        ),
         key_path=AGENT_NOBILLING_KEY_PATH,
     )
     assert resp.status_code == httpx.codes.OK, (
@@ -143,7 +142,7 @@ def test_credit_less_agent_is_refused_with_billing_signal_and_no_url(
     resp = sign_post(
         f"{compose_stack.exchange}{_ACCEPT_OFFER_PATH}",
         body={
-            "ver": "1.0",
+            "ver": ProtocolVersion,
             "idempotency_key": tx_request_id,
             "requester": {
                 "id": NOBILLING_AGENT_ID,

@@ -27,8 +27,12 @@
 #      publishes;
 #   2. exactly one VERSION= declaration per deployment document — none means the
 #      reduction was reverted, two means it half was;
-#   3. all three documents declaring the same value, which is the partial update
-#      this guard exists to catch.
+#   3. every document declaring the same value, which is the partial update this
+#      guard exists to catch.
+#
+# WHICH documents is not decided here. scripts/deployment-docs.sh holds that list
+# and the release tool reads the same one, so a document cannot be rewritten by
+# one and unknown to the other.
 #
 # What it does NOT do: it is offline, so it cannot know whether the declared
 # version was ever published, or whether it matches the git tag the workflow
@@ -66,14 +70,35 @@ done
 
 cd "${repo_root}"
 
-# The three services that ship an image. The publishing workflow enumerates the
-# same three in its build matrix; a fourth service would have to be added in both
-# places, and the missing-document check below is what surfaces the omission here.
-DOCS=(
-  src/exchange/DEPLOYMENT.md
-  src/broker/DEPLOYMENT.md
-  src/identity/DEPLOYMENT.md
-)
+# The documents to read come from the shared definition, not from a copy here.
+# The release tool acts on the same list, and when each held its own, a document
+# one knew about and the other did not was rewritten and then never checked.
+#
+# Sourced from beside THIS script rather than from ${repo_root}: with --root the
+# gate scans another tree, and the definition it applies is its own. The sibling
+# reference gate resolves its shared definition the same way, and the harness
+# relies on it — it copies both files into a fixture and runs the fixture's copy.
+[ -r "${script_dir}/deployment-docs.sh" ] || die "cannot read ${script_dir}/deployment-docs.sh
+      That file lists the documents this gate reads. Without it there is nothing
+      to check, and a silent PASS would be worse than this message."
+# shellcheck source=scripts/deployment-docs.sh
+source "${script_dir}/deployment-docs.sh"
+
+# A file that sources cleanly and defines nothing under this name — what a
+# half-finished rename leaves behind. Without this, the next line reports
+# "DEPLOYMENT_DOCS: unbound variable" from a line the reader did not write.
+declare -p DEPLOYMENT_DOCS >/dev/null 2>&1 \
+  || die "${script_dir}/deployment-docs.sh defines no DEPLOYMENT_DOCS.
+      It was read, so the file exists and runs; it just sets nothing this gate
+      can use. Check the array's name."
+
+# Before the first expansion of the array, not after. An empty one aborts
+# "${DEPLOYMENT_DOCS[@]}" with "unbound variable" under the bash 3.2 that macOS
+# ships, and on bash 5 it does something worse: the loops below run zero times
+# and the agreement check reports a disagreement between no documents at all.
+# Same shape as the tracked-file guard further down.
+[ "${#DEPLOYMENT_DOCS[@]}" -gt 0 ] || die "${script_dir}/deployment-docs.sh lists no deployment documents.
+      A gate that reads nothing cannot pass; it has simply stopped checking."
 
 # scripts/ is deliberately absent: rule 1 has to spell out the string it forbids,
 # so a gate that scanned its own directory would fail on itself.
@@ -86,7 +111,7 @@ fail() {
   failures=$((failures + 1))
 }
 
-for d in "${DOCS[@]}"; do
+for d in "${DEPLOYMENT_DOCS[@]}"; do
   [ -f "${d}" ] || die "deployment document missing from the tree: ${d}
       This guard reads the version from each one; a document it cannot find is a
       check it silently loses."
@@ -189,7 +214,7 @@ fi
 # would bury the one line that carries information.
 declared=""
 listing=""
-for d in "${DOCS[@]}"; do
+for d in "${DEPLOYMENT_DOCS[@]}"; do
   count="$(grep -c '^VERSION=' "${d}" || true)"
   if [ "${count}" != "1" ]; then
     fail "${d}: ${count} VERSION= declaration(s), expected exactly 1"
@@ -205,7 +230,7 @@ if [ "${failures}" -eq 0 ]; then
   if [ "${distinct}" != "1" ]; then
     fail "the deployment documents declare ${distinct} different versions:"
     printf '%s' "${listing}"
-    echo "      A release edits all three. One left behind names an image that was"
+    echo "      A release edits every one of them. One left behind names an image that"
     echo "      never published."
   fi
 fi

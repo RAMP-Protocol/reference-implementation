@@ -25,6 +25,7 @@ package transport_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	connect "connectrpc.com/connect"
 
@@ -240,5 +241,137 @@ func TestResolve_SelectionAudit_CrossGroupGlobalWinner(t *testing.T) {
 	}
 	if outcome, _ := rationale["outcome"].(string); outcome != "discovered" {
 		t.Errorf("Rationale[outcome] = %q, want %q", outcome, "discovered")
+	}
+}
+
+// TestSelectionLog_LatestOfferingOffer pins the read the evidence-chain renderer
+// joins the Broker leg on. The renderer holds an agent identity and an offer id
+// from the Exchange's evidence row and asks the Broker "did you offer this offer
+// to this agent, shortly before this transaction?". There is no transaction id
+// on the Broker side to match — it only serves discovery, and no transaction
+// exists when it records a decision — so offer-id membership in the recorded
+// candidate set IS the join.
+//
+// Every predicate is exercised, because each one silently returning nothing
+// would render as "the Broker recorded no decision" and read as missing data
+// rather than a broken query.
+//
+// Round-trip honesty: the WRITE leg is a full PROTOCOL round-trip (signed
+// Connect client → RFC 9421 → httpsig → RequestIDMiddleware → BrokerService
+// handler → resolve core → auditSelection → Postgres). The READ leg is a
+// PERSISTENCE round-trip — the production repo.SelectionLogRepo over the sqlc
+// Querier, the documented tier-2 fallback, because the Broker still has no
+// public read surface for its selection audit. It is not a protocol round-trip
+// and is not claimed as one.
+func TestSelectionLog_LatestOfferingOffer(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t, ctx, fixtureOpts{providerDomain: "acme.example"})
+
+	const (
+		knownReqID = "req-selection-offer-join-0001"
+		agentID    = "agent-1"
+		offeredID  = "offer-1"
+	)
+
+	pub, priv := newBrokerKeyPair(t)
+	srv := startBrokerConnectServer(t, fx, agentID, pub)
+	client := signingBrokerClient(srv.base, srv.server.URL, agentID, priv)
+	req := connect.NewRequest(buildDiscoveryRequest(agentID, reqOpts{
+		query:       "RAMP intro",
+		budgetMinor: 10000,
+	}))
+	req.Header().Set("X-Request-ID", knownReqID)
+	if _, err := client.Resolve(ctx, req); err != nil {
+		t.Fatalf("Resolve returned transport error: %v", err)
+	}
+
+	logRepo := repo.NewSelectionLogRepo(fx.pool)
+
+	// The row's own recorded time anchors every window below. Reading it back
+	// through the repo also pins that CreatedAt is populated on the read path —
+	// the renderer prints it, and a zero time would render as the epoch.
+	written, err := logRepo.ByRequestID(ctx, knownReqID)
+	if err != nil {
+		t.Fatalf("ByRequestID(%q): %v", knownReqID, err)
+	}
+	if len(written) != 1 {
+		t.Fatalf("ByRequestID returned %d entries, want exactly 1", len(written))
+	}
+	recordedAt := written[0].CreatedAt
+	if recordedAt.IsZero() {
+		t.Fatal("CreatedAt is zero on the read path; the renderer would print the epoch")
+	}
+
+	t.Run("finds the decision that offered this offer to this agent", func(t *testing.T) {
+		got, err := logRepo.LatestOfferingOffer(ctx, agentID, offeredID, recordedAt, time.Hour)
+		if err != nil {
+			t.Fatalf("LatestOfferingOffer: %v", err)
+		}
+		if got == nil {
+			t.Fatal("no decision found for an offer the same resolve just recorded")
+		}
+		if got.LogID != written[0].LogID {
+			t.Errorf("LogID = %q, want %q", got.LogID, written[0].LogID)
+		}
+		if got.AgentID != agentID {
+			t.Errorf("AgentID = %q, want %q", got.AgentID, agentID)
+		}
+		// The decoded candidate set must still carry the offer, since that is
+		// what the renderer's assertion re-checks after the query matched.
+		candidates, ok := got.CandidateOffers.([]repo.CandidateInfo)
+		if !ok {
+			t.Fatalf("CandidateOffers type = %T, want []repo.CandidateInfo", got.CandidateOffers)
+		}
+		found := false
+		for _, c := range candidates {
+			if c.OfferID == offeredID {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the matched row does not list %q: %+v", offeredID, candidates)
+		}
+	})
+
+	// Each case below removes exactly one reason the row qualifies. All four
+	// must come back empty; a query missing any predicate would still return
+	// the row and the renderer would assert against the wrong decision.
+	for _, tc := range []struct {
+		name     string
+		agent    string
+		offer    string
+		notAfter time.Time
+		window   time.Duration
+	}{
+		{
+			name:  "an offer the Broker never listed",
+			agent: agentID, offer: "offer-never-seen",
+			notAfter: recordedAt, window: time.Hour,
+		},
+		{
+			name:  "the same offer, a different agent",
+			agent: "someone-else.example", offer: offeredID,
+			notAfter: recordedAt, window: time.Hour,
+		},
+		{
+			name:  "a decision recorded after the transaction",
+			agent: agentID, offer: offeredID,
+			notAfter: recordedAt.Add(-time.Second), window: time.Hour,
+		},
+		{
+			name:  "a decision older than the window",
+			agent: agentID, offer: offeredID,
+			notAfter: recordedAt.Add(2 * time.Hour), window: time.Hour,
+		},
+	} {
+		t.Run(tc.name+" is not matched", func(t *testing.T) {
+			got, err := logRepo.LatestOfferingOffer(ctx, tc.agent, tc.offer, tc.notAfter, tc.window)
+			if err != nil {
+				t.Fatalf("LatestOfferingOffer: %v", err)
+			}
+			if got != nil {
+				t.Errorf("matched selection %s, want no match", got.LogID)
+			}
+		})
 	}
 }

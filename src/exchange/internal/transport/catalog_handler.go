@@ -14,6 +14,7 @@ import (
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig/transportconnect"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/keypolicy"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
@@ -21,13 +22,16 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
 )
 
-// maxCatalogBodyBytes bounds the PushResources body the signature middleware
-// buffers before any verification. The endpoint is pre-auth (the RFC 9421
-// signature is checked in the handler, not at a gate), so an unbounded read
-// would let an unauthenticated caller exhaust memory (parallels the same cap on the
-// broker relay). 1 MiB is generous for a bulk catalog push while still bounding
-// the DoS surface.
-const maxCatalogBodyBytes int64 = 1 << 20
+// maxCatalogBodyBytes bounds the raw PushResources body CatalogSignatureMiddleware
+// buffers before any verification. The endpoint is pre-auth — the RFC 9421
+// signature is checked in the handler, over the exact bytes the middleware
+// captured — so the read runs before the caller is known, and an unbounded one
+// would let an unauthenticated caller exhaust memory. It is the same value as
+// the message cap CatalogMountOptions puts on the handler, so the raw body and
+// the decoded message are bounded alike on this mount, which is what
+// connectserver.WithMaxRequestBytes does for the ExchangeService mount from
+// one number.
+const maxCatalogBodyBytes int64 = MaxRPCReadBytes
 
 // httpContextKey holds the raw http.Request + captured body bytes so the
 // CatalogHandler can enforce RFC 9421 signature verification without requiring
@@ -55,11 +59,17 @@ func CatalogSignatureMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		// Bound the read: the endpoint is pre-auth, so an unbounded body would
-		// let an unauthenticated caller exhaust broker memory before the
-		// signature is checked.
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxCatalogBodyBytes))
+		// let an unauthenticated caller exhaust the Exchange's memory before the
+		// signature is checked. MaxBytesReader REFUSES a body past the cap; the
+		// LimitReader that used to sit here truncated it instead, and the
+		// truncated bytes were then misreported downstream: as a malformed
+		// message when they no longer decoded (a JSON push cut short answers
+		// InvalidArgument, "unexpected EOF"), or as an invalid signature when
+		// they still did and failed the content digest — never as the size
+		// limit the caller had actually hit.
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxCatalogBodyBytes))
 		if err != nil {
-			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+			writeCatalogReadError(w, r, err)
 			return
 		}
 		_ = r.Body.Close()
@@ -67,6 +77,38 @@ func CatalogSignatureMiddleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), httpContextKey{}, &catalogSignatureCtx{request: r, body: body})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// writeCatalogReadError answers a failed capture read. A body past the cap is a
+// resource limit, not an authentication failure: it is answered as Connect's
+// resource_exhausted with a 413, so a caller learns the one refusal it fixes by
+// sending less. transportconnect.WriteError hands that answer to the SDK's own
+// reject writer, the same one the verify face uses on the ExchangeService
+// mount, so the two mounts answer the same body the same way by construction
+// rather than by being kept level.
+//
+// The size refusal is also AUDITED, through the same observer the
+// ExchangeService mount registers as its reject hook. That mount gets the line
+// from the SDK's verify seam; this one has no seam to hook, so it calls the
+// observer itself. Without it the refusal left no trace at all, and the
+// operator documentation describes an outcome=body_too_large line on this
+// endpoint that nothing wrote.
+//
+// Any other read failure is a malformed request and is answered here, as plain
+// text with a 400. It deliberately does not go through the writer above: that
+// writer answers the verify seam's two verdicts and refuses anything else 401,
+// so routing a malformed read through it would turn a 400 into a 401. It is
+// deliberately not audited either: the reject vocabulary has no value for a
+// malformed read, so it would classify as the default, signature — the exact
+// misreport the body_too_large token was added to stop, sending an operator
+// after a key rotation for a caller whose connection broke mid-body.
+func writeCatalogReadError(w http.ResponseWriter, r *http.Request, err error) {
+	if transportconnect.IsBodyTooLarge(err) {
+		LogHTTPSigReject(r, err)
+		transportconnect.WriteError(w, err)
+		return
+	}
+	http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 }
 
 func isCatalogPush(r *http.Request) bool {

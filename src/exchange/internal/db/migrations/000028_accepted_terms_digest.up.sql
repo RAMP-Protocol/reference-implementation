@@ -1,0 +1,22 @@
+-- Record which licensing terms an agent accepted when it registered.
+--
+-- RegisterRequest carries a terms_digest, and an Exchange that publishes a
+-- digest in its manifest refuses a registration that names a different one or
+-- names none. Refusing is not enough on its own: the acceptance has to be
+-- recoverable afterwards, because the terms are versioned and "which revision
+-- did this account agree to" is a question the operator will be asked long after
+-- the request is gone.
+--
+-- The column is on ramp.agents rather than in the system of record. Terms
+-- acceptance is a protocol fact the Exchange must be able to answer even when
+-- the SoR backend is swapped for a CRM, and the SoR's account shape is
+-- deliberately free of protocol concerns.
+--
+-- Nullable with no default, and the NULL is meaningful: it says the Exchange
+-- published no digest at the moment this account registered, which is a
+-- different state from "registered against an empty digest". Written once, in
+-- the same guarded UPDATE that writes billing_ref, so first-write-wins covers
+-- both columns together. UpsertAgent deliberately does not touch it, so a key
+-- rotation re-upsert leaves the recorded acceptance intact.
+ALTER TABLE ramp.agents
+    ADD COLUMN accepted_terms_digest TEXT;

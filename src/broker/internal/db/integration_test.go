@@ -45,9 +45,9 @@ func TestBrokerMigrationsSmoke(t *testing.T) {
 		t.Fatalf("UpsertExchange: %v", err)
 	}
 
-	rows, err := q.ListActiveExchanges(ctx)
+	rows, err := q.ListUnblockedExchanges(ctx)
 	if err != nil {
-		t.Fatalf("ListActiveExchanges: %v", err)
+		t.Fatalf("ListUnblockedExchanges: %v", err)
 	}
 	found := false
 	for _, r := range rows {
@@ -57,6 +57,6 @@ func TestBrokerMigrationsSmoke(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("expected exchange %q in ListActiveExchanges", exchangeID)
+		t.Errorf("expected exchange %q in ListUnblockedExchanges", exchangeID)
 	}
 }

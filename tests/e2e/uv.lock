@@ -1303,8 +1303,8 @@ requires-dist = [
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "ramp-protocol", git = "https://github.com/RAMP-Protocol/protocol.git?subdirectory=gen%2Fpython&rev=104d867aa9a15a316723af6c3dd61d73ed490363" },
-    { name = "ramp-protocol-sdk", git = "https://github.com/RAMP-Protocol/protocol.git?subdirectory=sdk%2Fpython&rev=104d867aa9a15a316723af6c3dd61d73ed490363" },
+    { name = "ramp-protocol", git = "https://github.com/RAMP-Protocol/protocol.git?subdirectory=gen%2Fpython&rev=5a2674e6617202a792a8e57362fce32cb5d2db7e" },
+    { name = "ramp-protocol-sdk", git = "https://github.com/RAMP-Protocol/protocol.git?subdirectory=sdk%2Fpython&rev=5a2674e6617202a792a8e57362fce32cb5d2db7e" },
     { name = "rfc8785", specifier = ">=0.1.4" },
 ]
 
@@ -1317,7 +1317,7 @@ dev = [
 [[package]]
 name = "ramp-protocol"
 version = "0.1.0"
-source = { git = "https://github.com/RAMP-Protocol/protocol.git?subdirectory=gen%2Fpython&rev=104d867aa9a15a316723af6c3dd61d73ed490363#104d867aa9a15a316723af6c3dd61d73ed490363" }
+source = { git = "https://github.com/RAMP-Protocol/protocol.git?subdirectory=gen%2Fpython&rev=5a2674e6617202a792a8e57362fce32cb5d2db7e#5a2674e6617202a792a8e57362fce32cb5d2db7e" }
 dependencies = [
     { name = "pydantic" },
 ]
@@ -1325,11 +1325,12 @@ dependencies = [
 [[package]]
 name = "ramp-protocol-sdk"
 version = "0.0.0"
-source = { git = "https://github.com/RAMP-Protocol/protocol.git?subdirectory=sdk%2Fpython&rev=104d867aa9a15a316723af6c3dd61d73ed490363#104d867aa9a15a316723af6c3dd61d73ed490363" }
+source = { git = "https://github.com/RAMP-Protocol/protocol.git?subdirectory=sdk%2Fpython&rev=5a2674e6617202a792a8e57362fce32cb5d2db7e#5a2674e6617202a792a8e57362fce32cb5d2db7e" }
 dependencies = [
     { name = "cryptography" },
     { name = "httpcore" },
     { name = "httpx" },
+    { name = "jsonschema" },
     { name = "pydantic" },
     { name = "rfc8785" },
 ]

@@ -30,23 +30,24 @@ type authFlow struct {
 	UpstreamVerifier string `json:"uvf"`
 }
 
-// pending is the state sealed at /callback (when the form is still needed) and
-// reopened at /form. It carries the downstream client's request forward so the code
-// can be issued after the form, plus the authenticated developer identity and the
-// subdomain minted for it.
+// pending is the state sealed at /callback and reopened at /consent. It carries the
+// downstream client's request forward so the code can be issued once the developer
+// approves, plus the subdomain minted for them.
+//
+// It holds no part of the developer's upstream identity. The issuer and subject were
+// here only so the registration form could write its fields against them; consent
+// needs neither, so the browser stops carrying them.
 type pending struct {
 	ClientID        string `json:"cid"`
 	ClientName      string `json:"cnm"`
 	RedirectURI     string `json:"ruri"`
 	ClientState     string `json:"cst"`
 	ClientChallenge string `json:"cch"`
-	Issuer          string `json:"iss"`
-	Subject         string `json:"sub"`
 	Subdomain       string `json:"sd"`
 	// CSRFToken is the synchronizer token minted at /callback, sealed here (so the
-	// browser cannot read or forge it), and echoed as a hidden field on the form.
-	// /form verifies the submitted field against it, making CSRF protection
-	// independent of SameSite support.
+	// browser cannot read or forge it), and echoed as a hidden field on the consent
+	// screen. /consent verifies the submitted field against it, making CSRF
+	// protection independent of SameSite support.
 	CSRFToken string `json:"csrf"`
 }
 
@@ -119,14 +120,37 @@ func (s *Server) clearCookie(w http.ResponseWriter, name string) {
 	s.setCookie(w, name, "", -1)
 }
 
-// readPendingPOST is the prelude the /form and /consent POST handlers share: open the
-// sealed pending cookie, parse a size-bounded form body, and verify the CSRF token.
-// It writes the 400 and returns ok=false on any failure, so the caller returns
-// immediately on !ok; on success it returns the reopened pending state.
-func (s *Server) readPendingPOST(w http.ResponseWriter, r *http.Request) (pending, bool) {
+// csrfField is the hidden form field carrying the synchronizer token bound into the
+// sealed pending cookie. A cross-site request cannot read the sealed cookie, so it
+// cannot present a matching token — this is what stops a page the developer did not
+// open from approving a client on their behalf, even on a SameSite-unaware agent
+// where the cookie alone would travel.
+const csrfField = "csrf_token"
+
+// openPending opens the sealed pending cookie and is the one place /consent
+// refuses a request that has no sign-in session behind it. Both legs of the route
+// start here — handleConsentGet for the render, readPendingPOST for the
+// submission — so one route answers one condition in one sentence, rather than
+// two handlers keeping two copies of it in step by hand.
+//
+// It writes the 400 and returns ok=false on failure, so the caller returns
+// immediately on !ok.
+func (s *Server) openPending(w http.ResponseWriter, r *http.Request) (pending, bool) {
 	var p pending
 	if err := s.readSealed(r, pendingCookie, &p); err != nil {
-		userError(w, http.StatusBadRequest, "no active sign-up session; start again")
+		userError(w, http.StatusBadRequest, "no active sign-in session; start again")
+		return pending{}, false
+	}
+	return p, true
+}
+
+// readPendingPOST is the prelude the /consent POST handler runs: open the sealed
+// pending cookie, parse a size-bounded form body, and verify the CSRF token. It
+// writes the 400 and returns ok=false on any failure, so the caller returns
+// immediately on !ok; on success it returns the reopened pending state.
+func (s *Server) readPendingPOST(w http.ResponseWriter, r *http.Request) (pending, bool) {
+	p, ok := s.openPending(w, r)
+	if !ok {
 		return pending{}, false
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)

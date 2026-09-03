@@ -254,6 +254,49 @@ run "empty_default_tenant_is_rejected" {
   ]
 }
 
+run "default_agent_credit_disabled_by_default" {
+  command = apply
+
+  # The variable's default must render as the explicit "0" the binary treats
+  # as disabled — a freshly applied stack grants nothing until the operator
+  # opts in.
+  assert {
+    condition     = strcontains(output.compose_yaml, "EXCHANGE_DEFAULT_AGENT_CREDIT: \"0\"")
+    error_message = "The welcome credit must render disabled (\"0\") unless the stack opts in"
+  }
+}
+
+run "default_agent_credit_renders_when_configured" {
+  command = apply
+
+  variables {
+    default_agent_credit = "100"
+  }
+
+  # "100" means 100.00 whole currency units (EUR 100.00 on the default EUR
+  # ledger), not 100 minor units — the value passes through verbatim and the
+  # Exchange does the scale-8 conversion.
+  assert {
+    condition     = strcontains(output.compose_yaml, "EXCHANGE_DEFAULT_AGENT_CREDIT: \"100\"")
+    error_message = "The configured welcome credit must reach the Exchange env verbatim"
+  }
+}
+
+run "malformed_default_agent_credit_is_rejected" {
+  command = plan
+
+  # A negative value, an exponent, or a currency symbol would stop the
+  # Exchange boot at apply time; the variable validation moves that failure
+  # to plan.
+  variables {
+    default_agent_credit = "-100"
+  }
+
+  expect_failures = [
+    var.default_agent_credit,
+  ]
+}
+
 run "sor_database_is_created_unconditionally" {
   command = apply
 
@@ -605,8 +648,18 @@ run "identity_plane_is_wired" {
   }
 
   assert {
-    condition     = strcontains(output.compose_yaml, "IDENTITY_MCP_BROKER_URL: \"http://broker:8082\"") && strcontains(output.compose_yaml, "IDENTITY_MCP_EXCHANGE_URL: \"http://exchange:8081\"")
-    error_message = "The RAMP legs the MCP tools drive are in-network hops"
+    condition     = strcontains(output.compose_yaml, "IDENTITY_MCP_BROKER_URL: \"http://broker:8082\"")
+    error_message = "Discovery is an in-network hop to the Broker"
+  }
+
+  assert {
+    condition     = strcontains(output.compose_yaml, "IDENTITY_MCP_EXCHANGE_ALLOWLIST: \"exchange.staging.example\"") && strcontains(output.compose_yaml, "\n      EXCHANGE_DOMAIN: \"exchange.staging.example\"")
+    error_message = "The Exchange policy names the identity the Exchange publishes about itself, which is the value an agent names in a tool call and the value that Exchange answers to"
+  }
+
+  assert {
+    condition     = !strcontains(output.compose_yaml, "IDENTITY_MCP_EXCHANGE_URL") && !strcontains(output.compose_yaml, "IDENTITY_MCP_EXCHANGE_DOMAIN")
+    error_message = "No Exchange origin is configured: an account call names its Exchange per call and resolves the endpoint from that Exchange's own manifest, so a rendered origin would be a setting nothing reads"
   }
 
   assert {
@@ -652,11 +705,12 @@ run "identity_secrets_are_generated_not_ephemeral" {
 run "fully_loaded_user_data_fits_the_ec2_limit" {
   command = apply
 
-  # Every optional block staging turns on at once — publisher origin, registry
-  # login, the EXA key — because the limit has to hold for the LARGEST
-  # cloud-init the module can emit, not the fixture's minimum. The RSA key is
-  # optional too (see rsa_key_is_optional), but the fixture defaults already
-  # supply it, so this run carries it without listing it here.
+  # Every optional block a deployment can turn on at once — publisher origin,
+  # registry login, the EXA key, Zitadel's outbound mail — because the limit
+  # has to hold for the LARGEST cloud-init the module can emit, not the
+  # fixture's minimum. The RSA key is optional too (see rsa_key_is_optional),
+  # but the fixture defaults already supply it, so this run carries it without
+  # listing it here. A new optional block belongs in this list.
   variables {
     origin_hostname   = "origin.staging.example"
     publisher_image   = "registry.example.com/group/proj/publisher:test"
@@ -664,6 +718,12 @@ run "fully_loaded_user_data_fits_the_ec2_limit" {
     registry_username = "gitlab+deploy-token-123456"
     registry_password = "glpat-XXXXXXXXXXXXXXXXXXXX"
     exa_api_key       = "00000000-0000-0000-0000-000000000000"
+
+    smtp_host      = "email-smtp.us-east-1.amazonaws.com:587"
+    smtp_user      = "AKIAEXAMPLEEXAMPLE"
+    smtp_password  = "BEXAMPLEsmtppasswordEXAMPLEsmtppasswordEXAM"
+    smtp_from      = "noreply@demo.staging.example"
+    smtp_from_name = "RAMP Demo"
   }
 
   # EC2 caps user data at 16384 bytes. aws-vm submits it gzipped, and Terraform
@@ -774,4 +834,44 @@ run "registry_credentials_without_server_are_rejected" {
   expect_failures = [
     random_password.postgres,
   ]
+}
+
+# The two operator-facing surfaces an evidence read needs: the Exchange admin
+# listener over HTTP, and the Postgres cluster. Both are published so that an
+# `ssh -L` to the VM reaches them, and both must stay bound to loopback.
+#
+# network_subnet is overridden away from its default here on purpose. That is
+# what proves ADMIN_ALLOWED_CIDRS is interpolated from the variable, rather
+# than written out as a literal that happens to match the default.
+run "operator_surfaces_bind_loopback_and_allow_the_compose_subnet" {
+  command = apply
+
+  variables {
+    network_subnet = "10.99.7.0/24"
+  }
+
+  assert {
+    condition     = strcontains(output.compose_yaml, "ADMIN_ALLOWED_CIDRS: \"10.99.7.0/24\"")
+    error_message = "ADMIN_ALLOWED_CIDRS must be interpolated from network_subnet. An empty or stale value answers 403 to every admin call: the allowlist middleware is fail-closed, and it reads RemoteAddr — which a published port rewrites to the compose network's gateway — never X-Forwarded-For."
+  }
+
+  assert {
+    condition     = strcontains(output.compose_yaml, "- \"127.0.0.1:8082:8082\"")
+    error_message = "The Exchange admin listener must be published on the VM's loopback interface, or an SSH tunnel to the VM reaches nothing."
+  }
+
+  assert {
+    condition     = strcontains(output.compose_yaml, "- \"127.0.0.1:5432:5432\"")
+    error_message = "Postgres must be published on the VM's loopback interface, or an SSH tunnel to the VM reaches nothing."
+  }
+
+  # Count every publish of container port 8082 or 5432, then require all of
+  # them to carry the 127.0.0.1 bind address. Dropping the prefix
+  # ("8082:8082") or widening it ("0.0.0.0:8082:8082") makes the two counts
+  # differ. Caddy's 80 and 443 are deliberately wildcard-bound, and this
+  # regex does not match them.
+  assert {
+    condition     = length(regexall("- \"[0-9.:]*(?:8082|5432):(?:8082|5432)\"", output.compose_yaml)) == length(regexall("- \"127\\.0\\.0\\.1:(?:8082|5432):(?:8082|5432)\"", output.compose_yaml))
+    error_message = "The admin listener has no login of any kind — only the source-address allowlist — so neither it nor Postgres may be published on a wildcard address."
+  }
 }

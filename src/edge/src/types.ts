@@ -2,6 +2,11 @@ import type { PopInput, PopResult } from '@ramp-protocol/sdk-l1/pop';
 import type { VerifyResult } from '@ramp-protocol/sdk-l1/verify';
 import type { BotSignal } from './bot-classification.js';
 
+// AppVariables is the per-request state the middleware puts on the Hono
+// context. It lives here rather than in app.ts so the log module can name it
+// without importing the app it is imported by.
+export type AppVariables = { requestId: string };
+
 export interface AuthorizedExchange {
   domain: string;
   endpoint: string;

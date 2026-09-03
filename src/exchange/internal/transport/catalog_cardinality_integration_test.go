@@ -23,23 +23,22 @@ import (
 // ---------------------------------------------------------------------------
 
 // TestPushResources_EmptyBatchRejectedInvalidArgument pins the zero-entry
-// boundary: the proto puts no min_items on PushResourcesRequest.entries, so the
-// empty batch is structurally valid and reaches the handler — where the service
-// guards it. An empty push is a meaningless request, so the handler fails fast
-// with InvalidArgument ("entries required") rather than silently returning a
-// 0/0 success. This is the lower bound of the batch-partition path, and the test
-// pins the guard so a future refactor cannot regress it into a silent no-op.
+// boundary. PushResourcesRequest.entries carries min_items = 1 on the wire — an
+// empty push asks for nothing and is refused rather than answered with zero
+// counts — so the empty batch is refused at the RPC boundary by the validate
+// interceptor, before the handler runs. The service keeps its own "entries
+// required" check for a direct caller, but it is no longer what refuses through
+// the RPC, which is why the test reads the Violations detail as well as the
+// code: InvalidArgument alone would also be the service's answer, and the two
+// are not the same gate.
 func TestPushResources_EmptyBatchRejectedInvalidArgument(t *testing.T) {
 	h := newPushHarness(t)
 	callerID := "caller.example"
 	client := setupTermContributor(t, h, callerID)
 
-	_, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  nil,
-	}))
+	_, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, nil)))
 	assertConnectCode(t, err, connect.CodeInvalidArgument)
+	assertWireViolation(t, err, "entries", "repeated.min_items")
 }
 
 // (TestDiscover_EmptyRestrictionTokensBehaveAsAnyAxis was removed with ADR-014's
@@ -184,11 +183,7 @@ func TestPushResources_LargeBatchAllAcceptedAndDiscoverable(t *testing.T) {
 		})
 	}
 
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  entries,
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, entries)))
 	if err != nil {
 		t.Fatalf("large batch push: %v", err)
 	}

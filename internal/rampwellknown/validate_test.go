@@ -9,6 +9,7 @@ import (
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
+	sharedtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 )
 
 // validJWK is a schema-conformant WBA JWK literal (x is 43 base64url chars, no kid).
@@ -75,6 +76,13 @@ func TestValidateManifest_Rejections(t *testing.T) {
 		json string
 	}{
 		{"wrong ver", `{"ver":"0.3","role":"ROLE_AGENT","domain":"a"}`},
+		// An unrecognised MINOR version is rejected here too, and that is the
+		// point: the manifest schema is a const, not a major-version prefix. It
+		// is the opposite of the RPC envelope rule, where a receiver MUST NOT
+		// reject an unrecognised minor version — which is why the two namespaces
+		// stay uncoupled. Without this case, relaxing the const to a prefix would
+		// pass the suite.
+		{"unrecognised minor ver", `{"ver":"1.1","role":"ROLE_AGENT","domain":"a"}`},
 		{"unknown role", `{"ver":"1.0","role":"ROLE_FOO","domain":"a"}`},
 		{"missing domain", `{"ver":"1.0","role":"ROLE_AGENT"}`},
 		{
@@ -150,5 +158,42 @@ func TestValidateRevocation(t *testing.T) {
 	missingAsOf := `{"revoked":["tp1"]}`
 	if err := rampwellknown.ValidateRevocation([]byte(missingAsOf)); !errors.Is(err, rampwellknown.ErrSchemaInvalid) {
 		t.Fatalf("want ErrSchemaInvalid for missing as_of, got %v", err)
+	}
+}
+
+// TestParseManifest_RefusesProtocolRuleViolations drives the consume path's
+// second check. ParseManifest runs the embedded JSON Schema first, which decides
+// the wire shape, and then the protocol's protovalidate constraints, which
+// decide the field and cross-field rules. Every document below passes the first
+// check and breaks the second: the schema types terms_uri and terms_digest as
+// plain strings and states no rule about either, so the refusal can only come
+// from protovalidate.
+//
+// This is the leg that defends a consumer against a remote participant serving a
+// document its own producer would have refused. Without these cases the
+// protovalidate call can be deleted or reordered and the whole package still
+// passes, because every other test here feeds ParseManifest a document this repo
+// built and already validated.
+func TestParseManifest_RefusesProtocolRuleViolations(t *testing.T) {
+	t.Parallel()
+	const head = `{"ver":"1.0","role":"ROLE_EXCHANGE","domain":"x.example"`
+	for _, tc := range sharedtestutil.MalformedTermsDigests {
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+			raw := head + `,"terms_digest":"` + tc.Digest + `"`
+			if tc.URI != "" {
+				raw += `,"terms_uri":"` + tc.URI + `"`
+			}
+			raw += `}`
+
+			// The wire shape is valid on its own — that is what makes the case
+			// reach the protovalidate call rather than stopping one check short.
+			if err := rampwellknown.ValidateManifest([]byte(raw)); err != nil {
+				t.Fatalf("the fixture fails the wire-shape schema, so it never reaches the protocol rules: %v", err)
+			}
+			if _, err := rampwellknown.ParseManifest([]byte(raw), rampwellknown.RoleExchange); !errors.Is(err, rampwellknown.ErrSchemaInvalid) {
+				t.Fatalf("ParseManifest accepted a document breaking the protocol's terms rules, want ErrSchemaInvalid, got %v", err)
+			}
+		})
 	}
 }

@@ -35,39 +35,40 @@ const billingURLTTL = 5 * time.Minute
 //     blocking on an unreachable cluster.
 func newTigerBeetleBillingAdapter(
 	ctx context.Context, logger *slog.Logger,
-) (billing.Adapter, func(), error) {
+) (billing.Adapter, string, func(), error) {
 	ledger, currency, err := billingLedgerCurrency()
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 	addr := runhttp.EnvOr("EXCHANGE_BILLING_TB_ADDRESS", "")
 	if addr == "" {
-		return nil, nil, fmt.Errorf("billing: EXCHANGE_BILLING_TB_ADDRESS is required for RAMP_BILLING_ADAPTER=tigerbeetle")
+		return nil, "", nil, fmt.Errorf(
+			"billing: EXCHANGE_BILLING_TB_ADDRESS is required for RAMP_BILLING_ADAPTER=tigerbeetle")
 	}
 	cluster, err := strconv.ParseUint(runhttp.EnvOr("EXCHANGE_BILLING_TB_CLUSTER_ID", "0"), 10, 64)
 	if err != nil {
-		return nil, nil, fmt.Errorf("billing: invalid EXCHANGE_BILLING_TB_CLUSTER_ID: %w", err)
+		return nil, "", nil, fmt.Errorf("billing: invalid EXCHANGE_BILLING_TB_CLUSTER_ID: %w", err)
 	}
 	grace, err := time.ParseDuration(runhttp.EnvOr("EXCHANGE_BILLING_HOLD_GRACE", "1m"))
 	if err != nil {
-		return nil, nil, fmt.Errorf("billing: invalid EXCHANGE_BILLING_HOLD_GRACE: %w", err)
+		return nil, "", nil, fmt.Errorf("billing: invalid EXCHANGE_BILLING_HOLD_GRACE: %w", err)
 	}
 	var clientOpts []tigerbeetle.Option
 	if raw := runhttp.EnvOr("EXCHANGE_BILLING_TB_OP_TIMEOUT", ""); raw != "" {
 		opTimeout, pErr := time.ParseDuration(raw)
 		if pErr != nil {
-			return nil, nil, fmt.Errorf("billing: invalid EXCHANGE_BILLING_TB_OP_TIMEOUT: %w", pErr)
+			return nil, "", nil, fmt.Errorf("billing: invalid EXCHANGE_BILLING_TB_OP_TIMEOUT: %w", pErr)
 		}
 		clientOpts = append(clientOpts, tigerbeetle.WithOpTimeout(opTimeout))
 	}
 
 	client, err := tigerbeetle.NewClient(cluster, []string{addr}, logger, clientOpts...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("billing: connect TigerBeetle at %s: %w", addr, err)
+		return nil, "", nil, fmt.Errorf("billing: connect TigerBeetle at %s: %w", addr, err)
 	}
 	if err := client.Health(ctx); err != nil {
 		client.Close()
-		return nil, nil, fmt.Errorf("billing: TigerBeetle health check: %w", err)
+		return nil, "", nil, fmt.Errorf("billing: TigerBeetle health check: %w", err)
 	}
 
 	adapter := billing.NewTigerBeetleAdapter(billing.TigerBeetleOptions{
@@ -82,7 +83,7 @@ func newTigerBeetleBillingAdapter(
 	logger.Info("billing adapter: tigerbeetle",
 		"ledger", ledger, "currency", currency, "address", addr,
 		"hold_timeout", billingURLTTL+grace)
-	return adapter, client.Close, nil
+	return adapter, currency, client.Close, nil
 }
 
 // billingLedgerCurrency reads EXCHANGE_BILLING_LEDGER (ISO 4217 numeric) and

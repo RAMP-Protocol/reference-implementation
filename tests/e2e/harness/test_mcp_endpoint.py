@@ -25,43 +25,16 @@ worthless to anyone who cannot present that key.
 from __future__ import annotations
 
 import base64
-import os
 
 import httpx
 import pytest
 from fastmcp import Client
 
-from .conftest import StackURLs, _wait_healthy
+from .conftest import StackURLs
 from .edge_fetch import edge_fetch_target
-from .identity_signup import mint_bearer, provision_agent
 from .seed import SeededFixture
 
 pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
-
-
-# The token signing seed and issuer come from the environment, which the compose
-# file's `x-identity-auth` anchor sets on BOTH the identity service and this
-# runner — one spelling, shared. They are read without a fallback on purpose: a
-# default here would be a second copy of a credential, and the failure mode of a
-# stale copy is an unexplained 401 rather than anything that names the mismatch.
-# Absent env means the stack was not brought up as the compose file defines it,
-# which is worth failing on rather than papering over.
-#
-# Read inside the test, not at import: a module-level failure would be a
-# COLLECTION error, and `make test-e2e-collect` enumerates this suite deliberately
-# without a stack. Failing in the test body keeps collection honest and still
-# refuses to run against a guessed credential.
-def _required_env(name: str) -> str:
-    """Read ``name`` or fail naming what is supposed to set it."""
-    value = os.environ.get(name)
-    if not value:
-        pytest.fail(
-            f"{name} is not set. docker-compose.e2e.yml sets it on the runner via the "
-            f"x-identity-auth anchor, shared with the identity service; run this test "
-            f"through `make test-e2e` (or `docker compose --profile test run --rm "
-            f"runner`), not a bare pytest."
-        )
-    return value
 
 
 # socrates lyric/article marker — the real delivered body, not a non-empty stub.
@@ -69,26 +42,10 @@ _CONTENT_MARKER = "Socrates"
 
 # The discovery method the MCP projection reports. Kept file-local rather than
 # shared with the Exchange-facing obligation suites: this one reads the value
-# through rampclient.EnumName in the MCP adapter, they read it off the Exchange
-# wire through protojson, and one shared name would hide two separate contracts.
+# through internal/rampreason.EnumPtrName in the MCP adapter, they read it off
+# the Exchange wire through protojson, and one shared name would hide two
+# separate contracts.
 _EXCHANGE_METHOD = "DISCOVERY_METHOD_EXCHANGE"
-
-
-def _require_in_network(compose_stack: StackURLs) -> None:
-    """The MCP-endpoint test is in-network only: identity publishes no host port."""
-    if os.environ.get("RAMP_E2E_IN_NETWORK") != "1" or not compose_stack.identity:
-        pytest.skip("identity MCP endpoint is reachable only in-network (RAMP_E2E_IN_NETWORK=1)")
-
-
-def _await_identity(compose_stack: StackURLs) -> None:
-    """Wait for identity to answer /healthz (distroless carries no healthcheck).
-
-    Uses the harness's one readiness poller rather than a third copy: that one
-    also treats a refused connection (OSError) as "not up yet", which is exactly
-    the condition here while the container is starting, and it reports the last
-    error it saw instead of discarding every diagnostic across the whole wait.
-    """
-    _wait_healthy(f"{compose_stack.identity}/healthz", timeout_seconds=60.0)
 
 
 def _embedded_content(executed: object) -> list[tuple[str, bytes]]:
@@ -111,19 +68,6 @@ def _embedded_content(executed: object) -> list[tuple[str, bytes]]:
     return found
 
 
-def _mcp_session_bearer(compose_stack: StackURLs) -> str:
-    """Provision a real agent through Zitadel sign-up and mint its bearer.
-
-    The issuer and seed the identity service verifies bearers with are read from
-    the shared compose env, never defaulted here — a default would let this suite
-    pass against a service configured differently from the one deployed.
-    """
-    issuer = _required_env("IDENTITY_AUTH_ISSUER")
-    seed_b64 = _required_env("IDENTITY_TOKEN_SIGNING_KEY")
-    subdomain = provision_agent(compose_stack.identity, compose_stack.zitadel)
-    return mint_bearer(subdomain, issuer=issuer, audience=issuer, seed_b64=seed_b64)
-
-
 def _refusal_reason(resp: httpx.Response) -> str:
     """The edge's refusal token, or a description of why there wasn't one.
 
@@ -144,6 +88,7 @@ def _refusal_reason(resp: httpx.Response) -> str:
 
 async def test_agent_discovers_executes_and_receives_content_over_mcp(
     compose_stack: StackURLs,
+    mcp_bearer: str,
     seeded: SeededFixture,
 ) -> None:
     """Two-call MCP flow against the Go endpoint: discover → execute → real bytes.
@@ -151,13 +96,9 @@ async def test_agent_discovers_executes_and_receives_content_over_mcp(
     Nothing is fetched from outside the MCP session: that is the point of the
     change this test covers. The content arrives on the execute result.
     """
-    _require_in_network(compose_stack)
-    _await_identity(compose_stack)
-
-    bearer = _mcp_session_bearer(compose_stack)
     res = seeded.free  # socrates: FREE EUR, no billing account required
 
-    async with Client(f"{compose_stack.identity}/mcp", auth=bearer) as client:
+    async with Client(f"{compose_stack.identity}/mcp", auth=mcp_bearer) as client:
         # Phase 1 — discovery. The agent asks for offers; nothing is charged and no
         # delivery URL is minted yet.
         discovered = await client.call_tool("ramp_discover", {"uris": [res.uri]})
@@ -220,6 +161,7 @@ async def test_agent_discovers_executes_and_receives_content_over_mcp(
 
 async def test_a_leaked_delivery_url_is_useless_without_the_key(
     compose_stack: StackURLs,
+    mcp_bearer: str,
     seeded: SeededFixture,
 ) -> None:
     """The security property, driven end to end: holding the URL is not enough.
@@ -229,13 +171,9 @@ async def test_a_leaked_delivery_url_is_useless_without_the_key(
     got lucky. The URL is a real one the service just used successfully; the only
     difference here is that the caller cannot prove possession of the key it names.
     """
-    _require_in_network(compose_stack)
-    _await_identity(compose_stack)
-
-    bearer = _mcp_session_bearer(compose_stack)
     res = seeded.free
 
-    async with Client(f"{compose_stack.identity}/mcp", auth=bearer) as client:
+    async with Client(f"{compose_stack.identity}/mcp", auth=mcp_bearer) as client:
         discovered = await client.call_tool("ramp_discover", {"uris": [res.uri]})
         offer = discovered.structured_content["offer_groups"][0]["offers"][0]
         executed = await client.call_tool("ramp_execute", {"offers": [offer]})
@@ -263,7 +201,9 @@ async def test_a_leaked_delivery_url_is_useless_without_the_key(
     )
 
 
-async def test_mcp_rejects_a_missing_or_invalid_bearer(compose_stack: StackURLs) -> None:
+async def test_mcp_rejects_a_missing_or_invalid_bearer(
+    identity_ready: StackURLs,
+) -> None:
     """The endpoint must refuse an unauthenticated caller before doing any work.
 
     The ticket's acceptance criteria ask for a missing/invalid-bearer negative,
@@ -271,13 +211,10 @@ async def test_mcp_rejects_a_missing_or_invalid_bearer(compose_stack: StackURLs)
     happy path rather than only in the Go suite. It needs no seeded fixture and
     no sign-up, so it is also the cheapest test here.
     """
-    _require_in_network(compose_stack)
-    _await_identity(compose_stack)
-
     # No credential at all: the endpoint answers 401 with the RFC 9728 challenge
     # that tells a client where to go and get one.
     resp = httpx.post(
-        f"{compose_stack.identity}/mcp",
+        f"{identity_ready.identity}/mcp",
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         headers={"Accept": "application/json, text/event-stream"},
         timeout=10.0,
@@ -292,7 +229,7 @@ async def test_mcp_rejects_a_missing_or_invalid_bearer(compose_stack: StackURLs)
 
     # A syntactically valid but unsigned-by-us token must fare no better.
     forged = httpx.post(
-        f"{compose_stack.identity}/mcp",
+        f"{identity_ready.identity}/mcp",
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         headers={
             "Accept": "application/json, text/event-stream",

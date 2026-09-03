@@ -15,6 +15,7 @@ import (
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
@@ -41,6 +42,67 @@ func Manifest(role rampwellknown.Role, domain string) *rampwellknown.Manifest {
 		Role:   role,
 		Domain: domain,
 	}
+}
+
+// ExchangeManifest renders the document an Exchange serves about itself: role,
+// its own domain, and the endpoint it advertises.
+//
+// Built through the protobuf message rather than written out as a JSON literal,
+// which is the whole reason it exists. A literal is not checked against the
+// schema, so a field renamed upstream leaves it serving a document the resolver
+// reads and ignores — and the test that depended on the endpoint then fails
+// somewhere else entirely, or worse, passes.
+//
+// The endpoint is a caller's argument because the rule it has to satisfy is the
+// point of most tests using this: an endpoint may name only the host and port
+// that served the manifest, or a subdomain of that host. Passing the serving
+// origin is the production shape; passing anything else is how the refusal is
+// driven.
+//
+// It DELEGATES rather than assembling a second message of its own. The two used
+// to build the same document side by side, so a member every Exchange manifest
+// should carry could be added to one and not the other while the sibling's
+// comment went on claiming they matched.
+func ExchangeManifest(domain, endpoint string) []byte {
+	return ExchangeManifestWithRegistration(domain, endpoint, Registration{})
+}
+
+// Registration is the optional registration half of an Exchange manifest: what
+// the Exchange asks a registration to carry, and which terms revision
+// submitting one accepts.
+//
+// DataSchemaJSON is the schema AS THE OPERATOR WROTE IT, and it travels through
+// a protojson round trip on its way into the document, exactly as it does in
+// production. That matters for any test about the size cap, which the protocol
+// measures over the served bytes rather than over what was configured.
+type Registration struct {
+	DataSchemaJSON string
+	TermsURI       string
+	TermsDigest    string
+}
+
+// ExchangeManifestWithRegistration renders the document an Exchange serves about
+// itself, carrying the registration members as well. An empty field is left
+// absent, so one fixture covers "publishes a schema", "publishes terms", and
+// every combination — including the pass-through case, which is what a manifest
+// with none of them means, and which is what ExchangeManifest asks for.
+func ExchangeManifestWithRegistration(domain, endpoint string, reg Registration) []byte {
+	m := Manifest(rampwellknown.RoleExchange, domain)
+	m.Endpoint = &endpoint
+	if reg.DataSchemaJSON != "" {
+		schema := &structpb.Struct{}
+		if err := protojson.Unmarshal([]byte(reg.DataSchemaJSON), schema); err != nil {
+			panic("rampwellknown/testutil: registration data_schema is not a JSON object: " + err.Error())
+		}
+		m.AccountRegistration = &rampv1.AccountRegistration{DataSchema: schema}
+	}
+	if reg.TermsURI != "" {
+		m.TermsUri = &reg.TermsURI
+	}
+	if reg.TermsDigest != "" {
+		m.TermsDigest = &reg.TermsDigest
+	}
+	return MarshalManifest(m)
 }
 
 // WBAFile assembles a WBA directory carrying the given keys; callers set
@@ -210,6 +272,12 @@ func (o *Origin) Block() (release func()) { return o.manifest.block() }
 
 // RevocationURL is the absolute URL clients poll for the revocation list.
 func (o *Origin) RevocationURL() string { return o.URL + RevocationPath }
+
+// Host is the origin's "host:port", which is the shape a domain-valued RAMP
+// field carries — URL, the embedded server's own field, carries a scheme and is
+// not that shape. A test driving a caller that takes a domain passes this; one
+// driving a caller that takes a URL passes URL.
+func (o *Origin) Host() string { return o.Listener.Addr().String() }
 
 func (o *Origin) serveRevocation(w http.ResponseWriter, _ *http.Request) {
 	p := o.revocation.Load()

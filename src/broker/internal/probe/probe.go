@@ -81,13 +81,13 @@ type Options struct {
 
 // manifestGetter is the narrow read the Prober needs from the shared
 // rampwellknown.Cache: fetch a host's publisher manifest, surfacing 404 as
-// rampwellknown.ErrNoManifest. *rampwellknown.Cache satisfies it.
+// rampwellknown.ErrNoDocument. *rampwellknown.Cache satisfies it.
 type manifestGetter interface {
 	Get(ctx context.Context, host string) (*rampwellknown.Manifest, error)
 }
 
 // Prober is a thin adapter over rampwellknown.Cache that translates
-// ErrNoManifest / fetch failures into the typed ErrManifestMissing /
+// ErrNoDocument / fetch failures into the typed ErrManifestMissing /
 // ErrProbeFailed surface the Broker resolve handler refuses on.
 type Prober struct {
 	cache  manifestGetter
@@ -152,7 +152,7 @@ func (p *Prober) Probe(ctx context.Context, domain string) (Result, error) {
 			Manifest:  toBrokerManifest(m),
 			FetchedAt: p.clk.Now(),
 		}, nil
-	case errors.Is(err, rampwellknown.ErrNoManifest):
+	case errors.Is(err, rampwellknown.ErrNoDocument):
 		return Result{}, ErrManifestMissing
 	default:
 		p.logger.InfoContext(ctx, "broker.probe",

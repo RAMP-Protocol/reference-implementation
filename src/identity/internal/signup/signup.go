@@ -1,3 +1,8 @@
+// Package signup owns the developer sign-up act: on a verified upstream sign-in it
+// mints the agent's subdomain, key, and card. It sits above custody (keystore) and
+// persistence (the account/card stores) and depends on them through narrow ports, so
+// its policy is unit-testable with fakes and its wiring is integration-tested through
+// the HTTP surface.
 package signup
 
 import (
@@ -52,8 +57,8 @@ type Config struct {
 	KeyLifetime time.Duration
 }
 
-// Service performs developer sign-up: provisioning at sign-in and the mandatory
-// form's validation and storage.
+// Service performs developer sign-up: it provisions the agent identity that an
+// authenticated developer signs in as.
 type Service struct {
 	cfg Config
 }
@@ -75,24 +80,24 @@ func New(cfg Config) (*Service, error) {
 }
 
 // SignIn provisions (or re-confirms) the agent identity for an authenticated
-// developer and reports whether the mandatory form still needs filling. It is
-// idempotent: a returning developer keeps the same subdomain, and a re-entry after a
-// mid-way crash finishes the missing steps. It mirrors the multi-backend, no-tx
-// order the Exchange's Register uses — the reserved account row is the durable
-// anchor, then the Vault key, then the card; every step is safe to replay.
-func (s *Service) SignIn(ctx context.Context, claims oidcup.Claims) (subdomain string, needsForm bool, err error) {
+// developer and returns the subdomain minted for it. It is idempotent: a returning
+// developer keeps the same subdomain, and a re-entry after a mid-way crash finishes
+// the missing steps. It mirrors the multi-backend, no-tx order the Exchange's
+// Register uses — the reserved account row is the durable anchor, then the Vault
+// key, then the card; every step is safe to replay.
+func (s *Service) SignIn(ctx context.Context, claims oidcup.Claims) (string, error) {
 	dev, err := s.resolveOrReserve(ctx, claims)
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
 	if err := s.ensureKey(ctx, dev.Subdomain); err != nil {
-		return "", false, err
+		return "", err
 	}
 	if err := s.ensureCard(ctx, dev.Subdomain, claims); err != nil {
-		return "", false, err
+		return "", err
 	}
 	s.cfg.Invalidator.Invalidate(dev.Subdomain)
-	return dev.Subdomain, !dev.RegistrationComplete, nil
+	return dev.Subdomain, nil
 }
 
 // resolveOrReserve returns the developer's existing account or reserves a new one.
@@ -165,32 +170,9 @@ func (s *Service) ensureCard(ctx context.Context, subdomain string, claims oidcu
 	return nil
 }
 
-// CompleteRegistration validates the form and, on success, stores the three
-// licensing fields and flips the account to registration-complete. A non-nil
-// *ValidationError means the form must re-render with no state changed; a returned
-// error is a store fault. Provisioning already happened at SignIn — this records
-// only the licensing data the form gates on.
-func (s *Service) CompleteRegistration(
-	ctx context.Context, issuer, subject string, in FormInput,
-) (account.Developer, *ValidationError, error) {
-	clean, verr := ValidateForm(in)
-	if verr != nil {
-		return account.Developer{}, verr, nil
-	}
-	dev, err := s.cfg.Developers.CompleteRegistration(ctx, issuer, subject, account.LicensingDetails{
-		LegalEntity:         clean.LegalEntity,
-		Address:             clean.Address,
-		JurisdictionCountry: clean.JurisdictionCountry,
-	})
-	if err != nil {
-		return account.Developer{}, nil, fmt.Errorf("signup: complete registration: %w", err)
-	}
-	return dev, nil, nil
-}
-
 // cardFromClaims derives the public card from the sign-in identity. The agent's own
 // subdomain is its client_uri; the verified email becomes a mailto contact; purpose
-// stays empty — a form-only sign-up asserts no intended use.
+// stays empty — sign-up asserts no intended use on the agent's behalf.
 func cardFromClaims(subdomain string, claims oidcup.Claims) directory.Card {
 	card := directory.Card{
 		ClientName: displayName(claims, subdomain),

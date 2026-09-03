@@ -22,6 +22,14 @@ type Agent struct {
 	// SetBillingRef; Upsert never touches it, so key rotation re-upserts
 	// leave it intact.
 	BillingRef string
+	// AcceptedTermsDigest is the digest of the licensing terms this account
+	// accepted at registration. It is a POINTER, not a string, because the column
+	// has three states and collapsing two of them would lose the distinction the
+	// column exists for: nil means the Exchange published no digest when this
+	// account registered, a non-nil value is the digest that was accepted, and a
+	// row with no billing_ref was never registered at all. Written once by
+	// SetBillingRef, in the same guarded UPDATE as BillingRef.
+	AcceptedTermsDigest *string
 }
 
 // AgentRepo is the narrow agent contract.
@@ -41,7 +49,9 @@ type Agent struct {
 type AgentRepo interface {
 	ByID(ctx context.Context, agentID string) (Agent, error)
 	Upsert(ctx context.Context, a Agent) (Agent, error)
-	SetBillingRef(ctx context.Context, agentID, billingRef string) (Agent, error)
+	SetBillingRef(
+		ctx context.Context, tx pgx.Tx, agentID, billingRef string, digest *string,
+	) (Agent, bool, error)
 }
 
 // ErrAgentNotFound is returned when an agent lookup has no match.
@@ -103,34 +113,62 @@ func (r *agentRepo) Upsert(ctx context.Context, a Agent) (Agent, error) {
 	return agentFromRow(row), nil
 }
 
-// SetBillingRef stores the billing account id for an agent, first write wins.
-// The UPDATE's billing_ref IS NULL guard makes a repeat call a no-op; on zero
-// rows the row is re-read and the stored ref wins (ADR-021 D4), or
-// ErrAgentNotFound surfaces if the agent does not exist at all.
-func (r *agentRepo) SetBillingRef(ctx context.Context, agentID, billingRef string) (Agent, error) {
+// SetBillingRef stores the billing account id and the accepted terms digest for
+// an agent, first write wins. The UPDATE's billing_ref IS NULL guard makes a
+// repeat call a no-op; on zero rows the row is re-read and the stored ref wins
+// (ADR-021 D4), or ErrAgentNotFound surfaces if the agent does not exist at all.
+//
+// The SECOND return says whether this call's UPDATE actually won. A caller that
+// only reads the returned Agent cannot tell the winner from the loser — both get
+// the stored account back — and a caller that writes an audit row on every
+// success would then record two registrations for one account. Two concurrent
+// first registrations for the same agent reach exactly that: both pass Register's
+// fast-path check, both call this, one UPDATE matches and the other returns zero
+// rows.
+//
+// It takes the transaction rather than running on the pool because its caller
+// writes an audit row in the same commit, and a pool-bound UPDATE would commit on
+// its own while only the audit insert could roll back. BOTH statements bind the
+// same tx-scoped querier for the same reason plus one more: a pool-bound re-read
+// inside a transaction takes a second connection, which can block until the pool
+// frees one — a deadlock when the transaction holds the last one — and reads
+// outside the transaction's own snapshot.
+func (r *agentRepo) SetBillingRef(
+	ctx context.Context, tx pgx.Tx, agentID, billingRef string, digest *string,
+) (Agent, bool, error) {
 	key, err := agentKey(agentID)
 	if err != nil {
-		return Agent{}, err
+		return Agent{}, false, err
 	}
-	row, err := r.q.SetAgentBillingRef(ctx, sqlc.SetAgentBillingRefParams{
-		AgentID:    key,
-		BillingRef: pgText(billingRef),
+	q := sqlc.New(tx)
+	row, err := q.SetAgentBillingRef(ctx, sqlc.SetAgentBillingRefParams{
+		AgentID:             key,
+		BillingRef:          pgText(billingRef),
+		AcceptedTermsDigest: pgTextPtr(digest),
 	})
 	if err == nil {
-		return agentFromRow(row), nil
+		return agentFromRow(row), true, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return Agent{}, fmt.Errorf("set agent billing ref: %w", err)
+		return Agent{}, false, fmt.Errorf("set agent billing ref: %w", err)
 	}
-	return r.ByID(ctx, key)
+	row, err = q.GetAgent(ctx, key)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Agent{}, false, ErrAgentNotFound
+		}
+		return Agent{}, false, fmt.Errorf("get agent: %w", err)
+	}
+	return agentFromRow(row), false, nil
 }
 
 func agentFromRow(row sqlc.RampAgent) Agent {
 	return Agent{
-		ID:            row.AgentID,
-		PublicKey:     row.PublicKey,
-		DiscoveryURL:  textOrEmpty(row.DiscoveryUrl),
-		RequesterType: string(row.RequesterType),
-		BillingRef:    textOrEmpty(row.BillingRef),
+		ID:                  row.AgentID,
+		PublicKey:           row.PublicKey,
+		DiscoveryURL:        textOrEmpty(row.DiscoveryUrl),
+		RequesterType:       string(row.RequesterType),
+		BillingRef:          textOrEmpty(row.BillingRef),
+		AcceptedTermsDigest: textFromPG(row.AcceptedTermsDigest),
 	}
 }

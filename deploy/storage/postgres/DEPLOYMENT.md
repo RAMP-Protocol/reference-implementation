@@ -24,7 +24,7 @@ operation is in [`RUNBOOK.md`](RUNBOOK.md).
 | A PostgreSQL 16 cluster you can reach from where the services will run | `pg_isready -h db.internal.example.net -p 5432` → `db.internal.example.net:5432 - accepting connections` |
 | Administrative access to that cluster, enough to create a role and **two** databases | `psql -h db.internal.example.net -U <admin-role> -c "SELECT rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname = current_user"` — both must be `t`. A superuser has both, but superuser is not required, which matters on managed services where the admin user is not one. |
 | A decision on whether the Exchange and Broker share one database | Sharing is supported, and it is what this repository's Docker Compose files do — see [`CONFIGURATION.md`](CONFIGURATION.md) §3 |
-| TLS enabled on the cluster | Required in production — [`CONFIGURATION.md`](CONFIGURATION.md) §2.3 |
+| A decision on whether the cluster needs TLS | It depends on the network the services cross to reach it, not on the environment name — [`CONFIGURATION.md`](CONFIGURATION.md) §2.3 has the three cases |
 
 **The Exchange needs two databases, not one.** One holds the catalog, the tenants and
 the transactions. The second holds the System of Record — the Exchange's register of

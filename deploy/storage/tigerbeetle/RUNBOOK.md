@@ -352,13 +352,18 @@ others.
 | Agent | `agent:{billing_ref}` | When the agent registers. | Limited — an agent can never spend more than it has been given. |
 | Resource-owner revenue | `owner:revenue:{resource_owner_id}` | On first use — when a purchase from that owner is first authorised. | Accrues credits. |
 | Platform fee | `platform:fee` | On first use — the first non-zero commission. | One account for the whole deployment. |
+| Operator liquidity | `platform:liquidity` | On first credit — by a funding script or the Register default credit. | Unlimited — goes negative by the total credit extended. |
 
 **Funding an agent account.** Adding money is done outside the platform on
-purpose — not because the feature is missing: no protocol flow creates a balance,
-and none is meant to. Per ADR-009 D2, an operator invoices the agent however they
-normally would, then adds the matching credit into the ledger by hand. A freshly
-deployed stack therefore starts with an empty ledger, and the first paid
-transaction is denied until you fund it.
+purpose. Per ADR-009 D2, an operator invoices the agent however they normally
+would, then adds the matching credit into the ledger by hand. One narrow
+exception exists (the ADR-009 amendment of 2026-08-13): a tenant with
+`default_agent_credit` above 0 grants that amount automatically, once, when an
+agent first registers — under the `service-welcome:{billing_ref}` transfer id,
+the same slot the funding scripts' reserved `service-welcome` label uses, so
+the two can never stack. With
+the setting at its default of 0 a freshly deployed stack starts with an empty
+ledger, and the first paid transaction is denied until you fund it.
 
 **Step 1 — read the agent's `billing_ref` from PostgreSQL.** You cannot calculate
 it and you cannot guess it. Everything below depends on this value:

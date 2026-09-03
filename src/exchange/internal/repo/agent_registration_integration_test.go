@@ -6,18 +6,47 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid/agentidtest"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
 
 // These are persistence round-trips (repo → sqlc → Postgres and back) that
-// arrange and assert through the production repository surfaces. No public
-// RPC reads billing_ref yet — the Register handler is the pending
-// public surface — so the repo interface is the sanctioned Testing Doctrine
-// §9 tier-2 fallback until it lands.
+// arrange and assert through the production repository surfaces. They stay at
+// the repository tier deliberately: what they pin is the guarded UPDATE's
+// first-write-wins behaviour and its winner flag, which no RPC exposes — Register
+// answers the same billing_ref to the winner and the loser, so a test driven
+// through it could not tell the two apart. The accepted terms digest has no
+// public read surface at all, which is filed as its own task.
+
+// setBillingRef drives AgentRepo.SetBillingRef through a real transaction, which
+// is the only way to call it: the method takes a pgx.Tx because its production
+// caller writes an audit row in the same commit. It returns the same three
+// values the port does, so each test reads the winner flag itself.
+func setBillingRef(
+	t *testing.T, ctx context.Context, pool *pgxpool.Pool, agents repo.AgentRepo,
+	agentID, billingRef string, digest *string,
+) (repo.Agent, bool, error) {
+	t.Helper()
+	var (
+		got repo.Agent
+		won bool
+	)
+	err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		var terr error
+		got, won, terr = agents.SetBillingRef(ctx, tx, agentID, billingRef, digest)
+		return terr
+	})
+	return got, won, err
+}
 
 // seedAgent registers an agent through the production write surface
 // (AgentRepo.Upsert), the same path the httpsig registry uses.
@@ -34,18 +63,32 @@ func seedAgent(t *testing.T, ctx context.Context, agents repo.AgentRepo, id stri
 // fresh agent and reads it back through the same repo surface.
 func TestSetBillingRefSetsAndReturns(t *testing.T) {
 	ctx := context.Background()
-	agents := repo.NewAgentRepo(newTestQueries(t, ctx))
+	pool := newTestPool(t, ctx)
+	agents := repo.NewAgentRepo(sqlc.New(pool))
 	const agentID = "agent.example.com"
-	if seeded := seedAgent(t, ctx, agents, agentID, 0x01); seeded.BillingRef != "" {
+	seeded := seedAgent(t, ctx, agents, agentID, 0x01)
+	if seeded.BillingRef != "" {
 		t.Fatalf("fresh agent BillingRef = %q, want empty (not registered yet)", seeded.BillingRef)
 	}
+	if seeded.AcceptedTermsDigest != nil {
+		t.Fatalf("fresh agent AcceptedTermsDigest = %q, want nil (nothing accepted yet)",
+			*seeded.AcceptedTermsDigest)
+	}
 
-	got, err := agents.SetBillingRef(ctx, agentID, "br-fresh")
+	digest := "sha256:" + strings.Repeat("a", 64)
+	got, won, err := setBillingRef(t, ctx, pool, agents, agentID, "br-fresh", &digest)
 	if err != nil {
 		t.Fatalf("SetBillingRef: %v", err)
 	}
+	if !won {
+		t.Error("SetBillingRef reported it did not win; the first write on a fresh agent must win")
+	}
 	if got.BillingRef != "br-fresh" {
 		t.Errorf("SetBillingRef returned BillingRef = %q, want %q", got.BillingRef, "br-fresh")
+	}
+	if got.AcceptedTermsDigest == nil || *got.AcceptedTermsDigest != digest {
+		t.Errorf("SetBillingRef returned AcceptedTermsDigest = %v, want %q",
+			got.AcceptedTermsDigest, digest)
 	}
 
 	back, err := agents.ByID(ctx, agentID)
@@ -55,6 +98,35 @@ func TestSetBillingRefSetsAndReturns(t *testing.T) {
 	if back.BillingRef != "br-fresh" {
 		t.Errorf("ByID BillingRef = %q, want %q", back.BillingRef, "br-fresh")
 	}
+	if back.AcceptedTermsDigest == nil || *back.AcceptedTermsDigest != digest {
+		t.Errorf("ByID AcceptedTermsDigest = %v, want %q", back.AcceptedTermsDigest, digest)
+	}
+}
+
+// TestSetBillingRefWithNoPublishedDigestStoresNull is the other half of the
+// digest column's contract. An Exchange that publishes no terms digest records
+// none, and the column stays NULL rather than holding an empty string — those
+// are different states, and only NULL says "nothing was published to accept".
+func TestSetBillingRefWithNoPublishedDigestStoresNull(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t, ctx)
+	agents := repo.NewAgentRepo(sqlc.New(pool))
+	const agentID = "nodigest.example.com"
+	seedAgent(t, ctx, agents, agentID, 0x01)
+
+	if _, _, err := setBillingRef(t, ctx, pool, agents, agentID, "br-nodigest", nil); err != nil {
+		t.Fatalf("SetBillingRef: %v", err)
+	}
+	back, err := agents.ByID(ctx, agentID)
+	if err != nil {
+		t.Fatalf("ByID: %v", err)
+	}
+	if back.BillingRef != "br-nodigest" {
+		t.Errorf("BillingRef = %q, want %q", back.BillingRef, "br-nodigest")
+	}
+	if back.AcceptedTermsDigest != nil {
+		t.Errorf("AcceptedTermsDigest = %q, want nil", *back.AcceptedTermsDigest)
+	}
 }
 
 // TestUpsertPreservesBillingRefOnKeyRotation is the ADR-021 D3 promise: a key
@@ -63,10 +135,12 @@ func TestSetBillingRefSetsAndReturns(t *testing.T) {
 // include billing_ref.
 func TestUpsertPreservesBillingRefOnKeyRotation(t *testing.T) {
 	ctx := context.Background()
-	agents := repo.NewAgentRepo(newTestQueries(t, ctx))
+	pool := newTestPool(t, ctx)
+	agents := repo.NewAgentRepo(sqlc.New(pool))
 	const agentID = "rotating.example.com"
 	seedAgent(t, ctx, agents, agentID, 0x01)
-	if _, err := agents.SetBillingRef(ctx, agentID, "br-rotation"); err != nil {
+	digest := "sha256:" + strings.Repeat("b", 64)
+	if _, _, err := setBillingRef(t, ctx, pool, agents, agentID, "br-rotation", &digest); err != nil {
 		t.Fatalf("SetBillingRef: %v", err)
 	}
 
@@ -90,6 +164,10 @@ func TestUpsertPreservesBillingRefOnKeyRotation(t *testing.T) {
 	if back.BillingRef != "br-rotation" {
 		t.Errorf("BillingRef after rotation = %q, want preserved %q", back.BillingRef, "br-rotation")
 	}
+	if back.AcceptedTermsDigest == nil || *back.AcceptedTermsDigest != digest {
+		t.Errorf("AcceptedTermsDigest after rotation = %v, want preserved %q — UpsertAgent must "+
+			"not touch the recorded acceptance either", back.AcceptedTermsDigest, digest)
+	}
 }
 
 // TestSetBillingRefRepeatKeepsStoredRef: a second write with a different
@@ -97,19 +175,32 @@ func TestUpsertPreservesBillingRefOnKeyRotation(t *testing.T) {
 // re-reads the row, so the originally stored ref wins (ADR-021 D4).
 func TestSetBillingRefRepeatKeepsStoredRef(t *testing.T) {
 	ctx := context.Background()
-	agents := repo.NewAgentRepo(newTestQueries(t, ctx))
+	pool := newTestPool(t, ctx)
+	agents := repo.NewAgentRepo(sqlc.New(pool))
 	const agentID = "repeat.example.com"
 	seedAgent(t, ctx, agents, agentID, 0x01)
-	if _, err := agents.SetBillingRef(ctx, agentID, "br-first"); err != nil {
+	first := "sha256:" + strings.Repeat("c", 64)
+	if _, won, err := setBillingRef(t, ctx, pool, agents, agentID, "br-first", &first); err != nil {
 		t.Fatalf("first SetBillingRef: %v", err)
+	} else if !won {
+		t.Fatal("first SetBillingRef reported it did not win")
 	}
 
-	again, err := agents.SetBillingRef(ctx, agentID, "br-second")
+	second := "sha256:" + strings.Repeat("d", 64)
+	again, won, err := setBillingRef(t, ctx, pool, agents, agentID, "br-second", &second)
 	if err != nil {
 		t.Fatalf("repeat SetBillingRef: %v", err)
 	}
+	if won {
+		t.Error("repeat SetBillingRef reported it won; the guarded UPDATE matched zero rows, so " +
+			"its caller must not record a second registration")
+	}
 	if again.BillingRef != "br-first" {
 		t.Errorf("repeat SetBillingRef returned %q, want stored %q", again.BillingRef, "br-first")
+	}
+	if again.AcceptedTermsDigest == nil || *again.AcceptedTermsDigest != first {
+		t.Errorf("repeat SetBillingRef returned AcceptedTermsDigest = %v, want stored %q",
+			again.AcceptedTermsDigest, first)
 	}
 
 	back, err := agents.ByID(ctx, agentID)
@@ -119,32 +210,45 @@ func TestSetBillingRefRepeatKeepsStoredRef(t *testing.T) {
 	if back.BillingRef != "br-first" {
 		t.Errorf("stored BillingRef = %q, want unchanged %q", back.BillingRef, "br-first")
 	}
+	if back.AcceptedTermsDigest == nil || *back.AcceptedTermsDigest != first {
+		t.Errorf("stored AcceptedTermsDigest = %v, want unchanged %q — both columns are written "+
+			"by one guarded statement, so first-write-wins covers them together",
+			back.AcceptedTermsDigest, first)
+	}
 }
 
 // TestSetBillingRefUnknownAgent drives the failure path through the same
 // surface: no agent row means no write and the repo's not-found error.
 func TestSetBillingRefUnknownAgent(t *testing.T) {
 	ctx := context.Background()
-	agents := repo.NewAgentRepo(newTestQueries(t, ctx))
+	pool := newTestPool(t, ctx)
+	agents := repo.NewAgentRepo(sqlc.New(pool))
 
-	if _, err := agents.SetBillingRef(ctx, "ghost.example.com", "br-x"); !errors.Is(err, repo.ErrAgentNotFound) {
+	_, _, err := setBillingRef(t, ctx, pool, agents, "ghost.example.com", "br-x", nil)
+	if !errors.Is(err, repo.ErrAgentNotFound) {
 		t.Fatalf("SetBillingRef(unknown agent) error = %v, want ErrAgentNotFound", err)
 	}
 }
 
-// TestTenantActivateNewAgentsByDefault reads the activation policy through
-// TenantRepo: TRUE on a fresh tenant, FALSE after the flip. TenantRepo is
-// read-only by design (tenant configuration is set out of band), so the flip
-// goes through the sqlc SetTenantActivateNewAgentsByDefault fixture mutator —
-// the established convention for tenant config columns. The tenant seed uses
-// sqlc InsertTenant for the same documented reason: no public
-// tenant-provisioning RPC exists yet.
+// TestTenantActivateNewAgentsByDefault drives the activation policy through the
+// tenant repository ports: read TRUE on a fresh tenant with TenantReadRepo, flip
+// it with TenantWriteRepo.SetActivateNewAgentsByDefault, read FALSE back. The
+// write port is the highest surface that reaches this column — no admin RPC
+// writes it — and the missing public surface is filed as its own task.
+//
+// The tenant seed still uses sqlc InsertTenant. That is a raw-sqlc arrange the
+// Testing Doctrine forbids, held open here rather than fixed: no production
+// code inserts tenants (they are provisioned by operator SQL), so a repository
+// insert port would exist only for tests, and many arrange sites across the
+// tree share this shape. Converting them behind a real tenant-provisioning
+// surface is filed as its own task.
 func TestTenantActivateNewAgentsByDefault(t *testing.T) {
 	ctx := context.Background()
-	q := newTestQueries(t, ctx)
+	pool := newTestPool(t, ctx)
+	q := sqlc.New(pool)
 	const tenantID = "t-activation"
 	if _, err := q.InsertTenant(ctx, sqlc.InsertTenantParams{
-		TenantID: tenantID, Domain: "activation.example.com", HmacSecretRef: "h", Ed25519KeyRef: "k",
+		TenantID: tenantID, Domain: "activation.example.com", Ed25519KeyRef: "k",
 		ReportingPolicy: []byte(`{}`), SigningScheme: sqlc.RampSigningSchemeED25519,
 	}); err != nil {
 		t.Fatalf("seed tenant: %v", err)
@@ -159,8 +263,16 @@ func TestTenantActivateNewAgentsByDefault(t *testing.T) {
 		t.Error("fresh tenant ActivateNewAgentsByDefault = false, want true (column default)")
 	}
 
-	if err := q.SetTenantActivateNewAgentsByDefault(ctx, sqlc.SetTenantActivateNewAgentsByDefaultParams{
-		TenantID: tenantID, ActivateNewAgentsByDefault: false,
+	writer := repo.NewTenantWriteRepo(q)
+	if err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		n, err := writer.SetActivateNewAgentsByDefault(ctx, tx, tenantID, false)
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return fmt.Errorf("rows affected = %d, want 1", n)
+		}
+		return nil
 	}); err != nil {
 		t.Fatalf("flip activation default: %v", err)
 	}
@@ -170,6 +282,23 @@ func TestTenantActivateNewAgentsByDefault(t *testing.T) {
 	}
 	if flipped.ActivateNewAgentsByDefault {
 		t.Error("ActivateNewAgentsByDefault after flip = true, want false")
+	}
+
+	// A write for a tenant that does not exist reports 0 rows affected instead
+	// of succeeding silently. This is what the query's :execrows annotation
+	// buys: with :exec the call below would be indistinguishable from a real
+	// update, and a typo in a tenant id would look like a working flip.
+	if err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		n, err := writer.SetActivateNewAgentsByDefault(ctx, tx, "t-does-not-exist", false)
+		if err != nil {
+			return err
+		}
+		if n != 0 {
+			return fmt.Errorf("rows affected = %d, want 0 for a missing tenant", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("flip activation default for a missing tenant: %v", err)
 	}
 }
 
@@ -184,7 +313,8 @@ func TestTenantActivateNewAgentsByDefault(t *testing.T) {
 // with, so it is the identity, not an echo of the argument.
 func TestAgentRepo_KeysOnCanonicalHost(t *testing.T) {
 	ctx := context.Background()
-	agents := repo.NewAgentRepo(newTestQueries(t, ctx))
+	pool := newTestPool(t, ctx)
+	agents := repo.NewAgentRepo(sqlc.New(pool))
 
 	const canonical = "repo-canon.example"
 	// Every folding axis at once, on the WRITE side.
@@ -219,7 +349,9 @@ func TestAgentRepo_KeysOnCanonicalHost(t *testing.T) {
 	// A second write under yet another spelling must update the one row rather
 	// than add a second: the billing ref set on the first survives, which is the
 	// consequence that made duplicate rows expensive.
-	if _, err := agents.SetBillingRef(ctx, "HTTPS://REPO-CANON.EXAMPLE", "br-canon"); err != nil {
+	if _, _, err := setBillingRef(
+		t, ctx, pool, agents, "HTTPS://REPO-CANON.EXAMPLE", "br-canon", nil,
+	); err != nil {
 		t.Fatalf("SetBillingRef under another spelling: %v", err)
 	}
 	again, err := agents.Upsert(ctx, repo.Agent{
@@ -240,7 +372,8 @@ func TestAgentRepo_KeysOnCanonicalHost(t *testing.T) {
 // reach.
 func TestAgentRepo_RefusesNonHostAgentID(t *testing.T) {
 	ctx := context.Background()
-	agents := repo.NewAgentRepo(newTestQueries(t, ctx))
+	pool := newTestPool(t, ctx)
+	agents := repo.NewAgentRepo(sqlc.New(pool))
 
 	// The shared corpus, so a new refusal class added to agentid reaches this layer
 	// without anyone remembering this file. The empty string is kept separately: it
@@ -259,7 +392,9 @@ func TestAgentRepo_RefusesNonHostAgentID(t *testing.T) {
 				t.Errorf("Upsert(%q) = %v; want ErrAgentIDNotAHost — this value would have "+
 					"become an agents-table key", bad, err)
 			}
-			if _, err := agents.SetBillingRef(ctx, bad, "br-x"); !errors.Is(err, repo.ErrAgentIDNotAHost) {
+			if _, _, err := setBillingRef(
+				t, ctx, pool, agents, bad, "br-x", nil,
+			); !errors.Is(err, repo.ErrAgentIDNotAHost) {
 				t.Errorf("SetBillingRef(%q) = %v; want ErrAgentIDNotAHost", bad, err)
 			}
 		})

@@ -9,6 +9,7 @@ import (
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/google/uuid"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
@@ -47,12 +48,7 @@ func (h *agentHarness) seedSignedOfferFor(t *testing.T, agentID string) *rampv1.
 	}
 	h.seedPublisherEntries(t, "attribution-pub-caller.example", entry)
 
-	discResp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver: "1.0", Uris: []string{"https://" + entry.GetDomain() + entry.GetPath()},
-		Requester: &rampv1.Requester{
-			Id: agentID, Domain: agentID, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	discResp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(newRequester(agentID, agentID), []string{"https://" + entry.GetDomain() + entry.GetPath()})))
 	if err != nil {
 		t.Fatalf("seed discover: %v", err)
 	}
@@ -83,7 +79,7 @@ func TestExecute_SchemedRequesterIDAttributesToCanonicalHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agent keypair: %v", err)
 	}
-	h.publishAgentOrigin(t, host, agentPub)
+	h.publishAgent(t, host, agentPub)
 	// Registers the agent for billing under the BARE host, which is what its own
 	// directory names it. This is the row the schemed execute below must find.
 	h.registerForBilling(t, host, agentPub, agentPriv)
@@ -94,11 +90,15 @@ func TestExecute_SchemedRequesterIDAttributesToCanonicalHost(t *testing.T) {
 	// with the same spelling — the exact shape the identity service produces.
 	agentClient := h.selfActingExchangeClient(schemed, agentPriv)
 	idempotencyKey := "tx-" + uuid.NewString()
-	requester := &rampv1.Requester{
-		Id: schemed, Domain: schemed, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	// The schemed spelling is what this test varies, and it belongs on id alone.
+	// domain is a bare host on the wire — it is concatenated into the URL a
+	// verifier fetches the agent's key from — so a schemed value there is refused
+	// for its shape, which would say nothing about the id normalisation under
+	// test. The identity service sends the same pair: a bare domain, and whatever
+	// spelling the caller's directory gives its id.
+	requester := newRequester(schemed, host)
 	execResp, err := agentClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", IdempotencyKey: idempotencyKey,
+		Ver: helpers.ProtocolVersion, IdempotencyKey: idempotencyKey,
 		Requester: requester,
 		Items: []*rampv1.TransactionItem{
 			{Offer: offer, AgentAcceptance: signAcceptanceFor(t, agentPriv, offer, requester, idempotencyKey)},
@@ -113,12 +113,7 @@ func TestExecute_SchemedRequesterIDAttributesToCanonicalHost(t *testing.T) {
 	// The load-bearing leg: report usage signing the BARE spelling. Accepted only
 	// if the transaction was attributed to the canonical host.
 	bareClient := h.selfActingExchangeClient(host, agentPriv)
-	repResp, err := bareClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-" + uuid.NewString(),
-		TransactionId: item.GetTransactionId(),
-		BillingId:     item.GetBillingId(),
-		Usage:         &rampv1.Usage{ConsumedQuantity: 1, Function: []string{"ai_input"}},
-	}))
+	repResp, err := bareClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-"+uuid.NewString(), item.GetTransactionId(), item.GetBillingId(), &rampv1.Usage{ConsumedQuantity: 1, Function: []string{"ai_input"}})))
 	if err != nil {
 		t.Fatalf("ReportUsage signed as %q against a transaction executed as %q: %v — "+
 			"the transaction was attributed to the raw spelling, so the agent cannot "+
@@ -194,7 +189,7 @@ func TestExecute_RequesterIDNamingNoHostIsInvalidRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agent keypair: %v", err)
 	}
-	h.publishAgentOrigin(t, host, agentPub)
+	h.publishAgent(t, host, agentPub)
 	h.registerForBilling(t, host, agentPub, agentPriv)
 	offer := h.seedSignedOfferFor(t, host)
 
@@ -203,11 +198,9 @@ func TestExecute_RequesterIDNamingNoHostIsInvalidRequest(t *testing.T) {
 	// non-empty string that clears the presence check upstream.
 	agentClient := h.selfActingExchangeClient(host, agentPriv)
 	idempotencyKey := "tx-" + uuid.NewString()
-	requester := &rampv1.Requester{
-		Id: "//" + host, Domain: host, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("//"+host, host)
 	_, err = agentClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", IdempotencyKey: idempotencyKey,
+		Ver: helpers.ProtocolVersion, IdempotencyKey: idempotencyKey,
 		Requester: requester,
 		Items: []*rampv1.TransactionItem{
 			{Offer: offer, AgentAcceptance: signAcceptanceFor(t, agentPriv, offer, requester, idempotencyKey)},

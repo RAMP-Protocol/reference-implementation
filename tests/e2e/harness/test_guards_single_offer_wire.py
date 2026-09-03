@@ -62,19 +62,11 @@ under a plain ``uv run pytest`` against this file alone.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-# Root of the e2e tree this guard scans. Resolved relative to THIS file so the
-# guard is location-stable whether run from the repo root, tests/e2e/, or the
-# runner container.
-_E2E_ROOT = Path(__file__).resolve().parent.parent  # tests/e2e/
-
-# This guard file itself constructs example single-offer dict literals in its
-# meta-tests; exclude it so the guard does not flag its own fixtures.
-_SELF = Path(__file__).resolve()
+from .ast_scan import dict_string_keys, scan_tree
 
 # Keys that mark a dict literal as a TOP-LEVEL TransactionRequest body (as
 # opposed to an items[]-nested per-item dict, which carries only offer +
@@ -86,33 +78,6 @@ _OFFER_KEY = "offer"
 _ACCEPTANCE_KEY = "agent_acceptance"
 
 
-@dataclass(frozen=True)
-class _Hit:
-    """A flagged single-offer sender dict literal."""
-
-    path: Path
-    lineno: int
-
-    def __str__(self) -> str:
-        rel = self.path.relative_to(_E2E_ROOT)
-        return f"tests/e2e/{rel}:{self.lineno}"
-
-
-def _dict_string_keys(node: ast.Dict) -> set[str]:
-    """Return the set of constant-string keys of a dict literal node.
-
-    Non-constant / non-string keys (``**spread``, computed keys) yield ``None``
-    entries in ``node.keys`` and are simply ignored — a single-offer body always
-    spells its keys as plain string literals, so this is sufficient and avoids
-    false positives from dynamic dicts.
-    """
-    keys: set[str] = set()
-    for key in node.keys:
-        if isinstance(key, ast.Constant) and isinstance(key.value, str):
-            keys.add(key.value)
-    return keys
-
-
 def _is_single_offer_body(node: ast.Dict) -> bool:
     """True iff ``node`` is a TOP-LEVEL single-offer TransactionRequest body.
 
@@ -121,66 +86,54 @@ def _is_single_offer_body(node: ast.Dict) -> bool:
     The items[]-nested per-item dict (``{offer, agentAcceptance}`` only) lacks any
     such marker and is therefore NOT flagged.
     """
-    keys = _dict_string_keys(node)
+    keys = dict_string_keys(node)
     if _OFFER_KEY not in keys or _ACCEPTANCE_KEY not in keys:
         return False
     return bool(keys & _REQUEST_LEVEL_MARKERS)
 
 
-def _scan_source(path: Path) -> list[_Hit]:
-    """Parse ``path`` and return every single-offer sender dict literal in it."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    hits: list[_Hit] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Dict) and _is_single_offer_body(node):
-            hits.append(_Hit(path=path, lineno=node.lineno))
-    return hits
+def _single_offer_offences(tree: ast.AST) -> list[tuple[int, str]]:
+    """Every top-level single-offer sender body in ``tree``, as (line, "").
 
-
-def _scan_e2e_tree() -> list[_Hit]:
-    """Scan every ``.py`` under tests/e2e/ for single-offer sender bodies."""
-    hits: list[_Hit] = []
-    for path in sorted(_E2E_ROOT.rglob("*.py")):
-        if path.resolve() == _SELF:
-            continue
-        hits.extend(_scan_source(path))
-    return hits
+    The reason is empty: there is one shape this guard refuses, and the
+    assertion below already names it.
+    """
+    return [
+        (node.lineno, "")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict) and _is_single_offer_body(node)
+    ]
 
 
 @pytest.mark.stack_isolation("shared-without-cleanup")
 def test_no_single_offer_wire_shape_in_e2e() -> None:
     """No e2e .py builds a top-level single-offer TransactionRequest body.
 
-    RED NOW (TDD): C2 has not migrated the 13 disposition-table instances yet,
-    so this fails listing the current single-offer senders (relay.py::relay_execute,
-    obligations/flow.py::execute_offer, and the inline obligation senders).
-    GREEN after C2 folds every single-offer body onto the items[] shape.
+    Green since every sender was folded onto the items[] shape --
+    ``relay.relay_execute``, ``obligations.flow.execute_offer`` and the inline
+    obligation senders all build the envelope now. It is a ratchet from here: it
+    fails the moment a new body puts ``offer`` and ``agent_acceptance`` back
+    beside a request-level key.
     """
-    hits = _scan_e2e_tree()
+    hits = scan_tree(_single_offer_offences, exclude=Path(__file__))
     assert not hits, (
         f"Found {len(hits)} single-offer TransactionRequest sender(s) in tests/e2e/ "
         f"(top-level 'offer'+'agentAcceptance' siblings of a request-level marker). "
-        f"C2 must migrate each to the items[] shape:\n  " + "\n  ".join(str(h) for h in hits)
+        f"Migrate each to the items[] shape:\n  " + "\n  ".join(hits)
     )
 
 
 # ---------------------------------------------------------------------------
 # Meta-tests for the guard itself (positive + negative). These keep the guard
 # honest: they prove it flags the disease shape and does NOT flag the allowed
-# items[]-nested shape — so when the production scan flips GREEN after C2, we
-# know it did so because the senders were migrated, not because the guard went
-# blind.
+# items[]-nested shape — so the passing scan above means the senders are on the
+# items[] shape, not that the matcher went blind.
 # ---------------------------------------------------------------------------
 
 
-def _hits_in_snippet(src: str) -> list[_Hit]:
+def _hits_in_snippet(src: str) -> list[tuple[int, str]]:
     """Run the same detector over an inline snippet (no file I/O)."""
-    tree = ast.parse(src)
-    return [
-        _Hit(path=Path("<snippet>"), lineno=node.lineno)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Dict) and _is_single_offer_body(node)
-    ]
+    return _single_offer_offences(ast.parse(src))
 
 
 _SINGLE_OFFER_SNIPPET = """

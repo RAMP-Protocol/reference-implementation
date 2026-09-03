@@ -6,8 +6,8 @@ import (
 	connect "connectrpc.com/connect"
 	rampadminv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/admin/v1"
 	"github.com/RAMP-Protocol/protocol/gen/go/ramp/admin/v1/rampadminv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
@@ -47,7 +47,7 @@ func (h *AdminHandler) SetTenantFeeRate(
 		return nil, exchange.ToConnect(err)
 	}
 	return connect.NewResponse(&rampadminv1.SetTenantFeeRateResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Rate: &rampadminv1.TenantFeeRate{
 			TenantId:   res.TenantID,
 			FeeRateBps: feeRateBps,
@@ -72,7 +72,7 @@ func (h *AdminHandler) SetReportingPolicy(
 		return nil, exchange.ToConnect(err)
 	}
 	return connect.NewResponse(&rampadminv1.SetReportingPolicyResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Policy: &rampadminv1.ReportingPolicy{
 			TenantId:          res.TenantID,
 			RequiredFields:    res.RequiredFields,

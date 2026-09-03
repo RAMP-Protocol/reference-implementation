@@ -11,8 +11,6 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
-
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/licenseterm"
 )
 
 // mapRecord converts a parsed Record into a proto-exact
@@ -20,10 +18,12 @@ import (
 // validates — the same contract CatalogService.PushResources accepts.
 //
 // Each declared offer becomes one LicenseTerm. After building a term its tokens
-// are canonicalized with licenseterm.Normalize (mirroring the PushResources
-// handler), so the produced terms carry canonical vocabulary and pass
-// licenseterm.Validate. This function does NOT reimplement normalization or
-// validation — it reuses the licenseterm package.
+// are canonicalized in place with the SDK's helpers.NormalizeLicenseTerm — the
+// same helper the Exchange runs over a pushed entry — so the produced terms
+// carry canonical vocabulary and the Exchange's ingest-tier checks
+// (helpers.ValidateLicenseTerm) see exactly what a publisher's own pre-check
+// would. This function does NOT reimplement normalization or validation; both
+// are the SDK's.
 func mapRecord(rec Record) (*rampv1.ResourceEntry, error) {
 	entry := &rampv1.ResourceEntry{
 		Domain: rec.Domain,
@@ -45,7 +45,7 @@ func mapRecord(rec Record) (*rampv1.ResourceEntry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("term %d: %w", i, err)
 		}
-		licenseterm.Normalize(term) // canonicalize tokens (handler-equivalent)
+		helpers.NormalizeLicenseTerm(term) // canonicalize tokens in place, as the Exchange does
 		entry.Terms = append(entry.Terms, term)
 	}
 	return entry, nil
@@ -249,14 +249,42 @@ func mapSemantics(s string) (rampv1.TermSemantics, error) {
 	}
 }
 
+// mapMetering resolves the feed's metering token over the closed enum set. An
+// empty token leaves the field unset, which the protocol reads as ONLINE — the
+// same default the Exchange applies — so a feed that says nothing about metering
+// produces the byte-identical Pricing it produced before the field existed. An
+// unrecognised token is an error rather than a silent default, because the
+// difference between "none" and anything else decides whether the transaction
+// owes a usage report.
+func mapMetering(s string) (*rampv1.PricingMetering, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return nil, nil
+	case "online":
+		return rampv1.PricingMetering_PRICING_METERING_ONLINE.Enum(), nil
+	case "offline_self_reported":
+		return rampv1.PricingMetering_PRICING_METERING_OFFLINE_SELF_REPORTED.Enum(), nil
+	case "none":
+		return rampv1.PricingMetering_PRICING_METERING_NONE.Enum(), nil
+	default:
+		return nil, fmt.Errorf("unknown pricing metering %q", s)
+	}
+}
+
 // mapPricing resolves the source pricing into a proto Pricing over the closed
 // FREE/PER_UNIT/FLAT set. PER_UNIT carries its unit; FLAT and FREE carry none;
-// FREE's rate is forced to 0.
+// FREE's rate is forced to 0. Metering rides alongside the model: it says how
+// usage is tracked, not what it costs, so it applies to every model.
 func mapPricing(p *Pricing) (*rampv1.Pricing, error) {
 	if p == nil {
 		return nil, fmt.Errorf("term has no pricing (pricing is required on every term)")
 	}
 	out := &rampv1.Pricing{Currency: p.Currency}
+	metering, err := mapMetering(p.Metering)
+	if err != nil {
+		return nil, err
+	}
+	out.Metering = metering
 	switch strings.ToLower(strings.TrimSpace(p.Model)) {
 	case "free":
 		out.Model = rampv1.PricingModel_PRICING_MODEL_FREE
@@ -433,8 +461,9 @@ func mapObligationTrigger(tr string) (rampv1.ObligationTrigger, error) {
 	}
 }
 
-// cloneTokens returns a fresh slice so Normalize's in-place canonicalization
-// never mutates the parser's record slices.
+// cloneTokens returns a fresh slice so the SDK's in-place canonicalization
+// (helpers.NormalizeLicenseTerm rewrites the permitted/prohibited elements where
+// they sit) never mutates the parser's record slices.
 func cloneTokens(in []string) []string {
 	if len(in) == 0 {
 		return nil

@@ -26,6 +26,13 @@ type CatalogEntry struct {
 	// distinct from TenantID (the operational slot). Sourced server-side from the
 	// owner manifest at push; the push gate guarantees it is non-empty.
 	ResourceOwnerID string
+	// Title is the resource's human-readable label, taken from the pushed
+	// ResourceEntry.title and projected onto Offer.title before the offer is
+	// signed. Nullable: nil round-trips to a NULL column and back to nil, which
+	// is how "the push carried no title" stays distinct from an empty string.
+	// It is stored in its own column rather than in MetadataJSON because that
+	// document projects only the extension-metadata fields.
+	Title *string
 }
 
 // CatalogRepo is the narrow contract CatalogService needs.
@@ -40,6 +47,15 @@ type CatalogRepo interface {
 
 // ErrCatalogNotFound is returned when a catalog lookup has no match.
 var ErrCatalogNotFound = errors.New("repo: catalog entry not found")
+
+// ErrCatalogURIImmutable is returned when an upsert would change the URI of an
+// existing resource_id. The catalog URI is immutable per resource: a signed
+// offer binds at execute via its Identity.canonical_url, so a URI move would
+// free the old URI for another resource and let a still-valid offer rebind to
+// it. The service precheck rejects the move per-entry; this error is the
+// race-safe database backstop (the upsert's DO UPDATE is guarded on an
+// unchanged uri and returns no row when the guard fails).
+var ErrCatalogURIImmutable = errors.New("repo: catalog uri is immutable for an existing resource_id")
 
 // NewCatalogRepo composes a CatalogRepo over a sqlc.Querier.
 func NewCatalogRepo(q sqlc.Querier) CatalogRepo { return &catalogRepo{q: q} }
@@ -67,8 +83,15 @@ func upsertCatalog(ctx context.Context, q sqlc.Querier, e CatalogEntry) (Catalog
 		DeliveryMethod:  sqlc.RampDeliveryMethod(e.DeliveryMethod),
 		Metadata:        e.MetadataJSON,
 		ResourceOwnerID: e.ResourceOwnerID,
+		Title:           pgTextPtr(e.Title),
 	})
 	if err != nil {
+		// The guarded DO UPDATE (WHERE catalog.uri = EXCLUDED.uri) is the only
+		// way this INSERT ... RETURNING yields no row: the resource exists and
+		// the push tried to move its URI.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CatalogEntry{}, ErrCatalogURIImmutable
+		}
 		return CatalogEntry{}, fmt.Errorf("upsert catalog entry: %w", err)
 	}
 	return catalogFromRow(row), nil
@@ -108,6 +131,7 @@ func catalogFromRow(row sqlc.RampCatalog) CatalogEntry {
 		DeliveryMethod:  string(row.DeliveryMethod),
 		MetadataJSON:    row.Metadata,
 		ResourceOwnerID: row.ResourceOwnerID,
+		Title:           textFromPG(row.Title),
 	}
 }
 

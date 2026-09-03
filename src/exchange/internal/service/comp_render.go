@@ -96,8 +96,8 @@ func withField(src *structpb.Struct, key string, val *structpb.Value) *structpb.
 // protojson-marshalled with INTEGER enums (UseEnumNumbers) and proto field names
 // (UseProtoNames) — the encoding canonical CoMP consumers and the comptest
 // conformance oracle expect. Deterministic from the term alone (no clock, no
-// per-request state), so discovery and tx-reconstruction render identical bytes
-// (signature parity).
+// per-request state), so a snapshot rebuild renders the same bytes for the
+// same stored term.
 func renderCompProfile(in compRenderInput) (*structpb.Struct, error) {
 	scope, err := scopeFromPricing(in.term.GetPricing())
 	if err != nil {
@@ -199,7 +199,7 @@ var auseUserType = map[string]compv1.AllowedUse{
 // auseFromRestrictions resolves CoMP Scope.ause from the term's USER_TYPE
 // restriction. ause is a SINGLE value: tokens are scanned in Permitted[] order
 // (deterministic — a stored slice, NOT map iteration) and the FIRST that maps
-// wins, so discovery and tx-reconstruction collapse identically (parity).
+// wins, so repeated renders of the same stored term collapse identically.
 func auseFromRestrictions(term *rampv1.LicenseTerm) (compv1.AllowedUse, bool) {
 	for _, r := range term.GetRestrictions() {
 		if r.GetKind() != rampv1.RestrictionKind_RESTRICTION_KIND_USER_TYPE {

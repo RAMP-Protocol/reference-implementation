@@ -13,6 +13,7 @@ import (
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	identitymcp "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/mcp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/token"
 )
@@ -25,14 +26,14 @@ import (
 
 func TestBearer_MissingTokenIsRefusedBeforeAnyRAMPCall(t *testing.T) {
 	f := newFixture(t)
-	f.provision(t, "dev-one", acmeDetails)
+	f.provision(t, "dev-one")
 
 	assertUnauthorized(t, f, "")
 }
 
 func TestBearer_GarbageTokenIsRefusedBeforeAnyRAMPCall(t *testing.T) {
 	f := newFixture(t)
-	f.provision(t, "dev-one", acmeDetails)
+	f.provision(t, "dev-one")
 
 	assertUnauthorized(t, f, "not-a-jwt")
 }
@@ -41,7 +42,7 @@ func TestBearer_GarbageTokenIsRefusedBeforeAnyRAMPCall(t *testing.T) {
 // well-formed it is. The forged issuer mints the same claims with its own key.
 func TestBearer_ForeignlySignedTokenIsRefused(t *testing.T) {
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	forger, err := token.NewIssuer(newTokenKey(t), authIssue, tokenAudience, systemClock())
 	if err != nil {
@@ -59,7 +60,7 @@ func TestBearer_ForeignlySignedTokenIsRefused(t *testing.T) {
 // what stops a token issued for some other service being replayed here.
 func TestBearer_WrongAudienceIsRefused(t *testing.T) {
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	other, err := token.NewIssuer(newTokenKey(t), authIssue, "http://elsewhere.example", systemClock())
 	if err != nil {
@@ -75,7 +76,7 @@ func TestBearer_WrongAudienceIsRefused(t *testing.T) {
 
 func TestBearer_ExpiredTokenIsRefused(t *testing.T) {
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	expired, err := f.tokens.Mint(a.Subdomain, -time.Minute)
 	if err != nil {
@@ -155,9 +156,9 @@ func TestRAMPRefusal_SurfacesTheTypedReason(t *testing.T) {
 		},
 	}))
 	f.exchange.failWith(refusal)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
-	msg := callToolErr(t, f.connect(t, a.Token), "ramp_register", nil)
+	msg := callToolErr(t, f.connect(t, a.Token), "ramp_register", registerArgs(t, f))
 
 	// The enum NAME, not the transport code: an agent branches on the reason, and
 	// "permission denied" does not say which of several refusals happened.
@@ -176,9 +177,9 @@ func TestRAMPRefusal_FallsBackToTheTransportCode(t *testing.T) {
 	f := newFixture(t)
 	f.exchange.failWith(connect.NewError(connect.CodePermissionDenied,
 		errStub("agent is not permitted to register")))
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
-	msg := callToolErr(t, f.connect(t, a.Token), "ramp_register", nil)
+	msg := callToolErr(t, f.connect(t, a.Token), "ramp_register", registerArgs(t, f))
 
 	if !strings.Contains(msg, "permission_denied") {
 		t.Errorf("tool error %q, want it to carry the transport code", msg)
@@ -202,7 +203,7 @@ func mustDetail(t *testing.T, msg *rampv1.ErrorDetail) *connect.ErrorDetail {
 // outbound call: an empty discovery has nothing to ask the Broker about.
 func TestDiscover_RequiresUrisOrQuery(t *testing.T) {
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	msg := callToolErr(t, f.connect(t, a.Token), "ramp_discover", map[string]any{})
 
@@ -219,7 +220,7 @@ func TestDiscover_RequiresUrisOrQuery(t *testing.T) {
 // the double-counting the field exists to prevent.
 func TestReport_RequiresAnIdempotencyKey(t *testing.T) {
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	msg := callToolErr(t, f.connect(t, a.Token), "ramp_report", map[string]any{
 		"exchange":       "exchange.example",
@@ -248,30 +249,23 @@ func TestReport_RequiresAnIdempotencyKey(t *testing.T) {
 // Each case asserts BOTH halves — the call is refused, and the manifest was never
 // fetched. The fetch count is the load-bearing assertion: a refusal that happened
 // after the request went out would prevent nothing.
-// The cases are built from the issuer's REAL host, so each one names a host that
-// would have answered. One fixture serves them all: every case must leave the
-// fetch count at zero, so a cumulative zero at the end is the same assertion made
-// once per case and is not weakened by sharing.
+// The cases come from the shared table, rendered against the issuer's REAL host,
+// so each one names a host that would have answered. The account tools and the
+// allowlist parser drive the same table, which is what makes a rule that started
+// admitting one of these show up in three places rather than one. One fixture
+// serves them all: every case must leave the fetch count at zero, so a
+// cumulative zero at the end is the same assertion made once per case and is not
+// weakened by sharing.
 func TestReport_RefusesAnExchangeThatIsNotABareDomain(t *testing.T) {
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 	session := f.connect(t, a.Token)
-	host := hostOf(t, f.issuer.URL())
+	host := f.issuer.Domain(t)
 
-	for _, tc := range []struct {
-		name     string
-		exchange string
-	}{
-		{"path and query behind a fragment", host + "/internal/admin?token=x#"},
-		{"bare fragment truncates to the root", host + "#"},
-		{"path", host + "/internal/admin"},
-		{"query", host + "?token=x"},
-		{"scheme", "http://" + host},
-		{"userinfo names a different host", host + "@internal.invalid"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, tc := range testutil.NonBareDomains {
+		t.Run(tc.Name, func(t *testing.T) {
 			msg := callToolErr(t, session, "ramp_report", map[string]any{
-				"exchange":        tc.exchange,
+				"exchange":        tc.Of(host),
 				"transaction_id":  "tx-1",
 				"idempotency_key": "idem-report-1",
 			})

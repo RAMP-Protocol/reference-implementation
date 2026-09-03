@@ -27,13 +27,18 @@ type batchItem struct {
 	exchange string
 }
 
-// batchBodyFor marshals a single batch TransactionRequest (offer absent,
-// items[] set) spanning the given items. Every item's AgentAcceptance is signed
-// with the agent key over the SHARED requester + idempotency_key (helpers.
+// batchRequestFor builds a batch TransactionRequest (offer absent, items[] set)
+// spanning the given items. Every item's AgentAcceptance is signed with the
+// agent key over the SHARED requester + idempotency_key (helpers.
 // SignOfferAcceptance), so the per-exchange sub-requests the broker fans out
 // carry acceptances that still verify at each Exchange. idem is the request-
 // level idempotency_key, shared across all items.
-func (e relayTestEnv) batchBodyFor(t *testing.T, idem string, items []batchItem) []byte {
+//
+// It stops short of the request-level complete-set proof so a test that needs
+// one can sign over the finished set; batchBodyFor is the shape without it.
+func (e relayTestEnv) batchRequestFor(
+	t *testing.T, idem string, items []batchItem,
+) *rampv1.TransactionRequest {
 	t.Helper()
 	requester := &rampv1.Requester{
 		Id:     e.agentKID,
@@ -59,16 +64,28 @@ func (e relayTestEnv) batchBodyFor(t *testing.T, idem string, items []batchItem)
 			},
 		})
 	}
-	body, err := protojson.Marshal(&rampv1.TransactionRequest{
-		Ver:            "0.3",
+	return &rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: idem,
 		Requester:      requester,
 		Items:          txItems,
-	})
+	}
+}
+
+// marshalBatchBody renders a batch request in the wire spelling an agent posts.
+func marshalBatchBody(t *testing.T, req *rampv1.TransactionRequest) []byte {
+	t.Helper()
+	body, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(req)
 	if err != nil {
 		t.Fatalf("marshal batch TransactionRequest: %v", err)
 	}
 	return body
+}
+
+// batchBodyFor is batchRequestFor rendered to the wire.
+func (e relayTestEnv) batchBodyFor(t *testing.T, idem string, items []batchItem) []byte {
+	t.Helper()
+	return marshalBatchBody(t, e.batchRequestFor(t, idem, items))
 }
 
 // readBatchResponse reads a relay response, asserts 200, and returns the FULL
@@ -97,13 +114,18 @@ func readBatchItems(t *testing.T, resp *http.Response) []*rampv1.TransactionResu
 }
 
 // registerSecondExchange stands up exchange #2 with its own well-known manifest
-// and registers it in the broker's trust registry, returning its mock + domain.
-func registerSecondExchange(t *testing.T, env relayTestEnv) (*mockExchange, string) {
+// and registers it in the broker's trust registry, returning its mock, the
+// headers and body it is sent, and its domain. The capture is exchange #2's
+// counterpart to relayTestEnv.captured, which holds exchange #1's — a fan-out
+// test that reads what ONE exchange received can only tell the two apart by
+// reading both.
+func registerSecondExchange(
+	t *testing.T, env relayTestEnv,
+) (*mockExchange, *capturedHeaders, string) {
 	t.Helper()
-	mock2, _, exchange2URL := startCapturingExchange(t)
+	mock2, captured2, exchange2URL := startCapturingExchange(t)
 	mock2.signedURL = "https://cdn.example/signed?from=ex2"
-	provider2 := startEndpointManifestProvider(t, exchange2URL)
-	exchange2Dom := strings.TrimPrefix(provider2.URL, "http://")
+	exchange2Dom := strings.TrimPrefix(exchange2URL, "http://")
 	if _, err := env.exchangeRepo.UpsertFromBootstrap(context.Background(), repo.Exchange{
 		ID:                "mp-" + exchange2Dom,
 		Domain:            exchange2Dom,
@@ -114,7 +136,7 @@ func registerSecondExchange(t *testing.T, env relayTestEnv) (*mockExchange, stri
 	}); err != nil {
 		t.Fatalf("seed exchange2: %v", err)
 	}
-	return mock2, exchange2Dom
+	return mock2, captured2, exchange2Dom
 }
 
 // TestExchangeRelay_BatchFansOutByOfferExchange pins the S4 batch path: a SINGLE
@@ -132,7 +154,7 @@ func registerSecondExchange(t *testing.T, env relayTestEnv) (*mockExchange, stri
 func TestExchangeRelay_BatchFansOutByOfferExchange(t *testing.T) {
 	env := newRelayTestEnv(t)
 	env.mockExch.signedURL = "https://cdn.example/signed?from=ex1"
-	mock2, exchange2Dom := registerSecondExchange(t, env)
+	mock2, _, exchange2Dom := registerSecondExchange(t, env)
 
 	// Interleave the offers across exchanges so "original item order" is a real
 	// constraint (item 0 → ex1, item 1 → ex2, item 2 → ex1).
@@ -204,7 +226,7 @@ func TestExchangeRelay_BatchFansOutByOfferExchange_SameCurrencyTotalCostSums(t *
 	// Both exchanges quote the SAME currency so a scalar total is well-defined.
 	env.mockExch.itemCostAmount = 2.50
 	env.mockExch.itemCostCurrency = "USD"
-	mock2, exchange2Dom := registerSecondExchange(t, env)
+	mock2, _, exchange2Dom := registerSecondExchange(t, env)
 	mock2.itemCostAmount = 2.50
 	mock2.itemCostCurrency = "USD"
 
@@ -284,7 +306,7 @@ func TestExchangeRelay_BatchFansOutByOfferExchange_CrossCurrencyDropsScalar(t *t
 	env.mockExch.signedURL = "https://cdn.example/signed?from=ex1"
 	env.mockExch.itemCostAmount = 2.50
 	env.mockExch.itemCostCurrency = "USD"
-	mock2, exchange2Dom := registerSecondExchange(t, env)
+	mock2, _, exchange2Dom := registerSecondExchange(t, env)
 	mock2.itemCostAmount = 3.00
 	mock2.itemCostCurrency = "EUR"
 
@@ -341,7 +363,7 @@ func TestExchangeRelay_BatchFansOutByOfferExchange_CrossCurrencyDropsScalar(t *t
 func TestExchangeRelay_BatchPartialFailure(t *testing.T) {
 	env := newRelayTestEnv(t)
 	env.mockExch.signedURL = "https://cdn.example/signed?from=ex1"
-	mock2, exchange2Dom := registerSecondExchange(t, env)
+	mock2, _, exchange2Dom := registerSecondExchange(t, env)
 	// Exchange #2 denies its item.
 	mock2.denyOfferIDs = map[string]bool{"offer-b": true}
 

@@ -1,0 +1,12 @@
+RAMP Demo Exchange - Terms of Use (revision 1)
+
+This Exchange is a demonstration deployment. It is not a commercial service.
+
+1. Accounts and content are for evaluating the RAMP protocol only.
+2. Licensed content is fictional sample data with no real rights attached.
+3. Balances are test money. Nothing is billed and nothing is owed.
+4. The deployment may be reset without notice, removing accounts,
+   registrations and transaction history.
+5. No warranty of any kind is offered, and no liability is accepted.
+
+Registering an account records acceptance of this revision.

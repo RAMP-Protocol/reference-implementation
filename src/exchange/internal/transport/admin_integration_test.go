@@ -4,6 +4,7 @@ package transport_test
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http/httptest"
 	"testing"
 
@@ -11,7 +12,9 @@ import (
 	rampadminv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/admin/v1"
 	"github.com/RAMP-Protocol/protocol/gen/go/ramp/admin/v1/rampadminv1connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
+	audiencetest "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/transport"
@@ -28,8 +31,24 @@ import (
 // raw-HTTP codec/403 tests).
 func startAdminServer(t *testing.T, h *testHarness, allowCIDRs string) (rampadminv1connect.AdminServiceClient, string) {
 	t.Helper()
+	return startAdminServerWithLogger(t, h, allowCIDRs, testutil.DiscardLogger())
+}
+
+// startAdminServerWithLogger is startAdminServer with the surface's logger
+// supplied by the caller, so a test can read what the plane logged. The logger
+// reaches the handlers only through RequestIDMiddleware, which binds it onto the
+// context — which is exactly the path a request-id correlation test has to
+// exercise.
+func startAdminServerWithLogger(
+	t *testing.T, h *testHarness, allowCIDRs string, logger *slog.Logger,
+) (rampadminv1connect.AdminServiceClient, string) {
+	t.Helper()
 	adminSvc := service.NewAdminServiceFromPool(h.pool, h.queries)
-	wrapped, err := transport.WrapAdminSurface(testutil.DiscardLogger(), adminSvc, allowCIDRs)
+	evidenceSvc := service.NewEvidenceReadService(h.queries)
+	audience := audiencetest.MustInterceptor(t, harnessExchangeDomain)
+	// The logger is the caller's, not a discard: this helper exists so a
+	// request-id correlation test can read what the surface recorded.
+	wrapped, err := transport.WrapAdminSurface(logger, adminSvc, evidenceSvc, allowCIDRs, audience)
 	if err != nil {
 		t.Fatalf("build admin handler: %v", err)
 	}
@@ -45,7 +64,7 @@ func mustSetFee(
 ) *connect.Response[rampadminv1.SetTenantFeeRateResponse] {
 	t.Helper()
 	resp, err := admin.SetTenantFeeRate(h.ctx, connect.NewRequest(&rampadminv1.SetTenantFeeRateRequest{
-		Ver:  "1.0",
+		Ver:  helpers.ProtocolVersion,
 		Rate: &rampadminv1.TenantFeeRate{TenantId: h.tenantID, FeeRateBps: bps, Notes: notes},
 	}))
 	if err != nil {
@@ -62,7 +81,7 @@ func mustSetPolicy(
 	t.Helper()
 	policy.TenantId = h.tenantID
 	resp, err := admin.SetReportingPolicy(h.ctx, connect.NewRequest(&rampadminv1.SetReportingPolicyRequest{
-		Ver:    "1.0",
+		Ver:    helpers.ProtocolVersion,
 		Policy: policy,
 	}))
 	if err != nil {
@@ -102,10 +121,7 @@ func TestAdmin_SetReportingPolicy_ZeroTolerance_ExactMatch(t *testing.T) {
 	mustSetPolicy(t, h, admin, &rampadminv1.ReportingPolicy{QuantityTolerance: &tol})
 
 	txID, billingID := executeTransactionFor(t, h, 100)
-	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-tol0", TransactionId: txID, BillingId: billingID,
-		Usage: &rampv1.Usage{ConsumedQuantity: 101}, // off by one → exact-match reject
-	}))
+	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-tol0", txID, billingID, &rampv1.Usage{ConsumedQuantity: 101})))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "outside")
 	assertReportRejectionField(t, err, "consumed_quantity")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_TOLERANCE")
@@ -121,10 +137,7 @@ func TestAdmin_SetReportingPolicy_RequiredFields_Enforced(t *testing.T) {
 	mustSetPolicy(t, h, admin, &rampadminv1.ReportingPolicy{RequiredFields: []string{"billing_id"}})
 
 	txID, _ := executeTransactionFor(t, h, 100)
-	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-req", TransactionId: txID, BillingId: "", // required but empty
-		Usage: &rampv1.Usage{ConsumedQuantity: 100},
-	}))
+	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-req", txID, "", &rampv1.Usage{ConsumedQuantity: 100})))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "billing_id")
 	assertReportRejectionField(t, err, "billing_id")
 	assertObligationState(t, h, txID, "PENDING", "REJECTED_FIELDS")

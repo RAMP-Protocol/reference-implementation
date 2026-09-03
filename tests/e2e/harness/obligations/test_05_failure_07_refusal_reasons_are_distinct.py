@@ -44,6 +44,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from ramp_sdk import ProtocolVersion
 
 from ..conftest import StackURLs
 from ..httpsig_signer import (
@@ -223,11 +224,23 @@ def test_five_bad_signature_refusals_are_specific_and_distinct(
     compose_stack: StackURLs,
 ) -> None:
     """All five v1 bad-signature refusals are non-empty, non-generic, and distinct."""
-    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/distinct-defect-guard.html"]}
+    body_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/distinct-defect-guard.html"],
+    }
     body = json.dumps(body_obj, separators=(",", ":")).encode()
-    body_b_obj = {"requester": {}, "uris": ["http://edge:8787/premium/tampered.html"]}
+    body_b_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/tampered.html"],
+    }
     body_b = json.dumps(body_b_obj, separators=(",", ":")).encode()
-    replay_body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/replay-distinct.html"]}
+    replay_body_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/replay-distinct.html"],
+    }
     replay_body = json.dumps(replay_body_obj, separators=(",", ":")).encode()
     url = f"{compose_stack.exchange}{_DISCOVER_PATH}"
 

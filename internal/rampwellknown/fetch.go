@@ -52,11 +52,43 @@ func (o FetchOptions) timeout() time.Duration {
 	return defaultTimeout
 }
 
+// Document is a fetched manifest together with the bytes it was served as.
+//
+// The decoded message answers every question but one: a rule measured over the
+// BYTES an origin sent cannot be answered from a message, because protojson
+// re-encodes with its own spacing and carries every JSON number as a float64.
+// The registration schema's size cap is exactly such a rule — the protocol
+// defines it over the data_schema member as served — so the body is kept beside
+// the message rather than reconstructed from it. A consumer that re-encoded
+// would reach a verdict near the cap that the publishing Exchange does not.
+//
+// Raw is the whole document, not the member: which member matters is the
+// reader's question, and slicing it here would put one reader's interest into
+// the type every reader shares.
+type Document struct {
+	Manifest *Manifest
+	Raw      []byte
+}
+
 // Fetch GETs host's /.well-known/ramp.json, schema-validates it, decodes it via
-// protojson, and (optionally) asserts its role. A 404 yields ErrNoManifest; a
+// protojson, and (optionally) asserts its role. A 404 yields ErrNoDocument; a
 // transient/non-2xx failure yields ErrFetch; a malformed body yields
 // ErrSchemaInvalid; a role mismatch yields ErrRoleMismatch.
+//
+// It is FetchDocument with the body dropped, and it stays because most readers
+// want only the message. One fetch-and-parse path serves both, so the two
+// cannot come to disagree about what a valid document is.
 func Fetch(ctx context.Context, host string, opts FetchOptions) (*Manifest, error) {
+	doc, err := FetchDocument(ctx, host, opts)
+	if err != nil {
+		return nil, err
+	}
+	return doc.Manifest, nil
+}
+
+// FetchDocument is Fetch, keeping the served body. Use it where a rule is
+// defined over the bytes rather than over the decoded message; see Document.
+func FetchDocument(ctx context.Context, host string, opts FetchOptions) (*Document, error) {
 	u, err := ManifestURL(host, opts.Scheme, opts.Port)
 	if err != nil {
 		return nil, err
@@ -69,13 +101,22 @@ func Fetch(ctx context.Context, host string, opts FetchOptions) (*Manifest, erro
 	if err != nil {
 		return nil, err
 	}
-	return ParseManifest(raw, opts.ExpectRole)
+	return ParseDocument(raw, opts.ExpectRole)
 }
 
 // ParseManifest schema-validates raw, decodes it via protojson, and asserts
 // role when expect is not RoleUnspecified. Exported so producers and tests can
 // round-trip bytes without an HTTP round-trip.
 func ParseManifest(raw []byte, expect Role) (*Manifest, error) {
+	doc, err := ParseDocument(raw, expect)
+	if err != nil {
+		return nil, err
+	}
+	return doc.Manifest, nil
+}
+
+// ParseDocument is ParseManifest, keeping raw beside the decoded message.
+func ParseDocument(raw []byte, expect Role) (*Document, error) {
 	var m Manifest
 	if err := decodeValidated(raw, &m, ValidateManifest); err != nil {
 		return nil, err
@@ -83,12 +124,12 @@ func ParseManifest(raw []byte, expect Role) (*Manifest, error) {
 	if expect != RoleUnspecified && m.GetRole() != expect {
 		return nil, fmt.Errorf("%w: want %s got %s", ErrRoleMismatch, expect, m.GetRole())
 	}
-	return &m, nil
+	return &Document{Manifest: &m, Raw: raw}, nil
 }
 
 // FetchWBA GETs host's /.well-known/http-message-signatures-directory, schema-
 // validates it, and decodes it via protojson into a WBAFile. A 404 yields
-// ErrNoManifest; a transient/non-2xx failure yields ErrFetch; a malformed body
+// ErrNoDocument; a transient/non-2xx failure yields ErrFetch; a malformed body
 // yields ErrSchemaInvalid. FetchOptions.ExpectRole is not consulted — the WBA
 // directory carries no role.
 func FetchWBA(ctx context.Context, host string, opts FetchOptions) (*WBAFile, error) {
@@ -118,14 +159,16 @@ func ParseWBA(raw []byte) (*WBAFile, error) {
 }
 
 // getDoc performs the GET and returns the (size-bounded) body. 404 →
-// ErrNoManifest; any other non-2xx or transport/read error → ErrFetch.
+// ErrNoDocument; any other non-2xx or transport/read error → ErrFetch. Both
+// sentinels are wrapped with rawURL, because this helper serves every well-known
+// document the package fetches and the sentinel alone cannot say which one.
 func getDoc(ctx context.Context, client HTTPDoer, rawURL string, timeout time.Duration) ([]byte, error) {
 	status, _, body, err := httpGet(ctx, client, rawURL, timeout)
 	if err != nil {
 		return nil, err
 	}
 	if status == http.StatusNotFound {
-		return nil, ErrNoManifest
+		return nil, noDocumentAt(rawURL)
 	}
 	if status < 200 || status >= 300 {
 		return nil, fmt.Errorf("%w: %s: status %d", ErrFetch, rawURL, status)

@@ -18,19 +18,21 @@ import (
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"github.com/jackc/pgx/v5"
 
+	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 )
 
 // ---- recording adapter ----------------------------------------------------
 
-// recordingAdapter wraps a billing.Adapter and records every Authorize /
-// Record / Release / Refund invocation (including the idempotency key) so tests
-// can assert call counts and lifecycle-key threading. It is NOT a mock of an
-// external API — every call is forwarded to the inner adapter so all balance
-// semantics remain correct.
+// recordingAdapter wraps a billing.Adapter and records every EnsureAgentAccount
+// / Credit / Authorize / Record / Release / Refund invocation (including the
+// idempotency key) so tests can assert call counts, call order, and
+// lifecycle-key threading. It is NOT a mock of an external API — every call is
+// forwarded to the inner adapter so all balance semantics remain correct.
 type recordingAdapter struct {
 	inner         billing.Adapter
 	mu            sync.Mutex
+	accountEvents []accountEvent
 	authorizeKeys []string
 	recordCalls   []recordCall
 	releaseCalls  []releaseCall
@@ -41,7 +43,25 @@ type recordingAdapter struct {
 	// the inner adapter). Used to mutate external state — e.g. a fee override —
 	// between Authorize and settlement, to prove the settled rate was frozen at
 	// Authorize and is not re-resolved at Record.
-	beforeRecord func()
+	beforeRecord func(context.Context)
+	afterRecord  func(context.Context)
+	// beforeAuthorize / afterAuthorize, when non-nil, run around the forward to
+	// the inner adapter's Authorize (after = the hold exists, the caller has not
+	// yet seen it). The concurrent-duplicate suite blocks in these to pin one
+	// request mid-flight at a chosen point relative to hold creation.
+	beforeAuthorize func(context.Context)
+	afterAuthorize  func(context.Context)
+}
+
+// accountEvent is one recorded account-lifecycle call (EnsureAgentAccount or
+// Credit), kept in a single ordered slice so the Register flow's
+// "EnsureAgentAccount, then Credit, exactly once each" ordering is assertable
+// directly. Amount and Key are set for Credit only.
+type accountEvent struct {
+	Method     string
+	BillingRef string
+	Amount     *big.Rat
+	Key        string
 }
 
 type recordCall struct {
@@ -67,29 +87,53 @@ func newRecordingAdapter(inner billing.Adapter) *recordingAdapter {
 }
 
 func (r *recordingAdapter) EnsureAgentAccount(ctx context.Context, billingRef string) error {
+	r.mu.Lock()
+	r.accountEvents = append(r.accountEvents, accountEvent{Method: "EnsureAgentAccount", BillingRef: billingRef})
+	r.mu.Unlock()
 	return r.inner.EnsureAgentAccount(ctx, billingRef)
+}
+
+func (r *recordingAdapter) Credit(ctx context.Context, billingRef string, amount billing.Amount, key string) error {
+	r.mu.Lock()
+	r.accountEvents = append(r.accountEvents, accountEvent{
+		Method: "Credit", BillingRef: billingRef, Amount: new(big.Rat).Set(amount.Value), Key: key,
+	})
+	r.mu.Unlock()
+	return r.inner.Credit(ctx, billingRef, amount, key)
 }
 
 func (r *recordingAdapter) Authorize(ctx context.Context, req billing.AuthorizeRequest) (billing.AuthorizeResult, error) {
 	r.mu.Lock()
 	r.authorizeKeys = append(r.authorizeKeys, req.IdempotencyKey)
+	before, after := r.beforeAuthorize, r.afterAuthorize
 	r.mu.Unlock()
-	return r.inner.Authorize(ctx, req)
+	if before != nil {
+		before(ctx)
+	}
+	res, err := r.inner.Authorize(ctx, req)
+	if after != nil {
+		after(ctx)
+	}
+	return res, err
 }
 
 func (r *recordingAdapter) Record(ctx context.Context, billingID string, qty int64, key string) error {
 	r.mu.Lock()
 	r.recordCalls = append(r.recordCalls, recordCall{BillingID: billingID, Qty: qty, Key: key})
 	fail := r.failRecord
-	hook := r.beforeRecord
+	before, after := r.beforeRecord, r.afterRecord
 	r.mu.Unlock()
-	if hook != nil {
-		hook()
+	if before != nil {
+		before(ctx)
 	}
 	if fail != nil {
 		return fail
 	}
-	return r.inner.Record(ctx, billingID, qty, key)
+	err := r.inner.Record(ctx, billingID, qty, key)
+	if after != nil {
+		after(ctx)
+	}
+	return err
 }
 
 func (r *recordingAdapter) Release(ctx context.Context, billingID string, key string) error {
@@ -112,6 +156,16 @@ func (r *recordingAdapter) GetBalance(ctx context.Context, agentID string) (bill
 
 func (r *recordingAdapter) GetQuota(ctx context.Context, agentID string) (int64, error) {
 	return r.inner.GetQuota(ctx, agentID)
+}
+
+// accountEventLog returns a copy of the ordered EnsureAgentAccount/Credit call
+// log.
+func (r *recordingAdapter) accountEventLog() []accountEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]accountEvent, len(r.accountEvents))
+	copy(out, r.accountEvents)
+	return out
 }
 
 func (r *recordingAdapter) recordCallCount() int {
@@ -183,12 +237,39 @@ func newRecordingHarnessWith(t *testing.T, opts harnessOptions) (*testHarness, *
 	return newTestHarnessWith(t, opts), rec
 }
 
-// failTxRunner is a db.TxRunner whose WithTx always fails, driving the
-// persist-failure branch of ExecuteTransaction.
-type failTxRunner struct{}
+// failTxRunner drives the persist-failure branch of ExecuteTransaction by
+// failing every transaction — but only once it is ARMED.
+//
+// Arming exists because the harness registers its caller through the same
+// runner while it is being built, and that registration is a real transactional
+// write the paid path then depends on: it mints the billing_ref, records the
+// registration, and is what the seeded balance is keyed on. A runner that failed
+// from construction would fail the bring-up instead of the execute the test is
+// about, and the test would report a broken harness rather than the branch it
+// exists to cover.
+//
+// Wrap it into a harness with harnessOptions.txRunnerWrap, which hands it the
+// real pool runner to delegate to, then call arm once bring-up is done.
+type failTxRunner struct {
+	inner sharedb.TxRunner
+	armed atomic.Bool
+}
 
-func (failTxRunner) WithTx(_ context.Context, _ func(pgx.Tx) error) error {
-	return errors.New("persist boom")
+// wrap records the real runner and returns itself, matching
+// harnessOptions.txRunnerWrap.
+func (r *failTxRunner) wrap(inner sharedb.TxRunner) sharedb.TxRunner {
+	r.inner = inner
+	return r
+}
+
+// arm makes every subsequent transaction fail.
+func (r *failTxRunner) arm() { r.armed.Store(true) }
+
+func (r *failTxRunner) WithTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	if r.armed.Load() {
+		return errors.New("persist boom")
+	}
+	return r.inner.WithTx(ctx, fn)
 }
 
 // failKeyStore is a signing.KeyStore that always errors, driving the
@@ -296,12 +377,7 @@ func TestReportUsage_DoesNotCallBilling(t *testing.T) {
 	releaseCountAfterExecute := len(rec.releaseCalls)
 	rec.mu.Unlock()
 
-	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-audit",
-		TransactionId: txID,
-		BillingId:     billingID,
-		Usage:         &rampv1.Usage{ConsumedQuantity: 80},
-	}))
+	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-audit", txID, billingID, &rampv1.Usage{ConsumedQuantity: 80})))
 	if err != nil {
 		t.Fatalf("report: %v", err)
 	}
@@ -341,13 +417,7 @@ func TestReportUsage_ConcurrentSecondGetsFailedPrecondition(t *testing.T) {
 		wg.Add(1)
 		go func(reportID string) {
 			defer wg.Done()
-			_, e := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-				Ver:            "1.0",
-				IdempotencyKey: reportID,
-				TransactionId:  txID,
-				BillingId:      billingID,
-				Usage:          &rampv1.Usage{ConsumedQuantity: 100},
-			}))
+			_, e := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport(reportID, txID, billingID, &rampv1.Usage{ConsumedQuantity: 100})))
 			if e == nil {
 				okCount.Add(1)
 				return
@@ -479,7 +549,9 @@ func assertReleasedOnExecuteFailure(t *testing.T, h *testHarness, rec *recording
 // TestExecuteTransaction_ReleaseOnPersistFailure forces persistTransaction to
 // fail (injected failing TxRunner) and asserts the reservation is released.
 func TestExecuteTransaction_ReleaseOnPersistFailure(t *testing.T) {
-	h, rec := newRecordingHarnessWith(t, harnessOptions{txRunner: failTxRunner{}})
+	runner := &failTxRunner{}
+	h, rec := newRecordingHarnessWith(t, harnessOptions{txRunnerWrap: runner.wrap})
+	runner.arm()
 	assertReleasedOnExecuteFailure(t, h, rec, "persist")
 }
 

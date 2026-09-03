@@ -37,6 +37,20 @@ import (
 
 // Version is the only RAMP protocol version this library produces or accepts.
 // Consumers reject manifests whose ver differs (enforced by the schema).
+//
+// This versions the /.well-known/ramp.json DOCUMENT SCHEMA. It is a namespace
+// deliberately separate from the version stamped on RPC envelope messages,
+// which the SDK owns as helpers.ProtocolVersion, and ramp.proto says in as many
+// words that the manifest version is not stamped from that constant.
+//
+// The two happen to read "1.0" today and must not be coupled, because they are
+// enforced in opposite ways. This library rejects EVERY manifest whose ver
+// differs, as the line above says and as schema/ramp-well-known.json enforces
+// with a const: a "1.1" manifest fails ValidateManifest with ErrSchemaInvalid,
+// not just a "2.0" one. The envelope ver is the reverse — advisory, never a
+// rejection gate, and a receiver that checks it MUST NOT reject an unrecognised
+// minor version. Coupling them would import one of those rules into the other's
+// namespace, and the day either value moves it would do so silently.
 const Version = "1.0"
 
 // Path is the fixed request path every RAMP participant serves the commercial

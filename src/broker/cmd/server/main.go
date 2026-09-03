@@ -8,7 +8,6 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RAMP-Protocol/protocol/sdk/go/connect"
 	"github.com/RAMP-Protocol/protocol/sdk/go/connectserver"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
@@ -27,6 +25,7 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentkeys"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/server"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/replay"
@@ -101,7 +100,7 @@ func run(logger *slog.Logger) error {
 
 	discovery := buildDiscoveryClient(logger)
 	fetchWiring := buildFetchWiring(ctx, logger)
-	xpool, ownKeys, err := setupRelayAndKeys(logger, brokerDomain)
+	identity, err := setupRelayAndKeys(logger, brokerDomain)
 	if err != nil {
 		return err
 	}
@@ -114,7 +113,7 @@ func run(logger *slog.Logger) error {
 			Log:       logRepo,
 			Discovery: discovery,
 			Prober:    fetchWiring.prober,
-			Exchange:  xpool,
+			Exchange:  identity.relay,
 			Budget:    budgetSvc,
 			Signer:    signer,
 			Endpoints: fetchWiring.endpoints,
@@ -123,16 +122,17 @@ func run(logger *slog.Logger) error {
 		},
 		signer:        signer,
 		brokerID:      brokerID,
-		ownKeys:       ownKeys,
+		ownKeys:       identity.ownKeys,
 		agentResolver: fetchWiring.agentResolver,
 		redisCli:      redisCli,
+		audience:      identity.audience,
 	})
 	if err != nil {
 		return err
 	}
 
-	// Launch refresher goroutine — fire-and-forget.
-	refresher := registry.NewRefresher(exchangeRepo, nil, logger, 0)
+	// Launch refresher goroutine — fire-and-forget; newHealthProbeClient says why the probe dials through the guard.
+	refresher := registry.NewRefresher(exchangeRepo, fetchWiring.endpoints, newHealthProbeClient(), logger, 0)
 	go refresher.Run(ctx)
 
 	// Keep the served discovery documents fresh: their validity windows are
@@ -162,42 +162,41 @@ func buildWrapped(logger *slog.Logger, mux http.Handler) http.Handler {
 	return transport.WrapPublicSurface(logger, mux, runhttp.PublicSurfaceOptionsFromEnv())
 }
 
-// setupRelayAndKeys builds the Broker's outbound xclient.Pool (wrapped in the
-// relay signing transport when a key is present) and the KeyRegistry carrying
-// the Broker's own published keys (the relay pubkey, so downstream Exchange
-// callers verifying broker-relay signatures find the kid in the Broker's WBA
-// directory). There is no key-file seeding: every other participant's key is
-// learned via well-known discovery.
-func setupRelayAndKeys(logger *slog.Logger, brokerDomain string) (*xclient.Pool, *transport.KeyRegistry, error) {
-	relayHTTP, relayKey, err := newRelayHTTPClient(logger, brokerDomain)
-	if err != nil {
-		return nil, nil, fmt.Errorf("broker relay signing: %w", err)
-	}
-	var own []ed25519.PublicKey
-	if relayKey != nil {
-		// The served WBA directory publishes this key with a validity window
-		// stamped from the signer clock at each document build. Verifiers
-		// address it by its RFC 7638 thumbprint, not a broker-prefixed kid.
-		own = append(own, relayKey.Private.Public().(ed25519.PublicKey))
-	}
-	ownKeys, err := transport.NewKeyRegistry(own...)
-	if err != nil {
-		return nil, nil, fmt.Errorf("broker own-key registry: %w", err)
-	}
-	return xclient.NewPool(relayHTTP), ownKeys, nil
-}
-
 // newRelayHTTPClient loads the broker-relay private key and builds an
 // *http.Client whose transport stamps RFC 9421 Signature headers on every
-// outbound Broker→Exchange call. When the key file is absent the returned
-// client is a plain http.Client — callers hitting a signed Exchange will get
+// outbound Broker→Exchange call. When the key file is absent the returned client
+// carries the guard but no signer — callers hitting a signed Exchange will get
 // 401 but the Broker will still boot (useful for local dev without bootstrap).
+//
+// Both returns dial through the SDK guarded client, never http.DefaultTransport.
+// Nothing operator-written bounds this leg's target: the execute relay reads its
+// admission off the row it fetched by DOMAIN and then POSTs the agent's signed
+// offer to whatever that exchange's own well-known advertises. The SDK's host
+// anchoring compares host and port and deliberately leaves the scheme to the
+// transport, so without the guard an exchange registered as https can advertise
+// http and receive a signed offer in the clear. The identity service holds the
+// same contract for the same leg.
+//
+// The factory's client is taken apart and reassembled rather than used whole,
+// because the signer has to sit ABOVE the dial: the signing round-tripper wraps
+// the guarded one, and the factory's redirect policy is carried across so a
+// redirect cannot walk the request onto a scheme the first hop was refused for.
+// Only the timeout is the relay's own.
 func newRelayHTTPClient(logger *slog.Logger, brokerDomain string) (*http.Client, *xclient.RelayKey, error) {
+	guarded := resolvers.NewGuardedClientFromEnv()
+	relayClient := func(rt http.RoundTripper) *http.Client {
+		return &http.Client{
+			Timeout:       10 * time.Second,
+			Transport:     rt,
+			CheckRedirect: guarded.CheckRedirect,
+		}
+	}
+
 	path := runhttp.EnvOr("BROKER_RELAY_KEY_FILE", "deploy/broker/broker-key.json")
 	_, statErr := os.Stat(path)
 	if errors.Is(statErr, os.ErrNotExist) {
 		logger.Warn("broker.relay.key_absent", "path", path)
-		return &http.Client{Timeout: 10 * time.Second}, nil, nil
+		return relayClient(guarded.Transport), nil, nil
 	}
 	if statErr != nil {
 		return nil, nil, fmt.Errorf("broker-relay stat %s: %w", path, statErr)
@@ -207,11 +206,13 @@ func newRelayHTTPClient(logger *slog.Logger, brokerDomain string) (*http.Client,
 		return nil, nil, err
 	}
 	logger.Info("broker.relay.signing", "keyid", key.KeyID)
-	transport, err := xclient.NewSigningTransport(http.DefaultTransport, key, brokerDomain, 30*time.Second, clock.System{})
+	signing, err := xclient.NewSigningTransport(
+		guarded.Transport, key, brokerDomain, 30*time.Second, clock.System{},
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("broker-relay signing transport: %w", err)
 	}
-	return &http.Client{Timeout: 10 * time.Second, Transport: transport}, key, nil
+	return relayClient(signing), key, nil
 }
 
 // brokerMuxDeps collects everything buildBrokerMux wires onto the HTTP
@@ -236,6 +237,19 @@ type brokerMuxDeps struct {
 	// in-memory otherwise). The relay route is excluded from the connectserver
 	// gate, so it enforces sig1 (keyid,signature) uniqueness itself.
 	redisCli *redis.Client
+	// audience refuses a request addressed to a different party. Nothing this
+	// interceptor sees names one today: the only agent-facing BrokerService RPC
+	// is discovery, and DiscoveryRequest carries no recipient field, so there is
+	// nothing to compare rather than a comparison that passes.
+	//
+	// The Broker is a participant in the contract all the same. The fan-out legs
+	// it AUTHORS name the Exchange each one goes to, and the execute relay
+	// receives TransactionRequests whose items name the downstream Exchange —
+	// that route is not a Connect route and so runs beside this interceptor, with
+	// its own refusal for an item that names nobody (src/broker/internal/relay).
+	// Mounted here so an agent-facing RPC that gains a recipient later is guarded
+	// the day it does rather than the day somebody remembers.
+	audience *rampaudience.Interceptor
 }
 
 // agentSig1Resolver returns the resolver both agent-facing surfaces verify an
@@ -308,22 +322,14 @@ func buildBrokerMux(d brokerMuxDeps) (*http.ServeMux, server.Handlers, error) {
 	// relay routes also draw from.
 	brokerResolver := d.agentSig1Resolver()
 	replayStore := replay.NewCoreAdapter(replay.NewStore(d.redisCli, "httpsig:broker:replay:"))
-	svrOpts := []connectserver.ServerOption{
-		connectserver.WithKeyResolver(brokerResolver),
-		connectserver.WithReplayStore(replayStore),
-		connectserver.WithValidation(connect.ValidationStrict),
-		// Zero-valued response fields stay on the wire (platform JSON contract).
-		connectserver.WithEmitUnpopulated(),
-		// A /ramp. request must clear the seam iff it PRESENTS a signature: an
-		// unsigned Resolve reaches the handler, which finds no verified context
-		// and returns the typed Unauthenticated fault (ADR-019 error detail) —
-		// the no-caller negative path the contract tests drive.
-		connectserver.WithVerifyGate(func(r *http.Request) bool {
-			return r.Header.Get("Signature-Input") != ""
-		}),
-		// Audit-log every gate rejection with its SDK-classified outcome
-		// (replay / broken_chain / hop_budget / signature).
-		connectserver.WithOnReject(transport.LogHTTPSigReject),
+	// Built by the function the integration harness builds it with, so the mount
+	// those tests drive is this mount. It carries the nil-audience refusal too —
+	// the same refusal the Exchange's mounts make, made by the same function:
+	// a nil interceptor mounts cleanly and checks nothing, which is the one
+	// failure mode this whole package exists to prevent.
+	svrOpts, err := transport.BrokerMountOptions(brokerResolver, replayStore, d.audience)
+	if err != nil {
+		return nil, server.Handlers{}, err
 	}
 	connectPath, connectHandler := connectserver.NewBrokerServiceHandler(
 		transport.NewBrokerConnectHandler(resolveHandler), svrOpts...,

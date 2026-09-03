@@ -52,6 +52,20 @@ func EnvOr(key, fallback string) string {
 	return fallback
 }
 
+// EnvTrimmed reads key and returns it with surrounding whitespace removed, so a
+// variable holding only whitespace reads as unset rather than being carried
+// verbatim. Use it for a value a downstream reader compares against "" to decide
+// whether the operator configured anything.
+//
+// It lives here beside EnvOr and EnvOrFile because "is this variable set?" must
+// have one answer per deployment. A composition root that trimmed at two call
+// sites and not at the other thirty would give the same operator two behaviours
+// for the same mistake, and the difference would be invisible from the
+// configuration file.
+func EnvTrimmed(key string) string {
+	return strings.TrimSpace(os.Getenv(key))
+}
+
 // EnvBool reads a boolean env var: unset → def; "0"/"false"/"no"/"off"
 // (case-insensitive) → false; any other non-empty value → true. Both services
 // gate their per-agent well-known resolution flag through this, so the parse

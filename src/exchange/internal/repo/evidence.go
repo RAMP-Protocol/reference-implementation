@@ -34,9 +34,11 @@ type EvidenceRecord struct {
 
 	// Exchange side (the signed offer).
 	//
-	// OfferID is the signed Offer.offer_id, which is the catalog resource_id and
-	// therefore always equals transaction_log.offer_id. It is duplicated here so
-	// an evidence row reads standalone, without a join.
+	// OfferID is the signed Offer.offer_id — the presented offer's own random
+	// per-offer UUID, the same value transaction_log.offer_id stores (the
+	// catalog resource identity is transaction_log.resource_id, a distinct
+	// value). It is duplicated here so an evidence row reads standalone,
+	// without a join.
 	OfferID                  string
 	OfferJSON                []byte // protojson of the full offer; presentational, queryable
 	OfferCanonicalBytes      []byte // verbatim JCS bytes the Exchange signature covered

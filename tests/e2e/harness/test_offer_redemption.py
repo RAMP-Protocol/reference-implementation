@@ -31,7 +31,7 @@ Round-trip honesty
 Each leg is a full discover→reflect→execute PROTOCOL round-trip on the Exchange
 RPC. Positives additionally fetch the signed URL through the edge (delivery
 round-trip). Negatives assert through the RESPONSE ONLY — the per-item
-``denialReason`` and the absence of ``retrievalEndpoint`` — because there is NO
+``denial_reason`` and the absence of ``retrieval_endpoint`` — because there is NO
 public transaction-read RPC by design
 and the e2e runner cannot reach the Exchange's repo in a separate process
 (Testing Doctrine §9): the strongest side-effect-absence observable through the
@@ -42,14 +42,15 @@ denial.go, NOT a weakening): on the items[] batch path the Exchange CLASSIFIES a
 tampered offer as a PER-ITEM denial (``verifyPresentedOffer`` →
 ``ErrOfferSignatureInvalid`` → ``KindSignatureInvalid`` → ``denialReasonByKind``)
 rather than aborting the envelope with a Connect error. So a 1-item tampered
-request now surfaces HTTP 200 with ``items[0].denialReason ==
-DENIAL_REASON_SIGNATURE_INVALID`` and no ``items[0].retrievalEndpoint`` — the
+request now surfaces HTTP 200 with ``items[0].denial_reason ==
+DENIAL_REASON_SIGNATURE_INVALID`` and no ``items[0].retrieval_endpoint`` — the
 rejection moved from the transport layer to the per-item layer (doctrine pt10
 honoured: it still rejects). The wire enum VALUE is full SCREAMING_SNAKE (the
-handler codec emits ``EmitUnpopulated`` protojson with no ``UseEnumNumbers`` /
-``UseProtoNames``; field NAMES stay camelCase). Unlike the pre-C2 single-offer
+handler codec emits ``EmitUnpopulated`` protojson with no ``UseEnumNumbers``,
+and it sets ``UseProtoNames``, so field NAMES are snake_case). Unlike the
+pre-C2 single-offer
 path the denial reason is now directly wire-observable, so the assertion pins
-the typed ``denialReason`` rather than the coarse Connect ``code``.
+the typed ``denial_reason`` rather than the coarse Connect ``code``.
 
 Expiry scope (SCOPING DECISION)
 -------------------------------------------
@@ -57,7 +58,7 @@ A genuinely-signed-but-stale offer (→ ``DENIAL_REASON_OFFER_EXPIRED``) is NOT
 e2e-producible: the harness holds no Exchange offer-signing key and the
 production Exchange clock has no override (hard-coded 5m OfferTTL). That case is
 covered by the Go integration ``TestExecuteTransaction_ExpiredOfferRejected``.
-Here, expiry is exercised via a TAMPERED ``expiresAt`` (set to a past instant),
+Here, expiry is exercised via a TAMPERED ``expires_at`` (set to a past instant),
 which the discovered offer's signature does NOT cover → rejected. The denial
 reason for a tampered field is ``SIGNATURE_INVALID`` (the signature check fires
 independently of the freshness check), surfacing as Connect ``unauthenticated``.
@@ -66,9 +67,9 @@ Denial-reason note
 ------------------
 On the items[] batch path the canonical ``DenialReason`` rides
 as a typed field on the per-item ``TransactionResultItem`` (``buildBatchResultItem``),
-emitted directly on the wire as ``items[0].denialReason`` (full SCREAMING_SNAKE
-enum value). So the wire-observable assertion is the typed ``denialReason ==
-DENIAL_REASON_SIGNATURE_INVALID`` plus the absent ``items[0].retrievalEndpoint``
+emitted directly on the wire as ``items[0].denial_reason`` (full SCREAMING_SNAKE
+enum value). So the wire-observable assertion is the typed ``denial_reason ==
+DENIAL_REASON_SIGNATURE_INVALID`` plus the absent ``items[0].retrieval_endpoint``
 — a stronger, fine-grained contract than the pre-C2 single-offer path, where the
 reason rode as an undecodable base64 ``ErrorDetail`` on a Connect error and only
 the coarse ``code`` was wire-observable.
@@ -93,8 +94,8 @@ pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 
 # The per-item denial reason a tampered offer produces on the items[] batch
 # path (KindSignatureInvalid → denialReasonByKind). SCREAMING_SNAKE: the handler
-# codec serializes enum VALUES as their full proto names (field NAMES stay
-# camelCase).
+# codec serializes enum VALUES as their full proto names, and field NAMES are
+# snake_case for the same reason — the codec sets UseProtoNames.
 _SIGNATURE_INVALID = "DENIAL_REASON_SIGNATURE_INVALID"
 
 # The priced PER_UNIT demo resource (wooden-door-creak, 0.25 USD) — the only
@@ -109,8 +110,8 @@ def _assert_tamper_denied(resp: httpx.Response, *, what: str) -> None:
 
     On the items[] batch path a tampered offer classifies as an
     in-body per-item denial (KindSignatureInvalid), not a Connect envelope error.
-    So the public-surface rejection is HTTP 200 + ``items[0].denialReason ==
-    DENIAL_REASON_SIGNATURE_INVALID`` + no ``items[0].retrievalEndpoint`` (no
+    So the public-surface rejection is HTTP 200 + ``items[0].denial_reason ==
+    DENIAL_REASON_SIGNATURE_INVALID`` + no ``items[0].retrieval_endpoint`` (no
     delivery side effect). ``what`` names the tampered field for the message.
     """
     assert resp.status_code == httpx.codes.OK, (
@@ -121,12 +122,12 @@ def _assert_tamper_denied(resp: httpx.Response, *, what: str) -> None:
     item = first_item_of(payload)
     assert item is not None, f"tamper response carried no items[0]: {payload!r}"
     assert item.get("denial_reason") == _SIGNATURE_INVALID, (
-        f"a tampered {what} must reject with items[0].denialReason == "
+        f"a tampered {what} must reject with items[0].denial_reason == "
         f"{_SIGNATURE_INVALID!r} (signature does not cover the presented bytes); "
         f"got {item.get('denial_reason')!r}, body={resp.text[:512]}"
     )
     assert retrieval_endpoint_of(item) is None, (
-        f"a rejected tamper must NOT issue items[0].retrievalEndpoint; body={resp.text[:512]}"
+        f"a rejected tamper must NOT issue items[0].retrieval_endpoint; body={resp.text[:512]}"
     )
 
 
@@ -138,7 +139,7 @@ def test_reflected_offer_redeems_and_delivers_content(
 
     Full discover→reflect→execute protocol round-trip on the Exchange RPC, then a
     delivery round-trip fetching the signed URL through the edge. Asserts a
-    non-empty transactionId, a non-empty retrievalEndpoint, the signed unit cost,
+    non-empty transaction_id, a non-empty retrieval_endpoint, the signed unit cost,
     and that the edge delivers real bytes.
     """
     offer = discover_first_offer(
@@ -162,15 +163,15 @@ def test_reflected_offer_redeems_and_delivers_content(
     payload: dict[str, Any] = resp.json()
 
     # The EXECUTE response is an items[] envelope — read the
-    # per-result fields (transactionId, retrievalEndpoint, cost) from items[0].
+    # per-result fields (transaction_id, retrieval_endpoint, cost) from items[0].
     item = first_item_of(payload)
     assert item is not None, f"accepted transaction carried no items[0]: {payload!r}"
     transaction_id = item.get("transaction_id")
     assert isinstance(transaction_id, str) and transaction_id, (
-        f"accepted transaction must carry a non-empty items[0].transactionId; got {payload!r}"
+        f"accepted transaction must carry a non-empty items[0].transaction_id; got {payload!r}"
     )
     signed_url = retrieval_endpoint_of(item)
-    assert signed_url, f"accepted transaction returned no items[0].retrievalEndpoint: {payload!r}"
+    assert signed_url, f"accepted transaction returned no items[0].retrieval_endpoint: {payload!r}"
 
     # The charged unit cost equals the SIGNED rate (the agent pays what it signed).
     # Money-as-string: Money.amount/unit_cost serialize as decimal
@@ -195,8 +196,8 @@ def test_tampered_price_on_reflected_offer_is_rejected(
     signed ``pricing.rate`` is mutated BEFORE signing+sending, so the genuine
     Exchange signature (over the original bytes) no longer covers the presented
     bytes. C2: on the items[] path this is an in-body per-item denial — asserts
-    HTTP 200 + ``items[0].denialReason == DENIAL_REASON_SIGNATURE_INVALID`` AND
-    that NO ``items[0].retrievalEndpoint`` is returned (no delivery side effect).
+    HTTP 200 + ``items[0].denial_reason == DENIAL_REASON_SIGNATURE_INVALID`` AND
+    that NO ``items[0].retrieval_endpoint`` is returned (no delivery side effect).
     """
     offer = discover_first_offer(
         compose_stack.exchange_c,
@@ -230,15 +231,15 @@ def test_tampered_expires_at_on_reflected_offer_is_rejected(
     compose_stack: StackURLs,
     seeded: SeededFixture,  # noqa: ARG001 — ordering: seed ingests the demo catalog
 ) -> None:
-    """TAMPERED EXPIRY: mutate offer.expiresAt after discovery → rejected, no URL.
+    """TAMPERED EXPIRY: mutate offer.expires_at after discovery → rejected, no URL.
 
     Full discover→reflect→execute protocol round-trip. The reflected offer's
-    signed ``expiresAt`` is set to a PAST instant the Exchange never signed; the
+    signed ``expires_at`` is set to a PAST instant the Exchange never signed; the
     signature does not cover the mutated expiry, so the offer is rejected on
     signature grounds — independent of the freshness check. C2: on the items[]
     path this is an in-body per-item denial — asserts HTTP 200 +
-    ``items[0].denialReason == DENIAL_REASON_SIGNATURE_INVALID`` AND the absent
-    ``items[0].retrievalEndpoint``.
+    ``items[0].denial_reason == DENIAL_REASON_SIGNATURE_INVALID`` AND the absent
+    ``items[0].retrieval_endpoint``.
 
     A genuinely-signed-but-stale offer (→ OFFER_EXPIRED) is NOT e2e-producible
     (no exchange offer key in the harness, no clock override); that case is
@@ -254,7 +255,7 @@ def test_tampered_expires_at_on_reflected_offer_is_rejected(
 
     def _expire_in_the_past(presented: dict[str, Any]) -> None:
         assert presented.get("expires_at"), (
-            f"discovered offer must carry expiresAt to tamper; got {presented!r}"
+            f"discovered offer must carry expires_at to tamper; got {presented!r}"
         )
         # An instant the Exchange never signed (and which is also strictly past).
         presented["expires_at"] = "2000-01-01T00:00:00Z"
@@ -268,4 +269,4 @@ def test_tampered_expires_at_on_reflected_offer_is_rejected(
         mutate=_expire_in_the_past,
     )
 
-    _assert_tamper_denied(resp, what="offer.expiresAt")
+    _assert_tamper_denied(resp, what="offer.expires_at")

@@ -6,16 +6,35 @@
 #   docker build -f Dockerfile.miniflare -t ramp/edge-miniflare:dev .
 
 FROM node:22-slim AS builder
-# @ramp-protocol/sdk-l1 is a git dependency (git+https://…/protocol#<sha>),
-# resolved off-commit like the Go/pip pins — `npm ci` clones it, so no sibling
-# checkout is mirrored in and any shallow workdir works. The slim base ships no
-# git binary; install it for the clone.
+# @ramp-protocol/sdk-l1 is pinned by full commit SHA on GitHub
+# (git+https://…/protocol#<sha>), resolved off-commit like the Go and Python pins,
+# so no sibling checkout is mirrored in and any shallow workdir works.
+#
+# npm does NOT clone it. For a GitHub-hosted spec pinned to a SHA it fetches
+# https://codeload.github.com/RAMP-Protocol/protocol/tar.gz/<sha> over plain
+# HTTPS. Confirmed by building this stage with no git binary present at all: the
+# install completes and the log carries that codeload fetch. A clone is pacote's
+# FALLBACK, taken only when the tarball fetch fails.
+#
+# git is installed for that fallback, and for nothing else. Removing it makes the
+# normal path work and the fallback fail — weeks later, on a machine nobody is
+# sitting at.
 WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
-RUN npm ci --include=dev
+# Persist npm's download cache across builds. The codeload response above lands
+# in it along with every registry tarball this step downloads; npm caches no
+# clones at all, which is the other reason the fallback is slow. The mount lives
+# with the builder, so nothing here reaches a layer.
+#
+# id, because BuildKit otherwise names a cache mount after its target: all three
+# npm mounts in this stack would be ONE cache, and sharing=locked would then make
+# the second and third image wait for the first. Compose builds them
+# concurrently. Per image, each keeps a warm cache with a single writer.
+RUN --mount=type=cache,id=npm-edge-miniflare,target=/root/.npm,sharing=locked \
+    npm ci --include=dev
 COPY . .
 RUN node scripts/build-worker.mjs --out dist/worker.mjs
 

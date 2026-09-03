@@ -11,8 +11,6 @@ import (
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"google.golang.org/protobuf/encoding/protojson"
-
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 )
 
 // TestExecute_SignsAcceptanceAsTheCallerAndReturnsTheDeliveryURL is the ticket's
@@ -27,7 +25,7 @@ import (
 func TestExecute_SignsAcceptanceAsTheCallerAndReturnsTheDeliveryURL(t *testing.T) {
 	f := newFixture(t)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:               rampproto.Ver,
+		Ver:               helpers.ProtocolVersion,
 		AgentIdentityHash: "thumb-xyz",
 		Items: []*rampv1.TransactionResultItem{{
 			OfferId:           "offer-1",
@@ -35,7 +33,7 @@ func TestExecute_SignsAcceptanceAsTheCallerAndReturnsTheDeliveryURL(t *testing.T
 			RetrievalEndpoint: strPtr("https://edge.example/deliver?sig=abc&agent_id=thumb-xyz"),
 		}},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	out := callTool[executeResult](t, f.connect(t, a.Token), "ramp_execute", map[string]any{
 		"offers": []map[string]any{signedOffer("offer-1", "exchange.example")},
@@ -108,10 +106,10 @@ func assertRequesterIsCaller(t *testing.T, f *fixture, a agent) *rampv1.Requeste
 func TestExecute_BatchOfOneIsNotSpecialCased(t *testing.T) {
 	f := newFixture(t)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:   rampproto.Ver,
+		Ver:   helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{{OfferId: "solo", TransactionId: "tx-solo"}},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	callTool[executeResult](t, f.connect(t, a.Token), "ramp_execute", map[string]any{
 		"offers": []map[string]any{signedOffer("solo", "exchange.example")},
@@ -134,10 +132,10 @@ func TestExecute_BatchOfOneIsNotSpecialCased(t *testing.T) {
 func TestExecute_CallerIdempotencyKeyReachesRelay(t *testing.T) {
 	f := newFixture(t)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:   rampproto.Ver,
+		Ver:   helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{{OfferId: "offer-1", TransactionId: "tx-1"}},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	callTool[executeResult](t, f.connect(t, a.Token), "ramp_execute", map[string]any{
 		"offers":          []map[string]any{signedOffer("offer-1", "exchange.example")},
@@ -156,10 +154,10 @@ func TestExecute_CallerIdempotencyKeyReachesRelay(t *testing.T) {
 func TestExecute_OmittedIdempotencyKeyIsMinted(t *testing.T) {
 	f := newFixture(t)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:   rampproto.Ver,
+		Ver:   helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{{OfferId: "offer-1", TransactionId: "tx-1"}},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	callTool[executeResult](t, f.connect(t, a.Token), "ramp_execute", map[string]any{
 		"offers": []map[string]any{signedOffer("offer-1", "exchange.example")},
@@ -178,13 +176,13 @@ func TestExecute_PerItemDenialIsCarriedNotErrored(t *testing.T) {
 	f := newFixture(t)
 	denied := rampv1.DenialReason_DENIAL_REASON_OFFER_EXPIRED
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{{
 			OfferId:      "offer-1",
 			DenialReason: &denied,
 		}},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	out := callTool[executeResult](t, f.connect(t, a.Token), "ramp_execute", map[string]any{
 		"offers": []map[string]any{signedOffer("offer-1", "exchange.example")},
@@ -214,13 +212,13 @@ func TestExecute_WholeRequestRefusalSurfacesTypedReason(t *testing.T) {
 			},
 		},
 	}
-	body, err := protojson.Marshal(denial)
+	body, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(denial)
 	if err != nil {
 		t.Fatalf("marshal ErrorDetail: %v", err)
 	}
 	f.broker.relayErrStatus = 403
 	f.broker.relayErrBody = body
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	msg := callToolErr(t, f.connect(t, a.Token), "ramp_execute", map[string]any{
 		"offers": []map[string]any{signedOffer("offer-1", "exchange.example")},
@@ -235,7 +233,7 @@ func TestExecute_WholeRequestRefusalSurfacesTypedReason(t *testing.T) {
 // signature is refused locally — there is nothing to accept — and nothing is sent.
 func TestExecute_RejectsAnUnsignedOfferBeforeAnyRelayCall(t *testing.T) {
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	unsigned := signedOffer("offer-1", "exchange.example")
 	delete(unsigned, "signature")
@@ -247,7 +245,9 @@ func TestExecute_RejectsAnUnsignedOfferBeforeAnyRelayCall(t *testing.T) {
 	if !strings.Contains(msg, "unsigned") {
 		t.Errorf("tool error %q, want it to name the unsigned offer", msg)
 	}
-	if len(f.broker.Calls()) != 0 {
+	// The broad count, not Calls(): a request the relay's signature gate refused
+	// still left this process, and Calls() cannot see one.
+	if f.broker.HTTPRequests() != 0 {
 		t.Error("an unsigned offer still reached the relay")
 	}
 }
@@ -255,7 +255,7 @@ func TestExecute_RejectsAnUnsignedOfferBeforeAnyRelayCall(t *testing.T) {
 // TestExecute_RequiresAtLeastOneOffer rejects an empty batch before any call.
 func TestExecute_RequiresAtLeastOneOffer(t *testing.T) {
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	msg := callToolErr(t, f.connect(t, a.Token), "ramp_execute", map[string]any{
 		"offers": []map[string]any{},
@@ -264,7 +264,7 @@ func TestExecute_RequiresAtLeastOneOffer(t *testing.T) {
 	if !strings.Contains(msg, "offer") {
 		t.Errorf("tool error %q, want it to mention the missing offers", msg)
 	}
-	if len(f.broker.Calls()) != 0 {
+	if f.broker.HTTPRequests() != 0 {
 		t.Error("an empty execute still reached the relay")
 	}
 }
@@ -273,15 +273,9 @@ func TestExecute_RequiresAtLeastOneOffer(t *testing.T) {
 // transaction_id execute hands back is the one report sends, so a purchase can be
 // reported without the agent inventing identifiers.
 func TestExecute_ReportsUsingTheReturnedTransaction(t *testing.T) {
-	// The SDK guard is two independent flags: SKIP_SSRF drops the dial-time
-	// address guard so the httptest loopback origin is reachable, and
-	// ALLOW_INSECURE permits its plaintext http scheme.
-	t.Setenv("SKIP_SSRF", "1")
-	t.Setenv("ALLOW_INSECURE", "1")
-
 	f := newFixture(t)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{{
 			OfferId:           "offer-1",
 			TransactionId:     "tx-99",
@@ -289,8 +283,8 @@ func TestExecute_ReportsUsingTheReturnedTransaction(t *testing.T) {
 			RetrievalEndpoint: strPtr("https://edge.example/deliver?sig=abc"),
 		}},
 	}
-	f.issuer.reportResp = &rampv1.UsageReportResponse{Ver: rampproto.Ver, ReportId: "rep-99"}
-	a := f.provision(t, "dev-one", acmeDetails)
+	f.issuer.reportResp = &rampv1.UsageReportResponse{Ver: helpers.ProtocolVersion, ReportId: "rep-99"}
+	a := f.provision(t, "dev-one")
 	session := f.connect(t, a.Token)
 
 	exec := callTool[executeResult](t, session, "ramp_execute", map[string]any{
@@ -302,7 +296,7 @@ func TestExecute_ReportsUsingTheReturnedTransaction(t *testing.T) {
 	}
 
 	report := callTool[reportResult](t, session, "ramp_report", map[string]any{
-		"exchange":        hostOf(t, f.issuer.URL()),
+		"exchange":        f.issuer.Domain(t),
 		"transaction_id":  txID,
 		"idempotency_key": "idem-report-1",
 	})
@@ -322,14 +316,8 @@ func TestExecute_ReportsUsingTheReturnedTransaction(t *testing.T) {
 // transaction id) to any public host it names. The control lives in rampclient; this
 // proves ramp_report wires it, so deleting the refusal fails here rather than passing.
 func TestReport_RefusesEndpointOnAnotherHost(t *testing.T) {
-	// The SDK guard is two independent flags: SKIP_SSRF drops the dial-time
-	// address guard so the httptest loopback origin is reachable, and
-	// ALLOW_INSECURE permits its plaintext http scheme.
-	t.Setenv("SKIP_SSRF", "1")
-	t.Setenv("ALLOW_INSECURE", "1")
-
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	// A second, unrelated host the manifest will try to redirect the report to.
 	elsewhere := newRAMPPeer(t, f.trust)
@@ -338,7 +326,7 @@ func TestReport_RefusesEndpointOnAnotherHost(t *testing.T) {
 	f.issuer.setManifestEndpoint(elsewhere.URL())
 
 	msg := callToolErr(t, f.connect(t, a.Token), "ramp_report", map[string]any{
-		"exchange":        hostOf(t, f.issuer.URL()),
+		"exchange":        f.issuer.Domain(t),
 		"transaction_id":  "tx-1",
 		"idempotency_key": "idem-report-1",
 	})
@@ -347,11 +335,16 @@ func TestReport_RefusesEndpointOnAnotherHost(t *testing.T) {
 		t.Errorf("tool error %q, want it to name the host-anchoring refusal", msg)
 	}
 	// The redirect target received nothing — no signed report leaked to the
-	// unrelated host.
-	if n := len(elsewhere.Calls()); n != 0 {
-		t.Errorf("the redirect-target host received %d calls; a refused report must reach no one", n)
+	// unrelated host. Counted on ANY path: a request that fails the peer's
+	// signature gate, or lands somewhere its mux does not serve, increments no
+	// per-RPC counter and still arrived.
+	if n := elsewhere.HTTPRequests(); n != 0 {
+		t.Errorf("the redirect-target host received %d requests; a refused report must reach no one", n)
 	}
-	// And the addressed Exchange got no report either: the refusal is before the send.
+	// And the addressed Exchange got no report either: the refusal is before the
+	// send. Counted per-RPC rather than per-request here, deliberately — this peer
+	// SERVES the manifest the resolver read, so a broad request count is expected
+	// to be non-zero and would say nothing about whether a report was sent.
 	if n := len(f.issuer.Calls()); n != 0 {
 		t.Errorf("the addressed Exchange received %d calls; the report was refused before sending", n)
 	}
@@ -362,18 +355,19 @@ func TestReport_RefusesEndpointOnAnotherHost(t *testing.T) {
 // acceptance over that item's OWN offer; at n=1 that loop is indistinguishable from
 // one that signs every item over items[0] or drops the tail. With two distinct
 // offers, a correct acceptance verifies against its own offer and MUST fail against
-// the sibling's — which catches a reused signature or a dropped item — and the two
-// must be relayed in submission order, since results map to offers by position.
+// the sibling's — which catches a reused signature or a dropped item. The relayed
+// request also preserves submission order; results correlate back to offers by
+// each result item's offer_id.
 func TestExecute_BatchSignsEachAcceptanceOverItsOwnOffer(t *testing.T) {
 	f := newFixture(t)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{
 			{OfferId: "offer-1", TransactionId: "tx-1"},
 			{OfferId: "offer-2", TransactionId: "tx-2"},
 		},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	callTool[executeResult](t, f.connect(t, a.Token), "ramp_execute", map[string]any{
 		"offers": []map[string]any{

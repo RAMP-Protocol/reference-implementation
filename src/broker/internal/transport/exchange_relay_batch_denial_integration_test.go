@@ -38,7 +38,7 @@ func resultsByOfferID(items []*rampv1.TransactionResultItem) map[string]*rampv1.
 func TestExchangeRelay_BatchWholeGroupFailureSynthesisesDenials(t *testing.T) {
 	env := newRelayTestEnv(t)
 	env.mockExch.signedURL = "https://cdn.example/signed?from=ex1"
-	mock2, exchange2Dom := registerSecondExchange(t, env)
+	mock2, _, exchange2Dom := registerSecondExchange(t, env)
 	// Exchange #2's entire fan-out call fails at the transport layer.
 	mock2.failExecute = true
 

@@ -29,6 +29,8 @@ import re
 import uuid
 
 import httpx
+import pytest
+from ramp_sdk.client import CallError
 
 from .broker_client import execute_first_offer
 from .catalog_push import (
@@ -42,11 +44,14 @@ from .catalog_push import (
     restriction,
 )
 from .conftest import StackURLs
+from .discovery import discoverable
 from .edge_fetch import fetch_signed
 from .resolve_carriers import first_item_of, licensed_of, retrieval_endpoint_of
 from .seed import (
     CONTRIBUTOR_KEY_PATH,
     DEMO_PHILOSOPHY_DOMAIN,
+    USD_AGENT_ID,
+    USD_AGENT_KEY_PATH,
     SeededFixture,
 )
 
@@ -104,8 +109,8 @@ def test_push_invalid_term_rejects_whole_batch(
     good_path = f"/articles/probe/good-{uuid.uuid4().hex}.txt"
     solo_path = f"/articles/probe/solo-{uuid.uuid4().hex}.txt"
 
-    # SUCCESS leg: the good entry pushed ALONE is accepted (strict=True asserts
-    # accepted == len(entries)), proving it is well-formed — so the batch
+    # SUCCESS leg: the good entry pushed ALONE is accepted (push_catalog raises
+    # unless accepted == len(entries)), proving it is well-formed — so the batch
     # rejection below is caused by the bad sibling, not the good entry.
     push_catalog(
         exchange_url=compose_stack.exchange,
@@ -119,11 +124,10 @@ def test_push_invalid_term_rejects_whole_batch(
             ),
         ],
         key_path=CONTRIBUTOR_KEY_PATH,
-        strict=True,
     )
 
     # FAILURE leg: the same shape of good entry + an invalid sibling → whole push rejected.
-    try:
+    with pytest.raises(CallError) as caught:
         push_catalog(
             exchange_url=compose_stack.exchange,
             tenant_id="tenant-demo-philosophy",
@@ -154,12 +158,34 @@ def test_push_invalid_term_rejects_whole_batch(
                 ),
             ],
             key_path=CONTRIBUTOR_KEY_PATH,
-            strict=False,
         )
-    except RuntimeError as exc:
-        assert "scope_license" in str(exc) or "invalid_argument" in str(exc), exc
-    else:
-        raise AssertionError("expected whole-batch rejection (400), push succeeded")
+    # The SDK's typed refusal: HTTP 400 with the Connect code as the reason, and
+    # the protovalidate message naming the rule (its id and text both carry
+    # ``scope_license``).
+    exc = caught.value
+    assert exc.status == httpx.codes.BAD_REQUEST, exc
+    assert exc.reason == "invalid_argument", exc
+    assert "scope_license" in str(exc), exc
+
+    # The all-or-nothing half, and the reason this test exists. The refusal
+    # status alone would hold for a server that stored the valid sibling and
+    # reported the invalid one, which is precisely the partial acceptance the
+    # docstring says cannot happen. Read the good entry back through the public
+    # discovery RPC and require it absent.
+    # The stored URI carries the scheme the deployment configures, which is
+    # http here — the same spelling every other read-back in this suite uses.
+    good_uri = f"http://{DEMO_PHILOSOPHY_DOMAIN}{good_path}"
+    assert not discoverable(
+        compose_stack.exchange, good_uri, agent_id=USD_AGENT_ID, key_path=USD_AGENT_KEY_PATH
+    ), f"the valid sibling {good_uri!r} was stored despite the batch being refused"
+
+    # The control: the same entry shape pushed alone IS discoverable, so the
+    # assertion above reflects the batch refusal rather than a read that finds
+    # nothing whatever it is given.
+    solo_uri = f"http://{DEMO_PHILOSOPHY_DOMAIN}{solo_path}"
+    assert discoverable(
+        compose_stack.exchange, solo_uri, agent_id=USD_AGENT_ID, key_path=USD_AGENT_KEY_PATH
+    ), f"the solo entry {solo_uri!r} is not discoverable, so the read leg proves nothing"
 
 
 def test_push_warning_unknown_vocab_accepted(
@@ -168,7 +194,7 @@ def test_push_warning_unknown_vocab_accepted(
 ) -> None:
     """An unknown vocab token is surfaced in warnings[] but the term is accepted."""
     warn_path = f"/articles/probe/warn-{uuid.uuid4().hex}.txt"
-    payload = push_catalog(
+    response = push_catalog(
         exchange_url=compose_stack.exchange,
         tenant_id="tenant-demo-philosophy",
         entries=[
@@ -193,13 +219,13 @@ def test_push_warning_unknown_vocab_accepted(
             ),
         ],
         key_path=CONTRIBUTOR_KEY_PATH,
-        strict=False,
     )
-    assert payload.get("accepted", 0) == 1, payload
-    assert payload.get("rejected", 0) == 0, payload
-    warnings = payload.get("warnings") or []
+    # Accepted whole: a refusal is a non-200 error the SDK raises before this
+    # line, and the reference Exchange never sets ``rejected``.
+    assert response.accepted == 1, response
+    warnings = response.warnings or []
     assert any("totally-made-up-use" in w for w in warnings), (
-        f"expected warnings[] to name the unregistered token, got {payload}"
+        f"expected warnings[] to name the unregistered token, got {response!r}"
     )
 
 

@@ -39,6 +39,7 @@ import httpx
 import pytest
 from .conftest import StackURLs
 from .discovery import DISCOVER_PATH, discover_body
+from .exchanges import recipient_of
 from .httpsig_signer import key_thumbprint, load_keypair
 from .constants import REVOCATION_PATH, WBA_DIRECTORY_PATH
 from .signing import sign_post
@@ -141,7 +142,11 @@ def _probe(exchange_url: str, agent_id: str) -> httpx.Response:
     """
     return sign_post(
         f"{exchange_url}{DISCOVER_PATH}",
-        body=discover_body(uris=[_PROBE_URI], agent_id=agent_id),
+        body=discover_body(
+            uris=[_PROBE_URI],
+            agent_id=agent_id,
+            exchange=recipient_of(exchange_url),
+        ),
         key_path=_THROWAWAY_KEY_PATH,
     )
 

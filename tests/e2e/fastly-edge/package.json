@@ -10,7 +10,7 @@
     "@fastly/js-compute": "^3.33.0",
     "@noble/ed25519": "^2.2.3",
     "@noble/hashes": "^1.6.1",
-    "@ramp-protocol/sdk-l1": "git+https://github.com/RAMP-Protocol/protocol.git#104d867aa9a15a316723af6c3dd61d73ed490363",
+    "@ramp-protocol/sdk-l1": "git+https://github.com/RAMP-Protocol/protocol.git#5a2674e6617202a792a8e57362fce32cb5d2db7e",
     "@ramp/edge": "file:../../../src/edge",
     "hono": "^4.7.0",
     "zod": "^3.24.0"

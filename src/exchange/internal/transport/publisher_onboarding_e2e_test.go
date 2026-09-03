@@ -95,9 +95,7 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 		{Domain: publisherDomain, Path: "/articles/three", Terms: []*rampv1.LicenseTerm{seedPricedTermEst(1)}},
 	}
 	pushResp, err := h.signedCat(publisherDomain, pubPriv).PushResources(h.ctx,
-		connect.NewRequest(&rampv1.PushResourcesRequest{
-			TenantId: publisherTenantID, CallerId: publisherDomain, Entries: entries,
-		}))
+		connect.NewRequest(newPushRequest(publisherTenantID, publisherDomain, entries)))
 	if err != nil {
 		t.Fatalf("PushResources: %v", err)
 	}
@@ -117,7 +115,7 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agent keypair: %v", err)
 	}
-	h.publishAgentOrigin(t, agentID, agentPub)
+	h.publishAgent(t, agentID, agentPub)
 	registerAgentViaPublicEndpoint(t, h, agentID)
 	// Directory registration does not mint a billing_ref; a paid transaction needs
 	// one, so billing-register the agent through the public Register RPC.
@@ -128,13 +126,7 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 	for i, e := range entries {
 		uris[i] = "https://" + e.GetDomain() + e.GetPath()
 	}
-	discResp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver: "1.0", Uris: uris,
-		Requester: &rampv1.Requester{
-			Id: agentID, Domain: agentID,
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	discResp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(newRequester(agentID, agentID), uris)))
 	if err != nil {
 		t.Fatalf("DiscoverResources: %v", err)
 	}
@@ -161,9 +153,9 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 	// transport client is needed here.
 	first := offers[0]
 	execTxID := "tx-" + uuid.NewString()
-	execReqr := &rampv1.Requester{Id: agentID, Domain: agentID, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT}
+	execReqr := newRequester(agentID, agentID)
 	execResp, err := h.exchange.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", IdempotencyKey: execTxID,
+		Ver: helpers.ProtocolVersion, IdempotencyKey: execTxID,
 		Requester: execReqr,
 		// R4: body acceptance signed by the registered agent key.
 		Items: []*rampv1.TransactionItem{
@@ -184,12 +176,7 @@ func TestPublisherOnboarding_HappyPath(t *testing.T) {
 	}
 
 	// Step 9: report usage → accepted=true.
-	repResp, err := h.exchange.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-" + uuid.NewString(),
-		TransactionId: item.GetTransactionId(),
-		BillingId:     item.GetBillingId(),
-		Usage:         &rampv1.Usage{ConsumedQuantity: 1, Function: []string{"ai_input"}},
-	}))
+	repResp, err := h.exchange.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-"+uuid.NewString(), item.GetTransactionId(), item.GetBillingId(), &rampv1.Usage{ConsumedQuantity: 1, Function: []string{"ai_input"}})))
 	if err != nil {
 		t.Fatalf("ReportUsage: %v", err)
 	}
@@ -216,7 +203,6 @@ func insertCloudFrontTenant(t *testing.T, h *pushHarness, tenantID, domain strin
 	if _, err := h.queries.InsertTenant(h.ctx, sqlc.InsertTenantParams{
 		TenantID:            tenantID,
 		Domain:              domain,
-		HmacSecretRef:       "unused",
 		Ed25519KeyRef:       "secret://ed25519/" + tenantID,
 		ReportingPolicy:     []byte(`{}`),
 		SigningScheme:       sqlc.RampSigningSchemeAWSCLOUDFRONTRSA,

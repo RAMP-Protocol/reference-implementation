@@ -16,8 +16,10 @@ import (
 	"time"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 )
@@ -59,6 +61,34 @@ type Config struct {
 	BaseCurrency        string
 	SupportedProfiles   []string
 	MaxIntermediaryHops *int32
+
+	// TermsURI is the terms of service document this participant serves, and
+	// TermsDigest pins WHICH revision of it, written as the hash method, a
+	// colon, then lowercase hex — "sha256:" and 64 characters, "sha384:" and
+	// 96, or "sha512:" and 128. A URL alone cannot answer which revision was
+	// agreed: its content changes, so after the first revision every earlier
+	// registration points at a document that no longer says what was agreed. A
+	// digest without a URI is a configuration error and the protocol's
+	// protovalidate rules refuse it, because a digest of a document with no
+	// address cannot be checked against anything. The digest's own shape is
+	// refused there too; the embedded JSON schema types both members as plain
+	// strings and states neither rule.
+	TermsURI    string
+	TermsDigest string
+
+	// RegistrationDataSchema is the JSON Schema describing the
+	// registration_data object an Exchange expects on Register. The protocol
+	// makes publishing it the enforcement switch: an Exchange that serves one
+	// has committed to validating registration_data against it and refusing a
+	// non-conforming payload, and one that serves none passes the payload
+	// through uninspected.
+	//
+	// It is the schema itself rather than a whole account_registration block
+	// because the block's presence follows from the schema's: a caller cannot
+	// publish an empty block, and the wire says "this Exchange inspects
+	// nothing" exactly one way. A later registration mode gains its own field
+	// here and joins the same block.
+	RegistrationDataSchema *structpb.Struct
 }
 
 // WBAConfig describes a WBA directory to build. Keys is required (a directory
@@ -77,6 +107,14 @@ func Build(cfg Config) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The protocol's field and cross-field rules are stated once, in the proto,
+	// and run here on the assembled message. The embedded JSON schema below
+	// checks the wire shape the marshaled document must have; it deliberately
+	// does not restate a single protovalidate rule, because a rule written in
+	// two languages drifts and the drift is invisible from either side.
+	if err := helpers.Validate(m); err != nil {
+		return nil, fmt.Errorf("rampwellknown/server: manifest violates the protocol: %w", err)
+	}
 	raw, err := (protojson.MarshalOptions{UseProtoNames: true}).Marshal(m)
 	if err != nil {
 		return nil, fmt.Errorf("rampwellknown/server: marshal: %w", err)
@@ -90,6 +128,13 @@ func Build(cfg Config) ([]byte, error) {
 // BuildWBA assembles, marshals, and schema-validates the WBA directory for cfg,
 // returning the protojson bytes. A validation failure (e.g. no keys) is a
 // producer-side configuration error.
+//
+// Unlike Build it runs no protovalidate pass, and does not need one: neither
+// WBAFile nor the JsonWebKey it repeats carries a single buf.validate option in
+// the pinned protocol module, so there is no protocol rule for a producer to
+// violate. ParseWBA runs the pass anyway because it is shared with the manifest
+// path, which does have rules. If a later revision constrains either message,
+// this is where the produce side has to catch up.
 func BuildWBA(cfg WBAConfig) ([]byte, error) {
 	f := &rampwellknown.WBAFile{}
 	if cfg.Keys != nil {
@@ -152,6 +197,25 @@ func setOptional(m *rampwellknown.Manifest, cfg Config) {
 	}
 	m.SupportedProfiles = cfg.SupportedProfiles
 	m.MaxIntermediaryHops = cfg.MaxIntermediaryHops
+	setRegistration(m, cfg)
+}
+
+// setRegistration fills the terms-versioning fields and the account
+// registration block. The block is written only when a schema is configured,
+// so an Exchange that inspects nothing publishes no block at all rather than
+// an empty one.
+func setRegistration(m *rampwellknown.Manifest, cfg Config) {
+	if cfg.TermsURI != "" {
+		m.TermsUri = proto.String(cfg.TermsURI)
+	}
+	if cfg.TermsDigest != "" {
+		m.TermsDigest = proto.String(cfg.TermsDigest)
+	}
+	if cfg.RegistrationDataSchema != nil {
+		m.AccountRegistration = &rampv1.AccountRegistration{
+			DataSchema: cfg.RegistrationDataSchema,
+		}
+	}
 }
 
 // Handler serves one built discovery document (overlay manifest or WBA

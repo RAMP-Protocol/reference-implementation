@@ -78,6 +78,42 @@ The same is true from the other side: `IDENTITY_AUTH_ISSUER` on the Identity Ser
 determines the redirect address this provider must have on file, so changing that means
 updating the client here ([`RUNBOOK.md`](RUNBOOK.md) §3).
 
+### Outbound mail, and why it is also a first-start setting
+
+Self-registration sends a confirmation code, and Zitadel does not treat the account
+as usable until the code is entered. Without a mail provider that code is never
+delivered, so a developer who registers is stuck. If nobody self-registers — every
+account is created by an operator or arrives through an external provider such as
+Google, which vouches for the address — no mail provider is needed.
+
+A provider can be configured in two ways, and they behave differently:
+
+| Setting | Value | Why |
+|---|---|---|
+| `ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_HOST` | `host:port` | Dialled verbatim. There is no default port — a bare hostname fails at send time. |
+| `ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_USER` | Relay username | For Amazon SES, the IAM access key id of the sending user. |
+| `ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_PASSWORD` | Relay password | For SES, the region-derived SMTP password — **not** the raw secret access key. |
+| `ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_TLS` | `"true"` | STARTTLS. Off, the password crosses the network in the clear. |
+| `ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_FROM` | Sender address | Must be one the relay is allowed to send as. |
+| `ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_FROMNAME` | Display name | Shown next to the address. |
+
+**These are read only when Zitadel creates its instance on the first start**, the same
+`FirstInstance` step that creates the admin user. Setting or changing them on an
+instance that already exists does nothing at all: the provider is stored in Zitadel's
+database, and the environment is no longer consulted. This is the same trap as the
+external domain above, with one difference — a wrong mail setting is recoverable
+without losing data, because the stored provider can be edited afterwards.
+
+Editing the stored provider is the second way: Zitadel console → Default settings →
+Notifications → SMTP provider, or the Admin API's email-provider endpoints. That is
+how a running deployment changes relays or rotates a password. An edit made there
+does not travel back into the environment, so a later rebuild from empty storage
+starts from whatever the environment says.
+
+The address in `FROM` matters beyond Zitadel. A relay that pins the sender — SES does,
+when the credential's policy names the address — rejects any send whose `FROM` differs,
+and the failure appears as unsent mail rather than as a configuration error.
+
 ### The OIDC client
 
 The Identity Service's client is an ordinary confidential web application:

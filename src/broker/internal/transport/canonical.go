@@ -2,8 +2,8 @@ package transport
 
 import (
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/resolve"
 )
 
@@ -85,7 +85,7 @@ func toDiscoveryResponse(r *resolve.Response) *rampv1.DiscoveryResponse {
 	// (inside the signed offer bytes), so a relaying Broker cannot redirect
 	// execution without invalidating the signature.
 	out := &rampv1.DiscoveryResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 	}
 	// Typed absence_reason (proto field 16) is the SOLE refusal-cause surface
 	// (ADR-019 — the ramp.broker.absence_reason ext key is gone). It is

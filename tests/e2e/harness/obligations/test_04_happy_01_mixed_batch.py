@@ -21,6 +21,9 @@ import httpx
 import pytest
 
 from ramp_sdk.core import sign_offer_acceptance_jcs
+from ramp_sdk import ProtocolVersion
+from ..exchanges import recipient_of
+from ..discovery import discover_body
 from ..conftest import StackURLs
 from ..edge_fetch import fetch_signed
 from ..httpsig_signer import load_keypair, sign_request
@@ -67,18 +70,14 @@ def test_mixed_batch_groups_known_offers_and_not_in_catalog_reason(
     """Batch DiscoverResources returns per-URI offer groups for known + unseeded demo URIs."""
     unseeded_uri = f"http://{DEMO_PHILOSOPHY_DOMAIN}/articles/never-seeded-{uuid.uuid4().hex}.txt"
     discover_url = f"{compose_stack.exchange}{_DISCOVER_PATH}"
-    body: dict[str, object] = {
-        "ver": "1.0",
-        "id": f"q-{uuid.uuid4().hex[:8]}",
-        "requester": {
-            "id": EUR_AGENT_ID,
-            "domain": DEMO_PHILOSOPHY_DOMAIN,
-            "type": "REQUESTER_TYPE_AGENT",
-            "user_type": "academic",
-            "geography": "EU",
-        },
-        "uris": [_KNOWN_URI_A, _KNOWN_URI_B, unseeded_uri],
-    }
+    body: dict[str, object] = discover_body(
+        agent_id=EUR_AGENT_ID,
+        uris=[_KNOWN_URI_A, _KNOWN_URI_B, unseeded_uri],
+        exchange=recipient_of(discover_url),
+        domain=DEMO_PHILOSOPHY_DOMAIN,
+        user_type="academic",
+        geography="EU",
+    )
     resp = _post_signed_json(discover_url, body)
     assert resp.status_code == httpx.codes.OK, (
         f"signed batch DiscoverResources should succeed, got {resp.status_code}: {resp.text[:256]}"
@@ -140,7 +139,7 @@ def test_mixed_batch_groups_known_offers_and_not_in_catalog_reason(
     tx_resp = _post_signed_json(
         accept_url,
         {
-            "ver": "1.0",
+            "ver": ProtocolVersion,
             "idempotency_key": tx_request_id,
             "requester": {
                 "id": EUR_AGENT_ID,

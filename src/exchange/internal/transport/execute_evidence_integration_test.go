@@ -27,9 +27,12 @@ import (
 // Connect-Go RPCs (CatalogService.PushResources → ExchangeService.
 // DiscoverResources → ExchangeService.ExecuteTransaction); the read-back stops
 // at the production repository surface (repo.EvidenceRepo) — the documented
-// Testing-Doctrine §9 tier-2 fallback, since no evidence-read RPC exists. Whether
-// one should exist, and on which surface, is an open decision filed and linked
-// from this ticket. No raw sqlc / SQL / second DB connection. The signature
+// Testing-Doctrine §9 tier-2 fallback. An evidence read does exist now, but it is
+// the operator plane's cross-tenant JSON endpoint on the internal listener, not
+// the public read surface the doctrine means. What this test asserts is that one
+// tenant's row was persisted under that tenant, and routing a tenant-scoped
+// assertion through a surface that ignores tenants would stop it proving that.
+// No raw sqlc / SQL / second DB connection. The signature
 // re-verification below runs entirely on the stored columns, which is exactly the
 // "no external state" guarantee the row exists to provide.
 
@@ -51,7 +54,7 @@ func TestExecuteTransaction_PersistsReVerifiableEvidence(t *testing.T) {
 	h := newTestHarness(t)
 
 	uri := seedResourceWithRate(t, h, "/articles/evidence", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const reqKey = "tx-evidence"
 	resp, err := executeSingleItem(t, h, reqKey, offer)
@@ -64,9 +67,8 @@ func TestExecuteTransaction_PersistsReVerifiableEvidence(t *testing.T) {
 	}
 	rec := evidenceFor(t, h, txID)
 
-	// offer_id is the signed Offer.offer_id. It equals the catalog resource_id
-	// (the Exchange mints and resolves offers on that key), so it duplicates
-	// transaction_log.offer_id — carried here so the row reads standalone.
+	// offer_id is the signed Offer.offer_id — the per-offer random UUID. It
+	// duplicates transaction_log.offer_id so the row reads standalone.
 	if rec.OfferID != offer.GetOfferId() {
 		t.Errorf("offer_id = %q, want the signed offer id %q", rec.OfferID, offer.GetOfferId())
 	}
@@ -194,10 +196,7 @@ func assertAcceptanceLegVerifies(t *testing.T, rec repo.EvidenceRecord) {
 		wantAlg: helpers.AcceptanceSignatureAlgorithm, sigHex: rec.AgentAcceptanceSignature,
 		key: rec.AgentPublicKey, signed: rec.AgentAcceptanceCanonicalBytes,
 	})
-	requester := &rampv1.Requester{
-		Id: rec.RequesterID, Domain: rec.RequesterDomain,
-		Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester(rec.RequesterID, rec.RequesterDomain)
 	reCanon, err := helpers.CanonicalAcceptanceBytes(storedOffer(t, rec), requester, rec.RequestIdempotencyKey)
 	if err != nil {
 		t.Fatalf("rebuild acceptance bytes from stored inputs: %v", err)
@@ -216,7 +215,7 @@ func assertAcceptanceLegVerifies(t *testing.T, rec repo.EvidenceRecord) {
 func TestExecuteTransaction_EvidenceAlgorithmLabelsAreServerDerived(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/evidence-alg", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 	offer.SignatureAlgorithm = "RS256-FORGED"
 
 	requester := agentRequester("agent-test")
@@ -258,7 +257,7 @@ func TestExecuteTransaction_EvidenceAlgorithmLabelsAreServerDerived(t *testing.T
 func TestExecuteTransaction_EvidenceEncodesAbsentDirectoryAsEmpty(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/evidence-no-directory", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	// Clear the caller's directory anchor, keeping its key so the identity↔key
 	// binding still holds and the execute still succeeds. The repository maps ""
@@ -327,7 +326,7 @@ func TestExecuteTransaction_EvidenceCorrelatesWithTheCallerVisibleRequestID(t *t
 	uri := seedResourceWithRate(t, h, "/articles/evidence-reqid", "0.05")
 
 	t.Run("caller-supplied id is the one persisted", func(t *testing.T) {
-		offer := discoverOfferForURI(t, h, uri)
+		offer := discoverOffer(t, h, uri)
 		const wantID = "caller-supplied-req-id"
 		resp, err := executeSingleItemWithRequestID(t, h, "tx-ev-reqid-given", offer, wantID)
 		if err != nil {
@@ -352,7 +351,7 @@ func TestExecuteTransaction_EvidenceCorrelatesWithTheCallerVisibleRequestID(t *t
 	// reach a server over the wire at all and are covered at the middleware instead.
 	// Length is the hostile property that does travel.
 	t.Run("a hostile header never reaches the column", func(t *testing.T) {
-		offer := discoverOfferForURI(t, h, uri)
+		offer := discoverOffer(t, h, uri)
 		hostile := strings.Repeat("A", 200) + " <script> ../../etc/passwd"
 		resp, err := executeSingleItemWithRequestID(t, h, "tx-ev-reqid-hostile", offer, hostile)
 		if err != nil {
@@ -371,7 +370,7 @@ func TestExecuteTransaction_EvidenceCorrelatesWithTheCallerVisibleRequestID(t *t
 	})
 
 	t.Run("minted id matches the one returned to the caller", func(t *testing.T) {
-		offer := discoverOfferForURI(t, h, uri)
+		offer := discoverOffer(t, h, uri)
 		const reqKey = "tx-ev-reqid-minted"
 		resp, err := executeSingleItem(t, h, reqKey, offer)
 		if err != nil {
@@ -417,8 +416,8 @@ func TestExecuteTransaction_PartiallyDeniedBatchEvidence(t *testing.T) {
 	h := newTestHarness(t)
 	uriA := seedResourceWithRate(t, h, "/articles/evidence-batch-a", "0.05")
 	uriB := seedResourceWithRate(t, h, "/articles/evidence-batch-b", "0.07")
-	offerA := discoverOfferForURI(t, h, uriA)
-	genuineB := discoverOfferForURI(t, h, uriB)
+	offerA := discoverOffer(t, h, uriA)
+	genuineB := discoverOffer(t, h, uriB)
 
 	// Mutate a signature-covered field on B after signing: B is denied
 	// SIGNATURE_INVALID while A commits normally.
@@ -430,7 +429,8 @@ func TestExecuteTransaction_PartiallyDeniedBatchEvidence(t *testing.T) {
 
 	requester := agentRequester("agent-test")
 	const reqKey = "tx-ev-partial"
-	resp, err := executeItems(t, h, reqKey,
+	resp, err := executeItems(
+		t, h, reqKey,
 		&rampv1.TransactionItem{Offer: offerA, AgentAcceptance: signAcceptanceFor(t, h.callerPriv, offerA, requester, reqKey)},
 		&rampv1.TransactionItem{Offer: tamperedB, AgentAcceptance: signAcceptanceFor(t, h.callerPriv, tamperedB, requester, reqKey)},
 	)

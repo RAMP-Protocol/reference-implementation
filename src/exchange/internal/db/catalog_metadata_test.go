@@ -5,6 +5,8 @@ package db_test
 import (
 	"context"
 	"testing"
+
+	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 )
 
 // TestCatalogMetadataMigration verifies the additive 000014 migration that adds
@@ -19,13 +21,12 @@ import (
 func TestCatalogMetadataMigration(t *testing.T) {
 	ctx := context.Background()
 	// Up to head — metadata added (000014).
-	dsn := migratedDSN(t, ctx)
+	dsn := sharedb.AcquireTestDSN(t, ctx, sharedPG)
 	if !hasColumn(t, ctx, dsn, "metadata") {
 		t.Fatal("after up: ramp.catalog is missing the metadata column")
 	}
 
-	m := migrator(t, dsn)
-	defer m.Close()
+	m := schemaProbe.Migrator(t, dsn)
 
 	// Migrate(13) reverses the 000014 ADD: the metadata column is removed.
 	if err := m.Migrate(13); err != nil {

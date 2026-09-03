@@ -20,6 +20,7 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/server"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/wellknownbuild"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/regschema"
 )
 
 // keyClockSkew backdates the published not_before so a verifier whose clock
@@ -55,6 +56,27 @@ type Config struct {
 	SupportedProfiles   []string
 	MaxIntermediaryHops *int32
 
+	// TermsURI is the terms of service document this Exchange serves and
+	// TermsDigest pins which revision of it, so a registration can state which
+	// document its operator accepted. The digest is published next to the URI
+	// rather than inside the registration block on purpose: an Exchange that
+	// inspects no registration data still needs to version its terms.
+	TermsURI    string
+	TermsDigest string
+
+	// RegistrationDataSchema is the schema this Exchange publishes as the
+	// registration_data shape it expects on Register. It is the loaded value the
+	// Register gate will check payloads against, which is what keeps the
+	// published schema and the enforced schema the same document. nil omits the
+	// block, which is the wire's way of saying this Exchange inspects nothing.
+	//
+	// The type is the loaded *regschema.Schema rather than a bare Struct on
+	// purpose. Only regschema.Load produces a usable one, so whatever reaches
+	// this field has been held to the protocol's rules for a published schema —
+	// a Struct here would have left that resting on the composition root
+	// passing the checked variable rather than an unchecked one.
+	RegistrationDataSchema *regschema.Schema
+
 	OfferKey    ed25519.PublicKey
 	Clock       clock.Clock
 	KeyLifetime time.Duration
@@ -86,9 +108,10 @@ func New(cfg Config) (server.Handlers, error) {
 		return server.Handlers{}, fmt.Errorf("wellknown: Config requires a Clock and a positive KeyLifetime")
 	}
 	// The Exchange WBA directory advertises no revocation_url: the offer-signing
-	// key is retired by rotation with a dual-key grace period (design-exchange
-	// §17), not by a keyed revocation list. Keyed revocation (ADR-003 §5) is the
-	// Broker's channel for the agent/relay kids it hosts, not the Exchange's.
+	// key is retired by rotation, publishing the old and the new key together
+	// for a grace period, rather than by a keyed revocation list. Keyed
+	// revocation (ADR-003 §5) is the Broker's channel for the agent and relay
+	// key ids it hosts, not the Exchange's.
 	return wellknownbuild.Build(wellknownbuild.Config{
 		Manifest: server.Config{
 			Role:                rampwellknown.RoleExchange,
@@ -98,6 +121,10 @@ func New(cfg Config) (server.Handlers, error) {
 			BaseCurrency:        cfg.BaseCurrency,
 			SupportedProfiles:   cfg.SupportedProfiles,
 			MaxIntermediaryHops: cfg.MaxIntermediaryHops,
+			TermsURI:            cfg.TermsURI,
+			TermsDigest:         cfg.TermsDigest,
+			// Document() is nil on a nil schema, which leaves the block absent.
+			RegistrationDataSchema: cfg.RegistrationDataSchema.Document(),
 		},
 		Keys: offerKeySource{key: cfg.OfferKey, clk: cfg.Clock, lifetime: cfg.KeyLifetime},
 	})

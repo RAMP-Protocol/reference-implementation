@@ -14,11 +14,11 @@ import (
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/regschema"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/sor"
@@ -31,9 +31,8 @@ type ExchangeConfig struct {
 	URLTTL       time.Duration // default 5m
 	ReportWindow time.Duration // default 24h
 	// SupportedProfiles is the Exchange's advertised extension-profile set (the
-	// same list published in WellKnownManifest.supported_profiles). It gates which
-	// profiles DiscoverResources will project and is the set tx-reconstruction
-	// retries for signature parity (ADR-014).
+	// same list published in WellKnownManifest.supported_profiles). It gates
+	// which profiles DiscoverResources will project (ADR-014).
 	SupportedProfiles []string
 	// DefaultTenantDomain names the single tenant a Register call reads its
 	// activate_new_agents_by_default policy from (ADR-021 §5 decision 1). The
@@ -43,6 +42,24 @@ type ExchangeConfig struct {
 	// (falling back to EXCHANGE_DOMAIN); handling per-publisher activation defaults
 	// is deferred past v1.
 	DefaultTenantDomain string
+	// LedgerCurrency is the deployment ledger currency (ISO 4217 alpha) the
+	// welcome-credit grant is denominated in. There is deliberately NO default:
+	// cmd/server threads the selected billing backend's currency here, and the
+	// billing gate rejects a Credit whose currency does not match the adapter's,
+	// so wiring that leaves this empty fails the first Register loudly. A
+	// default would substitute a plausible currency for missing wiring and
+	// misbook money instead.
+	LedgerCurrency string
+	// TermsDigest is the digest of the licensing terms this Exchange currently
+	// publishes — the SAME value the manifest serves as
+	// WellKnownManifest.terms_digest, threaded from the one place the operator's
+	// registration settings are read. Publishing a digest is what switches the
+	// Register terms gate on: a registration must then name this exact digest, and
+	// one that names a different digest or none is refused as stale. Empty means
+	// no terms are versioned, so a submitted digest is ignored and none is
+	// recorded — the behaviour every deployment had before terms versioning
+	// existed.
+	TermsDigest string
 }
 
 func (c ExchangeConfig) withDefaults() ExchangeConfig {
@@ -82,6 +99,15 @@ type ExchangeService struct {
 	// mints the candidate billing_ref the Exchange passes to the SoR (ADR-021 D2).
 	sor           sor.Adapter
 	billingRefGen BillingRefGen
+	// regSchema is the operator-configured registration schema the Register gate
+	// checks an incoming registration_data against. It is the SAME loaded value
+	// the manifest publishes, threaded in by the composition root; nil means no
+	// schema is configured, and every method on it is safe on nil, so the
+	// pass-through case needs no branch.
+	regSchema *regschema.Schema
+	// audit is the control-plane audit log. A first registration appends one row
+	// through it, in the same transaction as the account link it records.
+	audit repo.AuditRepo
 }
 
 // ExchangeDeps bundles the wiring dependencies.
@@ -94,10 +120,10 @@ type ExchangeDeps struct {
 	Tenants  repo.TenantReadRepo
 	Agents   repo.AgentRepo
 	// AgentReg drives ADR-009 D2 lazy registration: when resolveCaller meets
-	// a keyID with no ramp.agents row, the service pulls the caller's own
-	// /.well-known/ramp.json, verifies the key is published there, persists
-	// the row, and proceeds. nil disables lazy registration (an unknown keyID
-	// stays Unauthenticated) — used by tests that pre-seed every agent.
+	// a keyID with no ramp.agents row, the service pulls the caller's own Web
+	// Bot Auth key directory, pins the currently-valid key published there,
+	// persists the row, and proceeds. nil disables lazy registration (an unknown
+	// keyID stays Unauthenticated) — used by tests that pre-seed every agent.
 	AgentReg     agentreg.Registry
 	Transactions repo.TransactionRepo
 	Obligations  repo.ObligationRepo
@@ -124,6 +150,19 @@ type ExchangeDeps struct {
 	// uuid.NewString in NewExchangeService; tests inject a deterministic
 	// generator.
 	BillingRefGen BillingRefGen
+	// RegSchema is the registration schema the Register gate enforces. It MUST be
+	// the value loadRegistrationConfig already produced for the manifest, never a
+	// second load: publishing a schema commits the Exchange to enforcing that
+	// schema, and an Exchange advertising one document while refusing on another
+	// is wrong in a way neither reader could detect from where it stands.
+	// Structural guards under internal/guards keep every route to a second value
+	// closed. nil is the no-schema-configured case and passes payloads through
+	// uninspected.
+	RegSchema *regschema.Schema
+	// Audit is the control-plane audit log a first registration appends to.
+	// Required: every successful first Register writes one row, so a nil value
+	// would panic the registration path.
+	Audit repo.AuditRepo
 	// Clk is the time source consulted by the offer-expiry, signed-URL
 	// expiry and reporting-grace deadlines. nil defaults to clock.System{};
 	// integration tests pass a DeterministicClock so the gates are driven
@@ -166,8 +205,18 @@ func NewExchangeService(d ExchangeDeps) *ExchangeService {
 		cfg:           d.Config.withDefaults(),
 		sor:           d.SoR,
 		billingRefGen: gen,
+		regSchema:     d.RegSchema,
+		audit:         d.Audit,
 	}
 }
+
+// ExchangeDomain reports this Exchange's published identity — the domain it
+// stamps into the offers it issues and serves its manifest under. It exists so
+// the transport can name the refusing Exchange on a transaction denial without
+// reading the environment a second time or being wired with the value
+// separately: a denial that named a different domain than the offers it refuses
+// would be worse than one that named none.
+func (s *ExchangeService) ExchangeDomain() string { return s.cfg.Exchange }
 
 // DiscoverResources resolves URIs against the catalog, signs offers, returns
 // them grouped per URI:
@@ -211,7 +260,7 @@ func (s *ExchangeService) DiscoverResources(
 		flatOffers = append(flatOffers, groupOffers...)
 	}
 	resp := &rampv1.ResourceResponse{
-		Ver:         rampproto.Ver,
+		Ver:         helpers.ProtocolVersion,
 		Exchange:    s.cfg.Exchange,
 		Offers:      flatOffers,
 		OfferGroups: groups,
@@ -279,8 +328,9 @@ func (s *ExchangeService) releaseHold(ctx context.Context, billingID, idempotenc
 	}
 }
 
-// resolvedOffer carries the outcome of matching the caller's offer_id to a
-// catalog entry, with pricing rebuilt to reflect the selected variant.
+// resolvedOffer carries the outcome of binding the presented offer's signed
+// canonical URL to a catalog entry, with pricing rebuilt to reflect the
+// selected variant.
 // offerCanonicalBytes is what verifyPresentedOffer checked the Exchange signature
 // over, carried from there so the evidence row stores the verified bytes rather
 // than a second derivation of them.
@@ -291,14 +341,16 @@ type resolvedOffer struct {
 }
 
 // resolveOfferForTx verifies the PRESENTED reflected Offer statelessly, then
-// maps its SIGNED offer_id to a catalog entry for delivery/resource binding and
-// derives the charge from the SIGNED offer's pricing.
+// maps its SIGNED Identity.canonical_url to a catalog entry for
+// delivery/resource binding and derives the charge from the SIGNED offer's
+// pricing.
 //
 // Trust model:
-//   - The SIGNED offer.offer_id is the only offer identity. The catalog lookup
-//     keys on it. There is no unsigned top-level correlation scalar to reconcile
-//     against — offer identity lives inside the signed Offer, so a genuine offer
-//     for resource A cannot be redeemed against B.
+//   - The SIGNED offer's Identity.canonical_url is the catalog binding: it is
+//     set inside the offer before signing, so it carries the same trust as
+//     every other signed field, and catalog.uri is globally UNIQUE, so the
+//     exact-match lookup is well-defined. offer_id is an opaque per-offer
+//     identifier with no resource semantics and takes no part in binding.
 //   - Verification is over the PRESENTED bytes via verifyPresentedOffer (signature
 //   - expiry), never a reconstruct-from-catalog. A post-discovery tamper of any
 //     covered field breaks the signature.
@@ -308,11 +360,8 @@ type resolvedOffer struct {
 //     binding (entry.URI → SignURL, tenant, tx_log keys).
 func (s *ExchangeService) resolveOfferForTx(req *rampv1.TransactionRequest) (resolvedOffer, error) {
 	// Items-only: the offer is presented in items[0] (executeBatchItem
-	// re-projects each item onto a 1-item synthetic request). The signed offer_id
-	// is the only authority for catalog binding — there is no separate top-level
-	// offer to cross-check.
+	// re-projects each item onto a 1-item synthetic request).
 	presented := req.GetItems()[0].GetOffer()
-	signedOfferID := presented.GetOfferId()
 	// Verify the presented offer (signature over presented bytes + signed expiry)
 	// BEFORE trusting any of its fields for binding or billing. The canonical
 	// bytes it checked ride along to persistence.
@@ -320,10 +369,21 @@ func (s *ExchangeService) resolveOfferForTx(req *rampv1.TransactionRequest) (res
 	if err != nil {
 		return resolvedOffer{}, err
 	}
+	// The signed canonical URL is REQUIRED at execute: without it the offer binds
+	// to nothing. Its presence is checked at envelope validation, BEFORE the
+	// request claims its idempotency key, so a malformed offer cannot consume the
+	// key and leave the agent unable to retry with a corrected one.
+	canonicalURL := presented.GetIdentity().GetCanonicalUrl()
 	snap := s.catalog.Snapshot()
-	entry, ok := snap.byID[signedOfferID]
+	entry, ok := snap.byURI[canonicalURL]
 	if !ok {
-		return resolvedOffer{}, exchange.Newf(exchange.KindNotFound, "offer %q not found in catalog", signedOfferID)
+		// The offer is authentic but the resource behind it is gone from the
+		// catalog. That is a per-item DENIAL (DENIAL_REASON_CONTENT_UNAVAILABLE),
+		// not a batch abort: the agent keeps its other items, and the batch
+		// finalizes a complete response so an exact retry replays that denial
+		// instead of re-running against a claim that never stored one.
+		return resolvedOffer{}, exchange.Newf(exchange.KindContentUnavailable,
+			"offer resource %q not found in catalog", canonicalURL)
 	}
 	// Charge the SIGNED offer's pricing — the price the agent verifiably accepted.
 	// Not a recompute from the live catalog (which may have drifted since
@@ -333,6 +393,43 @@ func (s *ExchangeService) resolveOfferForTx(req *rampv1.TransactionRequest) (res
 		return resolvedOffer{}, exchange.Wrap(exchange.KindInvalidRequest, err, "parse signed offer pricing")
 	}
 	return resolvedOffer{entry: entry, pricing: pricing, offerCanonicalBytes: canonical}, nil
+}
+
+// agentKey is the ONE registered-agent key snapshot that every signature in one
+// ExecuteTransaction is verified against: the complete request proof, each
+// per-item check the broker-relay gate runs, and each item authorization at
+// execution time. It is resolved once, from the agent row the request already
+// had to load, and passed down; no verification site below reloads it.
+//
+// Threading the key rather than the agent id is what makes that structural. A
+// verifier that never receives an id cannot read the registry a second time, so
+// a key rotation landing mid-request cannot verify the proof and the early items
+// against the old key and the later items against the new one. That matters
+// because the response is finalized onto the request claim write-once: a
+// response assembled under two key snapshots would be stored permanently, and
+// every later retry under that idempotency key would replay its stale
+// SIGNATURE_INVALID denials.
+//
+// It carries the public key and the directory that key was pinned from, not a
+// whole agentBinding: a binding's acceptanceBytes describe ONE item's payload,
+// so a shared binding would carry the wrong payload for every item after the
+// first.
+type agentKey struct {
+	pub          ed25519.PublicKey
+	discoveryURL string
+}
+
+// verifier returns the Ed25519 key a signature is checked against. A snapshot
+// with no usable key means no registered agent row was resolved for this
+// request — the Exchange has no agents repo wired, or the stored key is not an
+// Ed25519 key. Neither is the caller's fault, so it surfaces as an internal
+// error rather than a signature denial.
+func (k agentKey) verifier() (ed25519.PublicKey, error) {
+	if len(k.pub) != ed25519.PublicKeySize {
+		return nil, exchange.Newf(exchange.KindInternal,
+			"no ed25519 agent key resolved for this request (%d bytes)", len(k.pub))
+	}
+	return k.pub, nil
 }
 
 // agentBinding carries the requesting agent's delivery-URL identity binding:
@@ -356,16 +453,15 @@ type agentBinding struct {
 	acceptanceBytes []byte
 }
 
-// agentBindingForKey computes the RFC 7638 thumbprint binding from a raw
-// Ed25519 public key, the directory it was pinned from, and the canonical
-// acceptance payload that key was just verified against. R4 binds the delivery
-// URL to the agent key proven by the BODY offer-acceptance signature (never the
-// transport caller / broker key), so the binding source is a bare key, not a
-// Caller. acceptanceBytes is taken as a parameter rather than filled in
-// afterwards so a binding is never half-built: every field describes the same
-// verification, or the value does not exist.
-func agentBindingForKey(pub ed25519.PublicKey, discoveryURL string, acceptanceBytes []byte) (agentBinding, error) {
-	sum, err := helpers.ThumbprintBytes(pub)
+// agentBindingForKey computes the RFC 7638 thumbprint binding from the request's
+// agent key snapshot and the canonical acceptance payload that key was just
+// verified against. R4 binds the delivery URL to the agent key proven by the
+// BODY offer-acceptance signature (never the transport caller / broker key), so
+// the binding source is a bare key, not a Caller. acceptanceBytes is taken as a
+// parameter rather than filled in afterwards so a binding is never half-built:
+// every field describes the same verification, or the value does not exist.
+func agentBindingForKey(key agentKey, acceptanceBytes []byte) (agentBinding, error) {
+	sum, err := helpers.ThumbprintBytes(key.pub)
 	if err != nil {
 		return agentBinding{}, exchange.Wrap(exchange.KindInternal, err, "compute agent thumbprint")
 	}
@@ -373,8 +469,8 @@ func agentBindingForKey(pub ed25519.PublicKey, discoveryURL string, acceptanceBy
 	return agentBinding{
 		thumbprint:      base64.RawURLEncoding.EncodeToString(digest),
 		digest:          digest,
-		pub:             pub,
-		discoveryURL:    discoveryURL,
+		pub:             key.pub,
+		discoveryURL:    key.discoveryURL,
 		acceptanceBytes: acceptanceBytes,
 	}, nil
 }

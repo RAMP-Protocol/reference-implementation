@@ -132,8 +132,14 @@ publisher's label (identity zone `mcp.demo.<your domain>`).
   proxy, every signed request fails while the service still reports
   healthy. (`src/exchange/CONFIGURATION.md` §4,
   `src/broker/CONFIGURATION.md` §4)
-- PostgreSQL connections must use TLS in production —
-  `sslmode=require` at minimum. (`deploy/storage/postgres/CONFIGURATION.md` §2.3)
+- PostgreSQL connections need TLS when they cross a network. A
+  connection that stays on the database host — a socket, loopback, or a
+  Docker bridge shared with the database container — does not need it.
+  On a private network you control end to end it is strongly
+  recommended. On any path you do not control exclusively, such as a
+  managed database service, it is required, `sslmode=require` at
+  minimum. Nothing in the platform checks this, so the choice is yours.
+  (`deploy/storage/postgres/CONFIGURATION.md` §2.3)
 
 ### 3.4 Accounts and credentials
 
@@ -214,7 +220,7 @@ start if it cannot reach it.
 | Broker | 8082 (`BROKER_ADDR`) | Public internet | Request signatures. |
 | Identity | 8083 (`IDENTITY_ADDR`) | Public internet | OAuth bearer token on `/mcp`; key directories are public by design. |
 | Edge worker | 443 on the CDN | Public internet | Verifies signed URLs before serving content. |
-| PostgreSQL | 5432 | Services only | Password + TLS. |
+| PostgreSQL | 5432 | Services only | Password. Whether TLS is needed follows the network path (§3.3). |
 | Redis | 6379 | Exchange and Broker only | Password + TLS, both inside `REDIS_URL`. |
 | TigerBeetle | 3000 | **Exchange only** | **None.** See the rule below. |
 | Vault | 8200 (`VAULT_ADDR`) | Identity service only | Token + TLS. |
@@ -244,10 +250,15 @@ the container. This port changes fee rates and reporting policies with
 no login. (`src/exchange/DEPLOYMENT.md` §7)
 
 **3. Storage stays private — and still needs credentials.** PostgreSQL,
-Redis, and Vault are never reachable from the public internet, and
-even inside the private network they run with passwords and TLS. Vault
-is the most sensitive store in the platform: whoever can read it can
-act as any agent. Treat its access and its backups with the same care
+Redis, and Vault are never reachable from the public internet, and they
+run with passwords even inside the private network. Redis and Vault run
+with TLS wherever they run, with no same-host exception: Redis holds the
+replay-protection state the platform depends on, and Vault holds agent
+private keys (`deploy/storage/redis/DEPLOYMENT.md` §3,
+`deploy/storage/vault/CONFIGURATION.md` §4). PostgreSQL is the one store
+whose TLS decision follows the network path (§3.3). Vault is the most
+sensitive store in the platform: whoever can read it can act as any
+agent. Treat its access and its backups with the same care
 as a certificate authority. (`deploy/storage/vault/CONFIGURATION.md` §1)
 
 **Reference layout.** The staging stack's firewall opens exactly three
@@ -271,7 +282,11 @@ the settings that switch a protection off completely:
 - `SKIP_SSRF` and `ALLOW_INSECURE` (Exchange, Broker, Identity):
   leave unset.
 - Any `*_WELLKNOWN_SCHEME=http`: keep the `https` default.
-- `sslmode=disable` in any database connection string.
+- `sslmode=disable` in a database connection string that crosses a
+  network you do not control exclusively — a managed database service,
+  a shared cloud network. On your own private network it is a risk you
+  are choosing knowingly, and on the database host itself it is the
+  correct setting (§3.3).
 - `BROKER_ALLOW_EPHEMERAL_KEY=true`: the Broker's published identity
   would change on every restart.
 - `RAMP_BILLING_ADAPTER=inmemory`: balances disappear on every restart

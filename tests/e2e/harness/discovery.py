@@ -32,7 +32,15 @@ sends the identity and nothing else.
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
+
+import httpx
+from ramp_sdk import ProtocolVersion
+
+from .constants import requester
+from .exchanges import recipient_of
+from .signing import sign_post
 
 DISCOVER_PATH = "/ramp.v1.ExchangeService/DiscoverResources"
 
@@ -41,24 +49,75 @@ def discover_body(
     *,
     uris: list[str],
     agent_id: str,
+    exchange: str,
     domain: str | None = None,
     user_type: str | None = None,
     geography: str | None = None,
 ) -> dict[str, Any]:
     """Build a ``ResourceQuery`` body for ``uris``, asking as ``agent_id``.
 
+    ``exchange`` is the bare identity domain of the exchange this query is
+    addressed to. It is required, and it is NOT the URL the query is posted to:
+    from the host those URLs are ephemeral ``127.0.0.1`` ports naming no
+    exchange, and an exchange refuses a query addressed to anything other than
+    its own domain. Use ``exchanges.recipient_of`` to get it from the URL being posted to.
+
     The ``id`` is fresh on every call — see the module docstring for why that is
     a correctness property and not a convenience. Facet arguments left at
     ``None`` are omitted from the requester entirely rather than sent empty.
     """
-    requester: dict[str, Any] = {"id": agent_id, "type": "REQUESTER_TYPE_AGENT"}
-    if domain is not None:
-        requester["domain"] = domain
-    if user_type is not None:
-        requester["user_type"] = user_type
-    if geography is not None:
-        requester["geography"] = geography
-    return {"id": f"q-{uuid.uuid4().hex}", "requester": requester, "uris": list(uris)}
+    return {
+        "ver": ProtocolVersion,
+        "id": f"q-{uuid.uuid4().hex}",
+        "exchange": exchange,
+        "requester": requester(agent_id, domain, user_type=user_type, geography=geography),
+        "uris": list(uris),
+    }
 
 
-__all__ = ["DISCOVER_PATH", "discover_body"]
+def offer_uris(payload: dict[str, Any]) -> set[str]:
+    """The resource URIs a Discover response carries an OFFER for.
+
+    ``ResourceResponse.offer_groups[]`` gives one group per requested URI, each
+    with a ``uri`` and an ``offers`` list; the wire is proto-JSON under proto
+    field names, so those are the keys. A URI counts as discoverable only when
+    its group has a NON-EMPTY ``offers`` — an empty group carries an
+    ``absence_reason`` and means the resource is not licensable, which is the
+    absence-of-side-effect signal every negative path reads.
+    """
+    groups = cast(list[dict[str, Any]], payload.get("offer_groups") or [])
+    found: set[str] = set()
+    for group in groups:
+        uri = group.get("uri")
+        if isinstance(uri, str) and uri and (group.get("offers") or []):
+            found.add(uri)
+    return found
+
+
+def discoverable(exchange_url: str, uri: str, *, agent_id: str, key_path: Path) -> bool:
+    """Whether ``uri`` resolves to an offer at ``exchange_url``.
+
+    This is the read leg every catalog negative path needs: it goes through the
+    production DiscoverResources RPC — signed httpsig, caller resolution,
+    catalog lookup — which is the same surface a real agent uses, and never
+    past it into the database. A push that was refused must leave its URI
+    undiscoverable, and asserting the refusal without asserting that leaves the
+    all-or-nothing claim untested: a server that answered the right status and
+    stored the entry anyway would pass.
+
+    ``exchange_url`` selects the owning exchange and also supplies the identity
+    the query is addressed to, because an exchange refuses a query naming
+    anyone else.
+    """
+    resp = sign_post(
+        f"{exchange_url}{DISCOVER_PATH}",
+        body=discover_body(uris=[uri], agent_id=agent_id, exchange=recipient_of(exchange_url)),
+        key_path=key_path,
+    )
+    if resp.status_code != httpx.codes.OK:
+        msg = f"DiscoverResources for {uri} failed: {resp.status_code} {resp.text}"
+        raise AssertionError(msg)
+    return uri in offer_uris(cast(dict[str, Any], resp.json()))
+
+
+__all__ = ["DISCOVER_PATH", "discover_body", "discoverable", "offer_uris"]

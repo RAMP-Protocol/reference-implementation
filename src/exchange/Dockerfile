@@ -20,7 +20,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc \
 # go.mod, so `go mod download` below is what fetches it.
 # Root go module + deps.
 COPY go.mod go.sum ./
-RUN go mod download
+# Persist the Go module and build caches across builds.
+#
+# Without these every rebuild recompiles the whole dependency graph, because
+# nothing in a container layer carries a compiler cache: on a cold stack build
+# the go steps alone cost minutes. A cache mount lives with the builder rather
+# than in the image, so it survives --no-cache and never lands in a layer.
+#
+# sharing=locked on the DOWNLOAD only. That step writes the module cache, and
+# compose builds these services concurrently, so two writers would race. The
+# build step below only reads it and takes the default shared mode: locking it
+# there serializes every Go image in the stack against every other, which
+# measured slower than having no cache at all.
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 
 # Source specific to the Exchange build target.
 COPY internal/ ./internal/
@@ -31,7 +44,8 @@ COPY src/exchange/ ./src/exchange/
 # repo publishes no multi-arch image.
 ENV CGO_ENABLED=1 GOOS=linux
 ARG TARGETARCH
-RUN GOARCH=${TARGETARCH:-amd64} \
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w" \
       -o /out/exchange ./src/exchange/cmd/server
 

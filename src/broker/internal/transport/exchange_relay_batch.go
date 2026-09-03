@@ -7,6 +7,7 @@ package transport
 
 import (
 	"net/http"
+	"strconv"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -49,18 +50,54 @@ func (h *ExchangeRelayHandler) serveBatch(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Duplicate offer_ids within one request are an invalid envelope, rejected
+	// here at ingress before signature admission, ResolveGroups, or any fan-out.
+	// Without this scan the duplicates only fail inside their own exchange group
+	// after decomposition, while a distinct item routed to another exchange
+	// still executes — a malformed envelope with partial side effects. This is
+	// fail-fast ingress validation only: the Exchange's own envelope validation
+	// remains the authoritative enforcement of the duplicate rule. Like the
+	// empty-items gate above it runs before the sig1 verify (it reveals nothing
+	// but the body's own internal consistency, and a rejection here must not
+	// spend the signature's replay slot).
+	seen := make(map[string]int, len(txReq.GetItems()))
+	for i, item := range txReq.GetItems() {
+		id := item.GetOffer().GetOfferId()
+		if j, dup := seen[id]; dup {
+			writeBrokerError(w, requestID, broker.Newf(broker.KindInvalidArgument,
+				"items %d and %d present duplicate offer_id %q; "+
+					"executing the same resource twice takes two separately issued offers", j, i, id).
+				WithField("items.offer.offer_id").WithMeta("item_index", strconv.Itoa(i)))
+			return
+		}
+		seen[id] = i
+	}
+
+	// ONE whole-body sig1 verify + ONE replay add over the entire batch body
+	// (endpoint "" — execute verifies as-received via BoundaryTargetURL).
+	//
+	// Ahead of the admission gate, so nothing about the registry is answered to a
+	// caller that has not proved who it is. offer.exchange arrives in an unsigned
+	// body, and the gate below answers it four different ways — never registered,
+	// registered and failing its probe, registered but not approved to be paid, or
+	// admitted. Answered first, that is a registry oracle anyone can query by
+	// naming a domain and reading the code back.
+	//
+	// The cost is that a request refused for a RETRYABLE reason has now spent its
+	// signature: the replay guard dedups on the signature value, so the retry the
+	// 503 invites has to be re-signed. That is what a retry already does — the
+	// signature covers its own created timestamp — and a byte-identical resend is
+	// a replay by definition. The discover route made the same trade.
+	if verr := h.core.VerifyAndGuardReplay(h, r, "", body); verr != nil {
+		writeBrokerError(w, requestID, verr)
+		return
+	}
+
 	// WHOLE-REQUEST admission gate: resolve + trust + SSRF EVERY distinct
 	// offer.exchange BEFORE any fan-out. Any failure rejects the whole request.
 	groups, berr := h.batch.ResolveGroups(ctx, h, &txReq)
 	if berr != nil {
 		writeBrokerError(w, requestID, berr)
-		return
-	}
-
-	// ONE whole-body sig1 verify + ONE replay add over the entire batch body
-	// (endpoint "" — execute verifies as-received via BoundaryTargetURL).
-	if verr := h.core.VerifyAndGuardReplay(h, r, "", body); verr != nil {
-		writeBrokerError(w, requestID, verr)
 		return
 	}
 

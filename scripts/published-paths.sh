@@ -32,9 +32,12 @@ ALLOW_DIRS=(
   docs/architecture
   .github
 )
-# schemas/ is load-bearing, not documentation: src/exchange/internal/comptest/schema_test.go
-# reads schemas/comp/v1/comp-v1.schema.json and carries NO build tag, so its absence fails
-# `make test-fast` and `make test-integration` alike.
+# schemas/ is load-bearing, not documentation, and two suites read it. Neither carries a
+# build tag, so the absence of either schema fails `make test-fast` and
+# `make test-integration` alike: src/exchange/internal/comptest/schema_test.go reads
+# schemas/comp/v1/comp-v1.schema.json, and src/exchange/internal/ingest/feedschema_test.go
+# reads schemas/catalog-feed/v1/ — both the schema and the example feed beside it, which it
+# validates line by line.
 #
 # docs/architecture is the only docs/ SUBTREE published, by owner decision. Individual
 # docs/ files outside it are published one at a time through ALLOW_DOC_FILES below.
@@ -92,6 +95,9 @@ ALLOW_SCRIPTS=(
   scripts/check-jwt-in-exchange-authz.sh
   scripts/check-sdk-pin-consistency.sh
   scripts/check-stale-proto-names.sh
+  # Keeps the edge worker's delivery-event name and the ledger's search for it
+  # in agreement; both files it compares are published, so the gate travels.
+  scripts/check-delivery-event-name.sh
   scripts/check-xfail-strict.sh
   # ... which is a thin wrapper that execs this AST-based checker.
   scripts/check_xfail_strict.py
@@ -102,13 +108,21 @@ ALLOW_SCRIPTS=(
   # Scans the same derived set for secrets, so a key reaching a published path
   # fails the branch rather than the publish. Ships for the same reason.
   scripts/check-published-secrets.sh
-  # Keeps the three deployment documents agreeing on one published image version.
+  # Keeps the deployment documents agreeing on one published image version.
   # Those documents ship, so the check on them has to ship with them.
   scripts/check-image-version.sh
+  # The list of documents that check reads. It sources this file and refuses to
+  # run without it, so shipping one without the other ships a gate that aborts.
+  scripts/deployment-docs.sh
 
   # Local stack + e2e bootstrap. The e2e key material is generated at bootstrap
   # (it is gitignored, never committed), so without these the published stack has
   # no signing keys at all.
+  #
+  # buildx-check is the first prerequisite of `make e2e-up`, so the published
+  # Makefile calls it on the reader's very first stack-up. Without it that
+  # target dies on a missing script instead of building.
+  scripts/check-buildx.sh
   scripts/devstack.sh
   scripts/gen-broker-relay-key.sh
   scripts/gen-buyer-delegation-key.sh
@@ -140,12 +154,12 @@ ALLOW_SCRIPTS=(
 #
 # The publish checks each of these out of the PUBLIC base after the allowlists above have
 # been staged, so the public branch's copy is what ships. LICENSE exists only there. The
-# other three are tracked here as well, and taking the public copy rather than this one is
-# deliberate for all three, for two different reasons. This tree's aws-demo runbook and
-# handoff carry identifiers of a live deployment where the public copies carry redacted
-# ones, so inheriting is what stops every snapshot undoing that redaction. The public
-# README is a different document altogether, written for a reader arriving at the reference
-# implementation, where this tree's is an internal working README.
+# README is tracked here as well, and taking the public copy rather than this one is
+# deliberate: the public README is a different document altogether, written for a reader
+# arriving at the reference implementation, where this tree's is an internal working
+# README. (The retired aws-demo runbook and handoff were inherited here too, for a
+# different reason — their private copies carried identifiers of a live deployment — until
+# the deployment they described was decommissioned and both documents were removed.)
 #
 # They land on the public tree all the same, so the reference gate must NOT treat a
 # citation of one as unresolvable — the same subtraction it applies to ALLOW_DOC_FILES.
@@ -159,7 +173,7 @@ ALLOW_SCRIPTS=(
 # stay disjoint afterwards, so no check that DERIVES its expectation from them can see it.
 # That is why tests/e2e/harness/test_guards_publish_gates.py writes out which documents
 # have to stay inherited, and why that list is maintained by hand rather than derived.
-INHERIT_FROM_MAIN=( LICENSE README.md RUNBOOK-aws-demo.md docs/HANDOFF-aws-demo.md )
+INHERIT_FROM_MAIN=( LICENSE README.md )
 
 # --- docs/ subtrees that are NOT published ---
 #
@@ -183,4 +197,4 @@ UNPUBLISHED_DOC_DIRS=(
 # gate forbids, the same carve-out the conventions make for rule text that has to
 # show the format it mandates.
 # published-ref-allow: the definition of the forbidden names cannot avoid naming them
-LOCAL_ONLY_FILES=( publish-public.sh PUBLISH-PUBLIC.md PUBLIC-REPO-FIXES.md PUBLISH-VALIDATION-FINDINGS.md PUBLISH-DOC-CITATIONS.md )
+LOCAL_ONLY_FILES=( publish-public.sh release-version.sh PUBLISH-PUBLIC.md PUBLIC-REPO-FIXES.md PUBLISH-VALIDATION-FINDINGS.md PUBLISH-DOC-CITATIONS.md )

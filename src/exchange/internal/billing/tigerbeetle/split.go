@@ -42,6 +42,13 @@ const (
 	// expired/resolved hold), matching the single post-pending path's
 	// ResolveAlreadyResolved.
 	LinkedPendingResolved
+	// LinkedExistsMismatch means a leg's id already exists with different contents
+	// (amount, accounts, flags, ...), so the batch did not apply and the existing
+	// transfer stands. Credit maps a single-leg mismatch to a no-op success (the
+	// first credit under an id wins, whatever its amount); the settle and refund
+	// paths treat it as an error, because their leg ids are derived from the same
+	// inputs as their contents and a mismatch means those drifted.
+	LinkedExistsMismatch
 )
 
 // Leg is one transfer in a CreateLinked batch. A non-zero PendingID makes the leg a
@@ -131,6 +138,18 @@ func linkedOutcome(results []tb.CreateTransferResult) (LinkedOutcome, error) {
 			tb.TransferPendingTransferAlreadyVoided,
 			tb.TransferPendingTransferExpired:
 			return LinkedPendingResolved, nil
+		case tb.TransferExistsWithDifferentFlags,
+			tb.TransferExistsWithDifferentDebitAccountID,
+			tb.TransferExistsWithDifferentCreditAccountID,
+			tb.TransferExistsWithDifferentAmount,
+			tb.TransferExistsWithDifferentPendingID,
+			tb.TransferExistsWithDifferentUserData128,
+			tb.TransferExistsWithDifferentUserData64,
+			tb.TransferExistsWithDifferentUserData32,
+			tb.TransferExistsWithDifferentTimeout,
+			tb.TransferExistsWithDifferentCode,
+			tb.TransferExistsWithDifferentLedger:
+			return LinkedExistsMismatch, nil
 		default:
 			return 0, fmt.Errorf("tigerbeetle: create linked: %w: leg %d: %s",
 				ErrCreateTransfer, i, results[i].Status)

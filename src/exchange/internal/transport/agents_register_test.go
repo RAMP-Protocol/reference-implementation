@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid/agentidtest"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/transport"
 )
@@ -36,6 +39,14 @@ func (s *safeBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.buf.String()
+}
+
+// Reset drops what has been captured so far, so one test can assert on the
+// lines a second request produced without the first request's still in view.
+func (s *safeBuffer) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf.Reset()
 }
 
 // registerArgs records what the handler passed down to the registry, so a test
@@ -93,7 +104,7 @@ func TestAgentsRegister_LogsCarryRequestID(t *testing.T) {
 		{
 			"register failed",
 			transport.AgentsRegisterOptions{},
-			stubRegistry{registerErr: agentreg.ErrMalformedManifest},
+			stubRegistry{registerErr: agentreg.ErrMalformedDirectory},
 			http.StatusBadRequest, "agents.register failed",
 		},
 		{"register ok", transport.AgentsRegisterOptions{}, stubRegistry{}, http.StatusOK, "agents.register ok"},
@@ -257,12 +268,131 @@ func TestAgentsRegister_RejectsAgentIDNamingNoHost(t *testing.T) {
 	}
 }
 
+// TestAgentsRegister_NoErrorBlamesTheCommercialOverlay covers every arm of the
+// register endpoint's diagnosis, not just the one that was fixed first.
+//
+// Registration reads exactly one remote document: the caller's Web Bot Auth key
+// directory. It never fetches the caller's ramp.json, and the overlay carries no
+// key material, so any message naming a manifest describes a repair that cannot
+// clear the refusal — an operator publishing keys in ramp.json would still be
+// rejected. Each arm below is driven through the real handler; a message that
+// reintroduces the word fails here.
+//
+// The single-case version of this assertion (ErrNotAHost, below) was written when
+// only that arm had been corrected. Covering the arms one at a time is how the
+// wrong vocabulary survived in the other three, so this drives them together.
+func TestAgentsRegister_NoErrorBlamesTheCommercialOverlay(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		err     error
+		wantSub string
+	}{
+		{"not a host", agentreg.ErrNotAHost, "does not name a host"},
+		{"host mismatch", agentreg.ErrAgentIDMismatch, "does not match agent_id"},
+		{"absent directory", rampwellknown.ErrNoDocument, "no key directory"},
+		{"malformed directory", agentreg.ErrMalformedDirectory, "key directory"},
+		{"no valid key", agentreg.ErrNoValidKey, "key directory"},
+		{"upstream fetch failure", errors.New("dial tcp: connection refused"), "key directory"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, body := postRegisterStubbed(t, stubRegistry{registerErr: tc.err}, map[string]string{
+				"agent_id": "agent.example", "discovery_url": "https://agent.example",
+			})
+			got := body["error"]
+			for _, banned := range []string{"manifest", "ramp.json"} {
+				if strings.Contains(got, banned) {
+					t.Errorf("error %q names %q; registration reads the key directory, not that document", got, banned)
+				}
+			}
+			if !strings.Contains(got, tc.wantSub) {
+				t.Errorf("error %q does not state the actual fault (want %q)", got, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestAgentsRegister_StatusFollowsTheSharedCallerFaultSplit pins WHICH answer
+// each fault gets, and pins it to the one definition the whole Exchange uses.
+//
+// Three paths reach the same registry: this endpoint, service.mapLazyRegisterError,
+// and the catalog self-signup handler. The other two ask agentreg.IsCallerFault
+// whether a failure is permanent. This endpoint used to decide by hand, and it
+// disagreed on one sentinel. An agent that serves no key directory got 502
+// "failed to fetch the agent's key directory" here, which tells the caller to
+// retry, and 401 on the other two, which tells it the identity is not
+// registrable. Retrying could never clear it: the origin answered, and it will
+// answer 404 again until the caller publishes the document.
+//
+// wantStatus is written out rather than computed, so the case below is a real
+// expectation and not a restatement of the code. The second assertion then ties
+// it to IsCallerFault, so the two cannot drift apart again in either direction:
+// an endpoint that stops reading the shared split fails the first check, and a
+// sentinel that changes sides without this table changing fails the second.
+func TestAgentsRegister_StatusFollowsTheSharedCallerFaultSplit(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"not a host", agentreg.ErrNotAHost, http.StatusBadRequest},
+		{"host mismatch", agentreg.ErrAgentIDMismatch, http.StatusBadRequest},
+		{"absent directory", rampwellknown.ErrNoDocument, http.StatusBadRequest},
+		{"malformed directory", agentreg.ErrMalformedDirectory, http.StatusBadRequest},
+		{"no valid key", agentreg.ErrNoValidKey, http.StatusBadRequest},
+		// The 502 case the endpoint was built for, and the control that keeps it
+		// from collapsing into the 400s: the origin is reachable and broken, so
+		// the next attempt genuinely may succeed.
+		{"unreachable origin", fmt.Errorf("%w: dial tcp: connection refused", rampwellknown.ErrFetch), http.StatusBadGateway},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			status, body := postRegisterStubbed(t, stubRegistry{registerErr: tc.err}, map[string]string{
+				"agent_id": "agent.example", "discovery_url": "https://agent.example",
+			})
+			if status != tc.wantStatus {
+				t.Errorf("status = %d, want %d (error %q)", status, tc.wantStatus, body["error"])
+			}
+			permanent := tc.wantStatus == http.StatusBadRequest
+			if agentreg.IsCallerFault(tc.err) != permanent {
+				t.Errorf("this table calls %v permanent=%v, agentreg.IsCallerFault says %v; "+
+					"the two must agree or one caller answers this fault differently from the others",
+					tc.err, permanent, agentreg.IsCallerFault(tc.err))
+			}
+		})
+	}
+}
+
+// TestAgentsRegister_AbsentDirectoryDoesNotBlameTheFetch is the message half of
+// the case above. A 404 means the fetch SUCCEEDED — the origin was reached and
+// answered. Reporting it as a failed fetch describes the caller's network, when
+// what they have to do is publish the document at discovery_url.
+func TestAgentsRegister_AbsentDirectoryDoesNotBlameTheFetch(t *testing.T) {
+	t.Parallel()
+
+	_, body := postRegisterStubbed(t, stubRegistry{registerErr: rampwellknown.ErrNoDocument}, map[string]string{
+		"agent_id": "agent.example", "discovery_url": "https://agent.example",
+	})
+	if strings.Contains(body["error"], "failed to fetch") {
+		t.Errorf("error %q blames the fetch; the origin answered, with 404", body["error"])
+	}
+	if !strings.Contains(body["error"], "no key directory") {
+		t.Errorf("error %q does not say the document is absent", body["error"])
+	}
+}
+
 // TestAgentsRegister_NotAHostIsNotReportedAsAMalformedManifest pins the
 // diagnostic split. discovery_url is not canonicalized at the edge — only its
 // anchoring to agent_id is decided, inside the registry — so a discovery_url that
 // names no host surfaces here as agentreg.ErrNotAHost. It used to share
-// ErrMalformedManifest's arm and answer "manifest is malformed" on an
-// unauthenticated public endpoint, sending the caller to inspect a document the
+// ErrMalformedDirectory's arm and blame a malformed document on an
+// unauthenticated public endpoint, sending the caller to inspect one the
 // Exchange never retrieved. The status is unchanged; only the diagnosis is.
 func TestAgentsRegister_NotAHostIsNotReportedAsAMalformedManifest(t *testing.T) {
 	t.Parallel()

@@ -65,10 +65,11 @@ func (a *TigerBeetleAdapter) settleSplit(ctx context.Context, pendingID, postID 
 		return err
 	}
 	net := new(big.Int).Sub(gross, fee)
-	return linkedErr(a.tb.CreateLinked(ctx, []tigerbeetle.Leg{
+	out, err := a.tb.CreateLinked(ctx, []tigerbeetle.Leg{
 		{ID: postID, PendingID: pendingID, Amount: net},
 		{ID: feeID, Debit: info.Debit, Credit: platformID, Amount: fee, Ledger: a.ledger, Code: tigerbeetle.CodeSettlement},
-	}))
+	})
+	return linkedErr(out, err, ErrInsufficientBalance)
 }
 
 // classifyForRefund enforces that the hold was recorded (not held, released, or
@@ -142,7 +143,8 @@ func (a *TigerBeetleAdapter) refundReverse(ctx context.Context, r refundLegs) er
 			Ledger: a.ledger, Code: tigerbeetle.CodeRefund, UserData128: r.pendingID,
 		})
 	}
-	return linkedErr(a.tb.CreateLinked(ctx, legs))
+	out, err := a.tb.CreateLinked(ctx, legs)
+	return linkedErr(out, err, ErrInsufficientBalance)
 }
 
 // refundMinor validates the refund amount (positive, matching currency) and converts it
@@ -162,7 +164,7 @@ func (a *TigerBeetleAdapter) refundMinor(amount Amount) (*big.Int, error) {
 // reuses the pending's post id (so ClassifyHold still detects a settled hold); the fee
 // leg needs its own id.
 func (a *TigerBeetleAdapter) feeLegID(pendingID tigerbeetle.ID) (tigerbeetle.ID, error) {
-	id, err := tigerbeetle.TransferID(a.idNS + "fee:" + tigerbeetle.EncodeID(pendingID))
+	id, err := tigerbeetle.TransferID(a.idNS + tigerbeetle.TransferFeePrefix + tigerbeetle.EncodeID(pendingID))
 	if err != nil {
 		return id, fmt.Errorf("billing: derive fee leg id: %w", err)
 	}
@@ -174,7 +176,7 @@ func (a *TigerBeetleAdapter) feeLegID(pendingID tigerbeetle.ID) (tigerbeetle.ID,
 func (a *TigerBeetleAdapter) refundLegIDs(
 	pendingID tigerbeetle.ID, key string,
 ) (netID, feeID tigerbeetle.ID, err error) {
-	base := a.idNS + "refund:" + tigerbeetle.EncodeID(pendingID) + ":" + key
+	base := a.idNS + tigerbeetle.TransferRefundPrefix + tigerbeetle.EncodeID(pendingID) + ":" + key
 	if netID, err = tigerbeetle.TransferID(base + ":net"); err != nil {
 		return netID, feeID, fmt.Errorf("billing: derive refund net id: %w", err)
 	}
@@ -197,7 +199,11 @@ func rateBps(userData tigerbeetle.ID) int {
 }
 
 // linkedErr maps a linked-batch outcome to the adapter's error contract.
-func linkedErr(out tigerbeetle.LinkedOutcome, err error) error {
+// exceedsCredits names the error for the LinkedExceedsCredits arm: the debited
+// party differs per call site (the agent at settle and refund, platform
+// liquidity at Credit), so the caller supplies the sentinel its contract
+// promises rather than this helper guessing whose balance ran out.
+func linkedErr(out tigerbeetle.LinkedOutcome, err error, exceedsCredits error) error {
 	if err != nil {
 		return fmt.Errorf("billing: linked transfer: %w", err)
 	}
@@ -205,9 +211,16 @@ func linkedErr(out tigerbeetle.LinkedOutcome, err error) error {
 	case tigerbeetle.LinkedApplied:
 		return nil
 	case tigerbeetle.LinkedExceedsCredits:
-		return ErrInsufficientBalance
+		return exceedsCredits
 	case tigerbeetle.LinkedPendingResolved:
 		return ErrUnknownBillingID
+	case tigerbeetle.LinkedExistsMismatch:
+		// Settle and refund derive their leg ids from the same inputs as the
+		// leg contents, so an id that exists with different contents means
+		// those drifted — a bug, never a benign replay. (Credit intercepts
+		// this outcome before calling here; its first-credit-wins contract
+		// makes it a no-op success there.)
+		return fmt.Errorf("billing: linked leg exists with different contents")
 	default:
 		return fmt.Errorf("billing: unexpected linked outcome %v", out)
 	}

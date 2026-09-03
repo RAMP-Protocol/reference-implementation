@@ -4,10 +4,14 @@
 # canary article costs a flat 9.99 EUR per run).
 #
 # A freshly deployed stack starts with an EMPTY ledger. There is no API to add
-# money on purpose: per ADR-009 D2 balance is created only by an operator's
-# manual credit into TigerBeetle. This script IS that manual credit for
-# staging — the ledger analogue of seed-staging.sh's documented one-time SQL.
-# The commands are printed in full before they run, never hidden.
+# money on purpose: per ADR-009 D2 balance is created by an operator's manual
+# credit into TigerBeetle, with ONE narrow exception (the ADR-009 amendment of
+# 2026-08-13): a tenant configured with default_agent_credit > 0 grants that
+# amount once, at Register, under the "service-welcome:" + billing_ref
+# transfer id.
+# This script IS the manual credit for staging — the ledger analogue of
+# seed-staging.sh's documented one-time SQL. The commands are printed in full
+# before they run, never hidden.
 #
 # How it works: account and transfer ids in TigerBeetle are derived
 # deterministically (low 16 bytes of sha256, little-endian — the same
@@ -29,6 +33,17 @@
 # so running it again with the same values is a no-op (TigerBeetle rejects the
 # duplicate id; the balance is not doubled). To add MORE money later, set a
 # new FUND_LABEL (e.g. FUND_LABEL=topup-2026-08-01).
+#
+# The label "service-welcome" is reserved: its transfer id is
+# "service-welcome:" + billing_ref (no amount in the derivation) — the SAME id
+# the Exchange's Register flow derives for the tenant-configured default
+# credit (billing.WelcomeCreditKey in src/exchange/internal/billing/welcome.go,
+# the Go owner of this derivation; a pinned-vector test there breaks when the
+# two sides drift). A service-welcome prefund and the service's grant therefore
+# occupy one ledger slot: whichever lands first wins and the other is a no-op,
+# so an agent is never double-credited. Every other label — including plain
+# "welcome" — keeps the amount-bearing derivation below and stacks
+# deliberately.
 #
 # Env (all optional):
 #   STACK_DIR    default deploy/terraform/stacks/staging-aws
@@ -60,7 +75,7 @@ command -v terraform >/dev/null 2>&1 || { echo "missing: terraform" >&2; exit 2;
 command -v python3 >/dev/null 2>&1 || { echo "missing: python3" >&2; exit 2; }
 command -v uv >/dev/null 2>&1 || { echo "missing: uv" >&2; exit 2; }
 
-read -r -a SSH_CMD <<< "$(tf_out ssh_command)"
+load_ssh_cmd
 
 # The account handle to fund. Asking Register is a no-op for an agent the seed
 # step already registered — it returns the stored ref (ADR-021 D4, "the stored
@@ -92,7 +107,17 @@ fi
 # Derive the ids and the integer amount locally. The Exchange stores amounts
 # at asset scale 8 (10^8 minor units per euro — see tigerbeetle_adapter.go),
 # and account ids as the little-endian low 16 bytes of sha256(prefix || id).
-IDS="$(python3 - "${BILLING_REF}" "${AMOUNT}" "${FUND_LABEL}" <<'PY'
+#
+# The program is read into a variable and piped, rather than written as a
+# heredoc directly inside the "$( ... )" that captures its output. Bash 3.2 —
+# which is the bash macOS ships, and what /usr/bin/env bash resolves to on a Mac
+# without a newer one installed — misparses that shape: it keeps tracking quotes
+# through the heredoc body while looking for the closing parenthesis, and aborts
+# the whole script with "unexpected EOF while looking for matching `)'" before a
+# single line runs. The read builtin returns non-zero when it stops at end of
+# input rather than a delimiter, which is the normal case here, so the || true
+# is required under set -e and does not hide a real failure.
+read -r -d '' FUND_IDS_PY <<'PY' || true
 import hashlib
 import sys
 from decimal import Decimal, InvalidOperation
@@ -111,10 +136,18 @@ if minor != minor.to_integral_value() or minor <= 0:
 
 print(f"AGENT_ACC={tb_id('agent:' + billing_ref)}")
 print(f"LIQ_ACC={tb_id('platform:liquidity')}")
-print(f"TRANSFER={tb_id(f'staging-fund:{billing_ref}:{amount}:{label}')}")
+# The reserved service-welcome label shares its transfer-id slot with the
+# Exchange's Register default credit (same derivation as the adapter:
+# sha256("service-welcome:" + ref) — billing.WelcomeCreditKey is the Go owner,
+# with a pinned-vector test), so a prefund and the service grant can never
+# both apply. Every other label keeps the amount-bearing staging derivation.
+if label == "service-welcome":
+    print(f"TRANSFER={tb_id('service-welcome:' + billing_ref)}")
+else:
+    print(f"TRANSFER={tb_id(f'staging-fund:{billing_ref}:{amount}:{label}')}")
 print(f"MINOR={int(minor)}")
 PY
-)"
+IDS="$(printf '%s' "${FUND_IDS_PY}" | python3 - "${BILLING_REF}" "${AMOUNT}" "${FUND_LABEL}")"
 eval "${IDS}"
 
 # The four ledger commands, in order:

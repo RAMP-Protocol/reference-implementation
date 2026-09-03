@@ -4,13 +4,14 @@
 // (sdk/go/connectserver.EmitUnpopulatedJSONCodec, sdk/go/core.NewSigningTransport)
 // — app code must not re-implement either. All app sign calls now route
 // through the SDK signing transport; no app-side transport is sanctioned.
+// forbiddenPaths additionally keeps the Exchange's retired license-term package
+// deleted: its canonicalization and ingest-tier checks are sdk/go/helpers now.
 package guards
 
 import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"testing"
 )
 
@@ -73,14 +74,18 @@ var jcsTransformCall = regexp.MustCompile(`jcs\.Transform\(|"github\.com/gowebpk
 // The mechanism stays so a future, justified exception is a one-line entry.
 var jcsAllowlist = map[string]bool{}
 
-// forbiddenPaths are the deleted homes of the disease; their resurrection is a
-// regression regardless of content.
+// forbiddenPaths are the deleted homes of app-side copies of SDK-owned logic:
+// the transport plumbing above, and the license-term canonicalization and
+// ingest-tier checks the Exchange once kept in its own package and now imports
+// from sdk/go/helpers. Their resurrection is a regression regardless of
+// content.
 var forbiddenPaths = []string{
 	"internal/rampcodec",
 	"internal/signingtransport",
 	"internal/sigwindow",
 	"src/exchange/internal/transport/jsoncodec.go",
 	"src/broker/internal/transport/jsoncodec.go",
+	"src/exchange/internal/licenseterm",
 }
 
 // repoRoot walks up from the working directory to the go.mod root.
@@ -103,33 +108,57 @@ func repoRoot(t *testing.T) string {
 }
 
 // appSourceFiles yields every non-test, non-generated .go file under src/ and
-// internal/, as repo-root-relative paths.
+// internal/, as repo-root-relative paths. Guards that bind production code use
+// this; one that must also read fixtures calls appSourceAndTestFiles instead, so
+// widening that guard cannot silently widen these.
 func appSourceFiles(t *testing.T, root string) []string {
 	t.Helper()
-	var files []string
-	for _, top := range []string{"src", "internal"} {
-		err := filepath.WalkDir(filepath.Join(root, top), func(path string, d os.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
-				return err
-			}
-			name := d.Name()
-			if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") ||
-				strings.HasSuffix(name, ".pb.go") || strings.HasSuffix(name, "connect.go") ||
-				strings.Contains(path, string(filepath.Separator)+"sqlc"+string(filepath.Separator)) {
-				return nil
-			}
-			rel, relErr := filepath.Rel(root, path)
-			if relErr != nil {
-				return relErr
-			}
-			files = append(files, filepath.ToSlash(rel))
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("walk %s: %v", top, err)
-		}
+	return appGoFiles(t, root, false)
+}
+
+// appSourceAndTestFiles yields the same set plus _test.go files. Only the ver
+// guard wants this: every "0.3" this project ever shipped was in a fixture, so a
+// check that skipped them could not have caught one.
+func appSourceAndTestFiles(t *testing.T, root string) []string {
+	t.Helper()
+	return appGoFiles(t, root, true)
+}
+
+// appGoFiles walks src/ and internal/ through the single filter every guard
+// shares, so the definition of "a file this repo owns" has one home.
+func appGoFiles(t *testing.T, root string, includeTests bool) []string {
+	t.Helper()
+	tops := []string{"src", "internal"}
+	files := make([]string, 0, len(tops))
+	for _, top := range tops {
+		files = append(files, goSourceFilesUnder(t, root, top, includeTests)...)
 	}
 	return files
+}
+
+// assertNoMatchOutsideAllowlist fails for every app source file outside
+// allowlist whose bytes match re, reporting msg with the offending path.
+//
+// Five guards in this package scan the same way — walk appSourceFiles, skip the
+// allowlist, read, match, report — and three values are all that differ between
+// them. Written out per guard, the copies drift in ways that mean nothing: one
+// of them converted an already-slash-form path again before indexing its
+// allowlist, which reads to the next person as a difference that matters.
+func assertNoMatchOutsideAllowlist(t *testing.T, re *regexp.Regexp, allowlist map[string]bool, msg string) {
+	t.Helper()
+	root := repoRoot(t)
+	for _, rel := range appSourceFiles(t, root) {
+		if allowlist[rel] {
+			continue
+		}
+		src, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if re.Match(src) {
+			t.Errorf("%s %s", rel, msg)
+		}
+	}
 }
 
 // TestNoHandRolledEmitUnpopulatedCodec fails when any app source file
@@ -137,16 +166,8 @@ func appSourceFiles(t *testing.T, root string) []string {
 // codec belongs to sdk/go/connectserver, never to app code.
 func TestNoHandRolledEmitUnpopulatedCodec(t *testing.T) {
 	t.Parallel()
-	root := repoRoot(t)
-	for _, rel := range appSourceFiles(t, root) {
-		src, err := os.ReadFile(filepath.Join(root, rel))
-		if err != nil {
-			t.Fatalf("read %s: %v", rel, err)
-		}
-		if emitUnpopulatedLiteral.Match(src) {
-			t.Errorf("%s constructs an EmitUnpopulated MarshalOptions literal — use sdk/go/connectserver.EmitUnpopulatedJSONCodec() / WithEmitUnpopulated() instead", rel)
-		}
-	}
+	assertNoMatchOutsideAllowlist(t, emitUnpopulatedLiteral, nil,
+		"constructs an EmitUnpopulated MarshalOptions literal — use sdk/go/connectserver.EmitUnpopulatedJSONCodec() / WithEmitUnpopulated() instead")
 }
 
 // TestNoHandRolledSigningRoundTripper fails when a non-allowlisted app source
@@ -154,19 +175,8 @@ func TestNoHandRolledEmitUnpopulatedCodec(t *testing.T) {
 // SDK (core.NewSigningTransport) or the single canonical app transport.
 func TestNoHandRolledSigningRoundTripper(t *testing.T) {
 	t.Parallel()
-	root := repoRoot(t)
-	for _, rel := range appSourceFiles(t, root) {
-		if signHelperAllowlist[rel] {
-			continue
-		}
-		src, err := os.ReadFile(filepath.Join(root, rel))
-		if err != nil {
-			t.Fatalf("read %s: %v", rel, err)
-		}
-		if signHelperCall.Match(src) {
-			t.Errorf("%s calls helpers.SignRequest/AppendSignature directly — compose the SDK signing transport (sdk/go/core.NewSigningTransport) instead", rel)
-		}
-	}
+	assertNoMatchOutsideAllowlist(t, signHelperCall, signHelperAllowlist,
+		"calls helpers.SignRequest/AppendSignature directly — compose the SDK signing transport (sdk/go/core.NewSigningTransport) instead")
 }
 
 // TestNoHandRolledEd25519Sign fails when a non-allowlisted app source file
@@ -174,19 +184,8 @@ func TestNoHandRolledSigningRoundTripper(t *testing.T) {
 // requests) lives behind the SDK faces.
 func TestNoHandRolledEd25519Sign(t *testing.T) {
 	t.Parallel()
-	root := repoRoot(t)
-	for _, rel := range appSourceFiles(t, root) {
-		if ed25519SignAllowlist[rel] {
-			continue
-		}
-		src, err := os.ReadFile(filepath.Join(root, rel))
-		if err != nil {
-			t.Fatalf("read %s: %v", rel, err)
-		}
-		if ed25519SignCall.Match(src) {
-			t.Errorf("%s calls ed25519.Sign directly — sign through the SDK faces (helpers.SignURLEd25519 / SignOffer / core.NewSigningTransport)", rel)
-		}
-	}
+	assertNoMatchOutsideAllowlist(t, ed25519SignCall, ed25519SignAllowlist,
+		"calls ed25519.Sign directly — sign through the SDK faces (helpers.SignURLEd25519 / SignOffer / core.NewSigningTransport)")
 }
 
 // TestNoHandRolledJCSCanonicalization fails when any app source file imports
@@ -194,19 +193,8 @@ func TestNoHandRolledEd25519Sign(t *testing.T) {
 // SDK-owned. (depguard carries the same ban at lint time; see .golangci.yml.)
 func TestNoHandRolledJCSCanonicalization(t *testing.T) {
 	t.Parallel()
-	root := repoRoot(t)
-	for _, rel := range appSourceFiles(t, root) {
-		if jcsAllowlist[rel] {
-			continue
-		}
-		src, err := os.ReadFile(filepath.Join(root, rel))
-		if err != nil {
-			t.Fatalf("read %s: %v", rel, err)
-		}
-		if jcsTransformCall.Match(src) {
-			t.Errorf("%s canonicalizes with gowebpki/jcs directly — sign/verify through the SDK faces (the JCS switch is SDK-internal)", rel)
-		}
-	}
+	assertNoMatchOutsideAllowlist(t, jcsTransformCall, jcsAllowlist,
+		"canonicalizes with gowebpki/jcs directly — sign/verify through the SDK faces (the JCS switch is SDK-internal)")
 }
 
 // TestForbiddenPathsStayDeleted fails when a deleted disease home reappears.
@@ -215,7 +203,8 @@ func TestForbiddenPathsStayDeleted(t *testing.T) {
 	root := repoRoot(t)
 	for _, rel := range forbiddenPaths {
 		if _, err := os.Stat(filepath.Join(root, rel)); err == nil {
-			t.Errorf("%s exists again — the emit-unpopulated codec was relocated to sdk/go/connectserver; do not resurrect the app copy", rel)
+			t.Errorf("%s exists again — its logic moved into the RAMP SDK "+
+				"(sdk/go/connectserver, sdk/go/core, sdk/go/helpers); do not resurrect the app copy", rel)
 		}
 	}
 }

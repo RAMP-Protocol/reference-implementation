@@ -25,7 +25,30 @@
 }
 
 ${exchange_hostname} {
+%{ if terms_enabled ~}
+	# Terms revisions, served from the directory cloud-init writes and the
+	# compose bundle mounts into this container. handle_path, not handle:
+	# handle matches WITHOUT stripping the prefix, so /terms/revision-1.txt
+	# would be looked for at /srv/exchange-terms/terms/revision-1.txt.
+	#
+	# Paths are immutable and revisioned. Never collapse them to a mutable
+	# /terms — a digest published against a replaced document identifies
+	# nothing, and registrations accepted under the old one stop resolving.
+	handle_path /terms/* {
+		root * /srv/exchange-terms
+		file_server
+	}
+
+	# Wrapped because the terms route above is a handler block: an unwrapped
+	# reverse_proxy alongside it would swallow /terms/* before file_server saw
+	# it. This arm exists only when terms are configured — the else arm below
+	# keeps the rendering byte-identical for every deployment that has none.
+	handle {
+		reverse_proxy exchange:8081
+	}
+%{ else ~}
 	reverse_proxy exchange:8081
+%{ endif ~}
 }
 
 ${broker_hostname} {

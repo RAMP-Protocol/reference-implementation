@@ -29,15 +29,11 @@ import (
 // kept scenarios build on (pushOneTerm covers the single-term case).
 func pushTerms(t *testing.T, h *pushHarness, client rampconnect.CatalogServiceClient, callerID, path string, terms ...*rampv1.LicenseTerm) {
 	t.Helper()
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.publisherDom,
-			Path:   path,
-			Terms:  terms,
-		}},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+		Domain: h.publisherDom,
+		Path:   path,
+		Terms:  terms,
+	}})))
 	if err != nil {
 		t.Fatalf("push %s: %v", path, err)
 	}
@@ -86,13 +82,10 @@ func userTypeTerm(label, userType string) *rampv1.LicenseTerm {
 // itself, issues its own request — this helper makes no claim about those.
 func discoverAs(t *testing.T, h *pushHarness, uri string, spec requesterSpec) *rampv1.ResourceResponse {
 	t.Helper()
-	resp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:                    "1.0",
-		Uris:                   []string{uri},
-		Requester:              spec.requester,
-		AcceptableRestrictions: spec.restrictions,
-		SupportedProfiles:      spec.profiles,
-	}))
+	query := newResourceQuery(spec.requester, []string{uri})
+	query.AcceptableRestrictions = spec.restrictions
+	query.SupportedProfiles = spec.profiles
+	resp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(query))
 	if err != nil {
 		t.Fatalf("discover %s: %v", uri, err)
 	}
@@ -101,8 +94,8 @@ func discoverAs(t *testing.T, h *pushHarness, uri string, spec requesterSpec) *r
 
 // discoverOffersAs reads the offers DiscoverResources projects for uri to the
 // given requester. Every projection assertion drives the FULL application chain
-// through this public RPC, never by calling licenseterm.Select with hand-built
-// structs.
+// through this public RPC, never by calling the service's selectTerms with
+// hand-built structs.
 func discoverOffersAs(t *testing.T, h *pushHarness, uri string, spec requesterSpec) []*rampv1.Offer {
 	t.Helper()
 	return discoverAs(t, h, uri, spec).GetOffers()
@@ -140,11 +133,7 @@ type requesterSpec struct {
 // user_type / geography / intended_use restrictions it declares. Empty values
 // are omitted.
 func requesterWithExt(id, userType, geography string, intendedUse ...string) requesterSpec {
-	r := &rampv1.Requester{
-		Id:     id,
-		Domain: "agent.example",
-		Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	r := newRequester(id, "agent.example")
 	var rs []*rampv1.AcceptableRestriction
 	if userType != "" {
 		rs = append(rs, &rampv1.AcceptableRestriction{

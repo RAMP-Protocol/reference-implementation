@@ -1,8 +1,8 @@
-"""Shared well-known route constants for the E2E harness.
+"""Shared constants for the E2E harness: well-known routes, User-Agents, and the
+default agent domain.
 
-Single source of truth for the well-known paths the harness probes, so a spec
-change (e.g. a WBA directory route rename) touches one line, not four. Also
-holds the User-Agent pair every bot-gate check uses, for the same reason.
+Single source of truth for each, so a spec change (e.g. a WBA directory route
+rename) touches one line, not four.
 """
 
 from __future__ import annotations
@@ -23,3 +23,39 @@ WBA_DIRECTORY_PATH = "/.well-known/http-message-signatures-directory"
 
 # Broker-published key-revocation channel (KeyRevocationList wire shape).
 REVOCATION_PATH = "/.well-known/ramp-key-revocations.json"
+
+# The requester domain the harness sends when a suite does not care which one it
+# is. Every addressed request carries requester.domain as a bare host — it names
+# where a verifier would fetch the agent's key — and an empty value is refused
+# for its shape. The Exchange authorizes on requester.id against the signing key,
+# not on this, so one value serves every suite that is not testing the field.
+AGENT_DOMAIN = "agent.example"
+
+
+def requester(
+    agent_id: str,
+    domain: str | None = None,
+    **facets: object,
+) -> dict[str, object]:
+    """The requester object every addressed request carries.
+
+    One builder rather than a dict written out per call site: the three keys and
+    the domain default were copied five times, and the two copies that left the
+    default out are the ones that sent an empty ``domain`` — a value the wire
+    refuses for its shape.
+
+    ``domain`` names where a verifier would fetch the agent's key. Nothing in
+    these suites resolves it (the Exchange authorizes on ``id`` against the
+    signing key), so a caller that does not care gets the harness's own agent
+    domain rather than an absent field. Facets left out are omitted entirely
+    rather than sent empty.
+    """
+    out: dict[str, object] = {
+        "id": agent_id,
+        "domain": domain or AGENT_DOMAIN,
+        "type": "REQUESTER_TYPE_AGENT",
+    }
+    for key, value in facets.items():
+        if value is not None:
+            out[key] = value
+    return out

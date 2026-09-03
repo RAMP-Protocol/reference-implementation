@@ -12,7 +12,7 @@ import (
 )
 
 const getTenantByDomain = `-- name: GetTenantByDomain :one
-SELECT tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay, fee_rate_bps, fee_rate_notes, activate_new_agents_by_default FROM ramp.tenants WHERE domain = $1
+SELECT tenant_id, domain, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay, fee_rate_bps, fee_rate_notes, activate_new_agents_by_default, default_agent_credit FROM ramp.tenants WHERE domain = $1
 `
 
 func (q *Queries) GetTenantByDomain(ctx context.Context, domain string) (RampTenant, error) {
@@ -21,7 +21,6 @@ func (q *Queries) GetTenantByDomain(ctx context.Context, domain string) (RampTen
 	err := row.Scan(
 		&i.TenantID,
 		&i.Domain,
-		&i.HmacSecretRef,
 		&i.Ed25519KeyRef,
 		&i.ReportingPolicy,
 		&i.CreatedAt,
@@ -32,12 +31,13 @@ func (q *Queries) GetTenantByDomain(ctx context.Context, domain string) (RampTen
 		&i.FeeRateBps,
 		&i.FeeRateNotes,
 		&i.ActivateNewAgentsByDefault,
+		&i.DefaultAgentCredit,
 	)
 	return i, err
 }
 
 const getTenantByID = `-- name: GetTenantByID :one
-SELECT tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay, fee_rate_bps, fee_rate_notes, activate_new_agents_by_default FROM ramp.tenants WHERE tenant_id = $1
+SELECT tenant_id, domain, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay, fee_rate_bps, fee_rate_notes, activate_new_agents_by_default, default_agent_credit FROM ramp.tenants WHERE tenant_id = $1
 `
 
 func (q *Queries) GetTenantByID(ctx context.Context, tenantID string) (RampTenant, error) {
@@ -46,7 +46,6 @@ func (q *Queries) GetTenantByID(ctx context.Context, tenantID string) (RampTenan
 	err := row.Scan(
 		&i.TenantID,
 		&i.Domain,
-		&i.HmacSecretRef,
 		&i.Ed25519KeyRef,
 		&i.ReportingPolicy,
 		&i.CreatedAt,
@@ -57,22 +56,22 @@ func (q *Queries) GetTenantByID(ctx context.Context, tenantID string) (RampTenan
 		&i.FeeRateBps,
 		&i.FeeRateNotes,
 		&i.ActivateNewAgentsByDefault,
+		&i.DefaultAgentCredit,
 	)
 	return i, err
 }
 
 const insertTenant = `-- name: InsertTenant :one
 INSERT INTO ramp.tenants (
-    tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy,
+    tenant_id, domain, ed25519_key_ref, reporting_policy,
     signing_scheme, rsa_key_ref, cloudfront_key_pair_id
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING tenant_id, domain, hmac_secret_ref, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay, fee_rate_bps, fee_rate_notes, activate_new_agents_by_default
+) VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING tenant_id, domain, ed25519_key_ref, reporting_policy, created_at, signing_scheme, rsa_key_ref, cloudfront_key_pair_id, allow_broker_relay, fee_rate_bps, fee_rate_notes, activate_new_agents_by_default, default_agent_credit
 `
 
 type InsertTenantParams struct {
 	TenantID            string            `json:"tenant_id"`
 	Domain              string            `json:"domain"`
-	HmacSecretRef       string            `json:"hmac_secret_ref"`
 	Ed25519KeyRef       string            `json:"ed25519_key_ref"`
 	ReportingPolicy     []byte            `json:"reporting_policy"`
 	SigningScheme       RampSigningScheme `json:"signing_scheme"`
@@ -84,7 +83,6 @@ func (q *Queries) InsertTenant(ctx context.Context, arg InsertTenantParams) (Ram
 	row := q.db.QueryRow(ctx, insertTenant,
 		arg.TenantID,
 		arg.Domain,
-		arg.HmacSecretRef,
 		arg.Ed25519KeyRef,
 		arg.ReportingPolicy,
 		arg.SigningScheme,
@@ -95,7 +93,6 @@ func (q *Queries) InsertTenant(ctx context.Context, arg InsertTenantParams) (Ram
 	err := row.Scan(
 		&i.TenantID,
 		&i.Domain,
-		&i.HmacSecretRef,
 		&i.Ed25519KeyRef,
 		&i.ReportingPolicy,
 		&i.CreatedAt,
@@ -106,11 +103,12 @@ func (q *Queries) InsertTenant(ctx context.Context, arg InsertTenantParams) (Ram
 		&i.FeeRateBps,
 		&i.FeeRateNotes,
 		&i.ActivateNewAgentsByDefault,
+		&i.DefaultAgentCredit,
 	)
 	return i, err
 }
 
-const setTenantActivateNewAgentsByDefault = `-- name: SetTenantActivateNewAgentsByDefault :exec
+const setTenantActivateNewAgentsByDefault = `-- name: SetTenantActivateNewAgentsByDefault :execrows
 UPDATE ramp.tenants
    SET activate_new_agents_by_default = $2
  WHERE tenant_id = $1
@@ -125,9 +123,14 @@ type SetTenantActivateNewAgentsByDefaultParams struct {
 // active in the billing system-of-record. Admin / fixture path; the column
 // defaults to TRUE on insert, so this is only needed to opt a tenant out.
 // Mirrors SetTenantAllowBrokerRelay.
-func (q *Queries) SetTenantActivateNewAgentsByDefault(ctx context.Context, arg SetTenantActivateNewAgentsByDefaultParams) error {
-	_, err := q.db.Exec(ctx, setTenantActivateNewAgentsByDefault, arg.TenantID, arg.ActivateNewAgentsByDefault)
-	return err
+// Returns rows-affected so a call for a missing tenant is a detectable no-op
+// rather than a silent success.
+func (q *Queries) SetTenantActivateNewAgentsByDefault(ctx context.Context, arg SetTenantActivateNewAgentsByDefaultParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setTenantActivateNewAgentsByDefault, arg.TenantID, arg.ActivateNewAgentsByDefault)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setTenantAllowBrokerRelay = `-- name: SetTenantAllowBrokerRelay :exec
@@ -147,6 +150,31 @@ type SetTenantAllowBrokerRelayParams struct {
 func (q *Queries) SetTenantAllowBrokerRelay(ctx context.Context, arg SetTenantAllowBrokerRelayParams) error {
 	_, err := q.db.Exec(ctx, setTenantAllowBrokerRelay, arg.TenantID, arg.AllowBrokerRelay)
 	return err
+}
+
+const setTenantDefaultAgentCredit = `-- name: SetTenantDefaultAgentCredit :execrows
+UPDATE ramp.tenants
+   SET default_agent_credit = $2
+ WHERE tenant_id = $1
+`
+
+type SetTenantDefaultAgentCreditParams struct {
+	TenantID           string         `json:"tenant_id"`
+	DefaultAgentCredit pgtype.Numeric `json:"default_agent_credit"`
+}
+
+// Replaces the per-tenant default credit granted to a newly registered agent
+// (deployment ledger currency; 0 disables the grant). Written by the boot-time
+// env seeding (EXCHANGE_DEFAULT_AGENT_CREDIT); otherwise set out of band like
+// activate_new_agents_by_default — there is no admin RPC.
+// Returns rows-affected so a call for a missing tenant is a detectable no-op
+// rather than a silent success.
+func (q *Queries) SetTenantDefaultAgentCredit(ctx context.Context, arg SetTenantDefaultAgentCreditParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setTenantDefaultAgentCredit, arg.TenantID, arg.DefaultAgentCredit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setTenantFeeRateBps = `-- name: SetTenantFeeRateBps :execrows

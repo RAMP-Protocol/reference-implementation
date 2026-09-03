@@ -16,13 +16,14 @@ and commit later via ExecuteTransaction.
 
 from __future__ import annotations
 
-import uuid
 
 from typing import Any, cast
 
 import httpx
 import pytest
 
+from ..exchanges import recipient_of
+from ..discovery import discover_body
 from ..conftest import StackURLs
 from ..seed import DEMO_PHILOSOPHY_DOMAIN, USD_AGENT_ID, SeededFixture
 from ..signing import sign_post
@@ -46,17 +47,14 @@ def test_single_uri_browse_returns_offers_with_prices_and_terms(
     """DiscoverResources on a single demo URI returns one Offer with full terms."""
     resp = sign_post(
         f"{compose_stack.exchange}{_DISCOVER_PATH}",
-        body={
-            "id": f"q-{uuid.uuid4().hex}",
-            "requester": {
-                "id": USD_AGENT_ID,
-                "domain": DEMO_PHILOSOPHY_DOMAIN,
-                "type": "REQUESTER_TYPE_AGENT",
-                "user_type": "individual",
-                "geography": "US",
-            },
-            "uris": [_RESOURCE_URI],
-        },
+        body=discover_body(
+            agent_id=USD_AGENT_ID,
+            uris=[_RESOURCE_URI],
+            exchange=recipient_of(compose_stack.exchange),
+            domain=DEMO_PHILOSOPHY_DOMAIN,
+            user_type="individual",
+            geography="US",
+        ),
     )
     # (a)
     assert resp.status_code == httpx.codes.OK, (

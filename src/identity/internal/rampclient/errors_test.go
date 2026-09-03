@@ -16,7 +16,7 @@ import (
 // produces; the other two are reachable in production from any peer that answers
 // with a message-only detail or a body that is not an ErrorDetail at all.
 func TestRelayError_ClassifiesEachReplyShape(t *testing.T) {
-	detailWithReason, err := protojson.Marshal(&rampv1.ErrorDetail{
+	detailWithReason, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&rampv1.ErrorDetail{
 		Message: "the offer expired",
 		Reason: &rampv1.ErrorDetail_TransactionDenial{
 			TransactionDenial: &rampv1.TransactionDenial{
@@ -27,7 +27,7 @@ func TestRelayError_ClassifiesEachReplyShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal detail: %v", err)
 	}
-	messageOnly, err := protojson.Marshal(&rampv1.ErrorDetail{Message: "try again later"})
+	messageOnly, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&rampv1.ErrorDetail{Message: "try again later"})
 	if err != nil {
 		t.Fatalf("marshal detail: %v", err)
 	}

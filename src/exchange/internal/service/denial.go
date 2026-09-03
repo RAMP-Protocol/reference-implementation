@@ -14,15 +14,23 @@ import (
 // internal) are absent and either carry only a transport code (single-offer
 // path) or abort the whole batch (batch path).
 //
+// KindContentUnavailable is a denial and KindNotFound is not, even though the
+// catalog miss that produces the first is a lookup failure. The distinction is
+// what the caller can do about it: an agent holding an authentic offer for
+// withdrawn content is refused that purchase and keeps its other items, while a
+// missing agent, tenant, evidence row or obligation means the request itself
+// does not describe anything the Exchange can act on.
+//
 // This is the SINGLE source of truth for the denial vocabulary: the transport
 // layer's executeTxError reuses DenialReasonForKind for the single-offer typed
 // ErrorDetail, and the batch ExecuteTransaction loop reuses it to set each
 // TransactionResultItem.denial_reason — so the per-item batch denial and the
 // single-offer transport denial can never drift (the derived per-item key).
 var denialReasonByKind = map[exchange.Kind]rampv1.DenialReason{
+	exchange.KindContentUnavailable:    rampv1.DenialReason_DENIAL_REASON_CONTENT_UNAVAILABLE,
 	exchange.KindBillingDenied:         rampv1.DenialReason_DENIAL_REASON_INSUFFICIENT_BALANCE,
-	exchange.KindAccountNotRegistered:  rampv1.DenialReason_DENIAL_REASON_BILLING_REF_INACTIVE,
-	exchange.KindAccountInactive:       rampv1.DenialReason_DENIAL_REASON_BILLING_REF_INACTIVE,
+	exchange.KindAccountNotRegistered:  rampv1.DenialReason_DENIAL_REASON_ACCOUNT_NOT_REGISTERED,
+	exchange.KindAccountInactive:       rampv1.DenialReason_DENIAL_REASON_ACCOUNT_INACTIVE,
 	exchange.KindSignatureInvalid:      rampv1.DenialReason_DENIAL_REASON_SIGNATURE_INVALID,
 	exchange.KindOfferExpired:          rampv1.DenialReason_DENIAL_REASON_OFFER_EXPIRED,
 	exchange.KindEntitlementMissing:    rampv1.DenialReason_DENIAL_REASON_ENTITLEMENT_MISSING,
@@ -31,6 +39,7 @@ var denialReasonByKind = map[exchange.Kind]rampv1.DenialReason{
 	exchange.KindEntitlementWrongBuyer: rampv1.DenialReason_DENIAL_REASON_ENTITLEMENT_WRONG_BUYER,
 	exchange.KindSubscriptionLapsed:    rampv1.DenialReason_DENIAL_REASON_SUBSCRIPTION_LAPSED,
 	exchange.KindEntitlementNotGranted: rampv1.DenialReason_DENIAL_REASON_ENTITLEMENT_NOT_GRANTED,
+	exchange.KindReportingOverdue:      rampv1.DenialReason_DENIAL_REASON_REPORTING_OVERDUE,
 }
 
 // DenialReasonForKind returns the canonical DenialReason for a transaction-denial

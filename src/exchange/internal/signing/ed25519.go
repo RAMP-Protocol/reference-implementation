@@ -57,9 +57,11 @@ func (s *Ed25519Signer) PublicKeyB64URL() string {
 	return base64.RawURLEncoding.EncodeToString(s.public)
 }
 
-// SignatureAlgorithm is the JWS alg value advertised on offers. It mirrors
-// helpers.OfferSignatureAlgorithm; offers signed by this package carry it on
+// SignatureAlgorithm is the algorithm name "EdDSA" carried on
 // Offer.signature_algorithm (which the canonical payload clears before signing).
+// It mirrors helpers.OfferSignatureAlgorithm. The name is the one JOSE registers
+// for Ed25519, but Offer.signature itself is a hex-encoded detached Ed25519
+// signature — not a JWS, and not any other JOSE object.
 const SignatureAlgorithm = helpers.OfferSignatureAlgorithm
 
 // SignOffer signs offer with the encapsulated private key and returns the

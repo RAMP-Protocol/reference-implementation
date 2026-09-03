@@ -31,9 +31,9 @@ import (
 // ErrUnknown is returned when LookupPublicKey has no registration for the agent.
 var ErrUnknown = errors.New("agentreg: unknown agent")
 
-// ErrNoValidKey is returned when a manifest has no key whose validity window
-// covers the registry's current clock reading.
-var ErrNoValidKey = errors.New("agentreg: no currently valid key in manifest")
+// ErrNoValidKey is returned when the key directory has no key whose validity
+// window covers the registry's current clock reading.
+var ErrNoValidKey = errors.New("agentreg: no currently valid key in the key directory")
 
 // ErrAgentIDMismatch is returned when the discovery URL's host does not match
 // the agent_id the caller asserted. Identity is anchored to the host that
@@ -41,20 +41,27 @@ var ErrNoValidKey = errors.New("agentreg: no currently valid key in manifest")
 // content is read on either side of the comparison.
 var ErrAgentIDMismatch = errors.New("agentreg: discovery host does not match the asserted agent id")
 
-// ErrMalformedManifest is returned when the manifest fails schema validation,
-// carries a non-AGENT role, or its selected key cannot be decoded.
-var ErrMalformedManifest = errors.New("agentreg: malformed manifest")
+// ErrMalformedDirectory is returned when the key directory fails schema
+// validation, its URL cannot be built from the identity, or its selected key
+// cannot be decoded.
+//
+// The document is the agent's Web Bot Auth key directory, NOT its ramp.json
+// commercial overlay: this package fetches only the former, and the role a
+// caller might have declared in the latter is never read. Naming the overlay
+// here sent an operator to the wrong document, which is the same failure the
+// ErrNotAHost split below was introduced to fix.
+var ErrMalformedDirectory = errors.New("agentreg: malformed key directory")
 
 // ErrNotAHost is returned when a value this package was asked to treat as an
 // identity does not name a host — so it can be neither a storage key nor a fetch
 // target. It is its own sentinel because the three refusals that share it are one
 // failure class, and the two they used to borrow both claim something the caller
 // can act on and this does not: ErrAgentIDMismatch says two hosts disagree, which
-// is a different repair from "this is not a host at all", and ErrMalformedManifest
+// is a different repair from "this is not a host at all", and ErrMalformedDirectory
 // points at a document that in this case was never retrieved. On the
-// unauthenticated agents/register endpoint that produced a 400 reading
-// "manifest is malformed" for a bad discovery_url, which sends the caller to
-// inspect a manifest the Exchange never fetched.
+// unauthenticated agents/register endpoint that produced a 400 blaming a
+// malformed document for a bad discovery_url, which sent the caller to inspect a
+// document the Exchange never fetched.
 //
 // IsCallerFault classifies it as a permanent caller fault, like the sentinels it
 // splits from, so no call site's accept/reject behaviour changes — only the
@@ -238,7 +245,7 @@ func (r *registry) RegisterFromDirectory(ctx context.Context, agentID, directory
 	}
 	resolvedURL, err := rampwellknown.WBAURL(identity, r.scheme, r.port)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrMalformedManifest, err)
+		return fmt.Errorf("%w: %w", ErrMalformedDirectory, err)
 	}
 	// The WBA directory carries only keys — no role, no domain field. The
 	// anchoring boundary is the fetch LOCATION: the directory is fetched from the
@@ -330,7 +337,7 @@ func (r *registry) selectValidKey(f *rampwellknown.WBAFile) (ed25519.PublicKey, 
 		// No key's validity window covers now → registrable-identity fault.
 		return nil, ErrNoValidKey
 	case err != nil:
-		return nil, fmt.Errorf("%w: %w", ErrMalformedManifest, err)
+		return nil, fmt.Errorf("%w: %w", ErrMalformedDirectory, err)
 	}
 	return pub, nil
 }
@@ -354,7 +361,7 @@ func requireAnchoredHost(agentID, discoveryURL string) (string, error) {
 	}
 	got, err := agentid.FromDirectory(discoveryURL)
 	if err != nil {
-		// ErrNotAHost, not ErrMalformedManifest: no manifest was fetched, so
+		// ErrNotAHost, not ErrMalformedDirectory: no manifest was fetched, so
 		// pointing the caller at one to inspect would be a false lead.
 		return "", fmt.Errorf("%w: discovery_url: %w", ErrNotAHost, err)
 	}
@@ -366,19 +373,24 @@ func requireAnchoredHost(agentID, discoveryURL string) (string, error) {
 }
 
 // mapFetchError translates rampwellknown fetch sentinels into agentreg's error
-// vocabulary. A schema failure is a malformed registration (client-facing 400
-// at the transport layer); a missing manifest (404) or a transport/non-2xx
-// failure is surfaced verbatim so the transport layer maps it to an
-// upstream-fetch failure (502).
+// vocabulary. A schema failure is a malformed registration; an absent key
+// directory (404) and a transport/non-2xx failure are both surfaced verbatim,
+// so callers keep the distinction rampwellknown drew between them.
+//
+// This function does NOT decide how a caller answers. It once said an absent
+// directory was surfaced "so the transport layer maps it to an upstream-fetch
+// failure (502)", which contradicted IsCallerFault ten lines below — the same
+// 404 was a permanent caller fault there. IsCallerFault is the decision; this
+// one only preserves the sentinels it switches on.
 func mapFetchError(err error) error {
 	if errors.Is(err, rampwellknown.ErrSchemaInvalid) {
-		return fmt.Errorf("%w: %w", ErrMalformedManifest, err)
+		return fmt.Errorf("%w: %w", ErrMalformedDirectory, err)
 	}
-	return fmt.Errorf("agentreg: fetch manifest: %w", err)
+	return fmt.Errorf("agentreg: fetch key directory: %w", err)
 }
 
 // IsCallerFault reports whether a RegisterFromDirectory error is a permanent
-// caller fault — the keyID is simply not a registrable identity (manifest
+// caller fault — the keyID is simply not a registrable identity (key directory
 // absent, malformed, unanchored, or publishing no currently-valid key) — rather
 // than a transient upstream failure (ErrFetch) the caller should retry. Every
 // lazy-registration call site (service.mapLazyRegisterError, the catalog
@@ -389,10 +401,10 @@ func IsCallerFault(err error) bool {
 	switch {
 	case errors.Is(err, ErrAgentIDMismatch),
 		errors.Is(err, ErrNotAHost),
-		errors.Is(err, ErrMalformedManifest),
+		errors.Is(err, ErrMalformedDirectory),
 		errors.Is(err, ErrNoValidKey),
 		errors.Is(err, ErrUnknown),
-		errors.Is(err, rampwellknown.ErrNoManifest):
+		errors.Is(err, rampwellknown.ErrNoDocument):
 		return true
 	default:
 		return false

@@ -188,6 +188,35 @@ linters:
           - gosec
           - lll
           - gocritic
+      # gosec G204 (subprocess with a variable argument): ramp-ledger reads the
+      # edge delivery logs by running the aws CLI. The command name is a
+      # constant and the arguments are passed as an argv array, so no shell
+      # parses them and there is no command string to inject into. The reachable
+      # risk is the CLI's OWN flag parser reading a dashed value as an option,
+      # and checkAWSArgs refuses that before the call: the region must match the
+      # AWS region grammar, the log group the CloudWatch name grammar, and the
+      # filter pattern must be a hex digest. gosec flags any non-literal
+      # argument and cannot see that guard.
+      - path: 'src/broker/cmd/ramp-ledger/edgelog.go'
+        text: 'G204'
+        linters:
+          - gosec
+      # gosec G704 (SSRF via taint analysis): SSRF is a server being tricked
+      # into making a request on someone else's behalf. ramp-ledger is an
+      # operator CLI, and the URL it fetches is the one the operator typed on
+      # their own command line, so there is no other party whose input reaches
+      # it. gosec sees only that a flag and an environment variable reach
+      # http.NewRequestWithContext, which is the tool's entire purpose.
+      # Routing this through the SDK's SSRF-guarded client would break it: the
+      # admin plane is not exposed, so the URL is normally a loopback tunnel
+      # such as http://127.0.0.1:8091, exactly what that guard rejects.
+      # evidenceURL still refuses a scheme that is not http or https and a URL
+      # with no host, so a typo fails on its own message rather than at the
+      # transport.
+      - path: 'src/broker/cmd/ramp-ledger/fetch.go'
+        text: 'G704'
+        linters:
+          - gosec
       # gosec G705 (XSS via taint analysis) does not apply to the Broker's
       # writeProtoJSON: the payload is server-built canonical proto-JSON written
       # with Content-Type application/json, never user-reflected HTML.

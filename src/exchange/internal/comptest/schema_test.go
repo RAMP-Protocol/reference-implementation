@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 )
 
 // compileCompSchema loads and compiles the authored CoMP V1 JSON Schema
@@ -15,31 +17,13 @@ import (
 // the rest of the repo uses (santhosh-tekuri/jsonschema/v6).
 func compileCompSchema(t *testing.T) *jsonschema.Schema {
 	t.Helper()
-	const name = "comp-v1.schema.json"
-	p := filepath.Join(repoRoot(t), "schemas", "comp", "v1", name)
-	raw, err := os.ReadFile(p) //nolint:gosec // schema path is repo-controlled
-	if err != nil {
-		t.Fatalf("read schema: %v", err)
-	}
-	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
-	if err != nil {
-		t.Fatalf("parse schema: %v", err)
-	}
-	c := jsonschema.NewCompiler()
-	if err := c.AddResource(name, doc); err != nil {
-		t.Fatalf("add schema: %v", err)
-	}
-	sch, err := c.Compile(name)
-	if err != nil {
-		t.Fatalf("compile schema: %v", err)
-	}
-	return sch
+	return testutil.CompileSchema(t, filepath.Join(repoRoot(t), "schemas", "comp", "v1", "comp-v1.schema.json"))
 }
 
 // instanceFromFile reads a canonical fixture as a generic JSON instance.
 func instanceFromFile(t *testing.T, path string) any {
 	t.Helper()
-	raw, err := os.ReadFile(path) //nolint:gosec // fixture path is test-controlled
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}

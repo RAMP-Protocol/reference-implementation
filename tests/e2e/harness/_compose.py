@@ -19,6 +19,7 @@ labels, which together pin the project context exactly.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,6 +28,36 @@ import docker
 
 if TYPE_CHECKING:
     from docker import DockerClient
+
+
+def resolve_compose_file() -> Path:
+    """Locate docker-compose.e2e.yml.
+
+    Inside the runner container we bind-mount it at RAMP_E2E_COMPOSE_FILE.
+    From the repo root (host run) it lives three dirs up from this file.
+
+    It lives here, beside the port lookup that reads it, rather than in
+    ``conftest``: a module that only needs to ask compose a question should not
+    have to import a pytest-convention file to do it. ``register_staging_agent``
+    is the case that proves it — not a pytest run at all, and it would otherwise
+    pull in pytest and the fixture stack to answer one question about a host.
+    """
+    env_path = os.environ.get("RAMP_E2E_COMPOSE_FILE")
+    if env_path:
+        return Path(env_path)
+    return Path(__file__).resolve().parents[3] / "docker-compose.e2e.yml"
+
+
+COMPOSE_FILE = resolve_compose_file()
+
+# The tree COMPOSE_FILE sits in. Defined beside it rather than in conftest.py for
+# the reason readiness.py states about the poller: conftest.py is the pytest
+# plugin file every module in this package already imports, so anything defined
+# there cannot be imported BACK by a module conftest itself uses. REPO_ROOT was
+# the last value still breaking that rule, and publish_harness.py reading it from
+# conftest is what forced conftest to import publish_harness inside a fixture
+# body. Defined here, both become ordinary top-level imports.
+REPO_ROOT = COMPOSE_FILE.parent
 
 
 # Compose's own project-name normalization (cli/utils.go::NormalizeProjectName):

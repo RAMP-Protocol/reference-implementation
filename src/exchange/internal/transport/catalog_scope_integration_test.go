@@ -25,21 +25,16 @@ func scopedTerm(label string, scopes ...string) *rampv1.LicenseTerm {
 }
 
 // requesterWithScopes builds a Requester carrying the Biscuit-authority scopes
-// Select reads from the native Requester.scopes field (distinct from the ext
-// facets requesterWithExt populates). No user_type/geography facets are set, so
+// selectTerms reads from the native Requester.scopes field (distinct from the
+// ext facets requesterWithExt populates). No user_type/geography facets are set, so
 // a scope-only term — which carries no restrictions — is gated purely on scope
 // coverage.
 func requesterWithScopes(id string, scopes ...string) requesterSpec {
-	return requesterSpec{requester: &rampv1.Requester{
-		Id:     id,
-		Domain: "agent.example",
-		Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		Scopes: scopes,
-	}}
+	return requesterSpec{requester: newRequester(id, "agent.example", scopes...)}
 }
 
 // TestDiscover_SelectByScope pins scope/subscription gating
-// (licenseterm.go:259-415 Select -> scopesCovered/scopeCovered) through
+// (service/termselect.go: selectTerms -> scopesCovered/scopeCovered) through
 // the public DiscoverResources RPC, the single observation surface. Each row
 // pushes ONE scope-gated term and discovers it as a requester with a given
 // Biscuit-authority scope set; a kept term projects on a single offer with the

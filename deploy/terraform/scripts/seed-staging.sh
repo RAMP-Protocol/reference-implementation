@@ -50,10 +50,9 @@ command -v go >/dev/null 2>&1 || { echo "missing: go" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "missing: python3" >&2; exit 2; }
 command -v uv >/dev/null 2>&1 || { echo "missing: uv" >&2; exit 2; }
 
-# The stack's ssh_command output is the one place that knows how to reach the
-# VM — it carries -i <key> when ssh_private_key_path is set in tfvars. Split
-# it into words for exec (none of its parts can contain spaces).
-read -r -a SSH_CMD <<< "$(tf_out ssh_command)"
+# Builds SSH_CMD from the stack.s vm_public_ip output. The identity comes from
+# RAMP_SSH_IDENTITY_FILE, not from Terraform - see lib/staging-env.sh.
+load_ssh_cmd
 
 # The rows seeded below are keyed by the smoke ids, and the services verify
 # those identities' signatures by fetching https://<id>/.well-known/... — so
@@ -101,8 +100,7 @@ RELAY_PUB_HEX="$(pub_hex "${KEYS_DIR}/broker-relay-key.json")"
 
 SQL_FILE="$(mktemp)"
 TMP_FEED="$(mktemp)"
-INGEST_LOG="$(mktemp)"
-trap 'rm -f "${SQL_FILE}" "${TMP_FEED}" "${INGEST_LOG}"' EXIT
+trap 'rm -f "${SQL_FILE}" "${TMP_FEED}"' EXIT
 
 # The SQL references every operator-supplied value as a psql variable
 # (:'name') — psql quotes those as SQL literals server-side, so no value is
@@ -113,9 +111,9 @@ cat > "${SQL_FILE}" <<'EOSQL'
 -- Tenant for the demo publisher domain; ed25519_key_ref matches the ref the
 -- Exchange registers its loaded PEM under (RAMP_DEMO_ED25519_KEY_REF default).
 INSERT INTO ramp.tenants (
-    tenant_id, domain, hmac_secret_ref, ed25519_key_ref,
+    tenant_id, domain, ed25519_key_ref,
     reporting_policy, signing_scheme
-) VALUES (:'tenant_id', :'publisher', 'none', 'exchange-primary', '{}', 'ED25519')
+) VALUES (:'tenant_id', :'publisher', 'exchange-primary', '{}', 'ED25519')
 ON CONFLICT (tenant_id) DO NOTHING;
 
 -- Broker-relayed ExecuteTransaction is opt-in per tenant.
@@ -176,23 +174,30 @@ echo "=========================================================="
     "sudo docker compose -f ${VM_COMPOSE_FILE} exec -T postgres psql -v ON_ERROR_STOP=1 $(printf '%q ' "${PSQL_VARS[@]}") -U ramp -d ramp" \
     < "${SQL_FILE}"
 
+# The Exchange starts before this one-time SQL creates the default tenant, so
+# its boot-time EXCHANGE_DEFAULT_AGENT_CREDIT write initially has no row to
+# update. Restart after seeding and wait for health before Register; this keeps
+# the boot path as the setting's sole owner and prevents a zero-credit race.
+echo "== restart Exchange to apply boot-time tenant settings =="
+"${SSH_CMD[@]}" \
+    "sudo docker compose -f ${VM_COMPOSE_FILE} restart exchange >/dev/null && \
+     sudo docker compose -f ${VM_COMPOSE_FILE} up -d --wait --wait-timeout 120 exchange"
+
 echo "== ingest demo feed as ${CONTRIBUTOR_ID} (domain rewritten to ${PUBLISHER}) =="
 sed "s|demo\.ramp-protocol\.org|${PUBLISHER}|g" "${FEED}" > "${TMP_FEED}"
 
+# The exit status is the whole verdict: the Exchange stores or refuses a
+# submission whole and the binary exits non-zero on any refusal, so there is
+# no second signal to read off its report.
 cd "${REPO_ROOT}"
 if ! go run ./src/exchange/cmd/ramp-ingest \
     --exchange-url "${EXCHANGE_URL}" \
     --tenant "${TENANT_ID}" \
     --key "${KEYS_DIR}/contributor-key.json" \
-    "${TMP_FEED}" 2>&1 | tee "${INGEST_LOG}"; then
-    echo "ingest failed" >&2
+    "${TMP_FEED}"; then
+    echo "ingest failed — seed is NOT complete" >&2
     exit 1
 fi
-if ! grep -q "rejected=0" "${INGEST_LOG}"; then
-    echo "ingest reported rejected entries — seed is NOT complete" >&2
-    exit 1
-fi
-rm -f "${INGEST_LOG}"
 
 # The SQL above gives the smoke agent an identity, not a billing account. The
 # billing_ref every ledger account id is derived from is minted only by the
@@ -215,4 +220,4 @@ fi
 
 echo "seed complete: tenant ${TENANT_ID} (${PUBLISHER}) + demo feed on ${EXCHANGE_URL}"
 echo "  smoke agent billing_ref: ${BILLING_REF}"
-echo "next: fund-staging-agent.sh — the smoke agent needs test money for the paid articles"
+echo "next: agent-balances.sh — verify the configured welcome credit; fund manually if the balance is zero"

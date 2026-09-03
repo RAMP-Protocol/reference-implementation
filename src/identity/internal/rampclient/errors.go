@@ -1,11 +1,15 @@
 package rampclient
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
+	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
-	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampreason"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/account"
 )
 
 // Kind classifies why an outbound RAMP call failed, so a caller can branch on
@@ -24,6 +28,12 @@ const (
 	// KindMalformed is an answer that arrived but could not be understood.
 	KindMalformed
 )
+
+// There is deliberately no kind for "refused here, before anything was sent".
+// The SDK already has one — rampsdkconnect.CallNotSent — and the routing
+// refusals are reported with it, so the same condition carries the same token
+// whichever leg produced it. A local kind would be a second vocabulary kept in
+// step with the first by spelling alone.
 
 // kindStrings names each Kind for logging. Parity with exchange.Kind and
 // broker.Kind, which both render their kind rather than logging a bare integer.
@@ -88,50 +98,36 @@ func (e *Error) statusText() string {
 func (e *Error) Unwrap() error { return e.Err }
 
 // Reason is the typed reason token the peer supplied, or "" when it sent none.
+// Rendered by internal/rampreason, which every outbound leg reads, so no two of
+// them can name the same refusal differently.
 func (e *Error) Reason() string {
 	if e.Detail == nil {
 		return ""
 	}
-	return ReasonName(e.Detail)
+	return rampreason.Name(e.Detail)
 }
 
-// ReasonName renders the populated arm of a RAMP ErrorDetail's reason oneof as a
-// short, stable token an agent can branch on — DENIAL_REASON_OFFER_EXPIRED rather
-// than a code an agent has no schema for. It is the single reader of the reason
-// oneof, shared by the relay error path here and the Connect error path in the
-// MCP tools, so the two cannot disagree on how a refusal is named.
+// noAccount labels an account-status failure that is really the "not registered"
+// answer, by wrapping account.ErrNoAccount. The cause is kept underneath, so the
+// layer that renders a refusal can still recover the code and any typed detail.
 //
-// Each arm is a distinct failure KIND — a denial is an access decision, a
-// rejection a refused submission, a failure an operation that could not complete
-// — and the enum inside names the specific cause. An empty result means the
-// detail carried no reason, and the caller falls back to the transport status.
-func ReasonName(detail *rampv1.ErrorDetail) string {
-	switch r := detail.GetReason().(type) {
-	case *rampv1.ErrorDetail_TransactionDenial:
-		return EnumName(r.TransactionDenial.GetReason())
-	case *rampv1.ErrorDetail_RegistrationFailure:
-		return EnumName(r.RegistrationFailure.GetReason())
-	case *rampv1.ErrorDetail_UsageReportRejection:
-		return EnumName(r.UsageReportRejection.GetReason())
-	case *rampv1.ErrorDetail_CatalogRejection:
-		return EnumName(r.CatalogRejection.GetReason())
-	case *rampv1.ErrorDetail_RetrievalAuthFailure:
-		return EnumName(r.RetrievalAuthFailure.GetReason())
-	default:
-		// The remaining arms (dispute, domain verification) belong to RPCs this
-		// adapter does not call; the transport status carries them adequately.
-		return ""
+// The CLASSIFICATION is here because this package owns the Connect vocabulary.
+// GetAccountStatus carries no typed denial in the protocol today, so the answer
+// arrives as a bare NotFound and something has to read it; a caller that read
+// the code itself would be deciding a domain answer, and a mutation, from a wire
+// detail it has no other reason to know. If the protocol later gives this answer
+// a reason of its own, this is the one function that changes.
+//
+// The SENTINEL is not here, and that split is deliberate. It is part of what the
+// account leg promises whoever consumes it, so it belongs beside that port in
+// account rather than inside one client that happens to satisfy it today — this
+// package goes when the two account RPCs land in the SDK, and a consumer holding
+// errors.Is against a sentinel defined here would go quiet at exactly that
+// moment, turning a normal "not registered" answer into a tool failure.
+func noAccount(exchange string, err error) error {
+	var connErr *connect.Error
+	if errors.As(err, &connErr) && connErr.Code() == connect.CodeNotFound {
+		return fmt.Errorf("%w %s: %w", account.ErrNoAccount, exchange, err)
 	}
-}
-
-// EnumName renders a protobuf enum value by its declared name. The zero value
-// means "unset" in every RAMP reason enum and reports nothing rather than a name.
-func EnumName(v protoreflect.Enum) string {
-	if v.Number() == 0 {
-		return ""
-	}
-	if d := v.Descriptor().Values().ByNumber(v.Number()); d != nil {
-		return string(d.Name())
-	}
-	return ""
+	return err
 }

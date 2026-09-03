@@ -16,13 +16,13 @@ CREATE SCHEMA IF NOT EXISTS sor;
 -- Nullability: only structural columns are NOT NULL — billing_ref (PK),
 -- subdomain (identity backstop; the caller derives it from the verified
 -- signature, never the payload), active (a boolean must be decided), and
--- extra (defaulted). Every licensing-deal column stays nullable: the
--- registration form — not the Exchange — is the mandatory-fields gate, and
--- Register is a public RPC that self-hosted agents call directly with
--- arbitrary registration_data. Completeness is enforced operationally via
--- active (the operator does not activate an incomplete account); a NULL
--- column is the "registration incomplete" signal. No format CHECKs either —
--- the SoR is a dumb store.
+-- extra (defaulted). Every licensing-deal column stays nullable, and nothing
+-- upstream makes them complete: Register is a public RPC that self-hosted
+-- agents call directly with arbitrary registration_data, and each Exchange
+-- decides for itself which fields it wants. Completeness is enforced
+-- operationally via active (the operator does not activate an incomplete
+-- account); a NULL column is the "registration incomplete" signal. There are
+-- no format CHECKs either — the SoR is a dumb store.
 CREATE TABLE sor.agent_accounts (
     -- Random UUID minted by the Exchange and passed in (ADR-021 D1/D2).
     billing_ref              TEXT PRIMARY KEY,

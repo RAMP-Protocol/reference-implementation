@@ -6,7 +6,8 @@ import (
 	"testing"
 
 	connect "connectrpc.com/connect"
-	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 )
 
 // An agent's identity is the HOST of the directory it names in the covered
@@ -41,10 +42,7 @@ func TestAgentIdentity_SchemeSpellingsShareOneAccount(t *testing.T) {
 	const host = "collapse-agent.example"
 	a := h.newAgent(t, host)
 
-	reg, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{
-		Ver:              "1.0",
-		RegistrationData: mustRegistrationStruct(t, map[string]any{"legal_entity": "Collapse AI Ltd"}),
-	}))
+	reg, err := a.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(testutil.RegistrationStruct(t, map[string]any{"legal_entity": "Collapse AI Ltd"}))))
 	if err != nil {
 		t.Fatalf("Register as bare host %q: %v", host, err)
 	}
@@ -58,7 +56,7 @@ func TestAgentIdentity_SchemeSpellingsShareOneAccount(t *testing.T) {
 		t.Run(directory, func(t *testing.T) {
 			client := h.clientFor(directory, a.priv)
 			resp, err := client.GetAccountStatus(h.ctx,
-				connect.NewRequest(&rampv1.GetAccountStatusRequest{Ver: "1.0"}))
+				connect.NewRequest(newAccountStatusRequest()))
 			if err != nil {
 				t.Fatalf("GetAccountStatus signing Signature-Agent %q: %v", directory, err)
 			}
@@ -87,7 +85,7 @@ func TestAgentIdentity_SchemeIsNotAnIdentityBoundary(t *testing.T) {
 
 	// Self-sign up and register under the https spelling.
 	httpsClient := h.clientFor("https://"+host, a.priv)
-	reg, err := httpsClient.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+	reg, err := httpsClient.Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 	if err != nil {
 		t.Fatalf("Register as %q: %v", "https://"+host, err)
 	}
@@ -96,7 +94,7 @@ func TestAgentIdentity_SchemeIsNotAnIdentityBoundary(t *testing.T) {
 	// A second Register under the bare spelling must be the already-registered fast
 	// path returning the SAME ref, not a fresh account (ADR-021 D4: the stored id
 	// wins). A new ref here would mean the bare spelling is a separate identity.
-	again, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+	again, err := a.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 	if err != nil {
 		t.Fatalf("Register as bare %q after registering as https: %v", host, err)
 	}
@@ -128,7 +126,7 @@ func TestAgentIdentity_QuotedSignatureAgentAuthorizes(t *testing.T) {
 	a := h.newAgent(t, host)
 
 	// Register with the bare form the agent self-signed up under.
-	reg, err := a.client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+	reg, err := a.client.Register(h.ctx, connect.NewRequest(newRegisterRequest(nil)))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -139,7 +137,7 @@ func TestAgentIdentity_QuotedSignatureAgentAuthorizes(t *testing.T) {
 	// and only the extracted directory is unquoted.
 	quoted := h.clientFor(`"https://`+host+`"`, a.priv)
 	resp, err := quoted.GetAccountStatus(h.ctx,
-		connect.NewRequest(&rampv1.GetAccountStatusRequest{Ver: "1.0"}))
+		connect.NewRequest(newAccountStatusRequest()))
 	if err != nil {
 		t.Fatalf(`GetAccountStatus signing Signature-Agent "https://%s": %v — a conformant signer must not be refused`, host, err)
 	}
@@ -174,10 +172,7 @@ func TestAgentIdentity_UnusableDirectoryIsRejected(t *testing.T) {
 	a := h.newAgent(t, host)
 
 	client := h.clientFor(`agent2="https://`+host+`"`, a.priv)
-	_, err := client.Register(h.ctx, connect.NewRequest(&rampv1.RegisterRequest{
-		Ver:              "1.0",
-		RegistrationData: mustRegistrationStruct(t, map[string]any{"legal_entity": "Dict Form AI Ltd"}),
-	}))
+	_, err := client.Register(h.ctx, connect.NewRequest(newRegisterRequest(testutil.RegistrationStruct(t, map[string]any{"legal_entity": "Dict Form AI Ltd"}))))
 	if err == nil {
 		t.Fatal("Register succeeded with a Signature-Agent that names no host; want rejection")
 	}
@@ -189,7 +184,7 @@ func TestAgentIdentity_UnusableDirectoryIsRejected(t *testing.T) {
 	// through the public read RPC: NotFound is the answer for an agent with no
 	// billing_ref, and only Register mints one.
 	_, err = a.client.GetAccountStatus(h.ctx,
-		connect.NewRequest(&rampv1.GetAccountStatusRequest{Ver: "1.0"}))
+		connect.NewRequest(newAccountStatusRequest()))
 	if got := connect.CodeOf(err); got != connect.CodeNotFound {
 		t.Fatalf("code = %v, want NotFound — the refused Register minted an account for %q anyway (err=%v)",
 			got, host, err)

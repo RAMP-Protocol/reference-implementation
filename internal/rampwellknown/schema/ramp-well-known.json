@@ -23,15 +23,25 @@
     },
     "max_intermediary_hops": { "type": "integer", "minimum": 0 },
     "base_currency": { "type": "string" },
-    "supported_profiles": { "type": "array", "items": { "type": "string" } }
+    "supported_profiles": { "type": "array", "items": { "type": "string" } },
+    "terms_uri": { "type": "string" },
+    "terms_digest": { "type": "string" },
+    "account_registration": { "$ref": "#/$defs/accountRegistration" }
   },
   "$defs": {
+    "accountRegistration": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "data_schema": { "type": "object" }
+      }
+    },
     "authorizedExchange": {
       "type": "object",
       "required": ["domain", "endpoint", "relationship"],
       "additionalProperties": true,
       "properties": {
-        "domain": { "type": "string", "minLength": 1 },
+        "domain": { "type": "string" },
         "endpoint": { "type": "string", "minLength": 1 },
         "relationship": {
           "enum": [

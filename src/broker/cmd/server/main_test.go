@@ -12,6 +12,7 @@ import (
 
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
+	audiencetest "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
@@ -73,17 +74,10 @@ func TestAgentSig1Resolver_OwnKeysNeverResolveInboundSignatures(t *testing.T) {
 // normalization), so every route is exercised the way production serves it.
 func minimalBrokerMux(t *testing.T) http.Handler {
 	t.Helper()
-	_, identityPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("identity keygen: %v", err)
-	}
-	signer, err := signing.NewCoSigner("broker.example", "broker-1", identityPriv, nil)
-	if err != nil {
-		t.Fatalf("cosigner: %v", err)
-	}
 	mux, _, err := buildBrokerMux(brokerMuxDeps{
 		resolveDeps:   resolve.Deps{},
-		signer:        signer,
+		audience:      audiencetest.MustInterceptor(t, "broker.example"),
+		signer:        mustCoSigner(t),
 		brokerID:      "broker-1",
 		ownKeys:       transporttest.MustRegistry(t),
 		agentResolver: transporttest.NeverResolves(),
@@ -172,6 +166,27 @@ func TestBuildBrokerMux_NilAgentResolverIsRefused(t *testing.T) {
 	}
 }
 
+// TestBuildBrokerMux_NilAudienceIsRefused pins the other half of that contract.
+// A nil recipient interceptor is worse than a nil resolver: it mounts cleanly
+// and checks nothing, so the surface comes up serving requests with the check
+// silently absent. Everything else the mux needs is supplied, so the refusal can
+// only be the missing interceptor.
+func TestBuildBrokerMux_NilAudienceIsRefused(t *testing.T) {
+	_, _, err := buildBrokerMux(brokerMuxDeps{
+		resolveDeps:   resolve.Deps{},
+		signer:        mustCoSigner(t),
+		brokerID:      "broker-1",
+		ownKeys:       transporttest.MustRegistry(t),
+		agentResolver: transporttest.NeverResolves(),
+	})
+	if err == nil {
+		t.Fatal("buildBrokerMux with a nil recipient interceptor returned nil error; want a refusal")
+	}
+	if !strings.Contains(err.Error(), "the recipient interceptor is required") {
+		t.Fatalf("error %q is not the missing-interceptor refusal", err)
+	}
+}
+
 // bootstrapRegistry must tolerate an unset BROKER_REGISTRY_FILE. It seeds
 // nothing in that case — no Exchange is registered until the operator supplies
 // a file — and, critically, it must not reach the YAML decoder: a zero-byte
@@ -200,4 +215,20 @@ func (c *countingExchangeRepo) UpsertFromBootstrap(
 ) (repo.Exchange, error) {
 	c.upserts++
 	return m, nil
+}
+
+// mustCoSigner builds the identity signer buildBrokerMux requires, on a fresh
+// key. What it signs as does not matter to the tests that take one; that it is
+// present does.
+func mustCoSigner(t *testing.T) *signing.CoSigner {
+	t.Helper()
+	_, identityPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("identity keygen: %v", err)
+	}
+	signer, err := signing.NewCoSigner("broker.example", "broker-1", identityPriv, nil)
+	if err != nil {
+		t.Fatalf("cosigner: %v", err)
+	}
+	return signer
 }

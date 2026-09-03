@@ -34,18 +34,21 @@ func guardFeeRateBps(bps int) (int32, error) {
 	return int32(bps), nil
 }
 
-// mapFeeWriteErr maps the error from a fee-rate write: a Postgres CHECK
-// violation (the 0 <= bps < 10000 bound) becomes ErrFeeRateOutOfRange; any other
-// error is wrapped with op for context. Returns nil for a nil err so callers can
-// tail-return it. The read-back count, when there is one, is the caller's to
-// return alongside. Shared by every fee-rate write port.
-func mapFeeWriteErr(err error, op string) error {
+// mapCheckWriteErr maps the error from a guarded write: a Postgres CHECK
+// violation becomes the caller's sentinel, and any other error is wrapped with
+// op for context. The Go-side guard runs before the round-trip and names the
+// specific cause; the CHECK is the in-store backstop, so a violation that slips
+// past the guard still surfaces as the caller's domain sentinel rather than a
+// raw pgconn.PgError. Returns nil for a nil err so callers can tail-return it.
+// The read-back count, when there is one, is the caller's to return alongside.
+// Shared by every guarded write port (fee rates, default agent credit).
+func mapCheckWriteErr(err error, op string, sentinel error) error {
 	if err == nil {
 		return nil
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == pgCheckViolation {
-		return ErrFeeRateOutOfRange
+		return sentinel
 	}
 	return fmt.Errorf("%s: %w", op, err)
 }
@@ -96,5 +99,5 @@ func (r *feeOverrideRepo) Set(ctx context.Context, tenantID, resourceOwnerID str
 		ResourceOwnerID: resourceOwnerID,
 		FeeRateBps:      v,
 	})
-	return mapFeeWriteErr(err, "upsert resource-owner fee override")
+	return mapCheckWriteErr(err, "upsert resource-owner fee override", ErrFeeRateOutOfRange)
 }

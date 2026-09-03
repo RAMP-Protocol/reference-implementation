@@ -14,10 +14,13 @@ import (
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/account"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/directory"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/keystore"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/publisher"
@@ -31,18 +34,39 @@ const baseZone = "rampmcp.org"
 // test (Vault mount reset + Postgres restore before it is built).
 //
 // Test state is arranged through the production write surfaces this service owns —
-// store.Create (KeyStore) and cards.Upsert (card repo) — not raw Vault/SQL, per
-// Testing Doctrine 9. There is no PUBLIC (RPC/HTTP) write surface to arrange
-// through yet: developer sign-up is what will create keys and write
-// cards over the wire. Until it lands, the repo/keystore surfaces are the
-// sanctioned tier-2 fallback. Once a public sign-up write surface exists,
-// re-arrange these through it.
+// store.Create (KeyStore), cards.Upsert (card repo), devs.Reserve (developer repo) —
+// not raw Vault/SQL, per Testing Doctrine 9.
+//
+// The public sign-up flow is the arrangement path for a NORMAL agent, and the
+// acceptance assertions live there: authflow_e2e_test.go drives sign-up over HTTP
+// through app.Build and reads every published document back over HTTP. This fixture
+// exists for the states sign-up cannot produce on purpose — an account reserved
+// before its key was minted, or a key with no account behind it. Reaching those
+// through the public flow would mean crashing sign-up mid-way, so they are arranged
+// at the repository tier instead.
 type fixture struct {
 	srv         *httptest.Server
 	svc         *publisher.Service
 	store       keystore.KeyStore
 	cards       *repo.PgxCardRepo
 	revocations *repo.PgxRevocationRepo
+	devs        *repo.PgxDeveloperRepo
+}
+
+// reserveAccount claims subdomain for a synthetic OIDC identity, which is what makes
+// the agent "registered" as far as the overlay is concerned. The issuer/subject pair is
+// derived from the subdomain so two agents in one test cannot collide on the account
+// table's primary key.
+func (f *fixture) reserveAccount(t *testing.T, subdomain string) {
+	t.Helper()
+	if _, err := f.devs.Reserve(t.Context(), account.Developer{
+		Issuer:    "https://login.example",
+		Subject:   "subject-for-" + subdomain,
+		Email:     "dev@" + subdomain,
+		Subdomain: subdomain,
+	}); err != nil {
+		t.Fatalf("reserve account %q: %v", subdomain, err)
+	}
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -51,8 +75,15 @@ func newFixture(t *testing.T) *fixture {
 	if err := sharedVault.Reset(ctx); err != nil {
 		t.Fatalf("reset vault: %v", err)
 	}
-	pool := acquireTestDB(t, ctx)
+	return wireFixture(t, acquireTestDB(t, ctx))
+}
 
+// wireFixture builds the server over the given pool. It is separate from
+// newFixture so the backend-outage suite can wire the identical production chain
+// over a pool that cannot connect, without a second copy of this wiring drifting
+// from the one every other test drives.
+func wireFixture(t *testing.T, pool *pgxpool.Pool) *fixture {
+	t.Helper()
 	store, err := keystore.NewVaultStore(keystore.Config{
 		Client: sharedVault.Client,
 		Mount:  sharedVault.Mount,
@@ -63,8 +94,10 @@ func newFixture(t *testing.T) *fixture {
 	}
 	cards := repo.NewCardRepo(pool)
 	revocations := repo.NewRevocationRepo(pool)
+	devs := repo.NewDeveloperRepo(pool)
 	svc, err := publisher.New(publisher.Config{
-		Keys: store, Cards: cards, Revocations: revocations, Clock: clock.System{},
+		Keys: store, Cards: cards, Revocations: revocations, Registrations: devs,
+		Clock: clock.System{},
 	})
 	if err != nil {
 		t.Fatalf("publisher.New: %v", err)
@@ -76,7 +109,7 @@ func newFixture(t *testing.T) *fixture {
 	srv := httptest.NewServer(transport.NewServer(testutil.DiscardLogger(), handler, func(context.Context) error { return nil }))
 	t.Cleanup(srv.Close)
 
-	return &fixture{srv: srv, svc: svc, store: store, cards: cards, revocations: revocations}
+	return &fixture{srv: srv, svc: svc, store: store, cards: cards, revocations: revocations, devs: devs}
 }
 
 // getForHost issues GET path with the given Host header (which drives dispatch)
@@ -117,7 +150,7 @@ func mustCreate(t *testing.T, store keystore.KeyStore, subdomain string) keystor
 // TestDirectoryAdvertisesDiscoverableRevocationURL drives the discovery leg a WBA
 // consumer actually walks: fetch the directory, read its revocation_url, and fetch
 // THAT back to the same server. Two agents on the wildcard zone are driven because
-// the consumer (rampwellknown.Loader) host-anchors the advertised URL and skips a
+// the consumer host-anchors the advertised URL (helpers.HostAnchored) and skips a
 // cross-host one — a single shared/static revocation_url could anchor to at most one
 // of them, silently leaving the other's revocation list unpolled (fail-open). The
 // existing revocation e2e fetches RevocationPath directly by Host; this one asserts
@@ -141,7 +174,7 @@ func TestDirectoryAdvertisesDiscoverableRevocationURL(t *testing.T) {
 		if doc.RevocationURL == "" {
 			t.Fatalf("%s: directory advertises no revocation_url — the revocation list is undiscoverable", sub)
 		}
-		anchored, err := rampwellknown.HostAnchored(sub, doc.RevocationURL)
+		anchored, err := helpers.HostAnchored(sub, doc.RevocationURL)
 		if err != nil {
 			t.Fatalf("%s: HostAnchored(%q): %v", sub, doc.RevocationURL, err)
 		}
@@ -270,13 +303,70 @@ func TestUnknownHostsAre404(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, path := range []string{rampwellknown.WBAPath, directory.CardPath, rampwellknown.RevocationPath} {
+			paths := []string{
+				rampwellknown.WBAPath, directory.CardPath,
+				rampwellknown.RevocationPath, rampwellknown.Path,
+			}
+			for _, path := range paths {
 				status, _, _ := f.getForHost(t, tc.host, path)
 				if status != http.StatusNotFound {
 					t.Errorf("GET %s Host=%s: status = %d, want 404", path, tc.host, status)
 				}
 			}
 		})
+	}
+}
+
+// TestManifestServedForReservedAccountWithoutKey drives the state sign-up passes
+// through on its way to a provisioned agent: the account row is reserved first, and the
+// Vault key and card come after, so a crash between those steps leaves an agent that is
+// registered and publishes nothing else. The overlay must still be served — it says
+// "this domain is a RAMP agent", which is true the moment the subdomain is claimed —
+// while the WBA directory correctly 404s because no key exists yet.
+//
+// The document is requested TWICE on purpose. The first call builds and caches the
+// document set; if the overlay were left out of the emptiness test the publisher uses to
+// decide what to remember, this agent would look absent from every source and be filed
+// in the negative cache, and the SECOND call would 404 for the whole negative TTL. One
+// call cannot see that.
+func TestManifestServedForReservedAccountWithoutKey(t *testing.T) {
+	f := newFixture(t)
+	sub := "agent-reserved." + baseZone
+	f.reserveAccount(t, sub) // account row only — no key, no card, no revocations
+
+	for i := 1; i <= 2; i++ {
+		status, _, body := f.getForHost(t, sub, rampwellknown.Path)
+		if status != http.StatusOK {
+			t.Fatalf("request %d: manifest status = %d, want 200", i, status)
+		}
+		m, err := rampwellknown.ParseManifest(body, rampwellknown.RoleAgent)
+		if err != nil {
+			t.Fatalf("request %d: served manifest invalid: %v", i, err)
+		}
+		if m.GetDomain() != sub {
+			t.Errorf("request %d: manifest domain = %q, want %q", i, m.GetDomain(), sub)
+		}
+	}
+	if status, _, _ := f.getForHost(t, sub, rampwellknown.WBAPath); status != http.StatusNotFound {
+		t.Errorf("WBA status = %d, want 404 (no key minted yet)", status)
+	}
+}
+
+// TestManifestAbsentForOrphanedKey is the other direction: keys exist for a subdomain
+// that no account row claims. Nothing in sign-up produces this, but a manual operation
+// or a partial delete can, and the overlay must not vouch for a domain nobody
+// registered. The directory keeps serving, because a published key is a fact about that
+// subdomain regardless of who owns it.
+func TestManifestAbsentForOrphanedKey(t *testing.T) {
+	f := newFixture(t)
+	sub := "agent-orphan." + baseZone
+	mustCreate(t, f.store, sub) // key but no account row
+
+	if status, _, _ := f.getForHost(t, sub, rampwellknown.Path); status != http.StatusNotFound {
+		t.Errorf("manifest status = %d, want 404 (no account row)", status)
+	}
+	if status, _, _ := f.getForHost(t, sub, rampwellknown.WBAPath); status != http.StatusOK {
+		t.Errorf("WBA status = %d, want 200 (key exists)", status)
 	}
 }
 
@@ -327,6 +417,8 @@ func TestPerAgentIsolation(t *testing.T) {
 	if _, err := f.cards.Upsert(t.Context(), subB, directory.Card{ClientName: "B", ClientURI: "https://" + subB}); err != nil {
 		t.Fatalf("upsert B: %v", err)
 	}
+	f.reserveAccount(t, subA)
+	f.reserveAccount(t, subB)
 
 	// Warm A's cache entry first, then ask for B.
 	f.getForHost(t, subA, rampwellknown.WBAPath)
@@ -349,6 +441,20 @@ func TestPerAgentIsolation(t *testing.T) {
 	}
 	if card.ClientURI != "https://"+subB {
 		t.Errorf("agent-b's card = %q, want its own (not agent-a's)", card.ClientURI)
+	}
+
+	// The overlay is derived from the request host rather than read from a store, so
+	// two agents' overlays differ in the domain field alone. A cache keyed or warmed
+	// wrongly would hand B a document naming A, and every other field would still look
+	// right.
+	f.getForHost(t, subA, rampwellknown.Path)
+	_, _, manifestB := f.getForHost(t, subB, rampwellknown.Path)
+	m, err := rampwellknown.ParseManifest(manifestB, rampwellknown.RoleAgent)
+	if err != nil {
+		t.Fatalf("parse B manifest: %v", err)
+	}
+	if m.GetDomain() != subB {
+		t.Errorf("agent-b's manifest domain = %q, want its own %q", m.GetDomain(), subB)
 	}
 }
 

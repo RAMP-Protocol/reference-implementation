@@ -14,6 +14,13 @@ services:
       POSTGRES_USER: ramp
       POSTGRES_PASSWORD: "${postgres_password}"
       POSTGRES_DB: ramp
+    ports:
+      # Published on the VM's LOOPBACK interface only, so an operator reaches
+      # it through `ssh -L 5432:127.0.0.1:5432` and nothing else can. Postgres
+      # here has one superuser role and a generated password; a wildcard bind
+      # (0.0.0.0, or dropping the 127.0.0.1 prefix, which means the same thing)
+      # would put that role on the public internet.
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # First-cluster-init SQL (extra exchange databases, if any). Runs once;
@@ -82,6 +89,19 @@ services:
       # the Exchange migrates it but never creates it.
       EXCHANGE_SOR_DSN: "postgres://ramp:${postgres_password}@postgres:5432/sor?sslmode=disable"
       EXCHANGE_ADDR: ":8081"
+      # Source addresses allowed to call the admin listener. An empty value
+      # denies EVERY request (the middleware is fail-closed), so leaving this
+      # unset makes the published admin port below answer 403 to everything.
+      #
+      # It is the compose network's own subnet, NOT 127.0.0.1: publishing a
+      # port makes Docker rewrite the source address to the network's gateway
+      # (host 1 of this subnet), so the container never sees loopback. The
+      # middleware reads RemoteAddr and deliberately ignores X-Forwarded-For,
+      # so no header can widen this — the CIDR is the only control.
+      #
+      # Interpolated from the network_subnet variable, the same value the
+      # networks block below uses, so the two cannot drift apart.
+      ADMIN_ALLOWED_CIDRS: "${network_subnet}"
       # Offer.exchange routing key: the public hostname, port-less — the
       # Broker fetches https://<domain>/.well-known/ramp.json from it.
       EXCHANGE_DOMAIN: "${exchange_hostname}"
@@ -93,6 +113,12 @@ services:
       # with a default-tenant-not-seeded error — which also means no agent ever
       # gets a billing_ref, so nothing can be charged.
       EXCHANGE_DEFAULT_TENANT: "${default_tenant_domain}"
+      # One-time welcome credit for each newly registered agent, in WHOLE
+      # units of the ledger currency: "100" on the default EUR ledger grants
+      # EUR 100.00 per agent, not 100 cents. "0" disables the grant. This
+      # variable is the sole owner of the setting — every boot overwrites the
+      # default tenant's stored value with it.
+      EXCHANGE_DEFAULT_AGENT_CREDIT: "${default_agent_credit}"
       RAMP_BILLING_ADAPTER: "${billing_adapter}"
 %{ if tigerbeetle_enabled }
       EXCHANGE_BILLING_TB_ADDRESS: "${tigerbeetle_ip}:3000"
@@ -121,6 +147,33 @@ services:
       # refuses only the requests that would need it, naming the setting to add.
       RAMP_RSA_PRIVATE_PEM_FILE: "/keys/rsa-private.pem"
 %{ endif }
+%{ if registration_schema_env != null ~}
+      # Published as account_registration.data_schema AND enforced on Register
+      # — the manifest and the gate read the same loaded value, so the Exchange
+      # cannot advertise one shape while refusing on another. Already quoted
+      # and escaped by the module (jsonencode for YAML, doubled dollars for
+      # Compose's own interpolation), so it carries no quotes here.
+      EXCHANGE_REGISTRATION_SCHEMA: ${registration_schema_env}
+%{ endif ~}
+%{ if terms_uri != null ~}
+      EXCHANGE_TERMS_URI: "${terms_uri}"
+%{ endif ~}
+%{ if terms_digest != null ~}
+      # A registering client must echo this. Publishing it for the first time
+      # refuses every client that does not yet send it — absent and stale are
+      # the same failure.
+      EXCHANGE_TERMS_DIGEST: "${terms_digest}"
+%{ endif ~}
+    ports:
+      # The admin listener (ADMIN_ADDR, default :8082). The container-side 8082
+      # is this container's own port — the Broker's :8082 belongs to a different
+      # container and is not published, so the two never collide on the host.
+      #
+      # Bound to the VM's LOOPBACK interface, so it is reachable only through
+      # `ssh -L 8082:127.0.0.1:8082`. Keep the 127.0.0.1 prefix: this listener
+      # has NO login of any kind, only the source-address allowlist above, so a
+      # wildcard bind would hand the admin plane to the internet.
+      - "127.0.0.1:8082:8082"
     volumes:
       # Per-service key directory: each container sees ONLY its own keys, so a
       # compromise of one service does not hand over another service's signing
@@ -270,6 +323,24 @@ services:
       ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: zitadel
       ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: "${zitadel_db_password}"
       ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+%{ if smtp_enabled ~}
+      # Outbound mail, for the confirmation code self-registration sends. Read
+      # ONLY while Zitadel creates its instance on the first start: after that
+      # the provider is stored in Zitadel's database and these values are
+      # ignored. Editing them here changes the VM's user data, which rebuilds
+      # the whole deployment; editing the running provider is a console or
+      # Admin API job.
+      #
+      # jsonencode on every interpolated value: a JSON string literal is also
+      # a valid YAML scalar, so a password holding a quote or a backslash
+      # cannot break the document.
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_HOST: ${jsonencode(smtp_host)}
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_USER: ${jsonencode(smtp_user)}
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_PASSWORD: ${jsonencode(smtp_password)}
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_TLS: "true"
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_FROM: ${jsonencode(smtp_from)}
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_FROMNAME: ${jsonencode(smtp_from_name)}
+%{ endif ~}
     volumes:
       - /opt/ramp/zitadel/init-steps.yaml:/etc/zitadel/init-steps.yaml:ro
       # First init writes the bootstrap machine user's PAT here; the identity
@@ -309,9 +380,15 @@ services:
       VAULT_ADDR: "http://identity-vault:8200"
       VAULT_TOKEN: "${vault_root_token}"
       IDENTITY_KV_MOUNT: "secret"
-      # In-network hops for the RAMP legs the MCP tools drive.
+      # The one in-network hop the MCP tools still take. Discovery goes to the
+      # Broker; everything Exchange-facing is resolved per call.
       IDENTITY_MCP_BROKER_URL: "http://broker:8082"
-      IDENTITY_MCP_EXCHANGE_URL: "http://exchange:8081"
+      # No Exchange origin, deliberately: an account call names its Exchange by
+      # the domain that Exchange publishes about itself, and the endpoint comes
+      # from that Exchange's own manifest. This deployment runs one, so the
+      # policy names it and nothing else — an agent cannot make this host sign
+      # and send to an Exchange the operator did not choose.
+      IDENTITY_MCP_EXCHANGE_ALLOWLIST: "${exchange_hostname}"
       IDENTITY_MCP_WELLKNOWN_SCHEME: "https"
     volumes:
       - zitadelbootstrap:/bootstrap:ro
@@ -357,6 +434,12 @@ services:
       # Static Web Bot Auth key directories written by cloud-init; the
       # Caddyfile's per-hostname site blocks serve them with file_server.
       - /opt/ramp/wba:/srv/wba:ro
+%{ endif ~}
+%{ if terms_enabled ~}
+      # Terms documents written by cloud-init. Caddy runs in this container,
+      # so the Caddyfile's `root * /srv/exchange-terms` resolves HERE, not on
+      # the host — without this mount file_server would serve nothing.
+      - /opt/ramp/exchange-terms:/srv/exchange-terms:ro
 %{ endif ~}
       - caddydata:/data
       - caddyconfig:/config

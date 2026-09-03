@@ -2,16 +2,16 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"math/big"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/money"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
 
@@ -53,7 +53,13 @@ func NewAdminServiceFromPool(pool *pgxpool.Pool, queries *sqlc.Queries) *AdminSe
 
 // AdminCaller carries the coarse attribution the audit row records: the caller's
 // source address (from the Connect peer), the correlation id, and an optional
-// actor. v1 has no authenticated operator identity, so Actor is nil in practice.
+// actor.
+//
+// Actor is nil on the RPC path, because v1 has no authenticated operator
+// identity to record. It is NOT always nil: a boot-time write has no network
+// peer and no request, so the process names itself instead (bootAdminCaller in
+// the composition root). Registration, on the agent plane, always has one — the
+// request signature identifies the agent that registered.
 type AdminCaller struct {
 	SourceAddr string
 	RequestID  string
@@ -92,7 +98,7 @@ func (s *AdminService) SetTenantFeeRate(
 	err = s.runSetter(ctx, caller, in.TenantID, "SetTenantFeeRate", detail, func(tx pgx.Tx) (int64, error) {
 		n, werr := s.tenants.SetFeeRate(ctx, tx, in.TenantID, in.FeeRateBps, in.Notes)
 		if werr != nil {
-			return 0, mapFeeWriteError(werr)
+			return 0, mapSetterError(werr, repo.ErrFeeRateOutOfRange, "fee rate out of range", "set tenant fee rate")
 		}
 		return n, nil
 	})
@@ -123,7 +129,7 @@ func (s *AdminService) SetReportingPolicy(
 	err = s.runSetter(ctx, caller, in.TenantID, "SetReportingPolicy", detail, func(tx pgx.Tx) (int64, error) {
 		n, werr := s.tenants.SetReportingPolicy(ctx, tx, in.TenantID, policyJSON)
 		if werr != nil {
-			return 0, exchange.Wrap(exchange.KindInternal, werr, "set reporting policy")
+			return 0, mapSetterError(werr, nil, "", "set reporting policy")
 		}
 		return n, nil
 	})
@@ -131,6 +137,39 @@ func (s *AdminService) SetReportingPolicy(
 		return ReportingPolicyValues{}, err
 	}
 	return in, nil
+}
+
+// defaultAgentCreditAudit is the audit-detail payload for a default-agent-credit
+// replace. Credit is the decimal rendering of the applied amount at the ledger
+// asset scale, so the JSONB stays readable without a rational-number decoder.
+type defaultAgentCreditAudit struct {
+	TenantID string `json:"tenant_id"`
+	Credit   string `json:"default_agent_credit"`
+}
+
+// SetDefaultAgentCredit replaces the tenant's default agent credit and records
+// the change. There is no admin RPC for this setter — the only caller is the
+// boot-time EXCHANGE_DEFAULT_AGENT_CREDIT seeding, which routes through here so
+// the write and its audit row commit in one transaction like every other write
+// on the tenant admin plane.
+func (s *AdminService) SetDefaultAgentCredit(
+	ctx context.Context, caller AdminCaller, tenantID string, credit *big.Rat,
+) error {
+	detail, err := marshalAuditDetail(defaultAgentCreditAudit{
+		TenantID: tenantID,
+		Credit:   money.DecimalString(credit),
+	})
+	if err != nil {
+		return err
+	}
+	return s.runSetter(ctx, caller, tenantID, "SetDefaultAgentCredit", detail, func(tx pgx.Tx) (int64, error) {
+		n, werr := s.tenants.SetDefaultAgentCredit(ctx, tx, tenantID, credit)
+		if werr != nil {
+			return 0, mapSetterError(werr, repo.ErrDefaultCreditInvalid,
+				"default agent credit invalid", "set tenant default agent credit")
+		}
+		return n, nil
+	})
 }
 
 // runSetter executes a setter mutation and its audit row in one transaction.
@@ -152,39 +191,24 @@ func (s *AdminService) runSetter(
 		if n == 0 {
 			return exchange.Newf(exchange.KindNotFound, "tenant %q not found", tenantID)
 		}
-		if aerr := s.audit.Append(ctx, tx, repo.AuditEntry{
-			LogID:      uuid.NewString(),
+		return appendAudit(ctx, tx, s.audit, repo.AuditEntry{
 			Actor:      caller.Actor,
 			SourceAddr: caller.SourceAddr,
 			Action:     action,
 			Detail:     detail,
 			TenantID:   tenantID,
 			RequestID:  requestIDPtr(caller.RequestID),
-		}); aerr != nil {
-			return exchange.Wrap(exchange.KindInternal, aerr, "append audit log")
-		}
-		return nil
+		})
 	})
 }
 
-func mapFeeWriteError(err error) error {
-	if errors.Is(err, repo.ErrFeeRateOutOfRange) {
-		return exchange.Wrap(exchange.KindInvalidRequest, err, "fee rate out of range")
+// mapSetterError wraps a tenant-setter write error for transport: the repo's
+// validation sentinel (nil when the setter has none) maps to KindInvalidRequest,
+// anything else to KindInternal, each with its op string. Every runSetter write
+// funnels through here so the sentinel-vs-internal split is spelled once.
+func mapSetterError(err, sentinel error, invalidOp, internalOp string) error {
+	if sentinel != nil && errors.Is(err, sentinel) {
+		return exchange.Wrap(exchange.KindInvalidRequest, err, invalidOp)
 	}
-	return exchange.Wrap(exchange.KindInternal, err, "set tenant fee rate")
-}
-
-func marshalAuditDetail(v any) ([]byte, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, exchange.Wrap(exchange.KindInternal, err, "marshal audit detail")
-	}
-	return b, nil
-}
-
-func requestIDPtr(id string) *string {
-	if id == "" {
-		return nil
-	}
-	return &id
+	return exchange.Wrap(exchange.KindInternal, err, internalOp)
 }

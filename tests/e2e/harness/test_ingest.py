@@ -1,13 +1,14 @@
 """Full e2e: the REAL ramp-ingest binary over the live stack (demo feeds).
 
 The seed already ingests the three demo feeds through the production
-``cmd/ramp-ingest`` binary (one signed ``CatalogService/PushResources``
-RPC per feed) — there is no SQL backdoor and no Python mapper. This module
-proves that path directly and idempotently:
+``cmd/ramp-ingest`` binary (signed ``CatalogService/PushResources`` RPCs, one
+per submission of at most the wire bound; each demo feed fits in one) — there
+is no SQL backdoor and no Python mapper. This module proves that path directly
+and idempotently:
 
-* re-running the binary against a demo feed reports accepted/rejected with no
-  rejects and exits 0 (the production parse → map → sign → push pipeline is
-  stable across runs);
+* re-running the binary against a demo feed exits 0 and reports every entry
+  accepted (the production parse → map → sign → push pipeline is stable across
+  runs);
 * a requester discovers the ingested FREE socrates term, the resolved cost is
   term-derived (0), and the Exchange-signed URL delivers origin bytes through
   the Cloudflare edge;
@@ -30,22 +31,28 @@ from pathlib import Path
 import httpx
 
 from .broker_client import execute_first_offer
-from .conftest import REPO_ROOT, StackURLs
+from .conftest import StackURLs
 from .constants import WBA_DIRECTORY_PATH
 from .edge_fetch import fetch_signed
 from .resolve_carriers import cost_of, first_item_of, licensed_of, retrieval_endpoint_of
 from .seed import (
     CATALOG_CONTRIBUTOR_ID,
+    CATALOG_DIR,
     CONTRIBUTOR_KEY_PATH,
     SELFPUB_PHILOSOPHY_KEY_PATH,
     SeededFixture,
 )
 
-# The philosophy demo feed (10 records) + the philosophy publisher's SELF-PUBLISH
+# The philosophy feed (10 records) + the philosophy publisher's SELF-PUBLISH
 # key (kid == demo.ramp-protocol.org). The Exchange learns this key ONLY by
 # fetching the philosophy edge's Web Bot Auth directory (Gate-1
 # self-signup) — there is NO ramp.agents pre-seed (Core Invariant).
-_PHILOSOPHY_FEED = REPO_ROOT / "deploy" / "fixtures" / "demo" / "philosophy.jsonl"
+#
+# Taken from the seed's own CATALOG_DIR rather than rebuilt here: this test
+# re-pushes the feed the seed already ingested and asserts the result is
+# unchanged, so a second path would let the two drift and turn an idempotence
+# test into a comparison of two different feeds.
+_PHILOSOPHY_FEED = CATALOG_DIR / "philosophy.jsonl"
 _PHILOSOPHY_DOMAIN = "demo.ramp-protocol.org"
 _INGEST_BIN = "/usr/local/bin/ramp-ingest"
 
@@ -59,7 +66,7 @@ def _run_ingester(
     ``key_path`` is the signing identity; its kid becomes the push caller_id, so
     the Exchange must learn that key via the well-known fetch (no DB pre-seed).
     Returns the completed process so callers can assert exit code + the
-    structured accepted/rejected/warnings report written to stderr.
+    structured accepted/warnings report written to stderr.
     """
     return subprocess.run(
         [
@@ -79,17 +86,19 @@ def _run_ingester(
     )
 
 
-def test_ingester_pushes_via_rpc_no_rejections(
+def test_ingester_pushes_via_rpc_and_exits_clean(
     compose_stack: StackURLs,
     seeded: SeededFixture,  # noqa: ARG001 — ordering: seed registers tenant + contributor
 ) -> None:
-    """Re-running the real ingester on the philosophy feed is idempotent and reports no rejects.
+    """Re-running the real ingester on the philosophy feed is idempotent and stores every entry.
 
     Re-pushing via the signed RPC under the philosophy publisher's OWN
-    self-publish key (kid == demo.ramp-protocol.org) must again report
-    accepted=10 / rejected=0 / exit 0 — confirming the production push path
-    (parse → map → sign → push → verdict) is stable and the self-publish key
-    remains resolvable via the well-known fetch across runs (no DB pre-seed).
+    self-publish key (kid == demo.ramp-protocol.org) must again exit 0 and
+    report accepted=10 — the Exchange stores or refuses a submission whole and
+    the binary exits non-zero on a refusal, so the exit code is the verdict —
+    confirming the production push path (parse → map → sign → push → verdict)
+    is stable and the self-publish key remains resolvable via the well-known
+    fetch across runs (no DB pre-seed).
     """
     proc = _run_ingester(
         compose_stack.exchange,
@@ -100,8 +109,7 @@ def test_ingester_pushes_via_rpc_no_rejections(
     assert proc.returncode == 0, (
         f"ingester failed: rc={proc.returncode}\nSTDERR:\n{proc.stderr}\nSTDOUT:\n{proc.stdout}"
     )
-    assert "accepted=10 rejected=0" in proc.stderr, proc.stderr
-    assert "ERROR:" not in proc.stderr, proc.stderr
+    assert "push: accepted=10 warnings=" in proc.stderr, proc.stderr
 
 
 def test_requester_discovers_free_term_and_gets_content(

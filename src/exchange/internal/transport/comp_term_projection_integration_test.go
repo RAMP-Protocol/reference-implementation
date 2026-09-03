@@ -81,7 +81,7 @@ func seedTermProjection() *rampv1.LicenseTerm {
 //	(1) CROSSWALK: comp.scope.ause == 0 (COMMERCIAL, N4); comp.scope.country ==
 //	    [276,840] (ISO-3166 numeric, sorted, EXACT codes pinned — DE=276, US=840,
 //	    N7); comp Package.citation == 1 (ATTRIBUTION). Slice-1 invariants still
-//	    hold WITHIN this richer term: comp.id == "<offer>#0", scope.unitprice ==
+//	    hold WITHIN this richer term: comp.id == "<resource>#0", scope.unitprice ==
 //	    term rate, scope.cur == currency.
 //
 //	(2) OMISSION + NON-LOSS: NO "function"/"subfn" key ANYWHERE under comp.*
@@ -95,7 +95,7 @@ func seedTermProjection() *rampv1.LicenseTerm {
 //	    the richer Package; no foreign keys leaked to canonical paths).
 //
 //	(4) PARITY: ExecuteTransaction on this comp-bearing offer succeeds — the
-//	    signed comp ext is reproduced byte-identically at tx-reconstruction.
+//	    presented signed bytes (comp ext included) verify at execute.
 //
 // It FAILS on current HEAD: the slice-1 renderer (comp_render.go) emits only a
 // pricing-derived Scope (unitprice/cur/pricetype) — no ause, no country, no
@@ -121,11 +121,7 @@ func TestComp_TermProjection(t *testing.T) {
 	}
 
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  []*rampv1.ResourceEntry{entry},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{entry})))
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -137,23 +133,26 @@ func TestComp_TermProjection(t *testing.T) {
 	term := seedTermProjection()
 
 	// POSITIVE: profile-aware discover renders the full term crosswalk. The
-	// requester declares the entitlement scope the term carries so licenseterm.
-	// Select keeps it (entitlement scopes are the only discovery eligibility
+	// requester declares the entitlement scope the term carries so selectTerms
+	// keeps it (entitlement scopes are the only discovery eligibility
 	// filter — restriction axes do not exclude terms; ADR-014).
 	compOffer := discoverCompOffer(t, h, uri, "entitlement:full")
-	assertCompTermProjection(t, compOffer, term)
+	assertCompTermProjection(t, compOffer, term, compPackageID(h, resourceID, 0))
 	assertCompUnmappableOmitted(t, compOffer)
 
-	// PARITY: the signed (now richer) comp ext survives tx-reconstruction. The
-	// tx requester carries the SAME entitlement scope so verifyOffer rebuilds the
-	// identical Select-filtered, comp-bearing offer and the signature re-verifies.
+	// PARITY: the signed (now richer) comp ext verifies unchanged at execute
+	// (presented-bytes verification). The tx requester still declares the same
+	// entitlement scope the offer was discovered under, as a real agent would.
 	assertTransactParityScoped(t, h, compOffer, "entitlement:full")
 }
 
 // assertTransactParityScoped drives ExecuteTransaction with a requester carrying
-// the given entitlement scope, mirroring assertTransactParity but matching the
-// scope the offer was discovered under (verifyOffer re-runs licenseterm.Select
-// with the tx requester, so the scope must match for byte-identical rebuild).
+// the given entitlement scope, mirroring assertTransactParity but declaring the
+// scope the offer was discovered under. At execute the Exchange verifies the
+// PRESENTED signed offer bytes (resolveOfferForTx → verifyPresentedOffer) and
+// never re-runs selectTerms or rebuilds the offer from the catalog, so the
+// scope is not re-checked there; the tx requester carries it so it states the
+// same entitlement the discovery requester did.
 func assertTransactParityScoped(t *testing.T, h *pushHarness, o *rampv1.Offer, scope string) {
 	t.Helper()
 	parityTransact(t, h, o, []string{scope})
@@ -162,7 +161,7 @@ func assertTransactParityScoped(t *testing.T, h *pushHarness, o *rampv1.Offer, s
 // assertCompTermProjection verifies property (1): the mappable crosswalk landed
 // on canonical comp paths with EXACT values, slice-1 pricing invariants still
 // hold within the richer term, and the emitted comp Struct passes comptest.
-func assertCompTermProjection(t *testing.T, o *rampv1.Offer, term *rampv1.LicenseTerm) {
+func assertCompTermProjection(t *testing.T, o *rampv1.Offer, term *rampv1.LicenseTerm, wantID string) {
 	t.Helper()
 	compVal, ok := o.GetExt().GetFields()["comp"]
 	if !ok || compVal == nil {
@@ -174,8 +173,10 @@ func assertCompTermProjection(t *testing.T, o *rampv1.Offer, term *rampv1.Licens
 	}
 	fields := comp.GetFields()
 
-	// Slice-1 invariant within the richer term: Package.id == "<offer>#0".
-	wantID := o.GetOfferId() + "#0"
+	// Slice-1 invariant within the richer term: Package.id ==
+	// "<resource_id>#0", derived by the caller from the pushed content_id via
+	// compPackageID — the package id is resource-intrinsic, not the offer's
+	// random per-offer offer_id.
 	if got := fields["id"].GetStringValue(); got != wantID {
 		t.Errorf("comp.id = %q, want %q", got, wantID)
 	}

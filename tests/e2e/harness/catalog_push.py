@@ -1,4 +1,4 @@
-"""Sign and POST ramp.v1.CatalogService/PushResources for the e2e harness.
+"""Push ramp.v1.CatalogService/PushResources for the e2e harness, through the SDK.
 
 Why this exists
 ---------------
@@ -10,21 +10,42 @@ tripwires at ``src/exchange/cmd/server/admin_removed_test.go`` and
 ``src/exchange/internal/transport/admin_removed_e2e_test.go`` make that
 policy loud.
 
-This module wraps the production signing path so the harness exercises
-the same auth gates every real third-party catalog pusher does:
+The push goes through the Python SDK's own catalog client
+(``ramp_sdk.sync.CatalogClient``), so the harness sends what a real
+third-party catalog pusher sends and clears the same gates:
 
 - **Gate 1** (httpsig, RFC 9421): the request is signed with an Ed25519
-  key whose ``kid`` is pre-registered in ``ramp.agents``.
-- **Gate 2** (contributor authorization): the caller must appear in the
-  publisher's ``ramp.json#catalog_contributors``. The e2e edge worker
-  advertises the harness contributor via ``CATALOG_CONTRIBUTORS_JSON``.
+  key. The Exchange resolves it for the request's ``kid`` — from the kid's
+  Web Bot Auth directory on first sight — and refuses a kid that serves no
+  key.
+- **Gate 2** (contributor authorization): the caller must be the publisher
+  itself or appear in the publisher's ``ramp.json#catalog_contributors``.
+  The e2e edge worker advertises the harness contributor via
+  ``CATALOG_CONTRIBUTORS_JSON``.
 
 Every e2e test that needs catalog data therefore implicitly verifies
 that RPC + both gates still work — no separate coverage needed.
 
+What the SDK client does that a hand-built POST did not: it refuses a
+request that names no recipient (``exchange`` must be a bare host), stamps
+``ver``, checks the request against the generated wire schema before
+signing, refuses redirects, caps the response read and validates the
+answer against the schema.
+
+All-or-nothing
+--------------
+``PushResources`` stores a submission whole or refuses it whole. A refusal
+is a non-2xx Connect error, which the SDK raises as
+``ramp_sdk.client.CallError`` carrying the HTTP ``status``, the Connect code
+as ``reason`` and the Exchange's message (which names each offending entry)
+as the cause. A caller therefore never sees a partially accepted response,
+and there is no per-entry verdict to inspect: ``PushResourcesResponse``
+carries a ``rejected`` count on the wire, but the reference Exchange never
+sets it.
+
 Public surface
 --------------
-``push_catalog(exchange_url, tenant_id, entries, key_path)`` — sign + POST.
+``push_catalog(exchange_url, tenant_id, entries, key_path)`` — one SDK call.
 """
 
 from __future__ import annotations
@@ -35,12 +56,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import httpx
-
+from ramp_sdk import ProtocolVersion
 from ramp_sdk.b64 import b64url_decode
-from .httpsig_signer import load_keypair, sign_request
+from ramp_sdk.client import ClientConfig
+from ramp_sdk.sync import CatalogClient
+from wire.models import PushResourcesResponse
 
-_PUSH_PROCEDURE = "/ramp.v1.CatalogService/PushResources"
+from .exchanges import recipient_of
+from .httpsig_signer import load_keypair, signing_transport
 
 
 def _format_money(rate: float) -> str:
@@ -63,26 +86,17 @@ def _format_money(rate: float) -> str:
 
 @dataclass(frozen=True)
 class CatalogEntry:
-    """One resource to seed. Mirrors ``rampv1.ResourceEntry`` on the wire.
-
-    ``required_scopes`` is the Path F gate: when non-empty, the Exchange
-    treats the entry as subscription-restricted and emits
-    ``OFFER_ABSENCE_REASON_SCOPE_INSUFFICIENT`` on resolves whose
-    delegation does not cover at least one matching scope. Tests that
-    need a "subscription-only" entry must populate this field; SQL
-    patches alone are insufficient because PushResources rebuilds the
-    in-memory snapshot from the row state at push time.
-    """
+    """One resource to seed. Mirrors ``ramp.v1.ResourceEntry`` on the wire."""
 
     domain: str
     path: str
     content_id: str
-    required_scopes: tuple[str, ...] = ()
-    subscription_id: str | None = None
-    # Publisher-declared licensing terms (proto3-JSON LicenseTerm dicts, camelCase
-    # field names). Each term is surfaced on Offer.terms after the Exchange filters
-    # them through licenseterm.Select for the requester. Use :func:`license_term`
-    # to build a well-formed dict. Empty = legacy single-price entry.
+    # Publisher-declared licensing terms: LicenseTerm dicts under the canonical
+    # snake_case wire names. Each term is surfaced on Offer.terms after the
+    # Exchange projects the entry's terms by the requester's scope coverage
+    # (``selectTerms`` in ``src/exchange/internal/service/termselect.go``). Use
+    # :func:`license_term` to build a well-formed dict. Empty = the entry is
+    # pushed with the default per-access term (``DEFAULT_ENTRY_RATE``).
     terms: tuple[dict[str, Any], ...] = ()
 
 
@@ -99,54 +113,56 @@ def push_catalog(
     entries: list[CatalogEntry],
     key_path: Path,
     timeout: float = 10.0,
-    strict: bool = True,
-) -> dict[str, Any]:
-    """Sign + POST a ``PushResourcesRequest`` covering ``entries``.
+) -> PushResourcesResponse:
+    """Push ``entries`` to the Exchange at ``exchange_url`` through the SDK client.
 
-    Returns the parsed ``PushResourcesResponse`` JSON (``accepted``,
-    ``rejected``, ``warnings``, and the harness-side ``rejections`` detail
-    when present) so callers can assert on partial-acceptance and warning
-    behaviour — the public PUSH surface this slice exercises.
+    Returns the parsed ``PushResourcesResponse`` (``accepted`` and
+    ``warnings``) so callers can assert on the warning behaviour — the public
+    PUSH surface this harness exercises. A refusal never returns: the SDK
+    raises ``CallError`` for a non-2xx answer (a protovalidate reject at the
+    RPC boundary, a Gate-1 or Gate-2 refusal, an entry the service rejects —
+    all of which refuse the whole submission) and for a request it declines
+    to send (no recipient, a body the wire schema refuses). There is no
+    partial acceptance to assert on.
 
-    The caller_id is the Ed25519 key's ``kid``, which must match both a
-    ``ramp.agents.agent_id`` row (Gate 1) and a
+    On a 2xx, ``accepted == len(entries)`` is the Exchange's all-or-nothing
+    contract, so it is checked here as an invariant: a 2xx that accepted fewer
+    entries than it was sent is a server defect and raises ``RuntimeError``.
+
+    The caller_id is the keyfile's ``kid``, which must name a Web Bot Auth
+    directory that serves the key (Gate 1) and be the publisher domain or a
     ``catalog_contributors[].domain`` entry in the publisher's ``ramp.json``
     (Gate 2).
-
-    ``strict`` (default ``True``) preserves the original fail-loud contract:
-    every entry MUST be accepted or the harness cannot proceed with a partial
-    catalog. Tests that DELIBERATELY push rejectable or warning-bearing
-    entries pass ``strict=False`` and inspect the returned counts themselves.
-    An HTTP-level failure (protovalidate reject at the RPC boundary, signature
-    refusal) always raises regardless of ``strict`` — it is never a per-entry
-    outcome.
     """
-    if not entries:
-        return {"accepted": 0, "rejected": 0, "warnings": []}
     kid, priv = load_keypair(key_path)
-    body = _build_request_json(tenant_id=tenant_id, caller_id=kid, entries=entries)
-    url = exchange_url.rstrip("/") + _PUSH_PROCEDURE
-    sig_headers = sign_request(method="POST", target_uri=url, body=body, kid=kid, priv=priv).headers
-    headers = {**sig_headers, "Content-Type": "application/json"}
-    resp = httpx.post(url, content=body, headers=headers, timeout=timeout)
-    if resp.status_code != httpx.codes.OK:
-        msg = f"PushResources failed: {resp.status_code} {resp.text[:512]}"
+    request = _request(
+        exchange=recipient_of(exchange_url),
+        tenant_id=tenant_id,
+        caller_id=kid,
+        entries=entries,
+    )
+    # No process-wide signing window here, unlike the agent clients: the
+    # replay store records (keyid, signature) pairs, and a push signs its own
+    # body, so two pushes collide only when they carry identical entries in
+    # one second — a harness bug, not a burst to disambiguate.
+    config = ClientConfig(
+        base_url=exchange_url,
+        signer=signing_transport(kid, priv),
+        call_timeout_sec=timeout,
+    )
+    with CatalogClient(config) as client:
+        response = client.push_resources(request)
+    if response.accepted != len(entries):
+        msg = (
+            f"PushResources answered 2xx but accepted {response.accepted} of "
+            f"{len(entries)} entries; the Exchange stores a submission whole or "
+            f"refuses it whole: {response!r}"
+        )
         raise RuntimeError(msg)
-    payload = resp.json()
-    if strict:
-        accepted = payload.get("accepted", 0)
-        rejected = payload.get("rejected", 0)
-        rejections = payload.get("rejections", [])
-        if accepted != len(entries) or rejected != 0:
-            msg = (
-                f"PushResources partial: accepted={accepted} rejected={rejected} "
-                f"rejections={rejections} body={payload}"
-            )
-            raise RuntimeError(msg)
-    return payload
+    return response
 
 
-# Proto3-JSON enum-name constants for LicenseTerm building (camelCase wire form).
+# Enum-name constants for LicenseTerm building, as the wire carries them.
 PRICING_MODEL_FREE = "PRICING_MODEL_FREE"
 PRICING_MODEL_PER_UNIT = "PRICING_MODEL_PER_UNIT"
 PRICING_MODEL_FLAT = "PRICING_MODEL_FLAT"
@@ -179,7 +195,7 @@ def restriction(
     prohibited: tuple[str, ...] = (),
     advisory: bool = False,
 ) -> dict[str, Any]:
-    """Build a proto3-JSON Restriction dict (camelCase wire form).
+    """Build a Restriction dict under the canonical snake_case wire names.
 
     ``advisory`` mirrors proto ``Restriction.advisory`` (replaced the old
     ``critical``, semantics inverted): omitted/false = binding (the default),
@@ -208,7 +224,7 @@ def license_term(
     obligations: tuple[dict[str, Any], ...] = (),
     semantics: str = TERM_SEMANTICS_ENUMERATED,
 ) -> dict[str, Any]:
-    """Build a proto3-JSON LicenseTerm dict (camelCase wire form).
+    """Build a LicenseTerm dict under the canonical snake_case wire names.
 
     Pricing is always emitted — the Exchange hard-rejects a term with no
     Pricing. ``model=FREE`` must keep ``rate=0`` (protovalidate CEL).
@@ -241,19 +257,21 @@ def license_term(
 DEFAULT_ENTRY_RATE = 0.05
 
 
-def _build_request_json(*, tenant_id: str, caller_id: str, entries: list[CatalogEntry]) -> bytes:
-    """Shape the body per proto3-JSON conventions (camelCase field names)."""
+def _request(
+    *, exchange: str, tenant_id: str, caller_id: str, entries: list[CatalogEntry]
+) -> dict[str, Any]:
+    """The ``PushResourcesRequest`` under its canonical snake_case wire names.
 
-    def _entry_json(e: CatalogEntry) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "domain": e.domain,
-            "path": e.path,
-            "content_id": e.content_id,
-        }
-        if e.required_scopes:
-            body["required_scopes"] = list(e.required_scopes)
-        if e.subscription_id is not None:
-            body["subscription_id"] = e.subscription_id
+    ``ver`` is stamped here from ``ramp_sdk.ProtocolVersion``. The SDK would
+    fill an empty one from the same constant, but the harness guard holds every
+    request-body literal to that constant, so a wrong or missing value cannot
+    hide behind the SDK filling it in — see the comment on the field below.
+    ``exchange`` is the recipient's bare host: the SDK requires it and refuses
+    to derive it from the dial address, because the field states whom the sender
+    meant.
+    """
+
+    def _entry(e: CatalogEntry) -> dict[str, Any]:
         terms = e.terms or (
             license_term(
                 model=PRICING_MODEL_PER_UNIT,
@@ -262,15 +280,25 @@ def _build_request_json(*, tenant_id: str, caller_id: str, entries: list[Catalog
                 estimated_quantity=1,
             ),
         )
-        body["terms"] = [dict(t) for t in terms]
-        return body
+        return {
+            "domain": e.domain,
+            "path": e.path,
+            "content_id": e.content_id,
+            "terms": [dict(t) for t in terms],
+        }
 
-    payload = {
+    return {
+        # Stamped from the single constant every sender uses; the SDK would fill
+        # an empty ver itself, but the harness guard holds every body literal to
+        # the constant so a wrong or missing value cannot hide behind that.
+        "ver": ProtocolVersion,
+        # Who the push is addressed to, taken from the host it is sent to — the
+        # same derivation the production ingester does.
+        "exchange": exchange,
         "tenant_id": tenant_id,
         "caller_id": caller_id,
-        "entries": [_entry_json(e) for e in entries],
+        "entries": [_entry(e) for e in entries],
     }
-    return json.dumps(payload, separators=(",", ":")).encode()
 
 
 __all__ = [

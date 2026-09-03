@@ -36,7 +36,8 @@ func parseCorpusFile(t *testing.T, name string) []ingest.Record {
 
 // TestIngestMetadata_ExtensionLineAccepted drives an extension-bearing feed
 // line from the shared corpus through the PRODUCTION ingest path —
-// ParseJSONL + MapRecords + PushEntries (RFC 9421-signed Connect RPC, no SQL) —
+// ParseJSONL + MapRecords + PushEntries through the SDK catalog client (RFC
+// 9421-signed Connect RPC, no SQL) —
 // against a real Exchange + testcontainers Postgres, and asserts PushResources
 // accepts it. The line carries ext (resource_mutability + previews),
 // content_hash/hash_method, word_count, estimated_quantity, source,
@@ -58,13 +59,13 @@ func TestIngestMetadata_ExtensionLineAccepted(t *testing.T) {
 		t.Fatalf("map extension line: %v", err)
 	}
 
-	report, err := ingest.PushEntries(h.ctx, h.server.URL, publisherTenant, kid, mustSigningClient(t, kid, priv), entries)
+	report, err := ingest.PushEntries(h.ctx,
+		mustCatalogClient(t, h.server.URL, kid, priv), pushTarget(publisherTenant, kid), entries)
 	if err != nil {
 		t.Fatalf("push extension line: %v", err)
 	}
-	if report.Accepted != 1 || report.Rejected != 0 {
-		t.Fatalf("push report = accepted %d / rejected %d, want 1 / 0 (warnings: %v)",
-			report.Accepted, report.Rejected, report.Warnings)
+	if report.Accepted != 1 {
+		t.Fatalf("push report = accepted %d, want 1 (warnings: %v)", report.Accepted, report.Warnings)
 	}
 }
 

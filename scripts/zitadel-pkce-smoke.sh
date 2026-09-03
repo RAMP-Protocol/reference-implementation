@@ -9,8 +9,8 @@
 #
 # Scope is the LOCAL user only. Federated Google sign-in cannot be scripted (it
 # redirects to Google's own consent UI), so it is verified by hand. The full
-# sign-up round-trip THROUGH the Identity Service, including the registration
-# form, is likewise out of scope here.
+# sign-up round-trip THROUGH the Identity Service, including its consent screen,
+# is likewise out of scope here.
 #
 # Usage:
 #   make zitadel-up

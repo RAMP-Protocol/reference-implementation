@@ -55,6 +55,14 @@ type EdgeDouble struct {
 
 	mu  sync.RWMutex
 	set settings
+	// remotes is the set of client addresses requests arrived from. Guarded by
+	// the same mutex as set, for the same reason: the test goroutine reads it
+	// while the server's goroutine writes it.
+	remotes map[string]struct{}
+	// requestIDs is the correlation id each request carried, in arrival order,
+	// with an absent header recorded as the empty string rather than skipped —
+	// "no id" is the failure worth seeing, so it must not look like "no request".
+	requestIDs []string
 }
 
 // settings is the double's programmable behaviour, held together so the handler
@@ -88,6 +96,7 @@ func NewEdgeDouble(tb testing.TB, now int64) *EdgeDouble {
 			body:        []byte("<html>licensed</html>"),
 			contentType: "text/html; charset=utf-8",
 		},
+		remotes: map[string]struct{}{},
 	}
 	e.server = httptest.NewServer(http.HandlerFunc(e.serve))
 	tb.Cleanup(e.server.Close)
@@ -112,6 +121,48 @@ func (e *EdgeDouble) URLFor(agentID string) string {
 // Hits counts requests that reached the handler, so a test can assert a redirect
 // was NOT followed.
 func (e *EdgeDouble) Hits() int32 { return e.hits.Load() }
+
+// DistinctRemotes is how many client addresses requests arrived from.
+//
+// It is how a test tells a reused connection from a fresh one, which is not
+// otherwise observable from this side. Go's HTTP client returns an idle
+// connection to its pool and takes it back for the next request to the same
+// host, so a batch fetched over one client arrives on one address. A batch that
+// builds a client per item cannot reuse anything — each client has its own pool —
+// and every item arrives on its own ephemeral port, having paid its own
+// handshake.
+func (e *EdgeDouble) DistinctRemotes() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.remotes)
+}
+
+// noteRemote records the address one request arrived from.
+func (e *EdgeDouble) noteRemote(addr string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.remotes[addr] = struct{}{}
+}
+
+// RequestIDs is the correlation id each request carried, in arrival order.
+//
+// The real edge mints one when the header is absent and writes it into every log
+// record, so a fetch that arrived without one is diagnosed under a value the
+// caller has never seen. Recording what actually arrived is the only way this
+// side can tell that apart from a fetch that arrived correlated.
+func (e *EdgeDouble) RequestIDs() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return append([]string(nil), e.requestIDs...)
+}
+
+// noteRequestID records the correlation id one request carried, or the empty
+// string when it carried none.
+func (e *EdgeDouble) noteRequestID(id string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.requestIDs = append(e.requestIDs, id)
+}
 
 // Close stops the double while leaving its URL valid to mint from, so a test can
 // drive the dial-failure path against an address that is genuinely refusing
@@ -153,6 +204,8 @@ func (e *EdgeDouble) snapshot() settings {
 
 func (e *EdgeDouble) serve(w http.ResponseWriter, r *http.Request) {
 	e.hits.Add(1)
+	e.noteRemote(r.RemoteAddr)
+	e.noteRequestID(r.Header.Get(helpers.RequestIDHeader))
 	set := e.snapshot()
 	if set.handler != nil {
 		set.handler(w, r)
@@ -210,7 +263,7 @@ func (e *EdgeDouble) verify(r *http.Request) string {
 
 // presentedKey decodes the key the fetcher offered.
 func presentedKey(r *http.Request) (ed25519.PublicKey, string) {
-	raw := r.Header.Get(httpsig.AgentKeyHeader)
+	raw := r.Header.Get(helpers.AgentKeyHeader)
 	if raw == "" {
 		return nil, "missing_agent_key"
 	}

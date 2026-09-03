@@ -39,6 +39,16 @@ type discoverFlags struct {
 	// failed (transient RPC errors). The resolve response is then
 	// stamped INTERNAL_ERROR rather than a refusal-shaped reason.
 	allUpstreamFailed bool
+	// namedExchangeDown is true when at least one manifest-named exchange was
+	// registered and trusted but not usable for this request.
+	//
+	// Separate from allUpstreamFailed, which observes the other half of the same
+	// outage: it needs an exchange to have been DIALLED and the call to have
+	// failed, so one the router declined before dialling never reaches it.
+	// Without this flag a batch whose only exchange is down falls through to
+	// NOT_IN_CATALOG — a permanent answer to a condition that clears within one
+	// refresher interval.
+	namedExchangeDown bool
 }
 
 // noHealthyExchangeResponse is the canonical broker-side response
@@ -110,7 +120,14 @@ func budgetExhaustedResponse() *Response {
 //  3. scopeRestricted → SCOPE_INSUFFICIENT (caller's biscuit did not
 //     unlock any offer; collapses the prior GRANTS_DO_NOT_COVER value
 //     onto the canonical scope-gate vocabulary).
-//  4. Otherwise NOT_IN_CATALOG — generic empty-offers fallback,
+//  4. namedExchangeDown → TEMPORARILY_UNAVAILABLE (transient: a
+//     manifest-named exchange was registered and trusted but not usable,
+//     so the router declined it before dialling). Ranked below the
+//     propagated upstream cause, because an exchange that DID answer said
+//     something specific about the request and that beats a sibling merely
+//     being down. Matches what noHealthyExchangeResponse gives the
+//     free-text query path for the same condition.
+//  5. Otherwise NOT_IN_CATALOG — generic empty-offers fallback,
 //     replacing the prior UNKNOWN_RESOURCE value.
 func pickResolveAbsenceReason(flags discoverFlags) rampv1.OfferAbsenceReason {
 	if flags.allUpstreamFailed {
@@ -121,6 +138,9 @@ func pickResolveAbsenceReason(flags discoverFlags) rampv1.OfferAbsenceReason {
 	}
 	if flags.scopeRestricted {
 		return rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_SCOPE_INSUFFICIENT
+	}
+	if flags.namedExchangeDown {
+		return rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_TEMPORARILY_UNAVAILABLE
 	}
 	return rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_NOT_IN_CATALOG
 }

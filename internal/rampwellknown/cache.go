@@ -61,7 +61,20 @@ type Cache struct {
 	expectRole  Role
 
 	negMu    sync.Mutex
-	negative map[string]time.Time
+	negative map[string]negative
+}
+
+// negative is a remembered 404: when the memory lapses, and the URL the origin
+// served it from.
+//
+// The URL is stored rather than rebuilt on read because ErrNoDocument names no
+// document — one sentinel covers the commercial overlay and the WBA key
+// directory, so the address is the only thing that says which one was missing
+// and where. A cached refusal that dropped it answered a later caller with less
+// than the first caller got, which is the opposite of what a cache should do.
+type negative struct {
+	until time.Time
+	url   string
 }
 
 // NewCache constructs a Cache with defaults applied.
@@ -91,12 +104,12 @@ func NewCache(opts CacheOptions) *Cache {
 		timeout:     opts.Timeout,
 		clk:         opts.Clk,
 		expectRole:  opts.ExpectRole,
-		negative:    map[string]time.Time{},
+		negative:    map[string]negative{},
 	}
 }
 
 // Get returns host's cached manifest, fetching through single-flight on a miss.
-// A domain that serves no manifest yields (nil, ErrNoManifest).
+// A domain that serves no manifest yields (nil, ErrNoDocument).
 func (c *Cache) Get(ctx context.Context, host string) (*Manifest, error) {
 	host = strings.ToLower(strings.TrimSpace(host))
 	if host == "" {
@@ -105,8 +118,8 @@ func (c *Cache) Get(ctx context.Context, host string) (*Manifest, error) {
 	if m, ok := c.store.get(host); ok {
 		return m, nil
 	}
-	if c.readNegative(host) {
-		return nil, ErrNoManifest
+	if url, ok := c.readNegative(host); ok {
+		return nil, noDocumentAt(url)
 	}
 	return c.single(ctx, host)
 }
@@ -124,8 +137,8 @@ func (c *Cache) Refresh(ctx context.Context, host string) (*Manifest, error) {
 
 func (c *Cache) single(ctx context.Context, host string) (*Manifest, error) {
 	return c.store.single(host, func() (*Manifest, error) {
-		if c.readNegative(host) {
-			return nil, ErrNoManifest
+		if url, ok := c.readNegative(host); ok {
+			return nil, noDocumentAt(url)
 		}
 		return c.load(ctx, host)
 	})
@@ -146,8 +159,8 @@ func (c *Cache) load(ctx context.Context, host string) (*Manifest, error) {
 		return nil, err
 	}
 	if status == http.StatusNotFound {
-		c.storeNegative(host)
-		return nil, ErrNoManifest
+		c.storeNegative(host, rawURL)
+		return nil, noDocumentAt(rawURL)
 	}
 	if status < 200 || status >= 300 {
 		return nil, fmt.Errorf("%w: %s: status %d", ErrFetch, rawURL, status)
@@ -166,19 +179,26 @@ func (c *Cache) storePositive(host string, m *Manifest, ttl time.Duration) {
 	c.clearNegative(host)
 }
 
-// storeNegative records a 404 for host and drops any positive entry.
-func (c *Cache) storeNegative(host string) {
+// storeNegative records a 404 for host, together with the URL it was served
+// from, and drops any positive entry.
+func (c *Cache) storeNegative(host, rawURL string) {
 	c.negMu.Lock()
-	c.negative[host] = c.clk.Now().Add(c.negativeTTL)
+	c.negative[host] = negative{until: c.clk.Now().Add(c.negativeTTL), url: rawURL}
 	c.negMu.Unlock()
 	c.store.drop(host)
 }
 
-func (c *Cache) readNegative(host string) bool {
+// readNegative reports whether host's 404 is still remembered, and returns the
+// URL that produced it so the caller can answer with the same error the origin
+// fetch would have.
+func (c *Cache) readNegative(host string) (string, bool) {
 	c.negMu.Lock()
 	defer c.negMu.Unlock()
-	until, ok := c.negative[host]
-	return ok && c.clk.Now().Before(until)
+	n, ok := c.negative[host]
+	if !ok || !c.clk.Now().Before(n.until) {
+		return "", false
+	}
+	return n.url, true
 }
 
 func (c *Cache) clearNegative(host string) {

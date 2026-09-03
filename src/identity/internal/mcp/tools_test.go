@@ -9,110 +9,9 @@ import (
 
 	"connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
-
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/signup"
 )
-
-// acmeDetails is the licensing information a developer submits at sign-up, and
-// what register must forward to the Exchange.
-var acmeDetails = signup.FormInput{
-	LegalEntity:         "Acme GmbH",
-	Address:             "1 Main St, Berlin",
-	JurisdictionCountry: "de",
-}
-
-// TestRegister_SignsAsTheCallerAndForwardsLicensingDetails is the ticket's core
-// property, driven end to end: a tool call authenticated by one developer's bearer
-// leaves as a RAMP request signed by THAT developer's custodied key.
-//
-// Both halves matter. The Exchange only accepted the call because the signature
-// verified under the production gate, and the recorded keyid proves which key
-// signed — so this is not "a request arrived" but "the right agent asked".
-func TestRegister_SignsAsTheCallerAndForwardsLicensingDetails(t *testing.T) {
-	f := newFixture(t)
-	f.exchange.registerResp = &rampv1.RegisterResponse{
-		Ver: rampproto.Ver, BillingRef: "acct-123", Active: true,
-	}
-	a := f.provision(t, "dev-one", acmeDetails)
-
-	out := callTool[accountResult](t, f.connect(t, a.Token), "ramp_register", nil)
-
-	if out.BillingRef != "acct-123" || !out.Active {
-		t.Fatalf("register returned %+v, want billing_ref acct-123 and active", out)
-	}
-	call := onlyCall(t, f.exchange)
-	if !strings.HasSuffix(call.Path, "/Register") {
-		t.Fatalf("exchange saw %q, want the Register RPC", call.Path)
-	}
-	if call.KeyID != a.Thumbprint {
-		t.Fatalf("signed with keyid %q, want the caller's own key %q", call.KeyID, a.Thumbprint)
-	}
-	if call.SignatureAgent != "http://"+a.Subdomain {
-		t.Fatalf("Signature-Agent %q, want the caller's own directory http://%s",
-			call.SignatureAgent, a.Subdomain)
-	}
-	// The licensing details reach the Exchange from OUR store, never from the
-	// caller: register takes no arguments, so this is the only way they arrive.
-	assertRegistrationField(t, f.exchange.LastRegistration(), "legal_entity", "Acme GmbH")
-	assertRegistrationField(t, f.exchange.LastRegistration(), "subdomain", a.Subdomain)
-	// "DE", not the "de" submitted: sign-up canonicalises the country to its ISO
-	// 3166-1 alpha-2 form on the way in (signup/validate.go), and what register
-	// forwards is the STORED value, not the raw submission.
-	assertRegistrationField(t, f.exchange.LastRegistration(), "jurisdiction_country", "DE")
-	assertNoBearerLeaked(t, f.exchange, f.broker)
-}
-
-// TestRegister_TwoAgentsSignAsThemselves pins the property that makes the registry
-// multi-tenant: one endpoint, one transport, but each caller's request signed with
-// its OWN key. A regression that bound one key at construction — or cached the
-// first caller's — would still pass every single-agent test and fail here.
-func TestRegister_TwoAgentsSignAsThemselves(t *testing.T) {
-	f := newFixture(t)
-	first := f.provision(t, "dev-one", acmeDetails)
-	second := f.provision(t, "dev-two", acmeDetails)
-	if first.Thumbprint == second.Thumbprint {
-		t.Fatal("the two agents share a key; the fixture cannot tell them apart")
-	}
-
-	callTool[accountResult](t, f.connect(t, first.Token), "ramp_register", nil)
-	callTool[accountResult](t, f.connect(t, second.Token), "ramp_register", nil)
-
-	calls := f.exchange.Calls()
-	if len(calls) != 2 {
-		t.Fatalf("exchange saw %d calls, want 2", len(calls))
-	}
-	if calls[0].KeyID != first.Thumbprint {
-		t.Errorf("first call signed with %q, want %q", calls[0].KeyID, first.Thumbprint)
-	}
-	if calls[1].KeyID != second.Thumbprint {
-		t.Errorf("second call signed with %q, want %q", calls[1].KeyID, second.Thumbprint)
-	}
-}
-
-// TestStatus_ReportsTheAccountState drives the second account RPC. Its request
-// carries no identifying field at all, so the signature is the ONLY thing telling
-// the Exchange whose status to answer with.
-func TestStatus_ReportsTheAccountState(t *testing.T) {
-	f := newFixture(t)
-	f.exchange.statusResp = &rampv1.GetAccountStatusResponse{
-		Ver: rampproto.Ver, BillingRef: "acct-123", Active: false,
-	}
-	a := f.provision(t, "dev-one", acmeDetails)
-
-	out := callTool[accountResult](t, f.connect(t, a.Token), "ramp_status", nil)
-
-	if out.BillingRef != "acct-123" {
-		t.Errorf("billing_ref = %q, want acct-123", out.BillingRef)
-	}
-	if out.Active {
-		t.Error("active = true, want the inactive account the Exchange reported")
-	}
-	if call := onlyCall(t, f.exchange); call.KeyID != a.Thumbprint {
-		t.Errorf("signed with %q, want the caller's key %q", call.KeyID, a.Thumbprint)
-	}
-}
 
 // TestDiscover_ReturnsOffersVerbatimAndNamesTheRequester checks the two things
 // discovery owes the agent: the offers arrive intact, and the request went out
@@ -122,20 +21,19 @@ func TestStatus_ReportsTheAccountState(t *testing.T) {
 // offer that came back re-modelled — a field dropped, a name changed — would be
 // useless to license with even though every other assertion passed.
 func TestDiscover_ReturnsOffersVerbatimAndNamesTheRequester(t *testing.T) {
+	// The offer is issued by the exchange peer and verified against the key that
+	// peer publishes, so the loopback directory fetch has to be reachable.
 	f := newFixture(t)
+	issued := f.exchange.Offer(t, "offer-1")
 	f.broker.resolveResp = &rampv1.DiscoveryResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		OfferGroups: []*rampv1.OfferGroup{{
 			Uri:             "https://pub.example/a",
 			DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_SEARCH.Enum(),
-			Offers: []*rampv1.Offer{{
-				OfferId:   "offer-1",
-				Exchange:  "exchange.example",
-				Signature: "deadbeef",
-			}},
+			Offers:          []*rampv1.Offer{issued},
 		}},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	out := callTool[discoverResult](t, f.connect(t, a.Token), "ramp_discover", map[string]any{
 		"uris": []string{"https://pub.example/a"},
@@ -159,7 +57,7 @@ func TestDiscover_ReturnsOffersVerbatimAndNamesTheRequester(t *testing.T) {
 		t.Errorf("discovery_method = %q, want %q", group.DiscoveryMethod, wantMethod)
 	}
 	if len(group.Offers) != 1 {
-		t.Fatalf("got %d offers, want 1", len(group.Offers))
+		t.Fatalf("got %d offers, want 1 (rejected=%+v)", len(group.Offers), group.Rejected)
 	}
 	offer := group.Offers[0]
 	// snake_case, and the signature anchor present: the agent receives the
@@ -167,8 +65,14 @@ func TestDiscover_ReturnsOffersVerbatimAndNamesTheRequester(t *testing.T) {
 	if offer["offer_id"] != "offer-1" {
 		t.Errorf("offer_id = %v, want offer-1", offer["offer_id"])
 	}
-	if offer["signature"] != "deadbeef" {
+	if offer["signature"] != issued.GetSignature() {
 		t.Errorf("signature = %v, want the offer's own signature carried through", offer["signature"])
+	}
+	// Nothing was rejected: the offer verified, which is the only way it could
+	// have reached the offers list at all. Asserting the empty rejection list
+	// alongside distinguishes "verified and returned" from "returned unchecked".
+	if len(group.Rejected) != 0 {
+		t.Errorf("group carried %d rejected offers, want none: %+v", len(group.Rejected), group.Rejected)
 	}
 	// requester.id is the caller's directory origin (scheme + subdomain), which is
 	// what the Broker/Exchange match against the signed Signature-Agent — not the
@@ -194,13 +98,13 @@ func TestDiscover_EmptyGroupCarriesItsReason(t *testing.T) {
 	f := newFixture(t)
 	absence := rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_NOT_IN_CATALOG
 	f.broker.resolveResp = &rampv1.DiscoveryResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		OfferGroups: []*rampv1.OfferGroup{{
 			Uri:           "https://pub.example/missing",
 			AbsenceReason: &absence,
 		}},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	out := callTool[discoverResult](t, f.connect(t, a.Token), "ramp_discover", map[string]any{
 		"uris": []string{"https://pub.example/missing"},
@@ -233,7 +137,20 @@ func TestDiscover_EmptyGroupCarriesItsReason(t *testing.T) {
 // into one group, reordered them, or dropped the empty group would leave the whole
 // rest of the suite green. The equivalent coverage lived in the retired Python
 // shim's e2e; this is it at the layer that now owns the behavior.
+//
+// The two groups that carry offers are issued by DIFFERENT peers, and that is
+// load-bearing rather than incidental colour. A Broker fans a query out to every
+// Exchange it knows and returns what each one minted, so one response routinely
+// carries offers signed by several keys under several domains — which is the
+// whole reason discovery resolves a key per exchange domain instead of pinning
+// one. With both groups from one peer, a resolver that collapsed to a single
+// issuer would verify everything and this test would still pass, while
+// production dropped every other Exchange's offers as unverifiable. Keep the two
+// peers distinct.
 func TestDiscover_BatchOfURIsKeepsOneGroupPerURI(t *testing.T) {
+	// Every offer below is verified against the issuing peer's published key, so
+	// the loopback directory fetch has to be reachable — for BOTH peers' keys,
+	// which are published at two different loopback origins.
 	f := newFixture(t)
 	uris := []string{
 		"https://pub.example/a",
@@ -242,7 +159,7 @@ func TestDiscover_BatchOfURIsKeepsOneGroupPerURI(t *testing.T) {
 	}
 	absence := rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_NOT_IN_CATALOG
 	f.broker.resolveResp = &rampv1.DiscoveryResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		OfferGroups: []*rampv1.OfferGroup{
 			{
 				// The caller named these URLs, so a real Broker reports EXCHANGE
@@ -252,14 +169,17 @@ func TestDiscover_BatchOfURIsKeepsOneGroupPerURI(t *testing.T) {
 				Uri:             uris[0],
 				DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE.Enum(),
 				Offers: []*rampv1.Offer{
-					{OfferId: "offer-a1", Exchange: "exchange.example", Signature: "sig-a1"},
-					{OfferId: "offer-a2", Exchange: "exchange.example", Signature: "sig-a2"},
+					f.exchange.Offer(t, "offer-a1"),
+					f.exchange.Offer(t, "offer-a2"),
 				},
 			},
 			{
+				// A SECOND issuer, signing with its own key under its own domain.
+				// Verifying this group means resolving a key the group above did
+				// not need.
 				Uri:             uris[1],
 				DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE.Enum(),
-				Offers:          []*rampv1.Offer{{OfferId: "offer-b1", Exchange: "other.example", Signature: "sig-b1"}},
+				Offers:          []*rampv1.Offer{f.issuer.Offer(t, "offer-b1")},
 			},
 			// Present but empty, with a typed reason — never silently dropped.
 			// It carries the method too: the Broker states one on the absence
@@ -271,7 +191,7 @@ func TestDiscover_BatchOfURIsKeepsOneGroupPerURI(t *testing.T) {
 			},
 		},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	out := callTool[discoverResult](t, f.connect(t, a.Token), "ramp_discover", map[string]any{
 		"uris": uris,
@@ -329,24 +249,16 @@ func TestDiscover_BatchOfURIsKeepsOneGroupPerURI(t *testing.T) {
 // Exchange's own manifest — not at the Broker, and not at whatever endpoint the
 // registry happens to be configured with.
 func TestReport_GoesToTheOffersOwnExchange(t *testing.T) {
-	// The peers are httptest servers on loopback, which the SSRF guard blocks by
-	// default. This is the same switch a local stack sets, not a test-only bypass.
-	// The SDK guard is two independent flags: SKIP_SSRF drops the dial-time
-	// address guard so the httptest loopback origin is reachable, and
-	// ALLOW_INSECURE permits its plaintext http scheme.
-	t.Setenv("SKIP_SSRF", "1")
-	t.Setenv("ALLOW_INSECURE", "1")
-
 	f := newFixture(t)
 	// The report is aimed at f.issuer — an Exchange this service is NOT configured
 	// with. That is what makes the assertions below discriminating: routing by
 	// configuration instead of by the offer would land on f.exchange, and the
 	// "issuer saw it / home saw nothing" pair would both fail.
-	f.issuer.reportResp = &rampv1.UsageReportResponse{Ver: rampproto.Ver, ReportId: "rep-1"}
-	a := f.provision(t, "dev-one", acmeDetails)
+	f.issuer.reportResp = &rampv1.UsageReportResponse{Ver: helpers.ProtocolVersion, ReportId: "rep-1"}
+	a := f.provision(t, "dev-one")
 
 	out := callTool[reportResult](t, f.connect(t, a.Token), "ramp_report", map[string]any{
-		"exchange":        hostOf(t, f.issuer.URL()),
+		"exchange":        f.issuer.Domain(t),
 		"transaction_id":  "tx-1",
 		"billing_id":      "bill-1",
 		"idempotency_key": "idem-1",
@@ -385,14 +297,8 @@ func TestReport_GoesToTheOffersOwnExchange(t *testing.T) {
 // outcome: it would send an agent-signed report about someone else's transaction
 // to an Exchange that has no business seeing it.
 func TestReport_UnresolvableExchangeIsRefusedWithNoFallback(t *testing.T) {
-	// The SDK guard is two independent flags: SKIP_SSRF drops the dial-time
-	// address guard so the httptest loopback origin is reachable, and
-	// ALLOW_INSECURE permits its plaintext http scheme.
-	t.Setenv("SKIP_SSRF", "1")
-	t.Setenv("ALLOW_INSECURE", "1")
-
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	msg := callToolErr(t, f.connect(t, a.Token), "ramp_report", map[string]any{
 		// A host that serves no /.well-known/ramp.json at all.
@@ -408,22 +314,59 @@ func TestReport_UnresolvableExchangeIsRefusedWithNoFallback(t *testing.T) {
 	}
 }
 
+// TestReport_BoundsAnExchangeThatEchoesThePayloadBack is the report leg's half of
+// the peer-text bound.
+//
+// The bound used to sit on the account tools alone, attached to which tool asked
+// rather than to where the text came from, so this leg wrote an Exchange's words
+// to the operator line unbounded. The usage report reaches an Exchange the caller
+// named, exactly as a registration does, so the same Exchange that would echo a
+// payload into a refusal here reaches the same log line.
+//
+// Pinning it on this leg is what stops the bound sliding back to being one tool's
+// rule: move it out of failed() and this test goes red while the account tools
+// stay green.
+func TestReport_BoundsAnExchangeThatEchoesThePayloadBack(t *testing.T) {
+	const head = "rejected, you sent: "
+	const tail = "Zolvath-Kreznik-Partnership-8817"
+	echo := head + strings.Repeat("x", 4096) + tail
+
+	f := newFixture(t)
+	f.issuer.failWith(connect.NewError(connect.CodeFailedPrecondition, errStub(echo)))
+	a := f.provision(t, "dev-one")
+
+	callToolErr(t, f.connect(t, a.Token), "ramp_report", map[string]any{
+		"exchange":        f.issuer.Domain(t),
+		"transaction_id":  "tx-1",
+		"idempotency_key": "idem-1",
+	})
+
+	lines := f.logs.Find("identity.mcp.call_failed")
+	if len(lines) != 1 {
+		t.Fatalf("got %d call_failed lines, want 1: %v", len(lines), lines)
+	}
+	line := lines[0]
+	if strings.Contains(line, tail) {
+		t.Errorf("the operator line carries text from past the cut: %s", line)
+	}
+	if !strings.Contains(line, "truncated") {
+		t.Errorf("the operator line is not marked as cut, so this leg is unbounded: %s", line)
+	}
+	if !strings.Contains(line, head) {
+		t.Errorf("the operator line dropped the start of the Exchange's message: %s", line)
+	}
+}
+
 // A RAMP-side refusal on the report leg must surface to the agent, and must not
 // look like success.
 func TestReport_RAMPRefusalSurfaces(t *testing.T) {
-	// The SDK guard is two independent flags: SKIP_SSRF drops the dial-time
-	// address guard so the httptest loopback origin is reachable, and
-	// ALLOW_INSECURE permits its plaintext http scheme.
-	t.Setenv("SKIP_SSRF", "1")
-	t.Setenv("ALLOW_INSECURE", "1")
-
 	f := newFixture(t)
 	f.issuer.failWith(connect.NewError(connect.CodeFailedPrecondition,
 		errStub("usage report rejected")))
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	msg := callToolErr(t, f.connect(t, a.Token), "ramp_report", map[string]any{
-		"exchange":        hostOf(t, f.issuer.URL()),
+		"exchange":        f.issuer.Domain(t),
 		"transaction_id":  "tx-1",
 		"idempotency_key": "idem-1",
 	})
@@ -441,7 +384,7 @@ func TestReport_RAMPRefusalSurfaces(t *testing.T) {
 func TestDiscover_RAMPRefusalSurfaces(t *testing.T) {
 	f := newFixture(t)
 	f.broker.failWith(connect.NewError(connect.CodeUnavailable, errStub("broker is down")))
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	msg := callToolErr(t, f.connect(t, a.Token), "ramp_discover", map[string]any{
 		"uris": []string{"https://pub.example/a"},
@@ -454,45 +397,6 @@ func TestDiscover_RAMPRefusalSurfaces(t *testing.T) {
 	}
 }
 
-// A RAMP-side refusal on status must surface. status is the tool an agent calls
-// to find out WHY something else was refused, so it silently reporting an empty
-// account when the Exchange is unreachable would be actively misleading.
-func TestStatus_RAMPRefusalSurfaces(t *testing.T) {
-	f := newFixture(t)
-	f.exchange.failWith(connect.NewError(connect.CodeUnavailable, errStub("exchange is down")))
-	a := f.provision(t, "dev-one", acmeDetails)
-
-	msg := callToolErr(t, f.connect(t, a.Token), "ramp_status", nil)
-	if !strings.Contains(msg, "ramp_status") {
-		t.Errorf("tool error %q, want it to name the tool that failed", msg)
-	}
-	if !strings.Contains(msg, "exchange is down") {
-		t.Errorf("tool error %q, want it to carry the Exchange's message", msg)
-	}
-}
-
-// A bearer whose subject names a subdomain with no developer record must be
-// refused BEFORE any Exchange call. Without this the registry would forward a
-// RegisterRequest whose licensing fields are all empty strings — a blank legal
-// entity recorded against a real agent.
-func TestRegister_UnknownDeveloperIsRefusedBeforeAnyExchangeCall(t *testing.T) {
-	f := newFixture(t)
-	// A validly-signed, unexpired, correctly-audienced token for an agent that
-	// never signed up.
-	tok, err := f.tokens.Mint("never-signed-up."+baseZone, tokenTTL)
-	if err != nil {
-		t.Fatalf("mint token: %v", err)
-	}
-
-	msg := callToolErr(t, f.connect(t, tok), "ramp_register", nil)
-	if !strings.Contains(msg, "sign up") {
-		t.Errorf("tool error %q, want it to name the missing sign-up", msg)
-	}
-	if len(f.exchange.Calls()) != 0 {
-		t.Error("a blank registration reached the Exchange; it must be refused locally")
-	}
-}
-
 // TestEveryTool_ReturnsTheCorrelationID pins the consistency the correlation id is
 // FOR: an agent quoting an id in a bug report should not have to know which of the
 // five tools happens to return one. Two of the five carried it before; a test per
@@ -502,47 +406,58 @@ func TestRegister_UnknownDeveloperIsRefusedBeforeAnyExchangeCall(t *testing.T) {
 // non-empty — a freshly minted id would satisfy "non-empty" while being
 // uncorrelatable with anything the caller has.
 func TestEveryTool_ReturnsTheCorrelationID(t *testing.T) {
-	// The SDK guard is two independent flags: SKIP_SSRF drops the dial-time
-	// address guard so the httptest loopback origin is reachable, and
-	// ALLOW_INSECURE permits its plaintext http scheme.
-	t.Setenv("SKIP_SSRF", "1")
-	t.Setenv("ALLOW_INSECURE", "1")
-
 	f := newFixture(t)
-	f.exchange.registerResp = &rampv1.RegisterResponse{Ver: rampproto.Ver, BillingRef: "acct-1", Active: true}
-	f.exchange.statusResp = &rampv1.GetAccountStatusResponse{Ver: rampproto.Ver, BillingRef: "acct-1", Active: true}
+	f.exchange.registerResp = &rampv1.RegisterResponse{Ver: helpers.ProtocolVersion, BillingRef: "acct-1", Active: true}
+	f.exchange.statusResp = &rampv1.GetAccountStatusResponse{Ver: helpers.ProtocolVersion, BillingRef: "acct-1", Active: true}
+	// Genuinely issued by a peer whose directory publishes the key, because
+	// discovery verifies. A hand-written literal is rejected now, and this test
+	// reads only the correlation id — so the discover leg would quietly become
+	// "returned nothing and an id" while still passing.
 	f.broker.resolveResp = &rampv1.DiscoveryResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		OfferGroups: []*rampv1.OfferGroup{{
 			Uri:             "https://pub.example/a",
 			DiscoveryMethod: rampv1.DiscoveryMethod_DISCOVERY_METHOD_EXCHANGE.Enum(),
-			Offers:          []*rampv1.Offer{{OfferId: "offer-1", Exchange: "exchange.example", Signature: "sig-1"}},
+			Offers:          []*rampv1.Offer{f.exchange.Offer(t, "offer-1")},
 		}},
 	}
-	f.issuer.reportResp = &rampv1.UsageReportResponse{Ver: rampproto.Ver, ReportId: "rep-1"}
+	f.issuer.reportResp = &rampv1.UsageReportResponse{Ver: helpers.ProtocolVersion, ReportId: "rep-1"}
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{{
 			OfferId: "offer-1", TransactionId: "tx-1",
 			RetrievalEndpoint: strPtr("https://edge.example/d?sig=a"),
 		}},
 	}
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 	session := f.connect(t, a.Token)
+
+	// Hoisted out of the map below so the whole result stays readable. Every tool
+	// here is expected to have DONE its job as well as reported an id, and
+	// discovery is the one where doing nothing is silent: an empty answer carries
+	// a correlation id just as happily as a full one, and the offer reaching the
+	// agent depends on verification passing.
+	discovered := callTool[discoverResult](t, session, "ramp_discover", map[string]any{
+		"uris": []string{"https://pub.example/a"},
+	})
 
 	// Each entry returns the request_id its tool reported. The id the fixture's
 	// session sends is what they must all echo.
 	got := map[string]string{
-		"ramp_register": callTool[accountResult](t, session, "ramp_register", nil).RequestID,
-		"ramp_status":   callTool[accountResult](t, session, "ramp_status", nil).RequestID,
-		"ramp_discover": callTool[discoverResult](t, session, "ramp_discover", map[string]any{
-			"uris": []string{"https://pub.example/a"},
+		"ramp_register": callTool[registerResult](t, session, "ramp_register", registerArgs(t, f)).RequestID,
+		// Named, so this drives the leg that actually calls the Exchange. The
+		// no-argument mode answers from a local note and never leaves the
+		// process, so an id echoed there would say nothing about correlation
+		// reaching a peer.
+		"ramp_status": callTool[statusResult](t, session, "ramp_status", map[string]any{
+			"exchange": f.exchange.Domain(t),
 		}).RequestID,
+		"ramp_discover": discovered.RequestID,
 		"ramp_execute": callTool[executeResult](t, session, "ramp_execute", map[string]any{
 			"offers": []map[string]any{signedOffer("offer-1", "exchange.example")},
 		}).RequestID,
 		"ramp_report": callTool[reportResult](t, session, "ramp_report", map[string]any{
-			"exchange":        hostOf(t, f.issuer.URL()),
+			"exchange":        f.issuer.Domain(t),
 			"transaction_id":  "tx-1",
 			"idempotency_key": "idem-1",
 		}).RequestID,
@@ -553,14 +468,36 @@ func TestEveryTool_ReturnsTheCorrelationID(t *testing.T) {
 			t.Errorf("%s returned no request_id; every tool returns one", tool)
 		}
 	}
+	if len(discovered.OfferGroups) != 1 || len(discovered.OfferGroups[0].Offers) != 1 {
+		t.Errorf("discovery returned %+v; an id echoed by a tool that answered nothing proves nothing",
+			discovered.OfferGroups)
+	}
 }
 
 // --- result shapes and helpers ---
 
-type accountResult struct {
+type registerResult struct {
+	Exchange   string `json:"exchange"`
 	BillingRef string `json:"billing_ref"`
 	Active     bool   `json:"active"`
 	RequestID  string `json:"request_id"`
+}
+
+// statusResult mirrors the tool's ONE output shape. Both modes decode into this
+// same type, which is how a test can assert they really do share a schema — two
+// types here would let them drift and every test would still pass.
+type statusResult struct {
+	Accounts  []statusEntry `json:"accounts"`
+	RequestID string        `json:"request_id"`
+}
+
+type statusEntry struct {
+	Exchange   string `json:"exchange"`
+	Source     string `json:"source"`
+	Registered bool   `json:"registered"`
+	Active     *bool  `json:"active"`
+	BillingRef string `json:"billing_ref"`
+	AsOf       string `json:"as_of"`
 }
 
 type discoverResult struct {
@@ -568,10 +505,18 @@ type discoverResult struct {
 		URI string `json:"uri"`
 		// Licensed is part of the wire contract deliberately (see offerGroup),
 		// so the mirror carries it rather than re-deriving it from len(offers).
-		Licensed        bool             `json:"licensed"`
-		Offers          []map[string]any `json:"offers"`
-		AbsenceReason   string           `json:"absence_reason"`
-		DiscoveryMethod string           `json:"discovery_method"`
+		Licensed bool             `json:"licensed"`
+		Offers   []map[string]any `json:"offers"`
+		// Rejected carries the offers verification refused. The mirror models it
+		// as its own shape rather than as a map, because the point of the field is
+		// that an agent can branch on the reason — a test reading it as loose JSON
+		// would not notice the reason going missing.
+		Rejected []struct {
+			OfferID string `json:"offer_id"`
+			Reason  string `json:"reason"`
+		} `json:"rejected"`
+		AbsenceReason   string `json:"absence_reason"`
+		DiscoveryMethod string `json:"discovery_method"`
 	} `json:"offer_groups"`
 	AbsenceReason string `json:"absence_reason"`
 	RequestID     string `json:"request_id"`

@@ -7,11 +7,10 @@ import (
 	"fmt"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/google/uuid"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/protobuf/encoding/protojson"
-
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 )
 
 // executeInput licenses one or more discovered offers. A single offer is not
@@ -88,9 +87,9 @@ func (t *toolset) handleExecute(
 	if err != nil {
 		return nil, executeOutput{}, err
 	}
-	resp, err := t.ramp.Execute(who.outbound(ctx), rpc)
+	resp, err := t.ramp.Execute(t.callCtx(ctx, who), rpc)
 	if err != nil {
-		return nil, executeOutput{}, rampError("ramp_execute", err)
+		return nil, executeOutput{}, t.failed(ctx, who, "ramp_execute", err)
 	}
 	out, err := projectTransaction(resp)
 	if err != nil {
@@ -98,7 +97,7 @@ func (t *toolset) handleExecute(
 	}
 	out.RequestID = who.requestID
 	log := t.logger(ctx, who)
-	blocks := t.deliver(who.outbound(ctx), log, who, in, &out)
+	blocks := t.deliver(t.callCtx(ctx, who), log, who, in, &out)
 	log.InfoContext(ctx, "identity.mcp.execute",
 		"subdomain", who.subdomain, "offers", len(in.Offers), "items", len(out.Items),
 		"delivery_failures", len(out.DeliveryFailures))
@@ -125,7 +124,7 @@ func buildTransactionRequest(
 		key = "idem-" + uuid.NewString()
 	}
 	return &rampv1.TransactionRequest{
-		Ver:            rampproto.Ver,
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: key,
 		Requester:      requester,
 		Items:          items,

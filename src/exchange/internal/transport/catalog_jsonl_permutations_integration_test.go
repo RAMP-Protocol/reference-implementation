@@ -133,7 +133,8 @@ func TestIngest_LicenseShapePermutations(t *testing.T) {
 				var entries []*rampv1.ResourceEntry
 				entries, mapErr = ingest.MapRecords(records)
 				if mapErr == nil {
-					_, pushErr = ingest.PushEntries(h.ctx, h.server.URL, tenant, kid, mustSigningClient(t, kid, priv), entries)
+					_, pushErr = ingest.PushEntries(h.ctx,
+						mustCatalogClient(t, h.server.URL, kid, priv), pushTarget(tenant, kid), entries)
 				}
 			}
 			rejected := parseErr != nil || mapErr != nil || pushErr != nil

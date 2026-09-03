@@ -64,9 +64,9 @@ command -v openssl >/dev/null 2>&1 || { echo "missing: openssl" >&2; exit 2; }
 # it. Kept in one place so the two docker run calls below cannot disagree.
 CURL_RUN=(--entrypoint sh --user 0)
 
-# The stack's ssh_command output is the one place that knows how to reach the
-# VM — it carries -i <key> when ssh_private_key_path is set in tfvars.
-read -r -a SSH_CMD <<< "$(tf_out ssh_command)"
+# Builds SSH_CMD from the stack.s vm_public_ip output. The identity comes from
+# RAMP_SSH_IDENTITY_FILE, not from Terraform - see lib/staging-env.sh.
+load_ssh_cmd
 IDENTITY_URL="$(tf_out identity_url)"
 ZITADEL_URL="$(tf_out zitadel_url)"
 ZITADEL_HOST="${ZITADEL_URL#https://}"
@@ -119,9 +119,9 @@ wait_for_http "zitadel" "${ZITADEL_URL}/.well-known/openid-configuration" 200
 ALICE_PASSWORD="${ALICE_PASSWORD:-$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9')Aa1!}"
 
 echo "== upload provisioning script =="
-# Piped over the existing ssh connection rather than scp'd: ssh_command is a
-# whole command line, and rewriting it into scp's argument shape is a parsing
-# job with no upside.
+# Piped over the existing ssh connection rather than scp'd: SSH_CMD is a whole
+# command line, and rewriting it into scp's argument shape is a parsing job with
+# no upside.
 "${SSH_CMD[@]}" "sudo tee ${VM_BOOTSTRAP} >/dev/null && sudo chmod 0600 ${VM_BOOTSTRAP}" < "${BOOTSTRAP_SRC}"
 
 # Provisioning runs INSIDE the compose network, dialling Zitadel directly at

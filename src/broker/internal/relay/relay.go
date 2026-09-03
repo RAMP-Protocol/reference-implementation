@@ -89,15 +89,80 @@ func NewCore(
 // arbitrary internal target (e.g. cloud metadata). Returns the typed rejection
 // (auditing it) for the adapter to write.
 func (c Core) AdmitEndpoint(ctx context.Context, b Boundary, endpoint string) *broker.Error {
-	allowed, err := c.EndpointAllowed(ctx, endpoint)
+	admission, err := c.EndpointAllowed(ctx, endpoint)
 	if err != nil {
-		return broker.Wrapf(broker.KindInternal, err, "exchange registry")
+		// Audited like every other refusal. A registry read that failed is the
+		// same class of fault the execute route records, and leaving it silent
+		// here meant one fault had a trail on one route and none on the other.
+		rerr := broker.Wrapf(broker.KindInternal, err, "exchange registry")
+		c.Audit(ctx, b, AuditAction(rerr), endpoint, err)
+		return rerr
 	}
-	if !allowed {
-		c.Audit(ctx, b, "REJECTED_ENDPOINT", endpoint, nil)
-		return UnregisteredEndpointError(endpoint)
+	return c.RefuseAdmission(ctx, b, admission, endpoint)
+}
+
+// Audit actions for a relay refusal. Every one begins with REJECTED_ so an
+// operator filtering that prefix sees every refusal, and each stays searchable
+// on its own.
+const (
+	// ActionRejectedEndpoint records an address the operator never authorized —
+	// the shape an SSRF attempt takes. Reserved for exactly that.
+	ActionRejectedEndpoint = "REJECTED_ENDPOINT"
+	// ActionRejectedEndpointDown records a registered, trusted exchange whose
+	// last probe failed. Kept apart from ActionRejectedEndpoint because filing a
+	// routine outage there makes every restart read like an attack.
+	ActionRejectedEndpointDown = "REJECTED_ENDPOINT_DOWN"
+	// ActionRejectedUpstream records a fault reaching an exchange that the
+	// registry is happy with — a DNS failure, a refused connection, a 500 from
+	// its well-known. Nothing about it is a refusal by the broker.
+	ActionRejectedUpstream = "REJECTED_UPSTREAM"
+	// ActionRejectedInternal records a fault on the BROKER's side, such as a
+	// registry read that failed. It says nothing about the exchange, and filing
+	// it against the exchange would blame the wrong party.
+	ActionRejectedInternal = "REJECTED_INTERNAL"
+)
+
+// AuditAction is the ONE place a refusal becomes an audit action. Every relay
+// audit of a refusal routes through it, so a single state cannot be recorded as
+// an outage on one route and as a rejection on the other.
+//
+// Deriving it from the error's Kind is what keeps that true. The Kind is already
+// decided wherever the refusal is built, and the alternative — each call site
+// naming an action by hand — is exactly how every routine outage on the execute
+// route came to be filed under the attack-shaped record: one function turned a
+// refusal into an action, and the audit calls beside it picked their own.
+func AuditAction(err *broker.Error) string {
+	if err == nil {
+		return ActionRejectedEndpoint
 	}
-	return nil
+	switch err.Kind {
+	case broker.KindUpstreamUnavailable:
+		return ActionRejectedEndpointDown
+	case broker.KindInternal:
+		return ActionRejectedInternal
+	case broker.KindUpstreamRejected:
+		return ActionRejectedUpstream
+	default:
+		return ActionRejectedEndpoint
+	}
+}
+
+// RefuseAdmission writes the audit record an admission owes and returns the
+// typed rejection with it, or nil when the endpoint is live. Both relay routes
+// classify here, and both route their action through AuditAction, so one state
+// cannot audit as an outage on one route and as a rejection on the other.
+func (c Core) RefuseAdmission(
+	ctx context.Context, b Boundary, admission EndpointAdmission, endpoint string,
+) *broker.Error {
+	if admission == EndpointLive {
+		return nil
+	}
+	rerr := UnregisteredEndpointError(endpoint)
+	if admission == EndpointDown {
+		rerr = DownEndpointError(endpoint)
+	}
+	c.Audit(ctx, b, AuditAction(rerr), endpoint, nil)
+	return rerr
 }
 
 // UnregisteredEndpointError is the single source of the SSRF-gate
@@ -114,22 +179,98 @@ func UnregisteredEndpointError(endpoint string) *broker.Error {
 		WithMeta("resolved_endpoint", endpoint)
 }
 
-// EndpointAllowed reports whether endpoint matches a registered Exchange.
-// Matching against the same registry discovery uses (repo.List) guarantees the
-// guard never rejects an endpoint the broker itself advertised. Both sides are
-// already canonical (endpoint normalized once during resolution, stored
-// endpoints normalized on store) so a direct comparison suffices.
-func (c Core) EndpointAllowed(ctx context.Context, endpoint string) (bool, error) {
-	exchanges, err := c.exchanges.List(ctx)
+// DownEndpointError refuses a relay to an Exchange the registry knows and the
+// operator still trusts, but whose last health probe failed. Separate from
+// UnregisteredEndpointError because the two differ in what an agent should do
+// next: an unregistered endpoint is refused identically on every retry, so it
+// arrives as invalid-argument, while a down Exchange clears itself within one
+// refresher interval. Saying invalid-argument here would tell an agent holding
+// a valid signed offer that the offer is bad, and "not a registered exchange"
+// would be false about an Exchange the registry lists. It rides the endpoint
+// under "resolved_endpoint", the same field the unregistered refusal uses.
+func DownEndpointError(endpoint string) *broker.Error {
+	return broker.Newf(broker.KindUpstreamUnavailable,
+		"exchange at %q is registered but its last health check failed", endpoint).
+		WithMeta("resolved_endpoint", endpoint)
+}
+
+// EndpointAdmission is what EndpointAllowed learned about a resolved endpoint.
+// Three states, because the caller owes a different answer to each.
+type EndpointAdmission int
+
+const (
+	// EndpointUnregistered means no non-BLOCKED registry row carries this
+	// endpoint — never registered, or trust withdrawn. Both settled, so the
+	// refusal is final.
+	EndpointUnregistered EndpointAdmission = iota
+	// EndpointDown means a registry row carries this endpoint and the operator
+	// still trusts it, but its last health probe failed. Transient.
+	EndpointDown
+	// EndpointLive means registered, trusted, and answering health probes.
+	EndpointLive
+)
+
+// EndpointAllowed classifies a CALLER-SUPPLIED endpoint against the registry.
+// The discover route is its caller: a known-URL query carries no signed
+// Offer.exchange, so the target arrives in a header and the registry is the
+// only thing bounding where the broker sends a signed POST.
+//
+// One ListUnblocked read answers both questions. The SSRF question is "is this
+// an address a registered Exchange advertises" — a down Exchange still
+// advertises the address it always did, so health is a separate answer, and
+// keeping it separate is what lets the caller refuse a down Exchange retryably.
+// BLOCKED rows never appear in the list, so a withdrawn Exchange is refused as
+// unregistered, the correct final verdict for it.
+//
+// The comparison is exact and stays exact: an anchored-host match would admit
+// every subdomain of a registered Exchange without it ever advertising one.
+// What keeps that from stranding an Exchange that moved is the refresher
+// writing each pass's resolved address back to the column. Both sides are
+// canonical (repo.CanonicalEndpoint).
+func (c Core) EndpointAllowed(ctx context.Context, endpoint string) (EndpointAdmission, error) {
+	exchanges, err := c.exchanges.ListUnblocked(ctx)
 	if err != nil {
-		return false, err
+		return EndpointUnregistered, err
 	}
+	// The BEST admission across every matching row, not the first match. Nothing
+	// makes the endpoint column unique — only the domain is — and two registered
+	// domains whose well-knowns advertise the same origin both carry it, which
+	// the refresher actively brings about by converging each row's column on what
+	// its well-known says. The list's ORDER BY does not break the tie between
+	// them, so reading the first match let the same request be admitted on one
+	// call and refused on the next with nothing in the registry having changed.
+	//
+	// Best-wins is also the older, correct rule: the question is whether ANY
+	// registered exchange advertises this address, and one row being down says
+	// nothing about another that is up. The constants are ordered
+	// Unregistered < Down < Live, so max reads as "the most permissive answer any
+	// matching row supports".
+	best := EndpointUnregistered
 	for _, ex := range exchanges {
 		if ex.Endpoint == endpoint {
-			return true, nil
+			best = max(best, admissionOf(ex))
 		}
 	}
-	return false, nil
+	return best, nil
+}
+
+// admissionOf projects the registry's routability verdict onto what a relay
+// caller is told — the ONE place the relay turns a row into an answer, so the
+// two routes cannot answer differently about the same row.
+//
+// The projection is not the identity: a blocked row reaches the caller as
+// UNREGISTERED. Both are settled refusals and an agent owes no distinction
+// between them, and telling them apart would report whether an endpoint is in
+// the registry at all — more than an unauthenticated caller needs to know.
+func admissionOf(ex repo.Exchange) EndpointAdmission {
+	switch ex.Admission() {
+	case repo.AdmissionLive:
+		return EndpointLive
+	case repo.AdmissionDown:
+		return EndpointDown
+	default:
+		return EndpointUnregistered
+	}
 }
 
 // VerifyAndGuardReplay runs the ONE whole-body sig1 boundary verify + the ONE

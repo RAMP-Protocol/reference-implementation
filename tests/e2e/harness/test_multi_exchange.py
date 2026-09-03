@@ -56,18 +56,24 @@ import pytest
 
 from . import broker_client
 from ._multi_exchange_common import (
-    _EXCHANGE_A_DOMAIN,
-    _EXCHANGE_B_DOMAIN,
-    _EXCHANGE_C_DOMAIN,
     _MUSIC_URI,
     _PHILOSOPHY_URI,
-    _REPORT_USAGE_PATH,
     _EXCHANGE_DOMAIN_TO_DB,
     _SFX_URI,
     _transaction_log_agent,
     _usage_record,
 )
 from .conftest import StackURLs
+from .exchanges import (
+    EXCHANGE_A_DOMAIN,
+    EXCHANGE_B_DOMAIN,
+    EXCHANGE_C_DOMAIN,
+    exchange_url,
+    recipient_of,
+)
+from .connect_errors import assert_refused
+from .discovery import discover_body
+from .reporting import REPORT_USAGE_PATH, report_body
 from .constants import WBA_DIRECTORY_PATH
 from .obligations.flow import discover_first_offer
 from .edge_fetch import fetch_signed
@@ -107,20 +113,21 @@ def _offer_exchange(offer: dict[str, object]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _discover_uris(exchange_url: str, uri: str) -> set[str]:
-    """Return the URIs ``exchange_url`` carries an OFFER for, for a single ``uri``.
+def _discover_uris(url: str, uri: str) -> set[str]:
+    """Return the URIs the exchange at ``url`` carries an OFFER for, for one ``uri``.
 
     A full DiscoverResources protocol round-trip on that exchange's RPC. An empty
     ``offers`` list (the URI is not in THAT exchange's catalog DB) yields the empty
     set — the absence-of-side-effect signal the isolation legs assert on.
+
+    The query names the exchange it is going to. Getting that wrong is refused
+    outright rather than answered with an empty catalog, so the isolation legs
+    below would read a refusal as "not in this exchange's catalog" if the
+    addressing were sloppy.
     """
     resp = sign_post(
-        f"{exchange_url}{_DISCOVER_PATH}",
-        body={
-            "id": f"q-{uuid.uuid4().hex}",
-            "requester": {"id": USD_AGENT_ID, "type": "REQUESTER_TYPE_AGENT"},
-            "uris": [uri],
-        },
+        f"{url}{_DISCOVER_PATH}",
+        body=discover_body(agent_id=USD_AGENT_ID, uris=[uri], exchange=recipient_of(url)),
         key_path=USD_AGENT_KEY_PATH,
     )
     assert resp.status_code == httpx.codes.OK, resp.text
@@ -162,7 +169,7 @@ def test_three_exchanges_isolated_catalogs(
         domain=DEMO_MUSIC_DOMAIN,
         key_path=USD_AGENT_KEY_PATH,
     )
-    assert _offer_exchange(music_offer) == _EXCHANGE_B_DOMAIN, music_offer
+    assert _offer_exchange(music_offer) == EXCHANGE_B_DOMAIN, music_offer
 
     # (b) sfx URI resolves on exchange-c, stamped with exchange-c's identity.
     sfx_offer = discover_first_offer(
@@ -172,7 +179,7 @@ def test_three_exchanges_isolated_catalogs(
         domain=DEMO_SFX_DOMAIN,
         key_path=USD_AGENT_KEY_PATH,
     )
-    assert _offer_exchange(sfx_offer) == _EXCHANGE_C_DOMAIN, sfx_offer
+    assert _offer_exchange(sfx_offer) == EXCHANGE_C_DOMAIN, sfx_offer
 
     # (c) philosophy URI resolves on exchange-a, stamped with exchange-a's identity.
     philo_offer = discover_first_offer(
@@ -182,7 +189,7 @@ def test_three_exchanges_isolated_catalogs(
         domain=DEMO_PHILOSOPHY_DOMAIN,
         key_path=USD_AGENT_KEY_PATH,
     )
-    assert _offer_exchange(philo_offer) == _EXCHANGE_A_DOMAIN, philo_offer
+    assert _offer_exchange(philo_offer) == EXCHANGE_A_DOMAIN, philo_offer
 
     # Catalog ISOLATION (separate DBs): a music URI is ABSENT from exchange-a's
     # catalog, and a philosophy URI is ABSENT from exchange-b's catalog. A shared
@@ -242,9 +249,9 @@ def test_broker_fans_out_batch_across_exchanges(
 
     by_uri = offer_exchanges_by_uri(payload)
     # Each requested URI gets its OWN offer_group keyed on the requested uri.
-    assert by_uri.get(_PHILOSOPHY_URI) == {_EXCHANGE_A_DOMAIN}, payload
-    assert by_uri.get(_MUSIC_URI) == {_EXCHANGE_B_DOMAIN}, payload
-    assert by_uri.get(_SFX_URI) == {_EXCHANGE_C_DOMAIN}, payload
+    assert by_uri.get(_PHILOSOPHY_URI) == {EXCHANGE_A_DOMAIN}, payload
+    assert by_uri.get(_MUSIC_URI) == {EXCHANGE_B_DOMAIN}, payload
+    assert by_uri.get(_SFX_URI) == {EXCHANGE_C_DOMAIN}, payload
 
     # Negative leg: the uncatalogued philosophy URI is PRESENT as a typed-absence
     # group (empty offers + NOT_IN_CATALOG), not silently dropped.
@@ -357,50 +364,37 @@ def test_broker_batch_execute_fans_out_across_three_exchanges(
     )
 
 
-def _exchange_url(compose_stack: StackURLs, exchange_domain: str) -> str:
-    """Map an offer.exchange domain to this stack's URL for that exchange.
-
-    The harness's in-network equivalent of the well-known endpoint resolution the
-    MCP adapter does in production: a report goes to the exchange that ISSUED the
-    offer, addressed here by its known stack URL rather than a hardcoded one.
-    """
-    return {
-        _EXCHANGE_A_DOMAIN: compose_stack.exchange,
-        _EXCHANGE_B_DOMAIN: compose_stack.exchange_b,
-        _EXCHANGE_C_DOMAIN: compose_stack.exchange_c,
-    }[exchange_domain]
-
-
-def _report_usage(compose_stack: StackURLs, exchange_domain: str, item: dict[str, Any]) -> str:
+def _report_usage(compose_stack: StackURLs, issuer_domain: str, item: dict[str, Any]) -> str:
     """Sign a ReportUsage for item to its issuing exchange; return the report_id.
 
-    Reports go DIRECTLY to the issuing exchange, never the broker. consumed
-    quantity is 0: the demo terms carry no reporting estimate, and the validator
-    strict-rejects a positive quantity against a zero-estimate obligation.
+    Reports go DIRECTLY to the issuing exchange, never the broker. ``issuer_domain``
+    is the offer's own ``exchange`` value: it both selects the URL to post to —
+    the harness's in-network stand-in for the well-known endpoint resolution the
+    MCP adapter does in production — and travels in the body as the recipient.
+    consumed quantity is 0: the demo terms carry no reporting estimate, and the
+    validator strict-rejects a positive quantity against a zero-estimate
+    obligation.
     """
-    body: dict[str, Any] = {
-        "ver": "1.0",
-        "idempotency_key": f"report-{uuid.uuid4().hex}",
-        "transaction_id": item.get("transaction_id"),
-        "usage": {"consumed_quantity": 0, "function": ["ai_input"]},
-        "requester": {
-            "id": USD_AGENT_ID,
-            "domain": _BATCH_REQUESTER_DOMAIN,
-            "type": "REQUESTER_TYPE_AGENT",
-        },
-    }
-    if item.get("billing_id"):
-        body["billing_id"] = item["billing_id"]
+    # The report is addressed to the exchange that ISSUED the offer, which is the
+    # same exchange the URL below resolves to. Naming a different one is refused
+    # before any obligation is looked up.
+    body = report_body(
+        exchange=issuer_domain,
+        transaction_id=str(item.get("transaction_id") or ""),
+        agent_id=USD_AGENT_ID,
+        domain=_BATCH_REQUESTER_DOMAIN,
+        billing_id=str(item.get("billing_id") or ""),
+    )
     resp = sign_post(
-        f"{_exchange_url(compose_stack, exchange_domain)}{_REPORT_USAGE_PATH}",
+        f"{exchange_url(compose_stack, issuer_domain)}{REPORT_USAGE_PATH}",
         body=body,
         key_path=USD_AGENT_KEY_PATH,
     )
     assert resp.status_code == httpx.codes.OK, (
-        f"ReportUsage to {exchange_domain} refused: {resp.status_code} {resp.text[:512]}"
+        f"ReportUsage to {issuer_domain} refused: {resp.status_code} {resp.text[:512]}"
     )
     report_id = resp.json().get("report_id")
-    assert report_id, f"ReportUsage to {exchange_domain} returned no report_id: {resp.text}"
+    assert report_id, f"ReportUsage to {issuer_domain} returned no report_id: {resp.text}"
     return str(report_id)
 
 
@@ -461,9 +455,9 @@ def test_full_multi_exchange_batch_lifecycle(
         sfx_offer.get("offer_id"): _SFX_URI,
     }
     assert {_offer_exchange(o) for o in chosen} == {
-        _EXCHANGE_A_DOMAIN,
-        _EXCHANGE_B_DOMAIN,
-        _EXCHANGE_C_DOMAIN,
+        EXCHANGE_A_DOMAIN,
+        EXCHANGE_B_DOMAIN,
+        EXCHANGE_C_DOMAIN,
     }, "the 3 chosen offers must route to 3 distinct exchanges"
 
     # ---- Leg 2: PURCHASE all three in ONE batch (broker fans out per exchange).
@@ -556,22 +550,23 @@ def test_cross_agent_usage_report_refused_no_ledger_side_effect(
     report succeed.
     """
     phantom_tx = f"tx-phantom-{uuid.uuid4().hex}"
-    report_url = f"{compose_stack.exchange_b}{_REPORT_USAGE_PATH}"
+    report_url = f"{compose_stack.exchange_b}{REPORT_USAGE_PATH}"
 
     resp = sign_post(
         report_url,
-        body={
-            "ver": "1.0",
-            "idempotency_key": f"report-{uuid.uuid4().hex}",
-            "transaction_id": phantom_tx,
-            "usage": {"consumed_quantity": 0, "function": ["ai_input"]},
-        },
+        body=report_body(
+            exchange=recipient_of(report_url),
+            transaction_id=phantom_tx,
+            agent_id=USD_AGENT_ID,
+        ),
         key_path=USD_AGENT_KEY_PATH,
     )
-    # Refusal (one of the not-found / auth flavours); NEVER a 2xx success.
-    assert resp.status_code >= httpx.codes.BAD_REQUEST, (
-        f"unclaimed report unexpectedly accepted: {resp.status_code} {resp.text[:256]}"
-    )
+    # The refusal must be the one this test is named for: no obligation holds
+    # this transaction, which the service layer answers with not_found. A
+    # status-only assertion passes on any 4xx, including the wire-validation
+    # refusal this test was changed to stop producing — it would keep passing
+    # while proving that protovalidate works.
+    assert_refused(resp, {"not_found"}, f"report for phantom transaction {phantom_tx}")
     # No ledger side effect: no obligation row was invented for the phantom tx.
     issued, outcome = _usage_record("ramp_b", phantom_tx)
     assert issued is None and outcome is None, (

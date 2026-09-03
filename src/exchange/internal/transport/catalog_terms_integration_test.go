@@ -68,16 +68,12 @@ func TestPushResources_TermsRoundTrip(t *testing.T) {
 	const path = "/articles/terms-roundtrip"
 	contentID := "res-" + uuid.NewString()
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries: []*rampv1.ResourceEntry{{
-			ContentId: proto.String(contentID),
-			Domain:    h.publisherDom,
-			Path:      path,
-			Terms:     wantTerms,
-		}},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+		ContentId: proto.String(contentID),
+		Domain:    h.publisherDom,
+		Path:      path,
+		Terms:     wantTerms,
+	}})))
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -117,15 +113,11 @@ func TestPushResources_NoTermsYieldsNoOffer(t *testing.T) {
 	const path = "/articles/no-terms"
 	contentID := "res-" + uuid.NewString()
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries: []*rampv1.ResourceEntry{{
-			ContentId: proto.String(contentID),
-			Domain:    h.publisherDom,
-			Path:      path,
-		}},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+		ContentId: proto.String(contentID),
+		Domain:    h.publisherDom,
+		Path:      path,
+	}})))
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}

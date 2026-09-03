@@ -58,20 +58,34 @@ func executeBrokerRelay(
 	txID string, offer *rampv1.Offer,
 ) (*connect.Response[rampv1.TransactionResponse], error) {
 	t.Helper()
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
+	return executeBrokerRelayOffers(t, h, client, txID, offer)
+}
+
+// executeBrokerRelayOffers is executeBrokerRelay for a batch: one item per
+// offer, each carrying its own acceptance over the SHARED requester +
+// idempotency key. Items-only contract after the C4 collapse; the relay multisig
+// chain rides on the transport (client).
+func executeBrokerRelayOffers(
+	t *testing.T, h *testHarness, client rampconnect.ExchangeServiceClient,
+	txID string, offers ...*rampv1.Offer,
+) (*connect.Response[rampv1.TransactionResponse], error) {
+	t.Helper()
+	requester := newRequester("agent-test", "agent.example")
+	items := make([]*rampv1.TransactionItem, 0, len(offers))
+	for _, offer := range offers {
+		items = append(items, &rampv1.TransactionItem{
+			Offer:           offer,
+			AgentAcceptance: signAcceptanceFor(t, h.callerPriv, offer, requester, txID),
+		})
 	}
-	// Items-only contract after the C4 collapse: a single batch item carrying the
-	// offer + the agent body acceptance over the SHARED requester + idempotency
-	// key. The relay multisig chain still rides on the transport (client).
-	return client.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+	req := &rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: txID,
 		Requester:      requester,
-		Items: []*rampv1.TransactionItem{
-			{Offer: offer, AgentAcceptance: signAcceptanceFor(t, h.callerPriv, offer, requester, txID)},
-		},
-	}))
+		Items:          items,
+	}
+	req.AgentRequestAcceptance = signRequestAcceptanceFor(t, h.callerPriv, req)
+	return client.ExecuteTransaction(h.ctx, connect.NewRequest(req))
 }
 
 // TestExecuteRelayR4_AgentDirectAcceptanceBindsAgent is the agent-direct
@@ -81,10 +95,10 @@ func executeBrokerRelay(
 func TestExecuteRelayR4_AgentDirectAcceptanceBindsAgent(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/r4-direct", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const txID = "tx-r4-direct"
-	resp, err := executePresented(t, h, txID, offer.GetOfferId(), offer)
+	resp, err := executeSingleItem(t, h, txID, offer)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -132,7 +146,7 @@ func TestExecuteRelayR4_BrokerRelayBindsAgentNotBroker(t *testing.T) {
 	h := newTestHarness(t)
 	h.enableBrokerRelay(t, h.tenantID)
 	uri := seedResourceWithRate(t, h, "/articles/r4-relay", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	relayClient := h.brokerRelayClient(t, "broker.relay-1.v1")
 	const txID = "tx-r4-relay"
@@ -179,7 +193,7 @@ func TestExecuteRelayR4_NonBrokerTypeRelayAdmittedWhenEnabled(t *testing.T) {
 	h := newTestHarness(t)
 	h.enableBrokerRelay(t, h.tenantID)
 	uri := seedResourceWithRate(t, h, "/articles/r4-nonbroker-relay", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	// The relay hop is a resolver-known key whose agents row is requester_type=AGENT.
 	relayClient := h.relayClientAs(t, "relay.nonbroker-1.v1", sqlc.RampRequesterTypeAGENT)
@@ -225,7 +239,7 @@ func TestExecuteRelayR4_BrokerOnlyAcceptanceBindsAgent(t *testing.T) {
 	h := newTestHarness(t)
 	h.enableBrokerRelay(t, h.tenantID)
 	uri := seedResourceWithRate(t, h, "/articles/r4-broker-only-bind", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	brokerClient := h.brokerOnlyClient(t, "broker.only-bind-1.v1")
 	const txID = "tx-r4-broker-only-bind"
@@ -266,7 +280,7 @@ func TestExecuteRelayR4_BrokerOnlyAcceptanceBindsAgent(t *testing.T) {
 func TestExecuteRelayR4_TamperedAcceptanceRejected(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/r4-tamper-acc", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const txID = "tx-r4-tamper-acc"
 	acc := h.defaultAcceptance(t, offer, txID)
@@ -281,12 +295,10 @@ func TestExecuteRelayR4_TamperedAcceptanceRejected(t *testing.T) {
 	acc.Signature = string(sig)
 
 	resp, err := h.exchangeClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: txID,
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-		Items: []*rampv1.TransactionItem{{Offer: offer, AgentAcceptance: acc}},
+		Requester:      newRequester("agent-test", "agent.example"),
+		Items:          []*rampv1.TransactionItem{{Offer: offer, AgentAcceptance: acc}},
 	}))
 	// KindSignatureInvalid is a denial-map kind → in-body per-item denial after
 	// the C4 items-only collapse (Flag #1). Strength preserved: SIGNATURE_INVALID
@@ -302,15 +314,13 @@ func TestExecuteRelayR4_TamperedAcceptanceRejected(t *testing.T) {
 func TestExecuteRelayR4_MissingAcceptanceRejected(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/r4-missing-acc", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const txID = "tx-r4-missing-acc"
 	_, err := h.exchangeClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: txID,
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
+		Requester:      newRequester("agent-test", "agent.example"),
 		// item carries the offer but its agent_acceptance is deliberately omitted.
 		Items: []*rampv1.TransactionItem{{Offer: offer}},
 	}))
@@ -330,16 +340,14 @@ func TestExecuteRelayR4_BrokerOnlyNoAcceptanceRejected(t *testing.T) {
 	h := newTestHarness(t)
 	h.enableBrokerRelay(t, h.tenantID)
 	uri := seedResourceWithRate(t, h, "/articles/r4-broker-only", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	brokerClient := h.brokerOnlyClient(t, "broker.only-1.v1")
 	const txID = "tx-r4-broker-only"
 	_, err := brokerClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: txID,
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
+		Requester:      newRequester("agent-test", "agent.example"),
 		// item carries the offer but no agent acceptance → no authoritative agent
 		// identity → envelope reject (KindInvalidRequest, not in the denial map).
 		Items: []*rampv1.TransactionItem{{Offer: offer}},
@@ -357,7 +365,7 @@ func TestExecuteRelayR4_BrokerRelayDeniedWhenDisabled(t *testing.T) {
 	h := newTestHarness(t)
 	// allow_broker_relay defaults to FALSE — do NOT enable it.
 	uri := seedResourceWithRate(t, h, "/articles/r4-relay-denied", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	relayClient := h.brokerRelayClient(t, "broker.denied-1.v1")
 	const txID = "tx-r4-relay-denied"
@@ -376,20 +384,18 @@ func TestExecuteRelayR4_BrokerRelayDeniedWhenDisabled(t *testing.T) {
 func TestExecuteRelayR4_WrongKeyAcceptanceRejected(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/r4-wrong-key", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const txID = "tx-r4-wrong-key"
 	// Sign the acceptance with a fresh key that is NOT agent-test's registered key.
 	wrongAcc := mintWrongKeyAcceptanceFor(t, offer,
-		&rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+		newRequester("agent-test", "agent.example"),
 		txID)
 	resp, err := h.exchangeClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: txID,
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-		Items: []*rampv1.TransactionItem{{Offer: offer, AgentAcceptance: wrongAcc}},
+		Requester:      newRequester("agent-test", "agent.example"),
+		Items:          []*rampv1.TransactionItem{{Offer: offer, AgentAcceptance: wrongAcc}},
 	}))
 	// Wrong-key acceptance → KindSignatureInvalid, a denial-map kind → in-body
 	// per-item denial after the C4 collapse (Flag #1).

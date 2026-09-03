@@ -13,6 +13,8 @@ import (
 	"github.com/RAMP-Protocol/protocol/sdk/go/core"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/shopspring/decimal"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
 )
 
 // ExchangeRef annotates an Offer with its originating exchange so the
@@ -81,15 +83,19 @@ func Rank(cands []Candidate) []Candidate {
 	return cands
 }
 
+// trustWeight orders the trust levels for ranking — a different question from
+// repo.Exchange.Admission, which only answers whether a row is routable at all.
+// A BLOCKED offer reaching here already escaped that gate, and the negative
+// weight sinks it rather than refusing it.
 func trustWeight(level string) int {
 	switch strings.ToUpper(level) {
-	case "PREFERRED":
+	case repo.TrustLevelPreferred:
 		return 3
-	case "VERIFIED":
+	case repo.TrustLevelVerified:
 		return 2
-	case "DISCOVERED":
+	case repo.TrustLevelDiscovered:
 		return 1
-	case "BLOCKED":
+	case repo.TrustLevelBlocked:
 		return -1
 	default:
 		return 0

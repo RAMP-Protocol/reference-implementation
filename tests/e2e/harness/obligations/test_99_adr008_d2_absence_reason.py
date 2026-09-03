@@ -32,10 +32,11 @@ import uuid
 
 import pytest
 
+from ..exchanges import recipient_of
+from ..discovery import discover_body
 from ..conftest import StackURLs
 from ..seed import DEMO_PHILOSOPHY_DOMAIN, EUR_AGENT_ID, SeededFixture
 from ..signing import sign_post
-
 
 # ADR-008 D5 — declare stack-isolation contract.
 pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
@@ -123,14 +124,12 @@ def test_unknown_uri_discover_resources_sets_not_in_catalog_enum(
     # helper stamps an RFC 9421 signature with the test signer kid
     # (test-signer-e2e.v1), whose key the Exchange resolves from the
     # test-signer-e2e.v1-jwks well-known host.
-    body = {
-        "requester": {
-            "id": _AGENT_ID,
-            "domain": _TENANT_DOMAIN,
-            "type": "REQUESTER_TYPE_AGENT",
-        },
-        "uris": [absence_reason_seed],
-    }
+    body = discover_body(
+        agent_id=_AGENT_ID,
+        uris=[absence_reason_seed],
+        exchange=recipient_of(compose_stack.exchange),
+        domain=_TENANT_DOMAIN,
+    )
     url = f"{compose_stack.exchange}{_LIST_OFFERS_PATH}"
     resp = sign_post(url, body=body)
 

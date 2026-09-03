@@ -12,6 +12,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 )
@@ -195,25 +196,48 @@ func (h *AgentsRegisterHandler) allow(ip string) bool {
 }
 
 // classifyRegisterError maps registry errors to HTTP status + client message.
-// Validation errors from the manifest (agent_id mismatch, malformed manifest,
-// no valid key) are client-facing 400s. Any other error is treated as an
-// upstream fetch failure (502).
+//
+// agentreg.IsCallerFault decides the status, and it is the ONLY thing that does.
+// That function is the single definition of "permanent caller fault vs transient
+// upstream failure", shared with service.mapLazyRegisterError and the catalog
+// self-signup handler; this endpoint used to make the same split by hand and
+// disagreed with it on one sentinel. An agent that serves no key directory was
+// answered here with 502 "failed to fetch", telling the caller to retry, and
+// answered 401 on the other two paths, telling it the identity is not
+// registrable. Reading the split from one function means a sentinel added to the
+// caller-fault set later cannot reintroduce that disagreement: it gets a 400
+// with the closing message below rather than a 502 that invites a retry which
+// can never succeed.
+//
+// The 400 arms differ only in wording, because each names a different repair.
+// Every message names the document the Exchange actually reads: the agent's Web
+// Bot Auth key directory. It fetches no ramp.json for a registering agent, so a
+// message blaming a manifest would send the caller to repair a document that has
+// no bearing on the outcome.
 func classifyRegisterError(err error) (int, string) {
+	if !agentreg.IsCallerFault(err) {
+		return http.StatusBadGateway, "failed to fetch the agent's key directory"
+	}
 	switch {
 	case errors.Is(err, agentreg.ErrNotAHost):
 		// Its own arm because the caller's repair is different: nothing was
 		// fetched and no two hosts disagree — one of the two submitted values is
-		// simply not a host. Answering "manifest is malformed" here sent the
-		// caller to inspect a document the Exchange never retrieved.
+		// simply not a host. Blaming a malformed document here sent the caller to
+		// inspect one the Exchange never retrieved.
 		return http.StatusBadRequest, "agent_id or discovery_url does not name a host"
 	case errors.Is(err, agentreg.ErrAgentIDMismatch):
-		return http.StatusBadRequest, "manifest agent_id does not match request"
-	case errors.Is(err, agentreg.ErrMalformedManifest):
-		return http.StatusBadRequest, "manifest is malformed"
+		return http.StatusBadRequest, "discovery_url host does not match agent_id"
+	case errors.Is(err, rampwellknown.ErrNoDocument):
+		// The fetch SUCCEEDED and the origin answered 404. Saying the fetch
+		// failed described the caller's network, when the repair is to publish
+		// the document.
+		return http.StatusBadRequest, "the agent serves no key directory at discovery_url"
+	case errors.Is(err, agentreg.ErrMalformedDirectory):
+		return http.StatusBadRequest, "the agent's key directory is malformed"
 	case errors.Is(err, agentreg.ErrNoValidKey):
-		return http.StatusBadRequest, "manifest has no currently valid key"
+		return http.StatusBadRequest, "the agent's key directory has no currently valid key"
 	default:
-		return http.StatusBadGateway, "failed to fetch or process agent manifest"
+		return http.StatusBadRequest, "the agent's key directory cannot establish this identity"
 	}
 }
 

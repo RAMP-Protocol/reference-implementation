@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	audiencetest "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 )
@@ -34,10 +35,17 @@ type okPing struct{}
 
 func (okPing) Ping(context.Context) error { return nil }
 
-// buildProbeMux assembles the public mux with only the fields the health and
-// readiness routes read. The Connect-Go handlers register against nil services and
-// are never invoked here, exactly as TestAdminRoutesReturn404 does it.
-func buildProbeMux(t *testing.T, d muxDeps) http.Handler {
+// completeMuxDeps fills the identity and signing dependencies every route
+// needs, leaving whatever the caller already set. The Connect-Go handlers
+// register against nil services and are never invoked from these tests, exactly
+// as TestAdminRoutesReturn404 does it.
+//
+// It is separate from buildPublicMux so that a test asserting buildMux REFUSES
+// a set of settings can reach the same dependencies. buildMux checks the
+// dependencies before it reaches the well-known handler, so a call that leaves
+// them nil fails on the missing recipient interceptor and never gets as far as
+// the settings under test.
+func completeMuxDeps(t *testing.T, d muxDeps) muxDeps {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -49,7 +57,15 @@ func buildProbeMux(t *testing.T, d muxDeps) http.Handler {
 	}
 	d.agentRegistry = noopRegistry{}
 	d.offerSigner = offerSigner
-	mux, _, err := buildMux(d)
+	d.audience = audiencetest.MustInterceptor(t, "exchange.example")
+	return d
+}
+
+// buildPublicMux assembles the public mux with only the fields the route under
+// test reads, over the dependencies completeMuxDeps fills in.
+func buildPublicMux(t *testing.T, d muxDeps) http.Handler {
+	t.Helper()
+	mux, _, err := buildMux(completeMuxDeps(t, d))
 	if err != nil {
 		t.Fatalf("build mux: %v", err)
 	}
@@ -132,7 +148,7 @@ func TestReadyzCoversTheLedger(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			srv := httptest.NewServer(buildProbeMux(t, tc.deps))
+			srv := httptest.NewServer(buildPublicMux(t, tc.deps))
 			t.Cleanup(srv.Close)
 
 			if got := statusOf(t, srv, "/healthz"); got != tc.wantHealthz {

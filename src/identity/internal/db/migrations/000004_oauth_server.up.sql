@@ -1,8 +1,9 @@
 -- The OAuth authorization-server state the Identity Service keeps so it can front
 -- an MCP client's sign-in flow. The service is its own authorization
 -- server: it federates authentication to Zitadel upstream but issues its own
--- authorization codes and tokens downstream, which is what lets the registration
--- form sit in the middle of the flow. Two pieces of that state are durable.
+-- authorization codes and tokens downstream, which is what lets it hold the flow
+-- open across a browser hop and ask the developer to approve the requesting client
+-- before releasing a code. Two pieces of that state are durable.
 
 -- A downstream client registered via RFC 7591 Dynamic Client Registration. MCP
 -- clients (e.g. Claude Code) self-register at runtime rather than being created by

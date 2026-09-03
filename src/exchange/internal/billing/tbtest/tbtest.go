@@ -20,17 +20,19 @@ import (
 	"math/big"
 	"testing"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing/tigerbeetle"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/money"
 )
 
-// Ledger is a test handle to one TigerBeetle ledger: the shared client, the
-// ledger id, and the asset scale. Construct one per suite from the package's
-// shared client and reuse it for every funding and balance call. Bundling the
-// three keeps the helpers under the project's argument-count limit.
+// Ledger is a test handle to one TigerBeetle ledger: the shared client and the
+// ledger id. The asset scale is not carried here — it is money.AssetScale,
+// deliberately fixed for every deployment. Construct one per suite from the
+// package's shared client and reuse it for every funding and balance call.
 type Ledger struct {
 	Client *tigerbeetle.Client
 	ID     uint32 // TigerBeetle ledger id (ISO 4217 numeric)
-	Scale  uint8  // power-of-ten asset scale
 }
 
 // creditLegs are the resolved endpoints, transfer-id keys, and amount of a single
@@ -52,15 +54,11 @@ type creditLegs struct {
 // factory — a closure with no *testing.T in scope — can call it too; test bodies
 // use MustFundAgent.
 func (l Ledger) FundAgent(ctx context.Context, salt, agentID string, amount *big.Rat) error {
-	m, err := tigerbeetle.MinorUnits(amount, l.Scale)
+	m, err := money.MinorUnits(amount)
 	if err != nil {
 		return err
 	}
-	liq, err := l.ensureAccount(ctx, tigerbeetle.PrefixPlatform, salt+"liquidity", tigerbeetle.CodePlatform)
-	if err != nil {
-		return err
-	}
-	agent, err := l.ensureAccount(ctx, tigerbeetle.PrefixAgent, salt+agentID, tigerbeetle.CodeAgent)
+	liq, agent, err := l.fundEndpoints(ctx, salt, agentID)
 	if err != nil {
 		return err
 	}
@@ -73,22 +71,65 @@ func (l Ledger) FundAgent(ctx context.Context, salt, agentID string, amount *big
 	})
 }
 
-// mustRat parses a decimal-dollar string into a big.Rat, failing the test on a bad
-// string. Shared by MustFundAgent and Minor so the parse-or-fatal is expressed once.
-func mustRat(tb testing.TB, dollars string) *big.Rat {
-	tb.Helper()
-	r, ok := new(big.Rat).SetString(dollars)
-	if !ok {
-		tb.Fatalf("tbtest: bad amount %q", dollars)
+// fundEndpoints resolves the salted platform:liquidity source and agent
+// destination every funding helper posts between — the account setup FundAgent
+// and FundAgentWelcome share.
+func (l Ledger) fundEndpoints(ctx context.Context, salt, agentID string) (liq, agent tigerbeetle.ID, err error) {
+	liq, err = l.ensureAccount(ctx, tigerbeetle.PrefixPlatform, salt+tigerbeetle.PlatformLiquidityID, tigerbeetle.CodePlatform)
+	if err != nil {
+		return liq, agent, err
 	}
-	return r
+	agent, err = l.ensureAccount(ctx, tigerbeetle.PrefixAgent, salt+agentID, tigerbeetle.CodeAgent)
+	return liq, agent, err
+}
+
+// FundAgentWelcome posts the single-phase liquidity→agent credit the operator
+// funding script issues under its reserved service-welcome label: one posted
+// transfer whose id is TransferID(salt + billing.WelcomeCreditKey(agentID))
+// — the SAME slot the Register flow's default-credit grant derives, so a
+// script prefund and the service grant can never both apply. Test stand-in for
+// fund-staging-agent.sh with the service-welcome label.
+func (l Ledger) FundAgentWelcome(ctx context.Context, salt, agentID string, amount *big.Rat) error {
+	minor, err := money.MinorUnits(amount)
+	if err != nil {
+		return fmt.Errorf("tbtest: welcome fund minor units: %w", err)
+	}
+	liq, agent, err := l.fundEndpoints(ctx, salt, agentID)
+	if err != nil {
+		return fmt.Errorf("tbtest: welcome fund: %w", err)
+	}
+	id, err := tigerbeetle.TransferID(salt + billing.WelcomeCreditKey(agentID))
+	if err != nil {
+		return fmt.Errorf("tbtest: welcome fund transfer id: %w", err)
+	}
+	out, err := l.Client.CreateLinked(ctx, []tigerbeetle.Leg{{
+		ID:    id,
+		Debit: liq, Credit: agent, Amount: minor,
+		Ledger: l.ID, Code: tigerbeetle.CodeSettlement,
+	}})
+	if err != nil {
+		return fmt.Errorf("tbtest: welcome fund transfer: %w", err)
+	}
+	if out != tigerbeetle.LinkedApplied {
+		return fmt.Errorf("tbtest: welcome fund transfer: outcome=%v", out)
+	}
+	return nil
+}
+
+// MustFundAgentWelcome is the testing.TB convenience over FundAgentWelcome for
+// test bodies, mirroring MustFundAgent's shape over FundAgent.
+func (l Ledger) MustFundAgentWelcome(tb testing.TB, salt, agentID, dollars string) {
+	tb.Helper()
+	if err := l.FundAgentWelcome(context.Background(), salt, agentID, testutil.MustRat(tb, dollars)); err != nil {
+		tb.Fatalf("tbtest: welcome fund: %v", err)
+	}
 }
 
 // MustFundAgent funds the salted agent with dollars (a decimal string) and fails
 // the test on any error. The testing.TB convenience over FundAgent for test bodies.
 func (l Ledger) MustFundAgent(tb testing.TB, salt, agentID, dollars string) {
 	tb.Helper()
-	if err := l.FundAgent(context.Background(), salt, agentID, mustRat(tb, dollars)); err != nil {
+	if err := l.FundAgent(context.Background(), salt, agentID, testutil.MustRat(tb, dollars)); err != nil {
 		tb.Fatalf("tbtest: fund agent: %v", err)
 	}
 }
@@ -194,7 +235,7 @@ func (l Ledger) TransferUserData64(tb testing.TB, id tigerbeetle.ID) uint64 {
 // express expected ledger balances in assertions.
 func (l Ledger) Minor(tb testing.TB, dollars string) int64 {
 	tb.Helper()
-	m, err := tigerbeetle.MinorUnits(mustRat(tb, dollars), l.Scale)
+	m, err := money.MinorUnits(testutil.MustRat(tb, dollars))
 	if err != nil {
 		tb.Fatalf("tbtest: %v", err)
 	}

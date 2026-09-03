@@ -83,32 +83,26 @@ _WORKFLOW_DIR_ENTRY = ".github"
 _ALLOW_DIR_ON_SOURCE = "schemas"
 
 # The documents the public branch owns, each with the reason its local copy is
-# not the one to publish. All three exist in this tree too, and the two reasons
-# are different — the message a failure prints has to say which one applies, so
-# they are carried per path rather than asserted once for the group.
+# not the one to publish — the message a failure prints has to say which reason
+# applies, so they are carried per path rather than asserted once for the group.
 #
 # Written out rather than derived, because what needs pinning IS the membership:
 # a derived list would follow the arrays wherever they were edited and agree with
 # every edit, including the one this guards against. LICENSE is deliberately
 # absent — it exists only on the public branch, so it cannot be published from
-# here by mistake.
+# here by mistake. The retired aws-demo runbook and handoff were pinned here too
+# (their private copies carried identifiers of a live deployment) until that
+# deployment was decommissioned and both documents were removed from the tree.
 #
 # The secret scan is not a dependable second line of defence here, and it must
-# not be treated as one. Measured on the private copies: the runbook and the
-# README scan completely clean, and the handoff produces two findings — both from
-# the default generic-api-key rule, on key-shaped material, not on the
-# identifiers this list exists to hold back. Account numbers, endpoint hostnames,
-# credential-profile names and user names match no rule at all.
+# not be treated as one: identifiers of the kind this list exists to hold back —
+# account numbers, endpoint hostnames, credential-profile names and user names —
+# match no gitleaks rule at all, and the private README measures completely
+# clean under the scan.
 _PUBLIC_BRANCH_OWNS = {
     "README.md": (
         "the public copy is a different document, written for a reader arriving at the "
         "reference implementation; this tree's is an internal working README"
-    ),
-    "RUNBOOK-aws-demo.md": (
-        "this tree's copy carries identifiers of a live deployment that the public copy does not"
-    ),
-    "docs/HANDOFF-aws-demo.md": (
-        "this tree's copy carries identifiers of a live deployment that the public copy does not"
     ),
 }
 
@@ -308,19 +302,24 @@ def test_an_inherited_file_in_a_publish_allowlist_is_rejected(
     did no work at all; that is asserted too.
     """
     source, bare, worktree = publish_fixture
-    inherited_doc = next(f for f in shared_array("INHERIT_FROM_MAIN") if f.startswith("docs/"))
+    # Any inherited entry works as the specimen — the refusal is array
+    # membership, checked before anything is staged, so the entry's shape does
+    # not have to match the allowlist it is planted into. LICENSE is skipped
+    # only because it does not exist in this tree, which keeps the specimen a
+    # file a confused edit could plausibly have tried to publish from here.
+    inherited_file = next(f for f in shared_array("INHERIT_FROM_MAIN") if f != "LICENSE")
     edit_fixture_definition(
         source,
         rf"^  {re.escape(first_entry('ALLOW_DOC_FILES'))}$",
-        f"  {first_entry('ALLOW_DOC_FILES')}\n  {inherited_doc}",
-        "put an inherited doc in a publish allowlist",
+        f"  {first_entry('ALLOW_DOC_FILES')}\n  {inherited_file}",
+        "put an inherited file in a publish allowlist",
     )
 
     proc = run_publish(source, bare, worktree)
 
     combined = proc.stdout + proc.stderr
     assert proc.returncode != 0, combined
-    assert inherited_doc in combined, combined
+    assert inherited_file in combined, combined
     assert "in a publish allowlist at the same time" in combined, combined
     assert not worktree.exists(), combined
 

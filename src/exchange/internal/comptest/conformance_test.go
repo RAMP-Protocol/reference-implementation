@@ -55,7 +55,7 @@ func structFromMap(t *testing.T, m map[string]any) *structpb.Struct {
 func loadExample(t *testing.T, n int) map[string]any {
 	t.Helper()
 	p := filepath.Join(canonicalDir(t), fmt.Sprintf("example-%d-package.json", n))
-	raw, err := os.ReadFile(p) //nolint:gosec // fixture path is test-controlled
+	raw, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatalf("read %s: %v", p, err)
 	}

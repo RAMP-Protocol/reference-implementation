@@ -127,6 +127,54 @@ published issuer before anybody signs up.
 - **The setup script and `init-steps.yaml` in this directory are for the automated
   test stack only.** They carry published passwords and a published master key.
 
+### 3.4 A developer registers and the confirmation code never arrives
+
+Zitadel sends the code and treats the account as unusable until it is entered, so this
+is reported as "I signed up and nothing happened". Work through it in this order —
+each step tells a Zitadel problem apart from a relay problem.
+
+**1. Is a provider configured at all?** Sign in to the console as the admin user, open
+Default settings → Notifications → SMTP provider. If it is missing or inactive on an
+instance that was deployed with mail settings, the first-start configuration did not
+take: fix the deployment and rebuild rather than configuring it by hand, or the next
+rebuild loses the fix. Configuration is in [`CONFIGURATION.md`](CONFIGURATION.md) §3.
+
+**2. Are the host, username and sender what you expect?** The password cannot be read
+back. Compare the rest against what the deployment configured.
+
+**3. Send a test message from that screen.** It reports the relay's own answer, which
+is the fastest way to separate the two sides:
+
+- Authentication rejected → wrong username or password, or a credential that was
+  deactivated at the relay.
+- Sender rejected → the relay does not allow that `FROM`. Amazon SES refuses any send
+  whose sender falls outside the verified identity, and refuses it again if the
+  credential's policy pins one exact address.
+- Connection refused or timed out → wrong host, wrong port, or egress blocked. Check
+  from inside the Zitadel container, not from your workstation.
+- Accepted, but nothing arrives → the relay took it. Continue at the relay.
+
+**4. On Amazon SES specifically**, three things reject mail after a clean apply:
+
+```bash
+# Is the sending identity verified, and is DKIM through?
+aws sesv2 get-email-identity --region us-east-1 --email-identity <domain>
+
+# Is the account still sandboxed? ProductionAccessEnabled tells you.
+aws sesv2 get-account --region us-east-1
+
+# What happened to what was accepted?
+aws sesv2 get-account --region us-east-1 --query 'SendQuota'
+```
+
+In the sandbox, SES accepts the send and delivers only to recipients verified in the
+same region — a registration to any other address disappears silently. Sandbox status,
+identity verification, the SMTP endpoint and the derived SMTP password are all
+per-region: mixing regions is the common cause of "the credential is right and it
+still fails".
+
+**5. Check the address the mail was sent to.** A code delivered to a mistyped address
+is not a fault in any of the above.
 ---
 
 ## 4. Procedures
@@ -191,6 +239,30 @@ v4 crash happens during, so the backup from step 1 is the real rollback path.
 Take the Identity Service down before a risky upgrade, or leave it running and simply
 do not restart it — it does not need the provider while it runs.
 
+### 4.4 Rotating the SMTP password
+
+The order matters. Zitadel holds one password at a time, and the relay stops accepting
+the old one the moment it is removed — so removing it first means every registration in
+that window fails silently, with no error anywhere in RAMP.
+
+Rotate with two credentials live at once:
+
+1. Create a **second** credential at the relay. Both are now valid. On Amazon SES this
+   is a second access key on the same IAM user, which allows two.
+2. Update the stored provider in Zitadel — console → Default settings → Notifications →
+   SMTP provider, or the Admin API — to the new username and password. The environment
+   variables are not involved: they are read only when the instance is first created
+   ([`CONFIGURATION.md`](CONFIGURATION.md) §3).
+3. Send a test message from that screen and confirm it arrives.
+4. Update whatever renders the first-start configuration, so a future rebuild from empty
+   storage comes up on the new credential rather than a deleted one.
+5. Only now, deactivate the old credential at the relay. Deactivate before deleting —
+   deactivating is reversible for a few minutes, deleting is not.
+
+Do not do this by re-running infrastructure tooling that replaces the credential in one
+step. That deletes the old password before Zitadel has the new one, which is the outage
+this procedure exists to avoid.
+
 ---
 
 ## 5. Backup and recovery
@@ -225,6 +297,10 @@ RAMP does not say how often you back up or how fast you must recover. You set th
 - **The master key cannot be changed or recovered**, and everything stored depends on
   it.
 - **A client secret cannot be read back**, only replaced.
+- **Mail settings in the environment apply only at first start.** On an instance that
+  already exists they are ignored, and the stored provider is edited instead — so the
+  two can drift apart, and a rebuild from empty storage comes up on the environment's
+  values, not the edited ones.
 - **The Identity Service reads the secret only at start-up**, so rotating it needs a
   restart and a short window in which sign-ups fail.
 - **The Identity Service will not start while this is unreachable**, even though it does

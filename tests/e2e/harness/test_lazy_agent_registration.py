@@ -1,11 +1,13 @@
 """Lazy agent registration (ADR-009 D2) through the real Agent -> Broker -> Exchange chain.
 
-A fresh agent — absent from ramp.agents, serving only its own
-ROLE_AGENT /.well-known/ramp.json on the ``lazy-agent-e2e`` network alias (== its
-keyID/domain), billing-seeded in docker-compose.e2e.yml — discovers an offer and
+A fresh agent — absent from ramp.agents, serving its own Web Bot Auth key
+directory on the ``lazy-agent-e2e`` network alias (== its keyID/domain),
+billing-seeded in docker-compose.e2e.yml — discovers an offer and
 relay-executes it. Both the Broker (sig1 boundary verify) and the Exchange resolve
-its transport key from that manifest; the Exchange then LAZILY persists the
-ramp.agents row.
+its transport key from that directory at
+/.well-known/http-message-signatures-directory; the Exchange then LAZILY persists
+the ramp.agents row. The host also serves a ROLE_AGENT ramp.json, but nothing on
+either path reads it — the overlay carries no keys.
 
 This is the only test that exercises the lazy-registration SUCCESS path through the
 genuine two-phase relay chain: seed.py pre-registers every other signing agent, so
@@ -50,7 +52,7 @@ GHOST_KEY_PATH = _FIXTURES / "agent_ghost_e2e_key.json"
 
 # epicurus: PER_UNIT 0.0001/characters USD — a PAID resource. A lazily registered
 # agent has an identity row but NO billing account (D1 / ADR-021), so the
-# paid execute is denied BILLING_REF_INACTIVE while the lazy-registration side
+# paid execute is denied ACCOUNT_NOT_REGISTERED while the lazy-registration side
 # effect still fires. Buying paid content requires an explicit Register first.
 _RESOURCE_URI = f"http://{DEMO_PHILOSOPHY_DOMAIN}/articles/philosophers/epicurus.txt"
 
@@ -78,12 +80,13 @@ def test_lazy_registration_fires_but_paid_needs_register(
     """A never-seen agent is lazily registered (identity), but a PAID buy needs Register.
 
     Round-trip: discover (Broker Resolve, sig1 over the agent's own key resolved
-    from http://lazy-agent-e2e/.well-known/ramp.json) -> relay-execute the winning
+    from http://lazy-agent-e2e/.well-known/http-message-signatures-directory) ->
+    relay-execute the winning
     Offer (agent sig1 + Broker sig2 + offer-acceptance). Lazy registration
     (ADR-009 D2) persists the ramp.agents IDENTITY row from the verified well-known
     — enough for free crawling, but NOT a billing account. Per ADR-021 D1 /
     ADR-021, an agent with no billing_ref cannot buy paid content, so the PAID
-    epicurus item is denied in-body with DENIAL_REASON_BILLING_REF_INACTIVE (the
+    epicurus item is denied in-body with DENIAL_REASON_ACCOUNT_NOT_REGISTERED (the
     agent must call Register first). The test asserts BOTH: the in-body paid denial
     AND the lazy-registration side effect — the agents row flips False -> True even
     on the denied paid request, because resolveAgentID persists the row before the
@@ -111,8 +114,8 @@ def test_lazy_registration_fires_but_paid_needs_register(
     accept_payload = cast(dict[str, Any], resp.json())
     item = first_item_of(accept_payload)
     assert item is not None, f"relay response carried no items[0]: {accept_payload}"
-    assert item.get("denial_reason") == "DENIAL_REASON_BILLING_REF_INACTIVE", (
-        f"a paid buy by an identity-only lazy agent must be denied BILLING_REF_INACTIVE "
+    assert item.get("denial_reason") == "DENIAL_REASON_ACCOUNT_NOT_REGISTERED", (
+        f"a paid buy by an identity-only lazy agent must be denied ACCOUNT_NOT_REGISTERED "
         f"(Register mints the account first): {accept_payload}"
     )
     assert not retrieval_endpoint_of(item), (

@@ -1,9 +1,13 @@
-"""Test-harness RFC 9421 Ed25519 signer for v1 obligation 05 tests.
+"""The harness's RFC 9421 Ed25519 signing, over the keyfiles ``scripts/gen-e2e-keys.sh`` writes.
 
-Mirrors the ``_sign_request`` helper in ``catalog_push.py`` so that obligation-05's
-"happy" (correctly refused) and "failure" (defect-guard) scenarios can
-construct deliberately-bad signatures against the canonical RPC surface
-(``DiscoverResources`` / ``ExecuteTransaction`` / ``ReportUsage``).
+Two ways to sign, for two different needs. :func:`sign_request` is the one the
+obligation-05 tests use: their "happy" (correctly refused) and "failure"
+(defect-guard) scenarios construct deliberately-bad signatures against the
+canonical RPC surface (``DiscoverResources`` / ``ExecuteTransaction`` /
+``ReportUsage``). :func:`signing_transport` is the SDK's own signing transport
+over the same keyfiles, and is what every SDK client the harness builds signs
+with — ``sdk_client.py`` for the agent verbs, ``catalog_push.py`` for the
+catalog push.
 
 The signing base, covered-component set, and crypto are the SDK's
 (``ramp_sdk.httpsig.sign_request``), and the 5-key Title-Case header lift is
@@ -16,7 +20,7 @@ expired, future-dated, or mis-attributed signatures against the canonical RPC
 surface (the SDK signer takes injected timestamps by design, which is exactly
 what those knobs need).
 
-The module exposes two pieces:
+The module exposes three pieces:
 
 - :class:`SignedRequest` — a frozen Pydantic-shaped dataclass holding
   the four headers (``Content-Digest``, ``Signature-Input``,
@@ -28,6 +32,9 @@ The module exposes two pieces:
   method, target URI, body bytes, and a keypair. The function accepts
   knobs for the timestamps so tests can construct expired or future-
   dated signatures without monkey-patching the clock.
+- :func:`signing_transport` — the SDK's ``SigningTransport`` over a
+  keyfile's ``(kid, key)`` pair, with the keyid/directory split applied
+  once, here, rather than at every client that needs it.
 """
 
 from __future__ import annotations
@@ -41,7 +48,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from ramp_sdk.b64 import b64url_decode
 from ramp_sdk.httpsig import sign_request as _sdk_sign_request
+from ramp_sdk.signing_transport import SigningTransport
 from ramp_sdk.thumbprint import thumbprint as ed25519_thumbprint
+from ramp_sdk.window import Window
 
 from .rampsig import title_case_signed_headers
 
@@ -127,6 +136,32 @@ def load_keypair(key_path: Path) -> tuple[str, Ed25519PrivateKey]:
     return doc["kid"], Ed25519PrivateKey.from_private_bytes(seed)
 
 
+def signing_transport(
+    directory: str, priv: Ed25519PrivateKey, *, window: Window | None = None
+) -> SigningTransport:
+    """The SDK's request signer over a keyfile's ``(kid, key)`` pair.
+
+    Two different values go in, and the split is load-bearing. After the Web
+    Bot Auth split the RFC 9421 ``keyid`` is the key's RFC 7638 thumbprint,
+    while the covered ``Signature-Agent`` names the directory the verifier
+    fetches to resolve it. The harness's key fixtures carry the DIRECTORY
+    under the name ``kid`` — in this stack an identity's directory, its caller
+    name and its fixture kid are one string — so passing that as the keyid
+    gets the request signed and then refused as an unknown keyid.
+
+    ``window`` mints ``(created, expires)``; ``None`` takes the SDK's own
+    clock window at its default validity. A caller whose requests can repeat
+    byte-for-byte inside one second passes a shared monotonic window instead
+    (the agent clients do — see ``sdk_client.py`` for why).
+    """
+    return SigningTransport(
+        window=window,
+        signer_seed=priv.private_bytes_raw(),
+        keyid=ed25519_thumbprint(priv.public_key().public_bytes_raw()),
+        signature_agent=directory,
+    )
+
+
 def generate_random_keypair(kid: str) -> tuple[str, Ed25519PrivateKey]:
     """Build an in-memory Ed25519 keypair tagged with ``kid``.
 
@@ -144,6 +179,7 @@ __all__ = [
     "generate_random_keypair",
     "load_keypair",
     "sign_request",
+    "signing_transport",
 ]
 
 

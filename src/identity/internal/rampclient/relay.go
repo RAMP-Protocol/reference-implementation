@@ -9,12 +9,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampreason"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 )
 
@@ -22,6 +25,22 @@ import (
 // /ramp.* path: the agent posts a TransactionRequest here and the Broker
 // re-packages it per exchange. The one RAMP call this package makes by hand.
 const relayExecutePath = "/broker/v1/exchange/execute"
+
+// relayRequestJSON marshals the outbound TransactionRequest with snake_case
+// proto field names. The RAMP wire is snake_case proto-JSON, and protojson's
+// default writes the camelCase json_name alias instead — which made this the one
+// proto-JSON producer in the tree whose output does not match what every other
+// one emits (the Broker's own relay writer, the well-known builders, the MCP
+// tool results all write proto names). The Broker decodes both spellings, so no
+// behavior changes at the far end; what changes is that a reader which accepts
+// only the canonical spelling can now read this leg.
+//
+// Deliberately NOT the emit-unpopulated codec the Broker's relay WRITER uses.
+// That codec is the response policy. This is a request, and the relay route
+// buffers it under a 64 KiB pre-auth cap; emitting every zero-valued field of
+// each embedded signed Offer would push a legitimate batch toward that cap and
+// buy nothing, because the receiver decodes the same message either way.
+var relayRequestJSON = protojson.MarshalOptions{UseProtoNames: true}
 
 // maxRelayResponseBytes bounds the relay response read. A TransactionResponse for
 // a realistic batch is small; the bound is a guard against a peer that answers
@@ -57,6 +76,61 @@ func relayTargetOf(relayURL string) func(*http.Request) bool {
 	}
 	return func(req *http.Request) bool {
 		return req.URL != nil && req.URL.Path == path
+	}
+}
+
+// accountProcedures are the two RPC procedures this client sends to an Exchange.
+// The generated constructor appends one of them to whatever endpoint it was
+// built on, so they are the SUFFIX of every account request's path.
+var accountProcedures = []string{
+	rampv1connect.ExchangeServiceRegisterProcedure,
+	rampv1connect.ExchangeServiceGetAccountStatusProcedure,
+}
+
+// accountTargetOf marks an account RPC sent to an endpoint carrying a path
+// prefix as RAMP-signed traffic.
+//
+// The transport's own rule reads the path's PREFIX: a path starting "/ramp." is
+// a RAMP RPC. That holds while the endpoint is a bare origin, and it stops
+// holding the moment an Exchange advertises one with a path. This branch made
+// exactly that possible: the account legs now dial an endpoint resolved from the
+// target Exchange's own manifest, where before it came from a setting an
+// operator wrote once. "https://exchange.example/api" produces the path
+// "/api/ramp.v1.ExchangeService/Register", the prefix test fails, and no profile
+// claims the request — so it goes out unsigned, carrying the operator's
+// registration details, and nothing on this side reports why. The far end fails
+// closed, so the visible symptom is an Exchange behind a path prefix that can
+// never be registered at.
+//
+// A path-prefixed endpoint is conformant. The pinned protocol module constrains
+// a manifest's endpoint on host, port and userinfo, and the endpoint rule this
+// client resolves through enforces those three, so such an endpoint arrives
+// without objection.
+//
+// Matched by procedure SUFFIX rather than by looking for "/ramp." anywhere in
+// the path: the two procedures below are the only ones this client sends, so
+// this claims exactly its own traffic and cannot start signing a request to some
+// other path that happens to contain those bytes. WithRAMPTargets only ADDS to
+// the signed set, so nothing that is signed today can stop being signed by this.
+func accountTargetOf(req *http.Request) bool {
+	if req.URL == nil {
+		return false
+	}
+	for _, proc := range accountProcedures {
+		if strings.HasSuffix(req.URL.Path, proc) {
+			return true
+		}
+	}
+	return false
+}
+
+// rampTargetsOf is the whole set of paths this client signs as RAMP that the
+// transport's own prefix rule does not already claim: the Broker's relay route,
+// and an account RPC behind an endpoint's path prefix.
+func rampTargetsOf(relayURL string) func(*http.Request) bool {
+	relay := relayTargetOf(relayURL)
+	return func(req *http.Request) bool {
+		return relay(req) || accountTargetOf(req)
 	}
 }
 
@@ -99,6 +173,13 @@ func signAcceptances(
 			SignatureAlgorithm: helpers.AcceptanceSignatureAlgorithm,
 		}
 	}
+	requestAcceptance, err := helpers.SignRequestAcceptance(priv, signed)
+	if err != nil {
+		return nil, &Error{Kind: KindMalformed, Op: "execute", Err: fmt.Errorf(
+			"sign request acceptance: %w", err,
+		)}
+	}
+	signed.AgentRequestAcceptance = requestAcceptance
 	return signed, nil
 }
 
@@ -108,7 +189,7 @@ func signAcceptances(
 func (c *Client) postRelay(
 	ctx context.Context, req *rampv1.TransactionRequest,
 ) (*rampv1.TransactionResponse, error) {
-	body, err := protojson.Marshal(req)
+	body, err := relayRequestJSON.Marshal(req)
 	if err != nil {
 		return nil, &Error{
 			Kind: KindMalformed, Op: "execute",
@@ -129,7 +210,7 @@ func (c *Client) postRelay(
 	// causes share an id; a fresh id is minted only when this call has no inbound
 	// request behind it.
 	httpReq.Header.Set(reqctx.HeaderRequestID, reqctx.IDOrNew(ctx))
-	resp, err := c.http.Do(httpReq)
+	resp, err := c.relayHTTP.Do(httpReq)
 	if err != nil {
 		return nil, &Error{
 			Kind: KindUnreachable, Op: "execute",
@@ -175,7 +256,7 @@ func relayError(status int, body []byte) error {
 	// DiscardUnknown so a Broker running a newer protocol than the one pinned
 	// here still yields its typed reason rather than degrading to a bare status.
 	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &detail); err == nil {
-		if ReasonName(&detail) != "" || detail.GetMessage() != "" {
+		if rampreason.Name(&detail) != "" || detail.GetMessage() != "" {
 			e.Detail = &detail
 		}
 	}

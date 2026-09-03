@@ -19,16 +19,17 @@ type IdentityAgentCard struct {
 }
 
 type IdentityDeveloperAccount struct {
-	OidcIssuer           string             `json:"oidc_issuer"`
-	OidcSubject          string             `json:"oidc_subject"`
-	Email                string             `json:"email"`
-	Subdomain            string             `json:"subdomain"`
-	LegalEntity          string             `json:"legal_entity"`
-	Address              string             `json:"address"`
-	JurisdictionCountry  string             `json:"jurisdiction_country"`
-	RegistrationComplete bool               `json:"registration_complete"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	OidcIssuer  string             `json:"oidc_issuer"`
+	OidcSubject string             `json:"oidc_subject"`
+	Email       string             `json:"email"`
+	Subdomain   string             `json:"subdomain"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type IdentityExchangeRegistration struct {
+	Subdomain    string             `json:"subdomain"`
+	Exchange     string             `json:"exchange"`
+	RegisteredAt pgtype.Timestamptz `json:"registered_at"`
 }
 
 type IdentityKeyRevocation struct {

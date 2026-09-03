@@ -3,8 +3,10 @@ package resolve
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/probe"
@@ -83,8 +85,8 @@ func stampMethod(groups []OfferGroup, method rampv1.DiscoveryMethod) []OfferGrou
 func (h *Service) discoverByRoute(
 	ctx context.Context, req Request, uris []string, manifests map[string]probe.Manifest,
 ) ([]OfferGroup, discoverFlags, error) {
-	plan, anyRouted := h.buildRoutePlan(ctx, uris, manifests)
-	flags := discoverFlags{}
+	plan, scan, anyRouted := h.buildRoutePlan(ctx, uris, manifests)
+	flags := discoverFlags{namedExchangeDown: scan.sawTransientDecline}
 	byURL := make(map[string]OfferGroup, len(uris))
 	failures := 0
 	for _, domain := range plan.exchangeOrder {
@@ -154,7 +156,19 @@ var errSignForward = errors.New("sign forward")
 func (h *Service) queryExchange(
 	ctx context.Context, req Request, ex repo.Exchange, uris []string,
 ) (*rampv1.ResourceResponse, error) {
-	rq := buildResourceQuery(ctx, req, h.deps.Clk, uris)
+	// The registry row's domain becomes the recipient this leg names, so it is
+	// held to the shape the wire admits before it is stamped — the same check
+	// every other sender in this repository runs on a value bound for the
+	// recipient field. A row holding something else is a registration fault, and
+	// saying so here is the difference between an operator reading it and an
+	// exchange that silently returns nothing: the far end would refuse the leg
+	// as malformed, and that refusal names the Broker's registry nowhere.
+	if !helpers.IsBareDomain(ex.Domain) {
+		return nil, fmt.Errorf(
+			"registered exchange %q is not a bare domain, so no request can be addressed to it",
+			ex.Domain)
+	}
+	rq := buildResourceQuery(ctx, req, h.deps.Clk, ex.Domain, uris)
 	sig, err := h.deps.Signer.SignForward(rq)
 	if err != nil {
 		return nil, errors.Join(errSignForward, err)

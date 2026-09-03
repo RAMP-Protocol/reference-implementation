@@ -5,9 +5,16 @@ import { type PopResult, verifyAgentBinding } from '@ramp-protocol/sdk-l1/pop';
 import { type VerifyResult, verifyEd25519SignedUrl } from '@ramp-protocol/sdk-l1/verify';
 
 import { classifyClient } from './bot-classification.js';
-import { type AppDeps, WBA_DIRECTORY_CONTENT_TYPE, WBA_PATH, WELL_KNOWN_PATH } from './types.js';
+import { type DeliveryFacts, logDelivery, logDeny, logEvent } from './log.js';
+import {
+  type AppDeps,
+  type AppVariables,
+  WBA_DIRECTORY_CONTENT_TYPE,
+  WBA_PATH,
+  WELL_KNOWN_PATH,
+} from './types.js';
 
-export type AppVariables = { requestId: string };
+export type { AppVariables } from './types.js';
 
 export type App = Hono<{ Variables: AppVariables }>;
 
@@ -99,7 +106,12 @@ async function catchallHandler(
   const bindingError = await enforceBinding(c, deps, url);
   if (bindingError) return bindingError;
 
-  return passToOrigin(c, deps);
+  // Authorized. passToOrigin emits the delivery record once it knows which
+  // branch served the request, and only if that branch answered.
+  return passToOrigin(c, deps, {
+    ...(result.kid !== undefined ? { kid: result.kid } : {}),
+    ...(result.agentId !== undefined ? { agentId: result.agentId } : {}),
+  });
 }
 
 function isReadMethod(method: string): boolean {
@@ -152,38 +164,6 @@ async function enforceBinding(
   return undefined;
 }
 
-// logEvent owns the canonical {method, path, request_id} base every edge
-// record carries, so the shape cannot drift between call sites. Levels:
-// warn = expected denial traffic (every unpaid bot produces one), error =
-// operational failure worth alerting on. One decision emits exactly one
-// record. The signature (and the raw query string carrying it) is never
-// logged; of the signed-URL params, only the public key id (kid) may appear,
-// on signature denials.
-function logEvent(
-  c: Context<{ Variables: AppVariables }>,
-  level: 'warn' | 'error',
-  event: string,
-  extra: Record<string, string>,
-): void {
-  const record = {
-    ...extra,
-    method: c.req.method,
-    path: c.req.path,
-    request_id: c.get('requestId'),
-  };
-  // Branched (not console[level]) so the noConsole lint rule can statically
-  // see that only the allowed warn/error methods are ever called.
-  if (level === 'error') {
-    console.error(event, record);
-  } else {
-    console.warn(event, record);
-  }
-}
-
-function logDeny(c: Context<{ Variables: AppVariables }>, event: string, reason: string): void {
-  logEvent(c, 'warn', event, { reason });
-}
-
 function handlePopResult(c: Context<{ Variables: AppVariables }>, pop: PopResult): Response {
   const reason = pop.reason ?? 'unknown';
   logDeny(c, 'edge.deny.binding', reason);
@@ -212,33 +192,47 @@ export const SIGNATURE_PARAMS = ['exp', 'sig', 'kid', 'agent_id'] as const;
 // runtimes the header simply never appears.
 export const CDN_AUTHORIZED_HEADER = 'x-edge-authorized';
 
-// resolveOriginTarget picks where a pass-through request goes: an explicit
-// origin (keeping path + query), the incoming URL itself (same-zone mode,
-// where Cloudflare routes the subrequest to the zone's origin), or nowhere —
-// undefined means the deployment's CDN owns the origin fetch (CloudFront-
+// resolveOrigin picks where a pass-through request goes: an explicit origin
+// (keeping path + query), the incoming URL itself (same-zone mode, where
+// Cloudflare routes the subrequest to the zone's origin), or nowhere — an
+// absent target means the deployment's CDN owns the origin fetch (CloudFront-
 // native) and the worker answers an empty 200.
-function resolveOriginTarget(rawUrl: string, deps: AppDeps): URL | undefined {
+//
+// It also names the branch it took. The delivery record reports which branch
+// served the request, and deriving that name anywhere else would be a second
+// copy of this decision that could disagree with the routing it describes.
+function resolveOrigin(
+  rawUrl: string,
+  deps: AppDeps,
+): { target?: URL; outcome: 'origin-forwarded' | 'same-zone' | 'cdn-origin-fetch' } {
   const incoming = new URL(rawUrl);
   let target: URL;
+  let outcome: 'origin-forwarded' | 'same-zone';
   if (deps.originUrl) {
     target = new URL(deps.originUrl);
     target.pathname = incoming.pathname;
     target.search = incoming.search;
+    outcome = 'origin-forwarded';
   } else if (deps.sameZoneOrigin) {
     target = incoming;
+    outcome = 'same-zone';
   } else {
-    return undefined;
+    return { outcome: 'cdn-origin-fetch' };
   }
   for (const p of SIGNATURE_PARAMS) target.searchParams.delete(p);
-  return target;
+  return { target, outcome };
 }
 
 async function passToOrigin(
   c: Context<{ Variables: AppVariables }>,
   deps: AppDeps,
+  delivery?: DeliveryFacts,
 ): Promise<Response> {
-  const target = resolveOriginTarget(c.req.url, deps);
-  if (!target) return c.body(null, 200, { [CDN_AUTHORIZED_HEADER]: 'cdn-origin-fetch' });
+  const { target, outcome } = resolveOrigin(c.req.url, deps);
+  if (!target) {
+    if (delivery) await logDelivery(c, delivery, outcome);
+    return c.body(null, 200, { [CDN_AUTHORIZED_HEADER]: 'cdn-origin-fetch' });
+  }
   const fetcher = deps.fetcher ?? fetch;
   const method = c.req.method;
   const init: RequestInit & { duplex?: 'half' } = {
@@ -256,7 +250,14 @@ async function passToOrigin(
     init.duplex = 'half';
   }
   try {
-    return await fetcher(new Request(target.toString(), init));
+    const response = await fetcher(new Request(target.toString(), init));
+    // Emitted only once the origin has answered, so a delivery that failed to
+    // reach the origin reports the failure below and nothing else — one
+    // decision, one record. The status travels with it: this is the only call
+    // site that has seen an origin response, so it is the only one that may
+    // say what the origin answered.
+    if (delivery) await logDelivery(c, delivery, outcome, response.status);
+    return response;
   } catch (err) {
     // The origin being down or misaddressed is a gateway problem, not an
     // internal error of this worker; say so with a 502 the operator can tell

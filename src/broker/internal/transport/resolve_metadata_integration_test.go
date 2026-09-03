@@ -33,6 +33,7 @@ import (
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 )
 
 // signedResolveFault spins up the signed Connect harness for callerID (its key
@@ -63,7 +64,8 @@ func TestResolve_AgentIDMissing_CarriesFieldMetadata(t *testing.T) {
 
 	// requester.id deliberately empty; sign with a valid registered key.
 	req := &rampv1.DiscoveryRequest{
-		Requester: &rampv1.Requester{Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+		Ver:       helpers.ProtocolVersion,
+		Requester: &rampv1.Requester{Domain: requesterDomain, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
 		Query:     ptr("RAMP intro"),
 	}
 	srv, err := signedResolveFault(t, fx, "agent-1", req)
@@ -88,7 +90,10 @@ func TestResolve_QueryAndURIBothEmpty_CarriesRequiredOneOfMetadata(t *testing.T)
 
 	const callerID = "agent-1"
 	req := &rampv1.DiscoveryRequest{
-		Requester: &rampv1.Requester{Id: callerID, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+		Ver: helpers.ProtocolVersion,
+		Requester: &rampv1.Requester{
+			Id: callerID, Domain: requesterDomain, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
+		},
 		// no Query, no Uris
 	}
 	srv, err := signedResolveFault(t, fx, callerID, req)
@@ -113,8 +118,11 @@ func TestResolve_UnparseableURI_CarriesFieldMetadata(t *testing.T) {
 
 	const callerID = "agent-1"
 	req := &rampv1.DiscoveryRequest{
-		Requester: &rampv1.Requester{Id: callerID, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
-		Uris:      []string{"http://[::1"},
+		Ver: helpers.ProtocolVersion,
+		Requester: &rampv1.Requester{
+			Id: callerID, Domain: requesterDomain, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
+		},
+		Uris: []string{"http://[::1"},
 	}
 	srv, err := signedResolveFault(t, fx, callerID, req)
 

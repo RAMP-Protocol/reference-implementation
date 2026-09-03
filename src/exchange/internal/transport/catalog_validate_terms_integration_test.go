@@ -11,7 +11,10 @@ import (
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"google.golang.org/protobuf/proto"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
 )
 
 // TestPushResources_TermValidation proves the hard-reject wired
@@ -106,15 +109,11 @@ func TestPushResources_TermValidation(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-				TenantId: h.tenantID,
-				CallerId: callerID,
-				Entries: []*rampv1.ResourceEntry{{
-					Domain: h.publisherDom,
-					Path:   tc.path,
-					Terms:  tc.terms,
-				}},
-			}))
+			resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+				Domain: h.publisherDom,
+				Path:   tc.path,
+				Terms:  tc.terms,
+			}})))
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("want rejection, got accepted=%d", resp.Msg.GetAccepted())
@@ -158,11 +157,7 @@ func TestPushResources_TermValidationMixedBatch(t *testing.T) {
 	// SUCCESS leg: the valid entry pushed ALONE is accepted and discoverable —
 	// proving it is well-formed, so the batch rejection below is caused by the
 	// bad sibling, not the good entry.
-	solo, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: soloPath, Terms: []*rampv1.LicenseTerm{validTerm()}}},
-	}))
+	solo, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{Domain: h.publisherDom, Path: soloPath, Terms: []*rampv1.LicenseTerm{validTerm()}}})))
 	if err != nil {
 		t.Fatalf("solo valid push: %v", err)
 	}
@@ -176,14 +171,10 @@ func TestPushResources_TermValidationMixedBatch(t *testing.T) {
 	// FAILURE leg: the same valid entry + a structurally-invalid sibling
 	// (ENUMERATED without pricing) → whole submission rejected at the
 	// protovalidate boundary, NEITHER URL persists. No partial acceptance.
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries: []*rampv1.ResourceEntry{
-			{Domain: h.publisherDom, Path: validPath, Terms: []*rampv1.LicenseTerm{validTerm()}},
-			{Domain: h.publisherDom, Path: invalidPath, Terms: []*rampv1.LicenseTerm{{Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED}}},
-		},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{
+		{Domain: h.publisherDom, Path: validPath, Terms: []*rampv1.LicenseTerm{validTerm()}},
+		{Domain: h.publisherDom, Path: invalidPath, Terms: []*rampv1.LicenseTerm{{Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED}}},
+	})))
 	if err == nil {
 		t.Fatalf("want whole-request rejection, got accepted=%d", resp.Msg.GetAccepted())
 	}
@@ -196,13 +187,23 @@ func TestPushResources_TermValidationMixedBatch(t *testing.T) {
 	}
 }
 
-// TestPushResources_RuleAudit proves the licenseterm-owned rules — the
-// ones protovalidate does NOT cover — wired end-to-end through PushResources.
-// Each HARD case must be rejected and leave zero discoverable offers; the matrix
-// is asserted entirely through the public RPC surface, never a struct call. The
-// baseline term is ENUMERATED with valid per-access pricing so only the
-// rule-under-test trips. (protovalidate-owned structural rejects are out of
-// scope: this test only exercises the licenseterm layer.)
+// TestPushResources_RuleAudit proves the term rules of both tiers refuse
+// end-to-end through PushResources. Three cases are the SDK's ingest-tier rules
+// (helpers.ValidateLicenseTerm over the canonicalized term: a bare, unregistered
+// Pricing.unit or Quota.metric, and a restriction whose permitted and prohibited
+// lists name one token once folded); the other four are wire-tier CEL rules the
+// protovalidate interceptor refuses before the handler runs. Disjointness
+// appears on both sides of that split, and deliberately: the wire rule reads the
+// tokens as received and the ingest-tier one reads what the fold produced, so
+// each catches a term the other admits. Each HARD case must
+// be rejected and leave zero discoverable offers; the matrix is asserted
+// entirely through the public RPC surface, never a struct call. The baseline
+// term is ENUMERATED with valid per-access pricing so only the rule-under-test
+// trips. For the ingest-tier cases the rejection text must also carry the SDK's
+// violation message behind the invalid_license_terms reason — the same string a
+// publisher's client-side check reports, so the two verdicts compare verbatim —
+// and the server must log the refusal at Warn with the violation's rule,
+// entry-relative path and token (assertIngestRefusal).
 func TestPushResources_RuleAudit(t *testing.T) {
 	h := newPushHarness(t)
 	callerID := "caller.example"
@@ -219,6 +220,10 @@ func TestPushResources_RuleAudit(t *testing.T) {
 		name string
 		path string
 		term *rampv1.LicenseTerm
+		// refusal is set only for the ingest-tier cases: a wire-tier refusal
+		// is the interceptor's error and never reaches the service's rejection
+		// format or its log line.
+		refusal *ingestRefusal
 	}{
 		// REFERENCE_ONLY carrying restrictions/quotas/obligations is now ACCEPTED
 		// (flexible model, ADR-014): machine fields are an advisory readable
@@ -233,22 +238,37 @@ func TestPushResources_RuleAudit(t *testing.T) {
 			}),
 		},
 		{
+			// The SDK's quota.metric.registered rule: a bare (non-namespaced)
+			// Quota.metric that is not a registered quota token is a hard
+			// ingest-tier reject; the wire tier checks only the token's format.
 			name: "quota with unregistered bare metric is rejected",
 			path: "/audit/quota-bad-metric",
 			term: base(func(t *rampv1.LicenseTerm) {
 				t.Quotas = []*rampv1.Quota{{Metric: "frobnications", Limit: 10, Window: rampv1.QuotaWindow_QUOTA_WINDOW_DAILY}}
 			}),
+			refusal: &ingestRefusal{
+				rule:   helpers.RuleQuotaMetricRegistered,
+				path:   "terms[0].quotas[0].metric",
+				token:  "frobnications",
+				detail: `quota metric "frobnications" is not a registered quota token`,
+			},
 		},
 		{
-			// validatePricingUnitMembership (licenseterm.go:107-116): a bare
-			// (non-namespaced) Pricing.unit that is not a registered metering token
-			// is a hard reject. A fresh Pricing is assigned (never the shared base
-			// pointer) so only this rule trips.
+			// The SDK's pricing.unit.registered rule: a bare (non-namespaced)
+			// Pricing.unit that is not a registered metering token is a hard
+			// ingest-tier reject. A fresh Pricing is assigned (never the shared
+			// base pointer) so only this rule trips.
 			name: "pricing unit unregistered bare token is rejected",
 			path: "/audit/pricing-unit-bad",
 			term: base(func(t *rampv1.LicenseTerm) {
 				t.Pricing = &rampv1.Pricing{Model: rampv1.PricingModel_PRICING_MODEL_PER_UNIT, Rate: "0.07", Currency: "USD", Unit: proto.String("frobnications")}
 			}),
+			refusal: &ingestRefusal{
+				rule:   helpers.RulePricingUnitRegistered,
+				path:   "terms[0].pricing.unit",
+				token:  "frobnications",
+				detail: `pricing unit "frobnications" is not a registered metering token`,
+			},
 		},
 		{
 			name: "duplicate restriction kind is rejected",
@@ -270,6 +290,29 @@ func TestPushResources_RuleAudit(t *testing.T) {
 			}),
 		},
 		{
+			// The SDK's restriction.canonical_disjoint rule, and the twin of the
+			// case directly above. That one writes one token identically in both
+			// lists, so the wire rule sees the overlap and refuses first. This one
+			// writes two accepted spellings of a single token — "scrape" is a
+			// registered alias of "crawl" — so the lists share nothing as received,
+			// the wire rule passes, and the collision exists only in what the fold
+			// produced. Two rules, two readings of the same lists; the pair is here
+			// so neither can be mistaken for the other restated.
+			name: "aliased permitted and prohibited tokens collide after the fold",
+			path: "/audit/restriction-canonical-overlap",
+			term: base(func(t *rampv1.LicenseTerm) {
+				t.Restrictions = []*rampv1.Restriction{
+					{Kind: rampv1.RestrictionKind_RESTRICTION_KIND_FUNCTION, Permitted: []string{"scrape"}, Prohibited: []string{"crawl"}},
+				}
+			}),
+			refusal: &ingestRefusal{
+				rule:   helpers.RuleRestrictionCanonicalDisjoint,
+				path:   "terms[0].restrictions[0].permitted[0]",
+				token:  "crawl",
+				detail: `restriction token "crawl" is both permitted and prohibited after canonicalisation`,
+			},
+		},
+		{
 			name: "share-alike obligation without scope_license is rejected",
 			path: "/audit/sharealike-no-scope",
 			term: base(func(t *rampv1.LicenseTerm) {
@@ -283,25 +326,56 @@ func TestPushResources_RuleAudit(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-				TenantId: h.tenantID,
-				CallerId: callerID,
-				Entries: []*rampv1.ResourceEntry{{
-					Domain: h.publisherDom,
-					Path:   tc.path,
-					Terms:  []*rampv1.LicenseTerm{tc.term},
-				}},
-			}))
+			resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+				Domain: h.publisherDom,
+				Path:   tc.path,
+				Terms:  []*rampv1.LicenseTerm{tc.term},
+			}})))
 			// All-or-nothing: a coherence-invalid term rejects the whole
 			// submission with InvalidArgument; nothing persists.
 			if err == nil {
 				t.Fatalf("want rejection, got accepted=%d", resp.Msg.GetAccepted())
 			}
 			assertConnectCode(t, err, connect.CodeInvalidArgument)
+			if tc.refusal != nil {
+				assertIngestRefusal(t, h, tc.path, err, *tc.refusal)
+			}
 			if got := discoverOfferCount(t, h, "https://"+h.publisherDom+tc.path); got != 0 {
 				t.Fatalf("DiscoverResources offers = %d, want 0 (rejected term must not persist)", got)
 			}
 		})
+	}
+}
+
+// ingestRefusal is what an ingest-tier reject exposes beyond its code: the
+// SDK's violation message in the rejection text, and the violation's rule,
+// entry-relative path and token on the server's Warn line.
+type ingestRefusal struct{ rule, path, token, detail string }
+
+// assertIngestRefusal checks every face of an ingest-tier reject for the entry
+// at path: the rejection text renders the SDK's message behind the
+// invalid_license_terms reason for the entry's URI, and the server logged BOTH
+// lines a term refusal produces — the uniform one naming the entry and its
+// reason, which every refused entry gets, and the term tier's own, carrying the
+// violation's rule, entry-relative path and token. Asserting both is what keeps
+// them from collapsing into one that carries half the fields. Each record is
+// selected by URI because the harness's sink accumulates one per rejected
+// subtest.
+func assertIngestRefusal(t *testing.T, h *pushHarness, path string, err error, want ingestRefusal) {
+	t.Helper()
+	uri := "https://" + h.publisherDom + path
+	text := uri + " (invalid_license_terms: " + want.detail + ")"
+	if !strings.Contains(err.Error(), text) {
+		t.Fatalf("rejection text = %q, want it to carry %q", err.Error(), text)
+	}
+	assertCatalogRejectLogged(t, h, path, service.RejectionReasonInvalidTerms)
+	line := findLogRecord(t, h.logs.String(), "license term refused at ingest",
+		func(rec map[string]any) bool { return rec["uri"] == uri })
+	wantAttrs := map[string]string{"level": "WARN", "rule": want.rule, "path": want.path, "token": want.token}
+	for key, wantVal := range wantAttrs {
+		if got, _ := line[key].(string); got != wantVal {
+			t.Errorf("refusal log line %s = %q, want %q (line: %v)", key, got, wantVal, line)
+		}
 	}
 }
 
@@ -352,15 +426,11 @@ func TestPushResources_LintWarnings(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-				TenantId: h.tenantID,
-				CallerId: callerID,
-				Entries: []*rampv1.ResourceEntry{{
-					Domain: h.publisherDom,
-					Path:   tc.path,
-					Terms:  []*rampv1.LicenseTerm{tc.term},
-				}},
-			}))
+			resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+				Domain: h.publisherDom,
+				Path:   tc.path,
+				Terms:  []*rampv1.LicenseTerm{tc.term},
+			}})))
 			if err != nil {
 				t.Fatalf("push: %v", err)
 			}
@@ -415,15 +485,11 @@ func TestPushResources_PricingUnitAccepted(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-				TenantId: h.tenantID,
-				CallerId: callerID,
-				Entries: []*rampv1.ResourceEntry{{
-					Domain: h.publisherDom,
-					Path:   tc.path,
-					Terms:  []*rampv1.LicenseTerm{enumeratedWithUnit(tc.unit)},
-				}},
-			}))
+			resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+				Domain: h.publisherDom,
+				Path:   tc.path,
+				Terms:  []*rampv1.LicenseTerm{enumeratedWithUnit(tc.unit)},
+			}})))
 			if err != nil {
 				t.Fatalf("push: %v", err)
 			}

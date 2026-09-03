@@ -18,24 +18,27 @@ import (
 
 // selectAdapters constructs the billing and SoR adapters together and returns a
 // single cleanup that releases both, so run() carries one boot step rather than
-// two near-identical select-and-defer pairs. A failure in either is a boot-time
+// two near-identical select-and-defer pairs. The returned currency is the
+// selected billing backend's ledger currency (ISO 4217 alpha), threaded into
+// ExchangeConfig.LedgerCurrency so the welcome-credit grant is denominated in
+// the same currency the adapter checks. A failure in either is a boot-time
 // config fault: the caller returns it and the process exits non-zero rather than
 // silently degrading. The billing cleanup is run even when the SoR construction
 // fails, so a half-built pair leaks nothing.
 func selectAdapters(
 	ctx context.Context, logger *slog.Logger,
-) (billing.Adapter, sor.Adapter, func(), error) {
-	billingAdapter, billingCleanup, err := selectBillingAdapter(ctx, logger)
+) (billing.Adapter, string, sor.Adapter, func(), error) {
+	billingAdapter, currency, billingCleanup, err := selectBillingAdapter(ctx, logger)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, "", nil, nil, err
 	}
 	// Constructed at boot so a misconfigured SoR fails fast.
 	sorAdapter, sorCleanup, err := selectSoRAdapter(ctx, logger)
 	if err != nil {
 		billingCleanup()
-		return nil, nil, nil, err
+		return nil, "", nil, nil, err
 	}
-	return billingAdapter, sorAdapter, func() {
+	return billingAdapter, currency, sorAdapter, func() {
 		sorCleanup()
 		billingCleanup()
 	}, nil
@@ -53,24 +56,32 @@ func selectAdapters(
 // adapter's own configuration lives under EXCHANGE_BILLING_* (this Exchange process's
 // settings). Selector vs. per-process config — two prefixes on purpose.
 //
-// The returned func() releases any adapter-owned resources (the TigerBeetle
-// client connection); it is a no-op for free/inmemory. A non-nil error means an
-// explicitly-selected backend could not be constructed — boot fails rather than
-// silently degrading to free.
-func selectBillingAdapter(ctx context.Context, logger *slog.Logger) (billing.Adapter, func(), error) {
+// The returned currency is the backend's ledger currency: the demo tiers
+// (free, in-memory) run in USD, TigerBeetle's comes from
+// EXCHANGE_BILLING_LEDGER. The returned func() releases any adapter-owned
+// resources (the TigerBeetle client connection); it is a no-op for
+// free/inmemory. A non-nil error means an explicitly-selected backend could
+// not be constructed — boot fails rather than silently degrading to free.
+func selectBillingAdapter(ctx context.Context, logger *slog.Logger) (billing.Adapter, string, func(), error) {
 	noop := func() {}
 	switch kind := runhttp.EnvOr("RAMP_BILLING_ADAPTER", "free"); kind {
 	case "free":
-		return billing.FreeAdapter{}, noop, nil
+		return billing.FreeAdapter{}, demoCurrency, noop, nil
 	case "inmemory":
-		return newBillingAdapter(logger), noop, nil
+		return newBillingAdapter(logger), demoCurrency, noop, nil
 	case "tigerbeetle":
 		return newTigerBeetleBillingAdapter(ctx, logger)
 	default:
 		logger.Warn("RAMP_BILLING_ADAPTER unknown value; using free", "value", kind)
-		return billing.FreeAdapter{}, noop, nil
+		return billing.FreeAdapter{}, demoCurrency, noop, nil
 	}
 }
+
+// demoCurrency is the ledger currency of the demo billing tiers (free,
+// in-memory). It reads the adapters' own constant rather than repeating the
+// literal, so the currency this wiring reports and the currency those adapters
+// check every Credit against cannot drift apart.
+const demoCurrency = billing.DemoCurrency
 
 // selectSoRAdapter chooses the System-of-Record Adapter at boot.
 // RAMP_SOR_ADAPTER=postgres (the default) returns the Postgres-backed adapter
@@ -100,6 +111,15 @@ func selectSoRAdapter(ctx context.Context, logger *slog.Logger) (sor.Adapter, fu
 // with demo agent balances from EXCHANGE_BILLING_SEED — a JSON object of the
 // shape `{"agent-id": {"value": "100.00", "currency": "USD"}}`. Malformed
 // entries are logged and skipped so a typo can't wedge the whole service.
+//
+// An entry in any currency other than demoCurrency is skipped for the same
+// reason, and this is the only production path that could otherwise create a
+// balance the tier does not denominate. Such a balance cannot receive the
+// Register welcome credit, and a publisher pricing a term in its currency could
+// spend it, so the account is better absent than present and wrong: a skipped
+// agent is denied at Authorize as an unknown account, which is a clean signal.
+// Skipping rather than failing boot follows the malformed-amount rule directly
+// below — one bad entry must not stop the service starting.
 func newBillingAdapter(logger *slog.Logger) *billing.InMemoryAdapter {
 	seed := billing.InMemoryOptions{Balances: map[string]billing.Amount{}}
 	raw := runhttp.EnvOr("EXCHANGE_BILLING_SEED", "")
@@ -118,6 +138,11 @@ func newBillingAdapter(logger *slog.Logger) *billing.InMemoryAdapter {
 		a, err := billing.NewAmount(amt.Value, amt.Currency)
 		if err != nil {
 			logger.Warn("EXCHANGE_BILLING_SEED entry skipped", "agent_id", agentID, "err", err)
+			continue
+		}
+		if a.Currency != demoCurrency {
+			logger.Warn("EXCHANGE_BILLING_SEED entry skipped: unsupported currency",
+				"agent_id", agentID, "currency", a.Currency, "want_currency", demoCurrency)
 			continue
 		}
 		seed.Balances[agentID] = a

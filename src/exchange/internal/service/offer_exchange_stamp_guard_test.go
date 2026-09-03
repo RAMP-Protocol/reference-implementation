@@ -20,16 +20,17 @@ import (
 // signed AND tamper-rejected" but would stay green whether the field is stamped
 // once or twice. Only a source-level guard can lock the single-stamp invariant.
 //
-// The guard goes RED on HEAD (commit 0c21a0f2): buildOffer stamps offer.Exchange
-// twice —
-//   - struct-literal form `Exchange: s.cfg.Exchange` (~line 107)
-//   - redundant re-assignment `offer.Exchange = s.cfg.Exchange` (~line 154)
+// The guard is GREEN and has been since the redundant re-assignment was deleted:
+// buildOffer now stamps the field once, in the struct literal. It is a ratchet
+// against a second stamp returning, not a pending migration. The two forms it
+// watches for are the struct-literal `Exchange: s.cfg.Exchange` and the
+// assignment `offer.Exchange = s.cfg.Exchange`; either alone is correct, both
+// together are the redundancy.
 //
-// After the fix deletes the re-stamp (discover.go:149-154), exactly one
-// stamp remains and the guard goes GREEN.
-//
-// Modeled on src/broker/internal/transport/ver_ssot_guard_test.go: whitespace-
-// normalized source scan + matcher meta-tests (positive / negative / regex-slip).
+// Shape: a whitespace-normalized scan of the buildOffer body, plus meta-tests
+// that drive the SAME matcher this file's real check calls, over positive,
+// negative and whitespace-slip snippets. That last part is the load-bearing
+// half — a matcher exercised only by a copy of itself proves the copy.
 
 // exchangeStampPattern matches either form by which buildOffer stamps the
 // canonical Exchange domain from static config:

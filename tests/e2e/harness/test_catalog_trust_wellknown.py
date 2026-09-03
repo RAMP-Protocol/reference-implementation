@@ -51,10 +51,12 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import httpx
 import pytest
+from ramp_sdk import ProtocolVersion
+from ramp_sdk.client import CallError
 
 from .catalog_push import (
     PRICING_MODEL_FREE,
@@ -63,7 +65,8 @@ from .catalog_push import (
     push_catalog,
 )
 from .conftest import StackURLs
-from .discovery import DISCOVER_PATH, discover_body
+from .discovery import discoverable
+from .exchanges import recipient_of
 from .httpsig_signer import generate_random_keypair, sign_request
 from .seed import (
     CONTRIBUTOR_KEY_PATH,
@@ -76,7 +79,6 @@ from .seed import (
     USD_AGENT_KEY_PATH,
     SeededFixture,
 )
-from .signing import sign_post
 
 pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 
@@ -91,40 +93,6 @@ _TENANT_MUSIC = "tenant-demo-music"
 def _free_term() -> dict[str, Any]:
     # FREE EUR so the discovered offer needs no billing arrangement to surface.
     return license_term(model=PRICING_MODEL_FREE, rate=0.0, currency="EUR")
-
-
-def _discover(exchange_url: str, uri: str) -> httpx.Response:
-    """DiscoverResources for a single URI, signed AS the USD buyer agent.
-
-    The read leg traverses the production ExchangeService RPC (signed httpsig →
-    resolveCaller → catalog trie lookup) — the same surface a real agent uses.
-    ``exchange_url`` selects the owning exchange (philosophy→exchange-a,
-    music→exchange-b, sfx→exchange-c).
-    """
-    return sign_post(
-        f"{exchange_url}{DISCOVER_PATH}",
-        body=discover_body(uris=[uri], agent_id=USD_AGENT_ID),
-        key_path=USD_AGENT_KEY_PATH,
-    )
-
-
-def _offer_uris(payload: dict[str, Any]) -> set[str]:
-    """Collect the resource URIs the Discover response carries an OFFER for.
-
-    DiscoverResources returns ``ResourceResponse.offer_groups[]`` (proto3-JSON
-    ``offerGroups``); each group carries a ``uri`` and an ``offers`` list. A URI
-    counts as discoverable only when its group has a non-empty ``offers`` — an
-    empty group (carrying ``absenceReason``) means the resource is NOT licensable
-    and is the absence-of-side-effect signal the negative paths assert on.
-    """
-    groups = cast(list[dict[str, Any]], payload.get("offer_groups") or [])
-    uris: set[str] = set()
-    for g in groups:
-        uri = g.get("uri")
-        offers = g.get("offers") or []
-        if isinstance(uri, str) and uri and offers:
-            uris.add(uri)
-    return uris
 
 
 def _assert_push_accepted_and_discoverable(
@@ -143,7 +111,7 @@ def _assert_push_accepted_and_discoverable(
     """
     path = f"/articles/trust/{uuid.uuid4().hex}.txt"
     uri = f"http://{domain}{path}"
-    payload = push_catalog(
+    response = push_catalog(
         exchange_url=exchange_url,
         tenant_id=tenant_id,
         entries=[
@@ -155,20 +123,16 @@ def _assert_push_accepted_and_discoverable(
             )
         ],
         key_path=key_path,
-        strict=True,
     )
-    assert payload.get("accepted") == 1, payload
-    assert payload.get("rejected") == 0, payload
+    # One entry in, one accepted. Nothing else on the response is a verdict: a
+    # refusal is a non-200 error the SDK raises before this line, and the
+    # reference Exchange never sets ``rejected``.
+    assert response.accepted == 1, response
 
     # PRIMARY: the resource is discoverable — only a fetched key could have
     # admitted the push, since nothing pre-seeded this writer's key.
-    resp = _discover(exchange_url, uri)
-    assert resp.status_code == httpx.codes.OK, resp.text
-    discovered = _offer_uris(cast(dict[str, Any], resp.json()))
-    assert uri in discovered, (
-        f"pushed resource {uri!r} not discoverable — the well-known key fetch "
-        f"did not admit the push; discovered={sorted(discovered)} "
-        f"body={resp.text[:512]}"
+    assert discoverable(exchange_url, uri, agent_id=USD_AGENT_ID, key_path=USD_AGENT_KEY_PATH), (
+        f"pushed resource {uri!r} not discoverable — the well-known key fetch did not admit the push"
     )
     return uri
 
@@ -256,7 +220,7 @@ def test_non_contributor_caller_rejected_at_gate2(
     """
     path = f"/lyrics/trust-neg/{uuid.uuid4().hex}.txt"
     uri = f"http://{DEMO_MUSIC_DOMAIN}{path}"
-    try:
+    with pytest.raises(CallError) as caught:
         push_catalog(
             exchange_url=compose_stack.exchange_b,  # music → exchange-b
             tenant_id=_TENANT_MUSIC,
@@ -270,22 +234,18 @@ def test_non_contributor_caller_rejected_at_gate2(
             ],
             # sfx self key: Gate-1 resolvable, Gate-2 unauthorized for music.
             key_path=SELFPUB_SFX_KEY_PATH,
-            strict=False,
         )
-    except RuntimeError as exc:
-        assert "caller_not_in_catalog_contributors" in str(exc) or "invalid_argument" in str(exc), (
-            exc
-        )
-    else:
-        raise AssertionError("expected Gate-2 whole-request rejection (400), push succeeded")
+    # The SDK's typed refusal: the HTTP status, the Connect code as the reason,
+    # and the Exchange's message naming the offending entry and its reason.
+    exc = caught.value
+    assert exc.status == httpx.codes.BAD_REQUEST, exc
+    assert exc.reason == "invalid_argument", exc
+    assert "caller_not_in_catalog_contributors" in str(exc), exc
 
     # No side effect: the rejected resource must not be discoverable.
-    resp = _discover(compose_stack.exchange_b, uri)
-    assert resp.status_code == httpx.codes.OK, resp.text
-    discovered = _offer_uris(cast(dict[str, Any], resp.json()))
-    assert uri not in discovered, (
-        f"Gate-2-rejected resource {uri!r} leaked into the catalog: discovered={sorted(discovered)}"
-    )
+    assert not discoverable(
+        compose_stack.exchange_b, uri, agent_id=USD_AGENT_ID, key_path=USD_AGENT_KEY_PATH
+    ), f"Gate-2-rejected resource {uri!r} leaked into the catalog"
 
 
 # ── NEGATIVE: Gate-1 reject — caller domain serves no fetchable key ─────────
@@ -311,6 +271,7 @@ def test_unfetchable_domain_caller_rejected_at_gate1(
     # with a real keypair whose kid is that same host.
     kid, priv = generate_random_keypair(unfetchable)
     body = _build_push_body(
+        exchange=recipient_of(compose_stack.exchange),
         tenant_id=_TENANT_PHILOSOPHY,
         caller_id=unfetchable,
         domain=DEMO_PHILOSOPHY_DOMAIN,
@@ -333,16 +294,14 @@ def test_unfetchable_domain_caller_rejected_at_gate1(
 
     # No side effect: the resource must not be discoverable (philosophy → exchange-a).
     discover_uri = f"http://{DEMO_PHILOSOPHY_DOMAIN}{path}"
-    discover_resp = _discover(compose_stack.exchange, discover_uri)
-    assert discover_resp.status_code == httpx.codes.OK, discover_resp.text
-    discovered = _offer_uris(cast(dict[str, Any], discover_resp.json()))
-    assert discover_uri not in discovered, (
-        f"Gate-1-rejected resource {discover_uri!r} leaked into the catalog: "
-        f"discovered={sorted(discovered)}"
-    )
+    assert not discoverable(
+        compose_stack.exchange, discover_uri, agent_id=USD_AGENT_ID, key_path=USD_AGENT_KEY_PATH
+    ), f"Gate-1-rejected resource {discover_uri!r} leaked into the catalog"
 
 
-def _build_push_body(*, tenant_id: str, caller_id: str, domain: str, path: str) -> bytes:
+def _build_push_body(
+    *, exchange: str, tenant_id: str, caller_id: str, domain: str, path: str
+) -> bytes:
     """Build a minimal proto3-JSON PushResourcesRequest body (one FREE entry).
 
     Built inline (rather than via push_catalog) so the Gate-1 negative can set a
@@ -352,6 +311,8 @@ def _build_push_body(*, tenant_id: str, caller_id: str, domain: str, path: str) 
     import json
 
     payload = {
+        "ver": ProtocolVersion,
+        "exchange": exchange,
         "tenant_id": tenant_id,
         "caller_id": caller_id,
         "entries": [

@@ -8,6 +8,7 @@ import (
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
@@ -22,6 +23,12 @@ import (
 // not the requester/uri/offer presence checks here), so the textual field
 // detail is stable and pinned via assertConnectError.
 
+// negOfferCanonicalURL is the catalog binding the negative-case offers carry. It
+// names a resource none of these cases seeds, so it clears the presence check
+// without ever resolving to a catalog entry. A var rather than a const because
+// the proto field is a pointer.
+var negOfferCanonicalURL = "https://publisher.example/articles/negative-case"
+
 // execTxNegReq builds an items[] TransactionRequest for the negative cases (the
 // items-only contract after the C4 collapse). A shared builder keeps the
 // near-identical literals out of every case (jscpd). The single item carries the
@@ -29,14 +36,36 @@ import (
 // envelope presence checks and reach the offer-signature verify.
 func execTxNegReq(id, offerID, sig string, requester *rampv1.Requester) *rampv1.TransactionRequest {
 	return &rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: id,
 		Requester:      requester,
 		// the offer signature rides on the reflected full Offer. An empty
 		// sig leaves the offer signature empty (the validateBatchRequest per-item
 		// guard case).
+		// The offer names this Exchange. Every case here is about a guard that
+		// runs INSIDE the handler, and the recipient check runs before it, so an
+		// offer naming nobody would be refused up front and none of these cases
+		// would reach the behaviour they name.
+		//
+		// It carries a canonical URL for the same reason: the envelope validator
+		// requires one before the request claims its idempotency key, so an offer
+		// without one is refused there and never reaches the signature guard these
+		// cases are about. The URL names a resource no case seeds, so a case that
+		// reaches the catalog lookup at all would fail with a catalog miss rather
+		// than succeed.
 		Items: []*rampv1.TransactionItem{
-			{Offer: &rampv1.Offer{OfferId: offerID, Signature: sig}},
+			{Offer: &rampv1.Offer{
+				OfferId:   offerID,
+				Exchange:  harnessExchangeDomain,
+				Signature: sig,
+				Identity: &rampv1.ResourceIdentity{
+					CanonicalUrl: &negOfferCanonicalURL,
+					// The proto requires a mutability other than UNSPECIFIED on any
+					// present ResourceIdentity, and the request validator enforces it
+					// before the handler runs.
+					ResourceMutability: rampv1.ResourceMutability_RESOURCE_MUTABILITY_STATIC,
+				},
+			}},
 		},
 	}
 }
@@ -53,52 +82,34 @@ func setNegItemAcceptance(req *rampv1.TransactionRequest, acc *rampv1.AgentAccep
 }
 
 func agentRequester(id string) *rampv1.Requester {
-	return &rampv1.Requester{
-		Id:     id,
-		Domain: "agent.example",
-		Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	return newRequester(id, "agent.example")
 }
 
 // ── DiscoverResources input validation (service/exchange.go:137-145) ──────────
 
 func TestDiscoverResources_NilRequesterRejected(t *testing.T) {
 	h := newTestHarness(t)
-	_, err := h.exchangeClient.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver: "1.0", Requester: nil,
-	}))
+	_, err := h.exchangeClient.DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(nil, nil)))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "requester required")
 	// Every DiscoverResources fault carries the ExchangeService domain
 	// stamp (ADR-019 §1), read through the public Connect error envelope.
-	assertErrorDomain(t, err, "ramp.v1.ExchangeService")
+	assertErrorDomain(t, err, exchangeServiceDomainLiteral)
 }
 
 func TestDiscoverResources_EmptyRequesterIDRejected(t *testing.T) {
 	h := newTestHarness(t)
-	_, err := h.exchangeClient.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.tenantDomain + "/articles/hello"},
-		Requester: &rampv1.Requester{
-			Id: "", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	_, err := h.exchangeClient.DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(newRequester("", "agent.example"), []string{"https://" + h.tenantDomain + "/articles/hello"})))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "requester.id required")
 	// Every DiscoverResources fault carries the ExchangeService domain stamp.
-	assertErrorDomain(t, err, "ramp.v1.ExchangeService")
+	assertErrorDomain(t, err, exchangeServiceDomainLiteral)
 }
 
 func TestDiscoverResources_NoURIsRejected(t *testing.T) {
 	h := newTestHarness(t)
-	_, err := h.exchangeClient.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: nil,
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	_, err := h.exchangeClient.DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(newRequester("agent-test", "agent.example"), nil)))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "at least one uri required")
 	// Every DiscoverResources fault carries the ExchangeService domain stamp.
-	assertErrorDomain(t, err, "ramp.v1.ExchangeService")
+	assertErrorDomain(t, err, exchangeServiceDomainLiteral)
 }
 
 // ── ExecuteTransaction validation + not-found (validateTxRequest / resolveOfferForTx) ──
@@ -120,7 +131,7 @@ func TestExecuteTransaction_EmptyOfferSignatureRejected(t *testing.T) {
 	// A non-denial ExecuteTransaction fault (the txDenialReason ok=false
 	// branch — invalid-argument, NOT a typed denial) also carries the
 	// ExchangeService domain stamp (ADR-019 §1), read at the Connect boundary.
-	assertErrorDomain(t, err, "ramp.v1.ExchangeService")
+	assertErrorDomain(t, err, exchangeServiceDomainLiteral)
 }
 
 // A malformed (non-hex) offer signature is a per-item denial, not a batch abort.
@@ -151,15 +162,15 @@ func TestExecuteTransaction_MalformedSignatureRejected(t *testing.T) {
 }
 
 // An offer whose signature does not verify against the Exchange key is rejected
-// with Unauthenticated BEFORE the catalog lookup, so an unknown offer_id never
-// produces a NotFound that would leak catalog membership to an unauthenticated
-// caller. (Pre-0d0jk.3 the lookup ran first and returned NotFound for an unknown
-// offer_id; the presented-offer contract reorders verify-before-lookup, so a
-// bogus-signature offer for any offer_id — known or not — fails at verification.)
-// Genuine catalog membership is exercised on the happy path
-// (TestExecuteTransaction_PresentedOfferAccepted); a validly-signed offer for a
-// since-removed catalog entry (the only remaining NotFound path) is not driveable
-// from the harness because the test side does not hold the Exchange offer key.
+// BEFORE the catalog lookup, so an unknown offer never produces a NotFound that
+// would leak catalog membership to an unauthenticated caller. (Previously the
+// lookup ran first and returned NotFound for an unknown offer; the
+// presented-offer contract reorders verify-before-lookup, so a bogus-signature
+// offer — for a known or unknown resource alike — fails at verification.)
+// The remaining NotFound path (a validly-signed offer whose canonical URL binds
+// to no catalog entry) IS driveable — the harness holds the Exchange offer key —
+// and is covered by TestExecuteTransaction_CanonicalURLExactMatchOnly in
+// execute_canonical_binding_integration_test.go.
 func TestExecuteTransaction_UnknownOfferRejectedBeforeLookup(t *testing.T) {
 	h := newTestHarness(t)
 	seedCatalog(t, h)
@@ -183,10 +194,12 @@ func TestExecuteTransaction_UnknownOfferRejectedBeforeLookup(t *testing.T) {
 // The Exchange no longer refuses Execute for a requester-attribute mismatch:
 // ADR-014's 2026-06-15 amendment removed user_type / geography / intended_use
 // restriction matching from the term projection, so a requester's self-declared
-// attributes never make a term "ineligible". Execute still returns NotFound for
-// an unknown offer (TestExecuteTransaction_UnknownOfferIDNotFound above) and for
-// an entry with no scope-covered priced term, but never for an attribute
-// mismatch — that exclusion path is gone, so its negative test is gone with it.
+// attributes never make a term "ineligible". Term eligibility is decided only
+// at discovery (licenseterm.Select's lone caller is the discovery path, where
+// an ineligible requester simply gets no offer); Execute's only NotFound is a
+// signed canonical URL that binds to no catalog entry, and it never rejects for
+// an attribute mismatch — that exclusion path is gone, so its negative test is
+// gone with it.
 
 // ── ReportUsage validation (service/report_usage.go) ─────────────────────────
 //
@@ -197,10 +210,7 @@ func TestExecuteTransaction_UnknownOfferRejectedBeforeLookup(t *testing.T) {
 
 func TestReportUsage_EmptyIdempotencyKeyRejected(t *testing.T) {
 	h := newTestHarness(t)
-	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "", TransactionId: "tx-x", BillingId: "b-x",
-		Usage: &rampv1.Usage{ConsumedQuantity: 1},
-	}))
+	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("", "tx-x", "b-x", &rampv1.Usage{ConsumedQuantity: 1})))
 	// An empty idempotency_key is now rejected at the SDK boundary by the proto
 	// (min_len=1) before the handler runs — the contract enforces it, not a
 	// hand-rolled string check.
@@ -209,9 +219,6 @@ func TestReportUsage_EmptyIdempotencyKeyRejected(t *testing.T) {
 
 func TestReportUsage_EmptyTransactionIDRejected(t *testing.T) {
 	h := newTestHarness(t)
-	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-x", TransactionId: "", BillingId: "b-x",
-		Usage: &rampv1.Usage{ConsumedQuantity: 1},
-	}))
+	_, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-x", "", "b-x", &rampv1.Usage{ConsumedQuantity: 1})))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "transaction_id required")
 }

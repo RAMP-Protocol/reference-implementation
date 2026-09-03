@@ -9,6 +9,7 @@ import (
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
@@ -21,19 +22,15 @@ import (
 // idempotency_key (DB UNIQUE) or one billing reference.
 func seedTwoResources(t *testing.T, h *testHarness) (*rampv1.Offer, *rampv1.Offer) {
 	t.Helper()
-	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries: []*rampv1.ResourceEntry{
-			{Domain: h.tenantDomain, Path: "/articles/one", Terms: []*rampv1.LicenseTerm{seedPricedTerm()}},
-			{Domain: h.tenantDomain, Path: "/articles/two", Terms: []*rampv1.LicenseTerm{seedPricedTerm()}},
-		},
-	}))
+	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{
+		{Domain: h.tenantDomain, Path: "/articles/one", Terms: []*rampv1.LicenseTerm{seedPricedTerm()}},
+		{Domain: h.tenantDomain, Path: "/articles/two", Terms: []*rampv1.LicenseTerm{seedPricedTerm()}},
+	})))
 	if err != nil {
 		t.Fatalf("seed push: %v", err)
 	}
-	offerOne := discoverOne(t, h, "https://"+h.tenantDomain+"/articles/one")
-	offerTwo := discoverOne(t, h, "https://"+h.tenantDomain+"/articles/two")
+	offerOne := discoverOffer(t, h, "https://"+h.tenantDomain+"/articles/one")
+	offerTwo := discoverOffer(t, h, "https://"+h.tenantDomain+"/articles/two")
 	return offerOne, offerTwo
 }
 
@@ -72,19 +69,15 @@ func seedFreeTermCurrency(currency string) *rampv1.LicenseTerm {
 // mixed-currency batch.
 func seedMixedCurrency(t *testing.T, h *testHarness) (paidUSD, freeEUR *rampv1.Offer) {
 	t.Helper()
-	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries: []*rampv1.ResourceEntry{
-			{Domain: h.tenantDomain, Path: "/articles/paid-usd", Terms: []*rampv1.LicenseTerm{seedPricedTermCurrency("USD")}},
-			{Domain: h.tenantDomain, Path: "/articles/free-eur", Terms: []*rampv1.LicenseTerm{seedFreeTermCurrency("EUR")}},
-		},
-	}))
+	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{
+		{Domain: h.tenantDomain, Path: "/articles/paid-usd", Terms: []*rampv1.LicenseTerm{seedPricedTermCurrency("USD")}},
+		{Domain: h.tenantDomain, Path: "/articles/free-eur", Terms: []*rampv1.LicenseTerm{seedFreeTermCurrency("EUR")}},
+	})))
 	if err != nil {
 		t.Fatalf("seed push: %v", err)
 	}
-	return discoverOne(t, h, "https://"+h.tenantDomain+"/articles/paid-usd"),
-		discoverOne(t, h, "https://"+h.tenantDomain+"/articles/free-eur")
+	return discoverOffer(t, h, "https://"+h.tenantDomain+"/articles/paid-usd"),
+		discoverOffer(t, h, "https://"+h.tenantDomain+"/articles/free-eur")
 }
 
 // seedFreePaidUSD pushes one PAID USD entry and one FREE USD entry and returns
@@ -93,30 +86,24 @@ func seedMixedCurrency(t *testing.T, h *testHarness) (paidUSD, freeEUR *rampv1.O
 // mixed-currency total_cost behavior seedMixedCurrency exercises.
 func seedFreePaidUSD(t *testing.T, h *testHarness) (paid, free *rampv1.Offer) {
 	t.Helper()
-	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries: []*rampv1.ResourceEntry{
-			{Domain: h.tenantDomain, Path: "/articles/paid-usd", Terms: []*rampv1.LicenseTerm{seedPricedTerm()}},
-			{Domain: h.tenantDomain, Path: "/articles/free-usd", Terms: []*rampv1.LicenseTerm{seedFreeTerm()}},
-		},
-	}))
+	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{
+		{Domain: h.tenantDomain, Path: "/articles/paid-usd", Terms: []*rampv1.LicenseTerm{seedPricedTerm()}},
+		{Domain: h.tenantDomain, Path: "/articles/free-usd", Terms: []*rampv1.LicenseTerm{seedFreeTerm()}},
+	})))
 	if err != nil {
 		t.Fatalf("seed push: %v", err)
 	}
-	return discoverOne(t, h, "https://"+h.tenantDomain+"/articles/paid-usd"),
-		discoverOne(t, h, "https://"+h.tenantDomain+"/articles/free-usd")
+	return discoverOffer(t, h, "https://"+h.tenantDomain+"/articles/paid-usd"),
+		discoverOffer(t, h, "https://"+h.tenantDomain+"/articles/free-usd")
 }
 
 // execTwoItemBatch executes a 2-item batch over the two offers under one shared
 // requester + idempotency_key and returns the response (or fails the test).
 func execTwoItemBatch(t *testing.T, h *testHarness, a, b *rampv1.Offer, idem string) *rampv1.TransactionResponse {
 	t.Helper()
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-test", "agent.example")
 	resp, err := h.exchangeClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: idem,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{
@@ -217,11 +204,9 @@ func TestExecuteTransaction_OverLongIdempotencyKeyNamesWireField(t *testing.T) {
 	h := newTestHarness(t)
 	ctx := h.ctx
 	uri := seedResourceWithRate(t, h, "/articles/overlong-idem", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-test", "agent.example")
 	// 300 bytes is well over the idempotency_key length cap. On the combined proto
 	// line the cap is a protovalidate string.max_len constraint (255) enforced at
 	// the Connect validate-interceptor boundary, which pre-empts the redundant
@@ -230,7 +215,7 @@ func TestExecuteTransaction_OverLongIdempotencyKeyNamesWireField(t *testing.T) {
 	// defect is the over-long key.
 	overLong := strings.Repeat("x", 300)
 	req := &rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: overLong,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{
@@ -284,13 +269,11 @@ func TestExecuteTransaction_OmittedIdempotencyKeyRejected(t *testing.T) {
 	h := newTestHarness(t)
 	ctx := h.ctx
 	uri := seedResourceWithRate(t, h, "/articles/omitted-idem", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-test", "agent.example")
 	req := &rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: "",
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{
@@ -321,25 +304,6 @@ func connectErrOf(t *testing.T, err error) *connect.Error {
 	return ce
 }
 
-// discoverOne discovers a single uri and returns its first signed Offer.
-func discoverOne(t *testing.T, h *testHarness, uri string) *rampv1.Offer {
-	t.Helper()
-	resp, err := h.exchangeClient.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{uri},
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
-	if err != nil {
-		t.Fatalf("discover %s: %v", uri, err)
-	}
-	if len(resp.Msg.GetOffers()) == 0 {
-		t.Fatalf("no offers for %s", uri)
-	}
-	return resp.Msg.GetOffers()[0]
-}
-
 // TestExecuteTransaction_BatchSucceedsPerItem pins the Exchange's first-class
 // items[] batch path (items[] batch path): a TransactionRequest carrying N
 // items (offer absent, each item with its own offer + per-item acceptance over
@@ -355,11 +319,9 @@ func TestExecuteTransaction_BatchSucceedsPerItem(t *testing.T) {
 	offerOne, offerTwo := seedTwoResources(t, h)
 
 	const idem = "tx-batch-ok"
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-test", "agent.example")
 	resp, err := h.exchangeClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: idem,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{
@@ -427,11 +389,9 @@ func TestExecuteTransaction_BatchPerItemDenial(t *testing.T) {
 	}
 
 	const idem = "tx-batch-mixed"
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-test", "agent.example")
 	resp, err := h.exchangeClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: idem,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{
@@ -499,14 +459,12 @@ func TestExecuteTransaction_BatchIdempotencyReplayReturnsOriginalResult(t *testi
 	h := newTestHarness(t)
 	ctx := h.ctx
 	uri := seedResourceWithRate(t, h, "/articles/batch-idem", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const idem = "tx-batch-idem"
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-test", "agent.example")
 	req := &rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: idem,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{

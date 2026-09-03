@@ -75,22 +75,61 @@ const (
 	// credential), like the signature-invalid family.
 	KindOfferExpired
 	// KindUnavailable signals a transient upstream dependency failure (e.g.
-	// the caller's /.well-known/ramp.json host is unreachable during ADR-009
-	// D2 lazy registration). Distinct from KindInternal so the caller learns
-	// the request is retryable rather than a server fault.
+	// the host serving the caller's Web Bot Auth key directory is unreachable
+	// during ADR-009 D2 lazy registration). Distinct from KindInternal so the
+	// caller learns the request is retryable rather than a server fault.
 	KindUnavailable
 	// KindAccountNotRegistered signals that a paid transaction came from an agent
 	// with no billing_ref — it never registered, so it has no account to charge
 	// (ADR-021 D5). A per-item business denial: it maps to the wire reason
-	// DENIAL_REASON_BILLING_REF_INACTIVE, not a server fault.
+	// DENIAL_REASON_ACCOUNT_NOT_REGISTERED, not a server fault. The remedy the
+	// agent is being told to apply is to call Register.
 	KindAccountNotRegistered
 	// KindAccountInactive signals that a paid transaction came from a registered
 	// agent whose account the operator switched off in the system of record (or
-	// whose account the SoR does not know at all). Same wire reason as
-	// KindAccountNotRegistered — DENIAL_REASON_BILLING_REF_INACTIVE — but a
-	// distinct kind, so logs and messages keep "never registered" and
-	// "registered but switched off" apart.
+	// whose account the SoR does not know at all). It maps to a wire reason of
+	// its own, DENIAL_REASON_ACCOUNT_INACTIVE: the account exists, so registering
+	// again is the wrong move — the agent waits for the operator to activate it.
+	// That is why the two kinds stay apart in logs and messages as well.
 	KindAccountInactive
+	// KindRegistrationDataInvalid signals that a registration payload did not
+	// conform to the JSON Schema the Exchange publishes in its manifest. An
+	// Exchange that publishes a schema has committed to refusing a payload that
+	// does not match it, so this is a caller fault the agent can act on: the
+	// per-field list travels with it as a typed detail, built in the service
+	// layer (this package stays protobuf-free).
+	KindRegistrationDataInvalid
+	// KindTermsDigestStale signals that a registration named a different digest
+	// of the licensing terms than the one the Exchange currently publishes, or
+	// named none while a digest is published. Both cases have the same remedy —
+	// re-fetch the terms, hash them again, and register with the new digest — so
+	// they share one kind. It is a precondition on the CALLER's copy of the
+	// terms, not a malformed request, which is why it is distinct from
+	// KindInvalidRequest.
+	KindTermsDigestStale
+	// KindContentUnavailable signals that an offer verified but the resource it
+	// binds to is no longer in the catalog: the signed canonical_url matches no
+	// entry. It is a per-item business denial carrying
+	// DENIAL_REASON_CONTENT_UNAVAILABLE, not a request fault, because the agent
+	// holds an authentic offer and the publisher withdrew the content behind it.
+	// Distinct from KindNotFound, which the Exchange also returns for a missing
+	// agent, tenant, evidence row, obligation, or system-of-record account —
+	// none of which is a transaction denial. It maps to connect.CodeNotFound for
+	// any path where it escapes as a transport error, matching what a catalog
+	// miss returned before it became a denial.
+	KindContentUnavailable
+	// KindReportingOverdue signals that the calling agent is far enough behind on
+	// usage reports for this tenant that the Exchange refuses its next
+	// transaction. A per-item business denial like the two account kinds above:
+	// it maps to the wire reason DENIAL_REASON_REPORTING_OVERDUE, so a batch
+	// denies the affected items and returns the rest rather than aborting.
+	//
+	// Distinct from KindFailedPrecondition, which the gate used to return. That
+	// kind carries no wire reason, so DenialReasonForKind reported ok=false and
+	// one overdue obligation killed every item in a multi-item request. The
+	// remedy the agent is being told to apply is to file the missing reports;
+	// they are accepted however late they are.
+	KindReportingOverdue
 )
 
 // Error is the canonical domain error. Handlers receive it from the service
@@ -140,6 +179,11 @@ var kindStrings = map[Kind]string{
 	KindUnavailable:           "unavailable",
 	KindAccountNotRegistered:  "account_not_registered",
 	KindAccountInactive:       "account_inactive",
+	KindReportingOverdue:      "reporting_overdue",
+
+	KindRegistrationDataInvalid: "registration_data_invalid",
+	KindTermsDigestStale:        "terms_digest_stale",
+	KindContentUnavailable:      "content_unavailable",
 }
 
 // String renders Kind for logging.
@@ -153,13 +197,13 @@ func (k Kind) String() string {
 // ConnectCode maps a Kind to the connect.Code the transport layer returns.
 func (k Kind) ConnectCode() connect.Code {
 	switch k {
-	case KindInvalidRequest:
+	case KindInvalidRequest, KindRegistrationDataInvalid:
 		return connect.CodeInvalidArgument
-	case KindNotFound:
+	case KindNotFound, KindContentUnavailable:
 		return connect.CodeNotFound
 	case KindSignatureInvalid:
 		return connect.CodeUnauthenticated
-	case KindBillingDenied, KindAccountNotRegistered, KindAccountInactive:
+	case KindBillingDenied, KindAccountNotRegistered, KindAccountInactive, KindReportingOverdue:
 		return connect.CodePermissionDenied
 	case KindIdempotent:
 		return connect.CodeAlreadyExists
@@ -167,7 +211,7 @@ func (k Kind) ConnectCode() connect.Code {
 		return connect.CodeInternal
 	case KindUnauthenticated:
 		return connect.CodeUnauthenticated
-	case KindFailedPrecondition:
+	case KindFailedPrecondition, KindTermsDigestStale:
 		return connect.CodeFailedPrecondition
 	case KindPermissionDenied:
 		return connect.CodePermissionDenied
@@ -199,16 +243,24 @@ func Wrap(kind Kind, cause error, msg string) *Error {
 	return &Error{Kind: kind, Message: msg, Err: cause}
 }
 
-// WithField records the offending field name as structured Metadata so the
-// transport boundary can stamp it onto ErrorDetail.metadata["field"] (ADR-019),
-// rather than embedding it in the non-authoritative Message string. Returns the
-// receiver for fluent chaining off Newf/Wrap.
-func (e *Error) WithField(name string) *Error {
+// WithMeta records a structured, machine-readable key/value as Metadata so the
+// transport boundary stamps it onto ErrorDetail.metadata (ADR-019) instead of
+// the caller embedding it in the non-authoritative Message string. It is the
+// general API for axes other than the offending field — for example the
+// item_index that tells a client WHICH item of a batch envelope was rejected.
+// Returns the receiver for fluent chaining off Newf/Wrap.
+func (e *Error) WithMeta(key, value string) *Error {
 	if e.Metadata == nil {
 		e.Metadata = make(map[string]string, 1)
 	}
-	e.Metadata["field"] = name
+	e.Metadata[key] = value
 	return e
+}
+
+// WithField is the ergonomic shortcut for the common case — the offending input
+// field's identity, recorded under the conventional "field" key.
+func (e *Error) WithField(name string) *Error {
+	return e.WithMeta("field", name)
 }
 
 // ToConnect converts any error into a connect.Error, preserving Kind mapping

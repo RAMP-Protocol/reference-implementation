@@ -12,24 +12,42 @@ import type { AppDeps } from '../../src/types.js';
 
 describe('classifyClient', () => {
   it.each([
-    ['Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)', 'search_crawler'],
-    ['Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)', 'search_crawler'],
-    ['DuckDuckBot/1.0; (+http://duckduckgo.com/duckduckbot.html)', 'search_crawler'],
-    ['Mozilla/5.0 (compatible; YandexBot/3.0)', 'search_crawler'],
-    ['Mozilla/5.0 (compatible; Applebot/0.1; +http://www.apple.com/go/applebot)', 'search_crawler'],
-  ])('classifies %s as a search crawler', (ua, expected) => {
-    expect(classifyClient(ua)).toBe(expected);
+    'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+    'Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)',
+    'DuckDuckBot/1.0; (+http://duckduckgo.com/duckduckbot.html)',
+    'Mozilla/5.0 (compatible; YandexBot/3.0)',
+    'Mozilla/5.0 (compatible; Applebot/0.1; +http://www.apple.com/go/applebot)',
+  ])('classifies %s as a search crawler', (ua) => {
+    expect(classifyClient(ua)).toBe('search_crawler');
   });
 
   it.each([
-    ['GPTBot/1.0', 'ai_bot'],
-    ['Mozilla/5.0 (compatible; ClaudeBot/1.0)', 'ai_bot'],
-    ['Mozilla/5.0 (compatible; Google-Extended)', 'ai_bot'],
-    ['Applebot-Extended/0.1', 'ai_bot'],
-    ['PerplexityBot/1.0', 'ai_bot'],
-    ['unknown-crawler spider v2', 'ai_bot'],
-  ])('classifies %s as an AI bot', (ua, expected) => {
-    expect(classifyClient(ua)).toBe(expected);
+    'GPTBot/1.0',
+    'Mozilla/5.0 (compatible; ClaudeBot/1.0)',
+    'Mozilla/5.0 (compatible; Google-Extended)',
+    'Applebot-Extended/0.1',
+    'PerplexityBot/1.0',
+    // Bare form on purpose: Meta-ExternalAgent's documented full UA ends in a
+    // "…/webmasters/crawler" docs URL that /crawler/i already matches, so the
+    // full string would pass without a Meta-ExternalAgent pattern and prove
+    // nothing. The bare form is also what a plain client sends.
+    'Meta-ExternalAgent/1.1',
+    'unknown-crawler spider v2',
+    // User-initiated assistant fetchers: a human asked for the page, but the
+    // publisher stance is the same as for autonomous crawlers — AI access to
+    // paid content is licensed. None of these UAs contain the word "bot", so
+    // without their own deny patterns they would fall through to 'human' and
+    // read paid content free.
+    'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; Claude-User/1.0; +Claude-User@anthropic.com',
+    // Bare form on purpose: the full ChatGPT-User UA ends in the URL
+    // "+https://openai.com/bot", which the generic /bot\b/ pattern already
+    // matches, so the full string would pass without a ChatGPT-User pattern
+    // and prove nothing. The bare form is also what a plain client sends.
+    'ChatGPT-User/1.0',
+    'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Perplexity-User/1.0; +https://perplexity.ai/perplexity-user)',
+    'Meta-ExternalFetcher/1.1',
+  ])('classifies %s as an AI bot', (ua) => {
+    expect(classifyClient(ua)).toBe('ai_bot');
   });
 
   it.each(['python-httpx/0.28.1', 'python-httpx/0.27.0'])('lets %s through as human', (ua) => {

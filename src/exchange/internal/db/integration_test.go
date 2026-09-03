@@ -4,32 +4,20 @@ package db_test
 
 import (
 	"context"
-	"io"
-	"log/slog"
 	"testing"
 
 	"github.com/google/uuid"
 
 	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
-	exchangedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
 )
 
+// TestExchangeMigrationsSmoke round-trips a tenant through the sqlc layer on
+// the migrated-to-head schema (TestMain applies the migrations once for the
+// whole package; a migration failure fails the suite before any test runs).
 func TestExchangeMigrationsSmoke(t *testing.T) {
 	ctx := context.Background()
-	dsn := sharedb.StartPostgres(t, ctx)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	pool, err := sharedb.Setup(ctx, sharedb.SetupOptions{
-		DSN:             dsn,
-		Migrations:      exchangedb.Migrations,
-		MigrationsDir:   exchangedb.MigrationsDir,
-		MigrationsTable: exchangedb.MigrationsTable,
-	}, logger)
-	if err != nil {
-		t.Fatalf("db setup: %v", err)
-	}
-	t.Cleanup(pool.Close)
+	pool := sharedb.AcquireTestDB(t, ctx, sharedPG)
 
 	q := sqlc.New(pool)
 	tenantID := "t_" + uuid.NewString()
@@ -37,7 +25,6 @@ func TestExchangeMigrationsSmoke(t *testing.T) {
 	tenant, err := q.InsertTenant(ctx, sqlc.InsertTenantParams{
 		TenantID:        tenantID,
 		Domain:          tenantID + ".example",
-		HmacSecretRef:   "secret://hmac/" + tenantID,
 		Ed25519KeyRef:   "secret://ed25519/" + tenantID,
 		ReportingPolicy: []byte(`{}`),
 		SigningScheme:   sqlc.RampSigningSchemeED25519,

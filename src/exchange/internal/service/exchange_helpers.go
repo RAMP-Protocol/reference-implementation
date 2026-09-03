@@ -100,7 +100,7 @@ type billingResolution struct {
 // (ADR-021 D5), so it has no account to charge: deny before Authorize with a plain
 // message, no side effects. A registered agent whose account the operator switched
 // off in the SoR is denied next (checkAccountActive), still before any money is
-// reserved. The ref comes only from the agent's row (resolveAgentID), never from
+// reserved. The ref comes only from the agent's row (resolveAgent), never from
 // the caller's wire label, so a caller cannot spend another account.
 func (s *ExchangeService) resolveBilling(
 	ctx context.Context, in billingResolution,
@@ -125,7 +125,7 @@ func (s *ExchangeService) resolveBilling(
 //
 // Error policy (ADR-021 Follow-up): definitive answers fail closed — a
 // known-but-switched-off account and an account the SoR does not know are both
-// denied in-body with DENIAL_REASON_BILLING_REF_INACTIVE. Transient read
+// denied in-body with DENIAL_REASON_ACCOUNT_INACTIVE. Transient read
 // errors fail open — the transaction proceeds with a warning log, because the
 // ledger balance check still bounds spending, a SoR outage must not stop every
 // paid transaction, and the cache never stores errors, so enforcement resumes

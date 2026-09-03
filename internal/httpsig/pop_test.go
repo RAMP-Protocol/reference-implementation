@@ -1,25 +1,32 @@
 package httpsig
 
 import (
-	"context"
-	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"testing"
 
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 )
 
-// The two fixtures below are the cross-language contract for the agent-binding
-// profile. Paths are relative to this package directory; both live at the repo
-// root because the TypeScript edge and the Python e2e harness read them too.
+// Two fixtures, one profile. The paths are relative to this package directory;
+// both live at the repo root because the TypeScript edge and the Python e2e
+// harness read from there too.
+//
+// The BASE corpus pins the signature base string every implementation builds.
+// The SIGN corpus pins the three header values a signer emits, which is a
+// stricter contract: the byte string inside the Signature colons is standard
+// base64 while the key beside it is base64url, an asymmetry a hand-written
+// signer gets wrong silently and a base-only check cannot see.
+//
+// The Go signer is the protocol module's now, so the second corpus checks the
+// module against the values this repository's edge worker and Python harness are
+// built around. Before this it had no reader in any language while its own note
+// instructed the next person to refresh it from upstream — a corpus that reads
+// as a maintained gate and fails nothing.
 const (
 	popBaseVectorsPath = "../../testdata/pop-signature-base-vectors.json"
 	popSignVectorsPath = "../../testdata/pop-sign-vectors.json"
@@ -34,19 +41,6 @@ type popBaseVectorFile struct {
 	} `json:"vectors"`
 }
 
-type popSignVectorFile struct {
-	Vectors []struct {
-		Name               string `json:"name"`
-		Method             string `json:"method"`
-		URL                string `json:"url"`
-		AgentID            string `json:"agent_id"`
-		PresentedKeyB64URL string `json:"presented_key_b64url"`
-		SignerSeedHex      string `json:"signer_seed_hex"`
-		SignatureInput     string `json:"signature_input"`
-		Signature          string `json:"signature"`
-	} `json:"vectors"`
-}
-
 func loadJSONFixture[T any](t *testing.T, path string) T {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Clean(path))
@@ -58,45 +52,6 @@ func loadJSONFixture[T any](t *testing.T, path string) T {
 		t.Fatalf("decode %s: %v", path, err)
 	}
 	return out
-}
-
-// popWindow pulls created/expires back out of a vector's Signature-Input. The
-// fixture carries them only inside that string, and reading them from it keeps
-// the test driven by the fixture rather than by constants copied beside it.
-var popWindow = regexp.MustCompile(`created=(\d+);expires=(\d+)`)
-
-func popWindowOf(t *testing.T, signatureInput string) (created, expires int64) {
-	t.Helper()
-	m := popWindow.FindStringSubmatch(signatureInput)
-	if m == nil {
-		t.Fatalf("no created/expires in %q", signatureInput)
-	}
-	created, err := strconv.ParseInt(m[1], 10, 64)
-	if err != nil {
-		t.Fatalf("parse created: %v", err)
-	}
-	if expires, err = strconv.ParseInt(m[2], 10, 64); err != nil {
-		t.Fatalf("parse expires: %v", err)
-	}
-	return created, expires
-}
-
-func popKeyOf(t *testing.T, seedHex string) (ed25519.PrivateKey, ed25519.PublicKey, string) {
-	t.Helper()
-	seed, err := hex.DecodeString(seedHex)
-	if err != nil {
-		t.Fatalf("decode seed: %v", err)
-	}
-	priv := ed25519.NewKeyFromSeed(seed)
-	pub, ok := priv.Public().(ed25519.PublicKey)
-	if !ok {
-		t.Fatal("public half is not an ed25519 key")
-	}
-	thumbprint, err := helpers.Thumbprint(pub)
-	if err != nil {
-		t.Fatalf("thumbprint: %v", err)
-	}
-	return priv, pub, thumbprint
 }
 
 // TestPoPSignatureBaseMatchesSharedVectors pins the signature base against the
@@ -116,164 +71,132 @@ func TestPoPSignatureBaseMatchesSharedVectors(t *testing.T) {
 	}
 }
 
-// TestSignAgentBindingMatchesSharedVectors asserts the emitted header values
-// byte for byte against the SDK's generated corpus. It covers, in one pass, the
-// parameter order, the base bytes, the keyid derivation, and the encoding
-// asymmetry between the base64url agent key and the standard-base64 signature.
+type popSignVectorFile struct {
+	Vectors []popSignVector `json:"vectors"`
+}
+
+type popSignVector struct {
+	Name           string `json:"name"`
+	Method         string `json:"method"`
+	URL            string `json:"url"`
+	AgentID        string `json:"agent_id"`
+	PresentedKey   string `json:"presented_key_b64url"`
+	SignerSeedHex  string `json:"signer_seed_hex"`
+	SignatureInput string `json:"signature_input"`
+	Signature      string `json:"signature"`
+}
+
+// TestSignAgentBindingMatchesSharedVectors pins the three EMITTED header values
+// against the corpus the edge worker and the Python harness are built around.
 //
-// Vectors whose presented key does not hash to agent_id are the edge's
-// thumbprint-mismatch attack, and are handled separately below: this signer
-// refuses to mint one at all.
+// It signs through the protocol module, which owns the Go signer now. The
+// property under test is therefore not "our code is self-consistent" but "the
+// module still emits what our verifiers expect" — the check that used to exist
+// downstream and went with the signer.
+//
+// One vector is not a byte pin here. It presents a key the agent_id does not
+// name, which a verifier treats as a thumbprint mismatch and a SIGNER refuses
+// outright: mispairing a key and a keyid is a custody fault, and the module
+// declines rather than minting a proof that names one key while carrying
+// another. On this side that vector pins the refusal.
 func TestSignAgentBindingMatchesSharedVectors(t *testing.T) {
 	t.Parallel()
 	fixture := loadJSONFixture[popSignVectorFile](t, popSignVectorsPath)
 	if len(fixture.Vectors) == 0 {
 		t.Fatal("no vectors in the shared signing fixture")
 	}
-	honest := 0
+	// Both KINDS have to be present, not just some vectors. The two branches
+	// below assert opposite things — one compares emitted bytes, the other pins a
+	// refusal — and which one a vector takes is decided by the vector itself. A
+	// corpus that drifted to all-mismatch would run no byte comparison at all and
+	// still report green, which is the shape a non-empty check cannot see.
+	//
+	// Counted out here rather than inside the subtests because the classification
+	// is a pure function of the vector, and the subtests run in parallel.
+	var bytePins, refusalPins int
 	for _, v := range fixture.Vectors {
-		priv, pub, thumbprint := popKeyOf(t, v.SignerSeedHex)
-		if thumbprint != v.AgentID {
-			continue // the mismatch attack; see TestSignAgentBindingRefusesMismatchedKeyID
-		}
-		honest++
-		t.Run(v.Name, func(t *testing.T) {
-			t.Parallel()
-			created, expires := popWindowOf(t, v.SignatureInput)
-			got, err := SignAgentBinding(context.Background(), priv, PoPOptions{
-				URL: v.URL, KeyID: v.AgentID, Created: created, Expires: expires, Method: v.Method,
-			})
-			if err != nil {
-				t.Fatalf("sign: %v", err)
-			}
-			if want := base64.RawURLEncoding.EncodeToString(pub); got.AgentKey != want {
-				t.Errorf("agent key:\n got %q\nwant %q", got.AgentKey, want)
-			}
-			if got.AgentKey != v.PresentedKeyB64URL {
-				t.Errorf("agent key vs fixture:\n got %q\nwant %q", got.AgentKey, v.PresentedKeyB64URL)
-			}
-			if got.SignatureInput != v.SignatureInput {
-				t.Errorf("signature-input:\n got %q\nwant %q", got.SignatureInput, v.SignatureInput)
-			}
-			if got.Signature != v.Signature {
-				t.Errorf("signature:\n got %q\nwant %q", got.Signature, v.Signature)
-			}
-		})
-	}
-	if honest == 0 {
-		t.Fatal("no honest vectors exercised the signer")
-	}
-}
-
-// TestSignAgentBindingRefusesMismatchedKeyID covers the corpus's wrong-key
-// vector from the signing side. The edge answers thumbprint_mismatch for it;
-// this signer will not produce it in the first place, because a keyid that is
-// not the thumbprint of the key in hand can only come from a custody layer that
-// paired the two wrongly.
-//
-// The base is still pinned against the vector, by signing it directly: getting
-// the refusal right is worthless if the bytes we would have signed were wrong.
-func TestSignAgentBindingRefusesMismatchedKeyID(t *testing.T) {
-	t.Parallel()
-	fixture := loadJSONFixture[popSignVectorFile](t, popSignVectorsPath)
-	checked := 0
-	for _, v := range fixture.Vectors {
-		priv, _, thumbprint := popKeyOf(t, v.SignerSeedHex)
-		if thumbprint == v.AgentID {
+		if v.pinsBytes(t) {
+			bytePins++
 			continue
 		}
-		checked++
-		created, expires := popWindowOf(t, v.SignatureInput)
-		_, err := SignAgentBinding(context.Background(), priv, PoPOptions{
-			URL: v.URL, KeyID: v.AgentID, Created: created, Expires: expires, Method: v.Method,
-		})
-		if !errors.Is(err, ErrKeyIDMismatch) {
-			t.Fatalf("%s: want ErrKeyIDMismatch, got %v", v.Name, err)
-		}
-		// The bytes the attacker's signer did produce must still match ours, or a
-		// base bug could hide behind the refusal above.
-		params := popSignatureParams(v.AgentID, created, expires)
-		raw := ed25519.Sign(priv, []byte(PoPSignatureBase(v.Method, v.URL, params)))
-		if want := popLabel + "=:" + base64.StdEncoding.EncodeToString(raw) + ":"; want != v.Signature {
-			t.Errorf("%s signature over our base:\n got %q\nwant %q", v.Name, want, v.Signature)
-		}
+		refusalPins++
 	}
-	if checked == 0 {
-		t.Fatal("the corpus carries no mismatched-keyid vector")
+	if bytePins == 0 || refusalPins == 0 {
+		t.Fatalf("fixture has %d byte-pin and %d refusal vectors; the suite needs at least one of each",
+			bytePins, refusalPins)
 	}
-}
 
-// TestSignAgentBindingRefusals covers every precondition. Each one exists
-// because emitting the signature anyway would produce a proof that is accepted
-// somewhere while meaning nothing — the failure mode this profile cannot afford.
-func TestSignAgentBindingRefusals(t *testing.T) {
-	t.Parallel()
-	const url = "https://cdn.example/doc?agent_id=x"
-	priv, _, thumbprint := popKeyOf(t,
-		"333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152")
-	valid := PoPOptions{URL: url, KeyID: thumbprint, Created: 1700000000, Expires: 1700000600}
-
-	tests := []struct {
-		name string
-		priv ed25519.PrivateKey
-		mut  func(o PoPOptions) PoPOptions
-		want error
-	}{
-		{"short key", ed25519.PrivateKey("too short"), func(o PoPOptions) PoPOptions { return o }, ErrInvalidSigningKey},
-		{"no url", priv, func(o PoPOptions) PoPOptions { o.URL = ""; return o }, ErrMissingTargetURI},
-		{"no keyid", priv, func(o PoPOptions) PoPOptions { o.KeyID = ""; return o }, ErrMissingKeyID},
-		{"no created", priv, func(o PoPOptions) PoPOptions { o.Created = 0; return o }, ErrMissingCreated},
-		{"no expires", priv, func(o PoPOptions) PoPOptions { o.Expires = 0; return o }, ErrMissingExpires},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, v := range fixture.Vectors {
+		t.Run(v.Name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := SignAgentBinding(context.Background(), tc.priv, tc.mut(valid)); !errors.Is(err, tc.want) {
-				t.Fatalf("want %v, got %v", tc.want, err)
+			signer, pub, opts := v.signingInputs(t)
+			binding, err := helpers.SignAgentBinding(t.Context(), signer, pub, opts)
+
+			if !v.pinsBytes(t) {
+				if !errors.Is(err, helpers.ErrKeyIDMismatch) {
+					t.Fatalf("signing a mispaired key returned %v, want ErrKeyIDMismatch", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("sign agent binding: %v", err)
+			}
+			if binding.AgentKey != v.PresentedKey {
+				t.Errorf("agent key header:\n got %q\nwant %q", binding.AgentKey, v.PresentedKey)
+			}
+			if binding.SignatureInput != v.SignatureInput {
+				t.Errorf("signature-input header:\n got %q\nwant %q", binding.SignatureInput, v.SignatureInput)
+			}
+			if binding.Signature != v.Signature {
+				t.Errorf("signature header:\n got %q\nwant %q", binding.Signature, v.Signature)
 			}
 		})
 	}
 }
 
-// TestSignAgentBindingDefaultsToGET pins the Method default. @method is covered,
-// so a proof minted for a GET cannot be lifted onto a write — and the default
-// is what almost every caller will rely on without stating it.
-func TestSignAgentBindingDefaultsToGET(t *testing.T) {
-	t.Parallel()
-	const url = "https://cdn.example/doc?agent_id=x"
-	priv, _, thumbprint := popKeyOf(t,
-		"333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152")
-	opts := PoPOptions{URL: url, KeyID: thumbprint, Created: 1700000000, Expires: 1700000600}
-
-	implicit, err := SignAgentBinding(context.Background(), priv, opts)
+// pinsBytes reports which of the two things a vector is for: the emitted header
+// bytes, or the signer's refusal.
+//
+// A vector whose agent_id is the thumbprint of the key it presents describes a
+// proof a correct signer produces, so its three header values are byte pins. One
+// that presents a different key describes a proof no signer will mint — the
+// module refuses a mispaired key and keyid outright — so on this side it pins
+// that refusal instead.
+func (v popSignVector) pinsBytes(t *testing.T) bool {
+	t.Helper()
+	pub, err := base64.RawURLEncoding.DecodeString(v.PresentedKey)
 	if err != nil {
-		t.Fatalf("sign implicit: %v", err)
+		t.Fatalf("decode presented key: %v", err)
 	}
-	opts.Method = http.MethodGet
-	explicit, err := SignAgentBinding(context.Background(), priv, opts)
+	thumbprint, err := helpers.Thumbprint(pub)
 	if err != nil {
-		t.Fatalf("sign explicit: %v", err)
+		t.Fatalf("thumbprint: %v", err)
 	}
-	if implicit.Signature != explicit.Signature {
-		t.Errorf("empty Method did not default to GET:\n got %q\nwant %q",
-			implicit.Signature, explicit.Signature)
-	}
+	return thumbprint == v.AgentID
 }
 
-// TestAgentBindingApply pins the header names a fetcher ends up sending. The
-// edge looks up exactly these three; a rename here is a silent 403.
-func TestAgentBindingApply(t *testing.T) {
-	t.Parallel()
-	h := http.Header{}
-	AgentBinding{AgentKey: "key", SignatureInput: "sig1=params", Signature: "sig1=:sig:"}.Apply(h)
-
-	for header, want := range map[string]string{
-		AgentKeyHeader:    "key",
-		"Signature-Input": "sig1=params",
-		"Signature":       "sig1=:sig:",
-	} {
-		if got := h.Get(header); got != want {
-			t.Errorf("%s: got %q, want %q", header, got, want)
-		}
+// signingInputs decodes one vector into what the signer takes. The two instants
+// come out of the vector's own parameter list, so the proof is signed over
+// exactly the parameters it is then compared against.
+func (v popSignVector) signingInputs(t *testing.T) (helpers.Signer, []byte, helpers.PoPOptions) {
+	t.Helper()
+	pub, err := base64.RawURLEncoding.DecodeString(v.PresentedKey)
+	if err != nil {
+		t.Fatalf("decode presented key: %v", err)
+	}
+	seed, err := hex.DecodeString(v.SignerSeedHex)
+	if err != nil {
+		t.Fatalf("decode signer seed: %v", err)
+	}
+	signer, err := helpers.NewEd25519SignerFromSeed(v.AgentID, seed)
+	if err != nil {
+		t.Fatalf("build signer: %v", err)
+	}
+	created, expires, err := PoPWindowOf(v.SignatureInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signer, pub, helpers.PoPOptions{
+		URL: v.URL, KeyID: v.AgentID, Created: created, Expires: expires, Method: v.Method,
 	}
 }

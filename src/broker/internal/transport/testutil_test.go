@@ -17,6 +17,7 @@ import (
 	"connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/connectserver"
 	"github.com/RAMP-Protocol/protocol/sdk/go/core"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
@@ -26,7 +27,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/offerkeys"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/offerkeys"
+	audiencetest "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience/testutil"
 )
 
 // mustMoney renders a test-authored float amount to the canonical wire decimal
@@ -106,12 +108,32 @@ type mockExchange struct {
 	discoverCalls int
 	executeCalls  int
 	reportCalls   int
+	// healthzStatus is what this Exchange's /healthz answers. Zero means 200:
+	// an Exchange is up unless a test says otherwise. A test flips it to take
+	// the Exchange down and back up while the broker keeps running, which is
+	// what the registry health refresher reads through the wire.
+	healthzStatus int
+	// healthzProbes counts the /healthz requests that arrived. It is how a test
+	// asserts an Exchange was NOT probed at all -- a BLOCKED Exchange must
+	// receive no traffic from the broker, health checks included.
+	healthzProbes int
 	// lastDiscoverRequesterID is the requester.id the broker actually FORWARDED on
 	// the most recent discover. The broker canonicalizes req.AgentID and writes it
 	// back onto the request, so this is where a test observes that the value which
 	// travelled upstream is the identity rather than the caller's spelling.
 	lastDiscoverRequesterID string
-	offerUnitCost           float64
+	// domain is this Exchange's own published identity: the value it signs into
+	// the offers it issues, the recipient it answers to, and the domain its
+	// registry row carries. Empty means mockExchangeDomain, which is what the
+	// single-exchange fixtures use; a fixture wiring a SECOND exchange gives that
+	// one its own, so a fan-out leg addressed to the wrong sibling is refused
+	// rather than served.
+	domain string
+	// lastDiscoverExchange is the recipient the most recent discover leg named.
+	// The Broker authors each leg, so this is where a test observes that the leg
+	// which arrived here says it was meant for here.
+	lastDiscoverExchange string
+	offerUnitCost        float64
 	// offerRate, when > 0, sets the discovered offer's Pricing.rate to a value
 	// DISTINCT from its unit_cost (which always comes from offerUnitCost). The
 	// real Exchange normalises a provider's per-model rate into a per-unit
@@ -238,6 +260,7 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 	m.mu.Lock()
 	m.discoverCalls++
 	m.lastDiscoverRequesterID = req.Msg.GetRequester().GetId()
+	m.lastDiscoverExchange = req.Msg.GetExchange()
 	cost := m.offerUnitCost
 	rate := m.offerRate
 	scopeRestricted := m.scopeRestricted
@@ -255,7 +278,7 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 		group := mockOfferGroup(groupURIFor(req, "https://acme.example/article-42"), method)
 		group.AbsenceReason = rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_SCOPE_INSUFFICIENT.Enum()
 		return connect.NewResponse(&rampv1.ResourceResponse{
-			Ver:         "0.3",
+			Ver:         helpers.ProtocolVersion,
 			OfferGroups: []*rampv1.OfferGroup{group},
 		}), nil
 	}
@@ -300,8 +323,8 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 		// Exchange (field 8) is the Exchange's canonical domain, signed into the
 		// offer (the execute-routing target). The Exchange producer
 		// sets this in buildOffer before SignOffer; the mock stands in for that
-		// producer with the same domain the registry row carries (mp.acme.example).
-		Exchange: mockExchangeDomain,
+		// producer with the same domain its own registry row carries.
+		Exchange: m.identity(),
 		Identity: &rampv1.ResourceIdentity{
 			CanonicalUrl:       &url,
 			ResourceMutability: rampv1.ResourceMutability_RESOURCE_MUTABILITY_STATIC,
@@ -339,7 +362,7 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 			Pricing:            pricing,
 			DeliveryMethod:     rampv1.DeliveryMethod_DELIVERY_METHOD_INSTRUCTIONS,
 			SignatureAlgorithm: helpers.OfferSignatureAlgorithm,
-			Exchange:           mockExchangeDomain,
+			Exchange:           m.identity(),
 			// The SDK Verifier is fail-closed on freshness (a missing or past
 			// expires_at is EXPIRED), so mint a real future bound covered by the
 			// signature — otherwise even the genuine offer is rejected.
@@ -373,7 +396,7 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 			Pricing:            pricing,
 			DeliveryMethod:     rampv1.DeliveryMethod_DELIVERY_METHOD_INSTRUCTIONS,
 			SignatureAlgorithm: helpers.OfferSignatureAlgorithm,
-			Exchange:           mockExchangeDomain,
+			Exchange:           m.identity(),
 			ExpiresAt:          timestamppb.New(time.Now().Add(time.Hour)),
 			Identity: &rampv1.ResourceIdentity{
 				CanonicalUrl:       &secondCanonicalURL,
@@ -396,7 +419,7 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 		group := mockOfferGroup(groupURIFor(req, url), method)
 		group.Offers = []*rampv1.Offer{validOffer, secondOffer}
 		return connect.NewResponse(&rampv1.ResourceResponse{
-			Ver:         "0.3",
+			Ver:         helpers.ProtocolVersion,
 			Offers:      []*rampv1.Offer{validOffer, secondOffer},
 			OfferGroups: []*rampv1.OfferGroup{group},
 		}), nil
@@ -416,7 +439,7 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 	group := mockOfferGroup(groupURIFor(req, url), method)
 	group.Offers = []*rampv1.Offer{offer}
 	return connect.NewResponse(&rampv1.ResourceResponse{
-		Ver:         "0.3",
+		Ver:         helpers.ProtocolVersion,
 		Offers:      []*rampv1.Offer{offer},
 		OfferGroups: []*rampv1.OfferGroup{group},
 	}), nil
@@ -427,6 +450,45 @@ func (m *mockExchange) DiscoverResources(_ context.Context, req *connect.Request
 // The discovery test asserts the broker forwards this verbatim, and the relay
 // test routes execute to it via the signed-domain mechanism (no endpoint header).
 const mockExchangeDomain = "mp.acme.example"
+
+// identity is the Exchange this mock stands for. Every place that needs the
+// value reads it here, so a fixture that gives a second exchange its own domain
+// moves the offers it signs and the recipient it accepts together.
+func (m *mockExchange) identity() string {
+	if m.domain == "" {
+		return mockExchangeDomain
+	}
+	return m.domain
+}
+
+// setHealthz takes this Exchange up or down for the health refresher by setting
+// the status its /healthz answers. Safe to call while the broker is running:
+// the refresher reads it over HTTP on its next pass.
+func (m *mockExchange) setHealthz(status int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.healthzStatus = status
+}
+
+// healthzProbeCount reports how many /healthz requests reached this Exchange.
+func (m *mockExchange) healthzProbeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.healthzProbes
+}
+
+// serveHealthz answers the liveness probe the registry health refresher sends,
+// recording that it arrived. Unset healthzStatus answers 200.
+func (m *mockExchange) serveHealthz(w http.ResponseWriter, _ *http.Request) {
+	m.mu.Lock()
+	m.healthzProbes++
+	status := m.healthzStatus
+	m.mu.Unlock()
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+}
 
 func (m *mockExchange) ExecuteTransaction(_ context.Context, req *connect.Request[rampv1.TransactionRequest]) (*connect.Response[rampv1.TransactionResponse], error) {
 	m.mu.Lock()
@@ -498,7 +560,7 @@ func (m *mockExchange) batchResponse(idem string, items []*rampv1.TransactionIte
 		}
 		results = append(results, result)
 	}
-	resp := &rampv1.TransactionResponse{Ver: "0.3", Items: results}
+	resp := &rampv1.TransactionResponse{Ver: helpers.ProtocolVersion, Items: results}
 	if m.itemCostCurrency != "" {
 		resp.TotalCost = &rampv1.Cost{
 			Amount:   mustMoney(groupTotal.InexactFloat64()),
@@ -513,7 +575,7 @@ func (m *mockExchange) ReportUsage(_ context.Context, req *connect.Request[rampv
 	m.reportCalls++
 	m.lastReport = req.Msg
 	m.mu.Unlock()
-	return connect.NewResponse(&rampv1.UsageReportResponse{ReportId: "rep-" + req.Msg.GetIdempotencyKey()}), nil
+	return connect.NewResponse(&rampv1.UsageReportResponse{Ver: helpers.ProtocolVersion, ReportId: "rep-" + req.Msg.GetIdempotencyKey()}), nil
 }
 
 // fakeEndpointResolver stands in for resolvers.WellKnownEndpointResolver in the
@@ -541,8 +603,24 @@ func (f *fakeEndpointResolver) ResolveEndpoint(_ context.Context, domain string)
 func startMockExchange(tb testing.TB, m *mockExchange) string {
 	tb.Helper()
 	mux := http.NewServeMux()
-	path, h := rampv1connect.NewExchangeServiceHandler(m)
+	// Behind the recipient check, keyed to this Exchange's own identity — a real
+	// Exchange mounts the same interceptor. Without it the Broker could stamp
+	// its own domain on every leg, or the first exchange's domain on all of
+	// them, and the whole suite would still pass.
+	// A real Exchange serves through the canonical codec, so this stand-in does
+	// too — otherwise the Broker's decode is only ever exercised against the
+	// camelCase alias no Exchange puts on the wire.
+	path, h := rampv1connect.NewExchangeServiceHandler(m,
+		connect.WithInterceptors(audiencetest.MustInterceptor(tb, m.identity())),
+		connect.WithCodec(connectserver.EmitUnpopulatedJSONCodec()))
 	mux.Handle(path, h)
+	// The liveness probe the broker's registry health refresher polls. A real
+	// Exchange mounts this route in its own composition root (the handler is
+	// healthzHandler in src/exchange/cmd/server/probes.go; internal/runhttp
+	// supplies only ProbeHealthz, the client half the healthcheck subcommand
+	// runs). The stub must serve it too — without it every mock Exchange
+	// answers 404 and the refresher reads the whole suite as permanently down.
+	mux.HandleFunc("GET /healthz", m.serveHealthz)
 	srv := httptest.NewServer(mux)
 	tb.Cleanup(srv.Close)
 	return srv.URL
@@ -640,4 +718,30 @@ func (v fixtureOfferVerifier) Sort(ctx context.Context, offers []*rampv1.Offer) 
 		return core.NewVerifier(core.Off, nil, time.Now).Sort(ctx, offers)
 	}
 	return core.NewVerifier(core.Strict, v.resolver, time.Now).Sort(ctx, offers)
+}
+
+// assertRelayAudit fails unless the captured relay audit carries want as an
+// outcome. The record is the operator's only view of a relay refusal — the
+// agent gets a status code and a message, and neither says which endpoint the
+// broker declined — so the action is asserted as behavior, not treated as
+// incidental output.
+func assertRelayAudit(t *testing.T, logs, want string) {
+	t.Helper()
+	if !strings.Contains(logs, `"outcome":"`+want+`"`) {
+		t.Errorf("no relay audit record with outcome %q; got: %s", want, logs)
+	}
+}
+
+// assertNoRelayAudit fails if the captured relay audit carries the outcome.
+// It is how a test pins that two different refusals are recorded apart: an
+// outage must not land under REJECTED_ENDPOINT, which records an address the
+// operator never authorized and is the shape an SSRF attempt takes. Without
+// this clause a route that answered correctly on the wire but filed the wrong
+// action would still pass.
+func assertNoRelayAudit(t *testing.T, logs, unwanted string) {
+	t.Helper()
+	if strings.Contains(logs, `"outcome":"`+unwanted+`"`) {
+		t.Errorf("relay audit recorded outcome %q, which names the wrong kind of "+
+			"refusal for this rejection; got: %s", unwanted, logs)
+	}
 }

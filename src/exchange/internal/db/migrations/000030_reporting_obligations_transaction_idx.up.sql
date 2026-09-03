@@ -1,0 +1,37 @@
+-- Index the obligations side of the reporting-compliance join.
+--
+-- The execute path asks, once per item, how many of an agent's obligations are
+-- unreported past their deadline. That query filters on transaction_log
+-- (tenant_id, agent_id) and joins reporting_obligations on transaction_id, so it
+-- carries no predicate on the obligations table at all. Neither existing index
+-- can serve it: reporting_obligations_state_deadline_idx is keyed on
+-- (state, deadline), and reporting_obligations_source_report_idx is partial —
+-- it covers only rows WHERE source_report_id IS NOT NULL, which excludes exactly
+-- the unreported rows the count is about. Postgres was left reading the whole
+-- table and hash-joining it, so purchase latency grew with total platform
+-- history and one publisher's volume slowed every other publisher's executes.
+--
+-- The FK on transaction_id does not create an index of its own; Postgres indexes
+-- only the referenced side. INCLUDE carries state and deadline so the aggregate
+-- can be answered by an index-only scan on heap pages the visibility map marks
+-- all-visible. That is a best case, not a guarantee: every accepted or rejected
+-- report UPDATEs a row and clears the all-visible bit on its page until the next
+-- vacuum, and the recently written rows are also the ones most likely to be
+-- probed, so in practice some probes still fetch from the heap.
+--
+-- Built blocking, not CONCURRENTLY. CONCURRENTLY would in fact run here — this
+-- runner is golang-migrate's pgx/v5 driver, which executes each file through
+-- ExecContext with no surrounding transaction, and a single-statement file is
+-- therefore not in a transaction block. It is deliberately not used: a
+-- concurrent build that fails part way leaves an INVALID index behind AND marks
+-- the schema_migrations row dirty, and migrations here run at service start, so
+-- a boot-time migrator cannot repair either one on its own — the service stays
+-- down until someone drops the index and forces the version by hand. The
+-- blocking build fails cleanly instead. Its cost is a SHARE lock held for the
+-- duration, which conflicts with ROW EXCLUSIVE and so blocks obligation INSERTs
+-- and report UPDATEs while it runs. On a deployment whose table has grown large
+-- enough for that pause to matter, decide between the two with those facts
+-- rather than assuming this choice was forced.
+CREATE INDEX reporting_obligations_transaction_idx
+    ON ramp.reporting_obligations (transaction_id)
+    INCLUDE (state, deadline);

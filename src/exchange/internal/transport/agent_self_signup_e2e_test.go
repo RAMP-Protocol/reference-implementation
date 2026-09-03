@@ -18,6 +18,7 @@ import (
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -60,12 +61,6 @@ func newAgentHarness(t *testing.T) *agentHarness {
 	return &agentHarness{pushHarness: ph, baseRT: guarded}
 }
 
-// publishAgentOrigin stands up a fresh fixture origin serving
-// /.well-known/ramp.json for agentID and wires host rewriting.
-func (h *agentHarness) publishAgentOrigin(t *testing.T, agentID string, pub ed25519.PublicKey) *pushAgentOrigin {
-	return h.pushHarness.publishAgent(t, agentID, pub)
-}
-
 // seedPublisherEntries stands up a publisher caller with its own directory and
 // pushes entries under the harness tenant through the signed catalog surface,
 // asserting every one was accepted.
@@ -76,7 +71,7 @@ func (h *agentHarness) publishAgentOrigin(t *testing.T, agentID string, pub ed25
 // different httptest servers, and the caller is a listed contributor with a
 // reachable manifest so CatalogHandler.verifyCallerSignature admits it on first
 // contact. Each entry must carry a priced term to yield an offer.
-func (h *agentHarness) seedPublisherEntries(
+func (h *pushHarness) seedPublisherEntries(
 	t *testing.T, pubCallerID string, entries ...*rampv1.ResourceEntry,
 ) {
 	t.Helper()
@@ -85,11 +80,9 @@ func (h *agentHarness) seedPublisherEntries(
 	if err != nil {
 		t.Fatalf("publisher keypair: %v", err)
 	}
-	h.publishAgentOrigin(t, pubCallerID, pubPub)
+	h.publishAgent(t, pubCallerID, pubPub)
 	pushResp, err := h.signedCat(pubCallerID, pubPriv).PushResources(h.ctx,
-		connect.NewRequest(&rampv1.PushResourcesRequest{
-			TenantId: h.tenantID, CallerId: pubCallerID, Entries: entries,
-		}))
+		connect.NewRequest(newPushRequest(h.tenantID, pubCallerID, entries)))
 	if err != nil {
 		t.Fatalf("seed push as %q: %v", pubCallerID, err)
 	}
@@ -107,7 +100,6 @@ func (h *agentHarness) insertTenant(t *testing.T, tenantID, domain string) {
 	if _, err := h.queries.InsertTenant(h.ctx, sqlc.InsertTenantParams{
 		TenantID:        tenantID,
 		Domain:          domain,
-		HmacSecretRef:   "unused",
 		Ed25519KeyRef:   "secret://ed25519/" + tenantID,
 		ReportingPolicy: []byte(`{}`),
 		SigningScheme:   sqlc.RampSigningSchemeED25519,
@@ -237,7 +229,7 @@ func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agent keypair: %v", err)
 	}
-	h.publishAgentOrigin(t, agentID, agentPub)
+	h.publishAgent(t, agentID, agentPub)
 
 	// Step 4: POST /exchange/v1/agents/register. Uses the harness's
 	// guarded base transport so any accidental /admin/* hit fails the test.
@@ -282,13 +274,7 @@ func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 	for i, e := range entries {
 		uris[i] = "https://" + e.GetDomain() + e.GetPath()
 	}
-	discResp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver: "1.0", Uris: uris,
-		Requester: &rampv1.Requester{
-			Id: agentID, Domain: agentID,
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	discResp, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(newRequester(agentID, agentID), uris)))
 	if err != nil {
 		t.Fatalf("DiscoverResources: %v", err)
 	}
@@ -308,9 +294,9 @@ func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 	// manifest fetch during self-signup, so no manual resolver seeding or
 	// multisig transport client is needed here.
 	idempotencyKey := "tx-" + uuid.NewString()
-	execReqr := &rampv1.Requester{Id: agentID, Domain: agentID, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT}
+	execReqr := newRequester(agentID, agentID)
 	execResp, err := h.exchange.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", IdempotencyKey: idempotencyKey,
+		Ver: helpers.ProtocolVersion, IdempotencyKey: idempotencyKey,
 		Requester: execReqr,
 		// R4: body acceptance signed by the self-registered agent's
 		// key (the agents-row key the Exchange verifies against), over the EXACT
@@ -350,12 +336,7 @@ func TestAgentSelfSignup_ExplicitRegister(t *testing.T) {
 	}
 
 	// Step 8: ReportUsage accepted=true.
-	repResp, err := h.exchange.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-" + uuid.NewString(),
-		TransactionId: item.GetTransactionId(),
-		BillingId:     item.GetBillingId(),
-		Usage:         &rampv1.Usage{ConsumedQuantity: 1, Function: []string{"ai_input"}},
-	}))
+	repResp, err := h.exchange.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-"+uuid.NewString(), item.GetTransactionId(), item.GetBillingId(), &rampv1.Usage{ConsumedQuantity: 1, Function: []string{"ai_input"}})))
 	if err != nil {
 		t.Fatalf("ReportUsage: %v", err)
 	}
@@ -393,12 +374,9 @@ func TestAgentSelfSignup_LazyFirstSeen(t *testing.T) {
 	}
 
 	client := h.signedCat(lazyAgentID, priv)
-	pushResp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: lazyTenantID, CallerId: lazyAgentID,
-		Entries: []*rampv1.ResourceEntry{
-			{Domain: lazyAgentID, Path: "/feed/latest"},
-		},
-	}))
+	pushResp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(lazyTenantID, lazyAgentID, []*rampv1.ResourceEntry{
+		{Domain: lazyAgentID, Path: "/feed/latest"},
+	})))
 	if err != nil {
 		t.Fatalf("lazy push: %v", err)
 	}
@@ -454,10 +432,7 @@ func TestAgentSelfSignup_RotatedKeyRepinnedAndAccepted(t *testing.T) {
 	h.registerHost(agentID, originA.server.URL)
 
 	if _, err := h.signedCat(agentID, keyAPriv).PushResources(h.ctx,
-		connect.NewRequest(&rampv1.PushResourcesRequest{
-			TenantId: tenantID, CallerId: agentID,
-			Entries: []*rampv1.ResourceEntry{{Domain: agentID, Path: "/feed/a"}},
-		})); err != nil {
+		connect.NewRequest(newPushRequest(tenantID, agentID, []*rampv1.ResourceEntry{{Domain: agentID, Path: "/feed/a"}}))); err != nil {
 		t.Fatalf("first push (self-signup with keyA): %v", err)
 	}
 
@@ -473,10 +448,7 @@ func TestAgentSelfSignup_RotatedKeyRepinnedAndAccepted(t *testing.T) {
 	// verify fails; the handler re-pins from the directory (now keyB) and the
 	// re-verify succeeds → accepted.
 	resp, err := h.signedCat(agentID, keyBPriv).PushResources(h.ctx,
-		connect.NewRequest(&rampv1.PushResourcesRequest{
-			TenantId: tenantID, CallerId: agentID,
-			Entries: []*rampv1.ResourceEntry{{Domain: agentID, Path: "/feed/b"}},
-		}))
+		connect.NewRequest(newPushRequest(tenantID, agentID, []*rampv1.ResourceEntry{{Domain: agentID, Path: "/feed/b"}})))
 	if err != nil {
 		t.Fatalf("post-rotation push (should re-pin keyB and accept): %v", err)
 	}

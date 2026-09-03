@@ -50,13 +50,6 @@ func (r *allowAllRegistry) RefreshDirectoryKey(_ context.Context, _ string) erro
 	return errors.New("allowAllRegistry: directory refresh not supported in tests")
 }
 
-// harnessExchangeDomain is this test Exchange's own canonical domain. The catalog
-// resource-owner gate reads resource_owner_id from the AuthorizedExchange entry
-// whose domain equals it, so the manifest stubs MUST attest on this same domain —
-// it is the single source the harness threads into both NewCatalogService and the
-// stub manifests.
-const harnessExchangeDomain = "exchange.ramp.test"
-
 // harnessResourceOwner is the resource_owner_id the catch-all manifest stub
 // attests for every push, so accepted entries carry a payee and pass the gate.
 const harnessResourceOwner = "owner-test"

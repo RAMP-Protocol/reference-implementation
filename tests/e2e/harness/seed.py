@@ -1,11 +1,15 @@
 """Seeding helpers for the E2E stack — Phase-2b demo-catalog edition.
 
-The e2e catalog is THE three demo publisher feeds
-(``deploy/fixtures/demo/{philosophy,music,sfx}.jsonl``), ingested through the
-REAL production binary ``cmd/ramp-ingest`` (ParseJSONL → mapRecord →
-licenseterm.Normalize/Validate → signed ``CatalogService/PushResources`` RPC).
+The e2e catalog is this harness's own three publisher feeds
+(``fixtures/catalog/{philosophy,music,sfx}.jsonl``), ingested through the
+REAL production binary ``cmd/ramp-ingest`` (ParseJSONL → mapRecord, which
+canonicalizes terms through the SDK helper → signed
+``CatalogService/PushResources`` RPC; the Exchange runs the SDK's ingest-tier
+term checks).
 There is NO Python re-implementation of mapper.go and NO ``push_catalog`` of
-demo content — the binary's single signed RPC is the only catalog write.
+demo content — the binary's signed RPCs are the only catalog write. It sends one
+per submission of at most the wire bound on ``entries``; every feed here fits in
+one.
 
 The binary ships in the runner image at ``/usr/local/bin/ramp-ingest``
 (built by the Go builder stage of ``tests/e2e/Dockerfile``); the seed shells
@@ -38,7 +42,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import time
 from pathlib import Path
 
@@ -49,7 +52,16 @@ from ramp_sdk.b64 import b64url_decode
 from .catalog_push import (
     load_public_key_bytes,
 )
-from .demo_catalog import (
+from .ingest_runner import ingest_succeeded, run_ingest
+from .exchanges import (
+    EXCHANGE_A_DOMAIN,
+    EXCHANGE_A_INTERNAL_URL,
+    EXCHANGE_B_DOMAIN,
+    EXCHANGE_B_INTERNAL_URL,
+    EXCHANGE_C_DOMAIN,
+    EXCHANGE_C_INTERNAL_URL,
+)
+from .e2e_catalog import (
     _FIXTURES_DIR,
     CANARY_MARKER,  # noqa: F401  (re-exported for the ~40 `from .seed import` call sites)
     CATALOG_CONTRIBUTOR_ID,
@@ -70,20 +82,22 @@ from .demo_catalog import (
     _build_fixture,
 )
 
-EXCHANGE_INTERNAL_URL = "http://exchange:8081"
-EXCHANGE_DOMAIN = "exchange:8081"
+EXCHANGE_INTERNAL_URL = EXCHANGE_A_INTERNAL_URL
 
 # ───── Multi-exchange topology: 3 REAL exchanges, each with its own
 # catalog DB + identity. exchange-a keeps the cluster default DB `ramp` (shared
 # with the broker schema); exchange-b/c get separate databases `ramp_b`/`ramp_c`.
-# Each exchange's EXCHANGE_DOMAIN is stamped onto Offer.exchange, and its
-# EXCHANGE_PUBLIC_ORIGIN MUST equal the endpoint registered in broker.exchanges
-# (the post-resolve SSRF equality gate). The music publisher (fastly-edge) is
-# fronted by exchange-b; the sfx publisher (aws-edge) by exchange-c.
-EXCHANGE_B_DOMAIN = "exchange-b:8081"
-EXCHANGE_B_INTERNAL_URL = "http://exchange-b:8081"
-EXCHANGE_C_DOMAIN = "exchange-c:8081"
-EXCHANGE_C_INTERNAL_URL = "http://exchange-c:8081"
+# Each exchange's EXCHANGE_DOMAIN is stamped onto Offer.exchange, named as the
+# recipient of every addressed request, and its EXCHANGE_PUBLIC_ORIGIN MUST
+# equal the endpoint registered in broker.exchanges (the post-resolve SSRF
+# equality gate). The music publisher (fastly-edge) is fronted by exchange-b;
+# the sfx publisher (aws-edge) by exchange-c.
+#
+# The three identities and the in-network URL built from each are defined in
+# exchanges.py, which also carries the mapping between them in both directions.
+# They are bound to the names this module has always exported so its callers do
+# not have to move.
+EXCHANGE_DOMAIN = EXCHANGE_A_DOMAIN
 
 # Default signing key refs — must match those the Exchange populates at startup
 # (see src/exchange/cmd/server/main.go).
@@ -103,31 +117,37 @@ SELFPUB_PHILOSOPHY_KEY_PATH = _FIXTURES_DIR / "selfpub_philosophy_key.json"
 SELFPUB_MUSIC_KEY_PATH = _FIXTURES_DIR / "selfpub_music_key.json"
 SELFPUB_SFX_KEY_PATH = _FIXTURES_DIR / "selfpub_sfx_key.json"
 
-# Per-edge demo feeds + their owning tenant/scheme. The Exchange derives the owning
+# The e2e catalog feeds, owned by this harness — see fixtures/catalog/README.md.
+# They are resolved from this package, not from the repository root, because the
+# runner image copies the harness tree to /runner/harness: a repo-root-relative
+# path would not exist in the container.
+CATALOG_DIR = _FIXTURES_DIR / "catalog"
+
+# Per-edge feed + its owning tenant/scheme. The Exchange derives the owning
 # tenant from each ResourceEntry's domain via the UNIQUE ramp.tenants.domain
 # mapping, so the binary's --tenant MUST be the domain's tenant.
 #
-# (tenant_id, domain, signing_scheme, repo-relative feed path, self-publish key)
-DEMO_PUBLISHERS: tuple[tuple[str, str, str, str, Path], ...] = (
+# (tenant_id, domain, signing_scheme, feed path, self-publish key)
+E2E_PUBLISHERS: tuple[tuple[str, str, str, Path, Path], ...] = (
     (
         "tenant-demo-philosophy",
         DEMO_PHILOSOPHY_DOMAIN,
         "ED25519",
-        "deploy/fixtures/demo/philosophy.jsonl",
+        CATALOG_DIR / "philosophy.jsonl",
         SELFPUB_PHILOSOPHY_KEY_PATH,
     ),
     (
         "tenant-demo-music",
         DEMO_MUSIC_DOMAIN,
         "ED25519",
-        "deploy/fixtures/demo/music.jsonl",
+        CATALOG_DIR / "music.jsonl",
         SELFPUB_MUSIC_KEY_PATH,
     ),
     (
         "tenant-demo-sfx",
         DEMO_SFX_DOMAIN,
         "AWS_CLOUDFRONT_RSA",
-        "deploy/fixtures/demo/sfx.jsonl",
+        CATALOG_DIR / "sfx.jsonl",
         SELFPUB_SFX_KEY_PATH,
     ),
 )
@@ -242,10 +262,10 @@ def _register_tenant(dsn: str, *, tenant_id: str, domain: str, scheme: str) -> N
             cur.execute(
                 """
                 INSERT INTO ramp.tenants (
-                    tenant_id, domain, hmac_secret_ref, ed25519_key_ref,
+                    tenant_id, domain, ed25519_key_ref,
                     reporting_policy, signing_scheme, rsa_key_ref,
                     cloudfront_key_pair_id, allow_broker_relay
-                ) VALUES (%s, %s, 'none', %s, '{}', 'AWS_CLOUDFRONT_RSA', %s, %s, TRUE)
+                ) VALUES (%s, %s, %s, '{}', 'AWS_CLOUDFRONT_RSA', %s, %s, TRUE)
                 """,
                 (tenant_id, domain, ED25519_KEY_REF, RSA_KEY_REF, CLOUDFRONT_KEY_PAIR_ID),
             )
@@ -253,9 +273,9 @@ def _register_tenant(dsn: str, *, tenant_id: str, domain: str, scheme: str) -> N
             cur.execute(
                 """
                 INSERT INTO ramp.tenants (
-                    tenant_id, domain, hmac_secret_ref, ed25519_key_ref,
+                    tenant_id, domain, ed25519_key_ref,
                     reporting_policy, signing_scheme, allow_broker_relay
-                ) VALUES (%s, %s, 'none', %s, '{}', 'ED25519', TRUE)
+                ) VALUES (%s, %s, %s, '{}', 'ED25519', TRUE)
                 """,
                 (tenant_id, domain, ED25519_KEY_REF),
             )
@@ -275,7 +295,7 @@ def _upsert_agent(
     ``agent_id``. Production mints a random handle at Register (ADR-021 D1), but
     the demo path never calls Register (onboarding RPC is out of e2e scope), and
     the paid charge path denies an agent whose row carries no billing_ref
-    (BILLING_REF_INACTIVE). Reusing the agent_id as the handle keeps the
+    (ACCOUNT_NOT_REGISTERED). Reusing the agent_id as the handle keeps the
     agent_id-keyed EXCHANGE_BILLING_SEED balances working without re-keying. A
     matching active SoR account is seeded by :func:`_register_sor_accounts`.
     Brokers keep a NULL billing_ref — they relay, they never buy.
@@ -306,10 +326,10 @@ def _register_sor_accounts(sor_dsn: str, agent_ids: tuple[str, ...]) -> None:
     that account is active (IsActive → checkAccountActive). The SoR runs in its
     OWN database (EXCHANGE_SOR_DSN: ramp_sor / ramp_sor_b / ramp_sor_c), which
     starts empty — so an account the SoR does not know is denied
-    BILLING_REF_INACTIVE before Authorize. Registering an active account
+    ACCOUNT_INACTIVE before Authorize. Registering an active account
     (billing_ref == subdomain == agent_id) lets the paid path reach billing;
     funding is separate (EXCHANGE_BILLING_SEED), so an active-but-unfunded buyer
-    is correctly denied INSUFFICIENT_BALANCE, not BILLING_REF_INACTIVE.
+    is correctly denied INSUFFICIENT_BALANCE, not ACCOUNT_INACTIVE.
     """
     with psycopg.connect(sor_dsn) as conn, conn.cursor() as cur:
         for agent_id in agent_ids:
@@ -366,7 +386,7 @@ def _register_tenants_and_buyers(dsn: str) -> None:
     keys and the 3rd-party contributor key are learned by the Exchange ONLY via
     the well-known fetch at catalog-push time (Gate-1 self-signup).
     """
-    for tenant_id, domain, scheme, _feed, _key in DEMO_PUBLISHERS:
+    for tenant_id, domain, scheme, _feed, _key in E2E_PUBLISHERS:
         _register_tenant(dsn, tenant_id=tenant_id, domain=domain, scheme=scheme)
         # the agent originates ExecuteTransaction via the Broker relay
         # (agent sig1 + broker sig2); authorizeForAgent honours the relay only on
@@ -426,38 +446,42 @@ def _ingest_binary_path() -> str:
     return os.environ.get("RAMP_INGEST_BIN", "/usr/local/bin/ramp-ingest")
 
 
-def _repo_root(compose_file: str) -> Path:
-    return Path(compose_file).resolve().parent
-
-
 def _ingest_feed(
-    *, exchange_url: str, tenant_id: str, feed_abspath: Path, binary: str, key_path: Path
+    *,
+    exchange_url: str,
+    exchange: str,
+    tenant_id: str,
+    feed_abspath: Path,
+    binary: str,
+    key_path: Path,
 ) -> None:
     """Shell out to the production ramp-ingest binary for one feed.
 
-    The binary signs (RFC 9421) and POSTs a single ``PushResources`` RPC — the
-    only catalog write. ``key_path`` is the publisher's SELF-PUBLISH key (kid ==
+    The binary signs (RFC 9421) and sends ``PushResources`` RPCs — one per
+    submission of at most the wire bound; every e2e feed fits in one — the only
+    catalog write. ``key_path`` is the publisher's SELF-PUBLISH key (kid ==
     domain); the binary's caller_id is that kid, so Gate-1 self-signup resolves
     it from the publisher's edge well-known and Gate-2 passes caller==domain — no
-    DB pre-seed. A non-zero rejected count or non-zero exit fails the seed.
+    DB pre-seed. A non-zero exit fails the seed: the Exchange stores or refuses
+    a submission whole and the binary exits non-zero on the first submission
+    that did not store — refused, or never answered — so the exit code is the
+    whole verdict.
+
+    ``exchange`` overrides the recipient the binary would otherwise take from
+    ``exchange_url``'s host. The harness needs the override because a host run
+    reaches the exchange through a mapped 127.0.0.1 port, which names no
+    exchange at all; a deployment dialling the exchange's own origin needs
+    nothing here.
     """
-    proc = subprocess.run(
-        [
-            binary,
-            "--exchange-url",
-            exchange_url,
-            "--tenant",
-            tenant_id,
-            "--key",
-            str(key_path),
-            str(feed_abspath),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=300,
+    proc = run_ingest(
+        argv_prefix=[binary],
+        exchange_url=exchange_url,
+        exchange=exchange,
+        tenant_id=tenant_id,
+        key_path=key_path,
+        feed=feed_abspath,
     )
-    if proc.returncode != 0 or "rejected=0" not in proc.stderr:
+    if not ingest_succeeded(proc):
         msg = (
             f"ramp-ingest failed for {feed_abspath} (tenant={tenant_id}): "
             f"rc={proc.returncode}\nSTDERR:\n{proc.stderr}\nSTDOUT:\n{proc.stdout}"
@@ -465,20 +489,20 @@ def _ingest_feed(
         raise RuntimeError(msg)
 
 
-def _ingest_all_feeds(compose_file: str, exchange_url_by_domain: dict[str, str]) -> None:
-    """Ingest each demo feed into its OWNING exchange's catalog DB.
+def _ingest_all_feeds(exchange_by_domain: dict[str, tuple[str, str]]) -> None:
+    """Ingest each e2e feed into its OWNING exchange's catalog DB.
 
-    ``exchange_url_by_domain`` maps each publisher domain to the URL of the
-    exchange that owns it (host-mapped on a host run, docker-DNS in-network). The
-    music catalog lands in exchange-b's DB and the sfx catalog in exchange-c's DB
-    — the catalog isolation the separate-DB topology guarantees.
+    ``exchange_by_domain`` maps each publisher domain to the ``(url, domain)``
+    of the exchange that owns it — where to send the push, and who to address it
+    to. The music catalog lands in exchange-b's DB and the sfx catalog in
+    exchange-c's DB — the catalog isolation the separate-DB topology guarantees.
     """
     binary = _ingest_binary_path()
-    root = _repo_root(compose_file)
-    for tenant_id, domain, _scheme, feed_rel, key_path in DEMO_PUBLISHERS:
-        feed_abspath = root / feed_rel
+    for tenant_id, domain, _scheme, feed_abspath, key_path in E2E_PUBLISHERS:
+        url, exchange = exchange_by_domain[domain]
         _ingest_feed(
-            exchange_url=exchange_url_by_domain[domain],
+            exchange_url=url,
+            exchange=exchange,
             tenant_id=tenant_id,
             feed_abspath=feed_abspath,
             binary=binary,
@@ -532,7 +556,7 @@ def seed_stack(
     # Active SoR accounts for the buyers in EACH exchange's OWN SoR database
     # (ramp_sor / ramp_sor_b / ramp_sor_c), keyed by billing_ref == agent_id.
     # Without these the now-live SoR active check (checkAccountActive) denies
-    # every paid transaction BILLING_REF_INACTIVE before Authorize.
+    # every paid transaction ACCOUNT_INACTIVE before Authorize.
     buyer_ids = (USD_AGENT_ID, EUR_AGENT_ID, NOBILLING_AGENT_ID)
     for sor_db in ("ramp_sor", "ramp_sor_b", "ramp_sor_c"):
         sor_dsn = _resolve_pg_dsn_for_db(compose_file, sor_db)
@@ -542,11 +566,10 @@ def seed_stack(
     _register_exchange_registry(broker_dsn)
 
     _ingest_all_feeds(
-        compose_file,
         {
-            DEMO_PHILOSOPHY_DOMAIN: exchange_host_url,
-            DEMO_MUSIC_DOMAIN: ex_b_url,
-            DEMO_SFX_DOMAIN: ex_c_url,
+            DEMO_PHILOSOPHY_DOMAIN: (exchange_host_url, EXCHANGE_A_DOMAIN),
+            DEMO_MUSIC_DOMAIN: (ex_b_url, EXCHANGE_B_DOMAIN),
+            DEMO_SFX_DOMAIN: (ex_c_url, EXCHANGE_C_DOMAIN),
         },
     )
     return _build_fixture()
@@ -584,9 +607,9 @@ def _upsert_tenant_ed25519(dsn: str, *, tenant_id: str, domain: str) -> None:
         cur.execute(
             """
             INSERT INTO ramp.tenants (
-                tenant_id, domain, hmac_secret_ref, ed25519_key_ref,
+                tenant_id, domain, ed25519_key_ref,
                 reporting_policy, signing_scheme
-            ) VALUES (%s, %s, 'none', %s, '{}', 'ED25519')
+            ) VALUES (%s, %s, %s, '{}', 'ED25519')
             ON CONFLICT (tenant_id) DO UPDATE SET
                 domain = EXCLUDED.domain,
                 signing_scheme = EXCLUDED.signing_scheme,
@@ -603,10 +626,10 @@ def _upsert_tenant_cf_rsa(dsn: str, *, tenant_id: str, domain: str) -> None:
         cur.execute(
             """
             INSERT INTO ramp.tenants (
-                tenant_id, domain, hmac_secret_ref, ed25519_key_ref,
+                tenant_id, domain, ed25519_key_ref,
                 reporting_policy, signing_scheme,
                 rsa_key_ref, cloudfront_key_pair_id
-            ) VALUES (%s, %s, 'none', %s, '{}', 'AWS_CLOUDFRONT_RSA', %s, %s)
+            ) VALUES (%s, %s, %s, '{}', 'AWS_CLOUDFRONT_RSA', %s, %s)
             ON CONFLICT (tenant_id) DO UPDATE SET
                 domain = EXCLUDED.domain,
                 signing_scheme = EXCLUDED.signing_scheme,

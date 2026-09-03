@@ -35,6 +35,31 @@ const (
 const (
 	OwnerRevenuePrefix = "revenue:"
 	PlatformFeeID      = "fee"
+	// PlatformLiquidityID names the operator liquidity account welcome credits
+	// are drawn from: AccountID(PrefixPlatform, PlatformLiquidityID). The same
+	// account the operator funding scripts debit — it carries no
+	// DebitsMustNotExceedCredits flag, so it may go arbitrarily negative (it
+	// represents money owed by the platform, not a prepaid balance).
+	PlatformLiquidityID = "liquidity"
+)
+
+// Transfer id-derivation namespaces for the transaction lifecycle's own
+// transfers. Each is prepended to a business id before it is hashed into a
+// TigerBeetle transfer id (TransferID below).
+//
+// They are constants because two places must agree on them: the adapter that
+// derives lifecycle transfer ids, and billing's shared Credit gate, which
+// refuses a caller-supplied credit key starting with any of them — such a key
+// could derive the same transfer id as a lifecycle transfer and misfile the
+// grant. Written as literals at each site, adding a sixth namespace would leave
+// the gate unaware of it, and renaming one would leave the gate guarding a
+// prefix nothing derives.
+const (
+	TransferPendingPrefix = "pending:"
+	TransferPostPrefix    = "post:"
+	TransferVoidPrefix    = "void:"
+	TransferFeePrefix     = "fee:"
+	TransferRefundPrefix  = "refund:"
 )
 
 // AccountCode classifies an account's category. It is a distinct named type from

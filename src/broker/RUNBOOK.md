@@ -78,15 +78,24 @@ Broker and the Exchange — grep it in all three to trace one request end to end
 | `broker.exit` | ERROR | Refused to start. The message names the cause. |
 | `broker.revocation.unavailable` | ERROR | The withdrawn-keys file is unreadable or malformed. |
 | `broker.resolve.record` | ERROR | Could not write the audit row. The request itself succeeded. |
-| `broker.httpsig.reject` | WARN | Signature rejected. `outcome` says why: `signature`, `replay`, `broken_chain`, `hop_budget`. |
+| `broker.httpsig.reject` | WARN | A request was rejected before it reached a handler. `outcome` says why: `signature`, `replay`, `broken_chain`, `hop_budget` or `body_too_large`. The first four are authentication outcomes and point at the caller's key, clock or relay chain. `body_too_large` is not one of them — the body passed the read cap before verification, and the caller fixes it by sending less. This Broker sets no cap of its own, so the bound is the SDK's own default rather than nothing. **On this Broker the line appears only for a request that carried a `Signature-Input` header.** The verification seam is what writes it, and this Broker admits an unsigned request to the handler without entering that seam, so an unsigned body past the cap is still refused and still bounded but leaves no audit line. Watching this line for over-size abuse therefore does not show you unauthenticated callers. |
+| `rampaudience.refused` | WARN, **ERROR** for an unusable identity | A request named a recipient other than this Broker and was refused before the handler ran. Carries `path` (the RPC — the same key `broker.httpsig.reject` uses), `verdict`, `self` (the identity this service answers to) and `reason`. No agent-facing RPC names a recipient today, so on this service the line should be rare; at **ERROR** it means this Broker's own identity is unusable and every addressed request would be refused. |
 | `broker.registry.no_bootstrap` | WARN | No Exchange registry file — the Broker routes to no Exchange until one is registered. |
 | `broker.relay.key_absent` | WARN | No relay key — calls to the Exchange go unsigned and get 401. |
-| `broker.registry.set_health` | WARN | Could not **write** a health flag. Fires on a failed write, not on a health change — a health change itself logs nothing. |
+| `broker.registry.set_probe_result` | WARN | Could not **write** what a health probe pass learned — the health flag, the endpoint, or both. Fires on a failed write, not on a change. Field `exchange_id`. |
+| `broker.registry.health_changed` | INFO | An Exchange went down or came back. Fields `exchange_id`, `domain`, `healthy`. This is the only line that timestamps an outage; the routing-skip line says an Exchange is down now but not when it went down. |
+| `broker.registry.endpoint_changed` | INFO | The address an Exchange advertises in its own `ramp.json` differs from the one the registry held, and the registry now holds the advertised one. Fields `exchange_id`, `domain`, `was`, `now`. Expected once after a bootstrap file names an address the Exchange has outgrown; repeating every polling interval means the Exchange is advertising an address that does not stay put. |
+| `broker.registry.resolve` | **INFO** | A probe pass could not read an Exchange's own `ramp.json`, so it learned nothing about where that Exchange is. Fields `domain`, `err`. The pass keeps the address already stored and marks the row unhealthy, because routing resolves the same way and could not reach it either. Note the level: this is the one probe-loop fault logged below WARN, while the same failure on the request path (`broker.routing.resolve`) is a WARN. Filtering at WARN shows you the request-path copy and hides the probe that took the Exchange out of service. |
+| `broker.registry.list` | WARN | A probe pass could not read the registry at all and did no work. Field `err`. Every Exchange keeps its last known state until the next pass. |
+| `broker.registry.refresh` | WARN | The same fault, reported by the polling loop. Field `err`. Paired with the line above for one failure. |
+| `broker.routing.skipped` | INFO (`unhealthy`, `blocked`), DEBUG (`unregistered`) | A manifest named an Exchange that discovery then declined. Fields `domain`, `reason`. `unhealthy` clears when the Exchange answers `/healthz` again; `blocked` only when an operator restores trust; `unregistered` means the manifest names an Exchange this Broker has never heard of, which is common and logged at DEBUG. |
+| `broker.batch.total_cost_aggregation_failed` | WARN | The relay could not total a batch's cost. The transaction itself is unaffected. |
 | `broker.discover` | WARN | An Exchange failed the discovery call. Field `exchange`. |
 | `broker.discover.offer_rejected` | WARN | An offer arrived but failed signature verification. Fields `exchange`, `uri`, `reason`. |
 | `broker.routing.resolve` | WARN | An Exchange is healthy but its `ramp.json` gave no endpoint. |
 | `broker.resolve.probe` | WARN | Could not read a publisher's `ramp.json`. Field `domain`. |
 | `broker.routing.lookup` | WARN | Reading a registered Exchange from the database failed with a real error (not "not registered"). Field `domain`. That Exchange is skipped for the current request. |
+| `broker.discover_relay` / `broker.exchange_relay` | INFO on success, WARN on a fault | The relay audit trail: one record per relay attempt, carrying `outcome` and `endpoint`. The outcomes are listed below. |
 | `broker.redis.ready` / `.disabled` | INFO | Whether replay protection is shared or per-process. |
 | `broker.exa.disabled` | INFO | `EXA_API_KEY` is unset. Logged once at start-up; free-text query requests will fail with `no domains for query`. |
 | `broker.exa.init_failed` | WARN | The key is set but the search client could not be built. Field `err`. The Broker starts anyway, and free-text query requests fail exactly as if the key were unset. |
@@ -103,10 +112,24 @@ on duty, at any hour.**
 |---|---|---|
 | `/healthz` non-200 for 2 minutes | **Wake on-call** | PostgreSQL is unreachable. |
 | Redis unreachable | **Wake on-call** | The Broker rejects requests rather than letting them through, but this **shows up as mass authentication failures, not 503s**. Check Redis before chasing key problems — the most misread outage on this service. |
-| Every Exchange unhealthy | **Wake on-call** | Agents get empty offer lists, and health does not recover on its own (§3.1). |
+| Every Exchange unhealthy for more than 3 polling intervals (~90s) | **Wake on-call** | Agents get empty offer lists. A single interval is not an alert: the Broker re-probes every Exchange it has not blocked, so one failed probe clears itself on the next pass. Sustained means the Exchanges really are unreachable, or the Broker cannot make outbound calls at all. |
 | `broker.httpsig.reject` rate spikes | **Wake on-call** | Key rotation, clocks that are out of sync, or a TLS proxy newly placed in front. |
 | `broker.revocation.unavailable` | **Wake on-call** | While broken, the Exchange cannot learn of any withdrawal. |
 | `broker.discover.offer_rejected` in bulk | Business hours | Exchange key rotation, or clocks that are out of sync between the two. |
+
+**Relay `outcome` values.** Every refusal begins with `REJECTED_`, so one filter on
+that prefix catches all of them, and each stays searchable on its own.
+
+| `outcome` | Means |
+|---|---|
+| `VALIDATED` | The request passed every gate and was forwarded. |
+| `REJECTED_ENDPOINT` | The caller named an address no registered Exchange advertises. This is the shape an SSRF attempt takes; a `BLOCKED` Exchange also lands here, because an agent is owed no distinction between "withdrawn" and "never registered". |
+| `REJECTED_ENDPOINT_DOWN` | The Exchange is registered and still trusted, and its last health probe failed. Routine, and it clears on its own — this is the one to exclude before reading a `REJECTED_` rate as an attack signal. |
+| `REJECTED_AUTHZ` | Either the agent's own signature did not verify at the Broker boundary, or the transaction named an Exchange that is registered but not approved to be paid (`DISCOVERED`). The message says which. |
+| `REJECTED_REPLAY` | The signature had already been used. |
+| `REJECTED_UPSTREAM` | Reaching the Exchange failed in a way the Exchange owns. |
+| `REJECTED_INTERNAL` | The Broker's own fault, such as a registry read that failed. Nothing is wrong with the Exchange; do not chase it. |
+| `RELAY_UPSTREAM_ERROR` | The Exchange was reached and answered with an error. |
 
 ---
 
@@ -116,7 +139,8 @@ on duty, at any hour.**
 
 | Symptom | Why | What to do |
 |---|---|---|
-| **Agents get empty offer lists and it never recovers** | An Exchange that fails one health probe is marked unhealthy and then **excluded from all future probes**. It cannot come back on its own — not when the Exchange recovers, not when the Broker restarts. | Manual fix only — §4.1. |
+| **Agents get empty offer lists, and it does not clear within a couple of minutes** | Every Exchange is failing its health probe. The Broker keeps probing an unhealthy Exchange and brings it back on its own once `/healthz` answers 200, so a state that persists is a real outage rather than a stuck flag. | §4.1 — find out why the probe fails; do not edit the flag. |
+| **One Exchange is unroutable while others work** | Its probe is failing, or an operator has `BLOCKED` it. `broker.routing.skipped` names the Exchange and says which. | Read the `reason` on that line. `unhealthy` points at the Exchange's `/healthz`; `blocked` is an operator decision and only an operator reverses it. |
 | Every signed request rejected, `outcome=signature` | A proxy in front terminates HTTPS and forwards HTTP, so the URL the agent signed is not the URL the Broker checks | Set `RAMP_TRUST_PROXY_HEADERS=true` — [`CONFIGURATION.md`](CONFIGURATION.md) §4. Only behind a proxy you control, never on a directly-exposed Broker. |
 | Mass authentication failures, no code change | Redis is down; the Broker rejects the request rather than letting it through, and the error reaches the client as an auth failure | Check Redis first. |
 | Discovery returns nothing **and the logs are empty** | Several paths return "no offers" silently | §3.2 — read the `absence_reason` the agent got. |
@@ -137,10 +161,13 @@ SELECT exchange_id, domain, endpoint, trust_level, healthy, last_health_check
   FROM broker.exchanges ORDER BY priority DESC;
 ```
 
-Two things to watch for in that output: `last_health_check` is **not a regular
-check-in time** — it is written only when health *changes*, so a
-permanently-healthy Exchange shows `NULL` forever. And once `healthy` is false it
-never changes back on its own (§3.1, §4.1).
+Two things to watch for in that output. `last_health_check` is **not a regular
+check-in time** — it is written only when a pass learns something the row does not
+already say, either a health change or a new address, so an Exchange that has been
+healthy and stationary since bootstrap shows `NULL` forever. And `healthy` is a
+live reading, not a latch: the Broker probes every non-`BLOCKED` Exchange each
+interval and clears the flag by itself once `/healthz` answers 200 again. A row
+sitting at `false` means the probe is still failing right now.
 
 **Why one discovery returned no offers.** Start with the logs, but expect nothing:
 
@@ -148,11 +175,14 @@ never changes back on its own (§3.1, §4.1).
 docker compose logs broker | grep '"request_id":"<ID>"'
 ```
 
-Several causes log no line at all — the publisher has no `ramp.json`, its hostname
-could not be read, the Exchange named in the manifest is not registered, or it is
-registered but unhealthy or `BLOCKED`. A zero-offer discovery also writes **no audit
-row**, so there is no database trail either. The reliable signal is the
-`absence_reason` in the response the agent received:
+An Exchange declined for its registry state does leave a line:
+`broker.routing.skipped` carries the `domain` and a `reason` of `unhealthy` or
+`blocked`, at INFO. The quiet causes are the rest — the publisher has no
+`ramp.json`, its hostname could not be read, or the manifest names an Exchange
+this Broker has never heard of (that last one logs at DEBUG, below the default
+floor). A zero-offer discovery also writes **no audit row**, so there is no
+database trail either. The reliable signal is the `absence_reason` in the response
+the agent received:
 
 | `absence_reason` | Meaning |
 |---|---|
@@ -221,19 +251,28 @@ psql "$BROKER_DSN" -c \
   "UPDATE broker.exchanges SET trust_level = 'BLOCKED' WHERE exchange_id = '<id>'"
 ```
 
-**Bring an Exchange back after it was marked unhealthy.** Once `healthy` is false the
-Broker stops probing that Exchange entirely, so it never recovers by itself — not
-when the Exchange returns, not on a Broker restart. Fix the Exchange, confirm it
-answers `200` on its own `/healthz`, then clear the flag by hand:
+**Bring an Exchange back after it was marked unhealthy.** There is nothing to do in
+the database, and editing `healthy` by hand is not a supported fix. The Broker
+re-probes every Exchange it has not blocked, once per 30-second cycle, and clears
+the flag itself on the first pass where `/healthz` answers 200. A row that stays
+at `false` is telling you the probe is still failing.
+
+Fix the cause instead. The Broker probes the address the Exchange advertises in
+its **own** `/.well-known/ramp.json`, never the `endpoint` column, so check that
+address:
 
 ```bash
-psql "$BROKER_DSN" -c \
-  "UPDATE broker.exchanges SET healthy = TRUE WHERE exchange_id = '<id>'"
-# Expect: UPDATE 1
+# What the Exchange says about itself, and whether that address answers.
+curl -s https://<exchange-domain>/.well-known/ramp.json | jq -r '.endpoint'
+curl -sS -o /dev/null -w '%{http_code}\n' "$(curl -s https://<exchange-domain>/.well-known/ramp.json | jq -r '.endpoint')/healthz"
 ```
 
-Probing resumes on the next 30-second cycle and stays healthy while the Exchange
-answers.
+The usual causes are that the Exchange is down, that its `ramp.json` advertises an
+address that no longer answers, or that the address it advertises is one the
+Broker's outbound guard refuses — a private or link-local target. `/healthz`
+answering 200 from your own shell but not from the Broker points at the last one.
+Once it answers, recovery costs at most one polling interval; `broker.registry.health_changed`
+records the moment it comes back.
 
 **Running more than one instance.** Above one instance `REDIS_URL` is mandatory and
 every instance must use the **same** Redis, or replay protection is per-process and
@@ -346,7 +385,7 @@ Everything lives in PostgreSQL and Redis, which are backed up separately.
 
 | What | Where | If you lose it |
 |---|---|---|
-| Exchange list | `broker.exchanges` | Re-created from `BROKER_REGISTRY_FILE` on the next start — provided that file is set, since nothing else fills it. Brief discovery outage, no data loss. The `healthy` flag is **not** restored — see §4.1. |
+| Exchange list | `broker.exchanges` | Re-created from `BROKER_REGISTRY_FILE` on the next start — provided that file is set, since nothing else fills it. Brief discovery outage, no data loss. Health needs no restoring: the first probe pass after start-up sets each flag from what the Exchange actually answers. |
 | Selection audit log | `broker.selection_log` | An audit-trail gap. No functional impact; nothing reads it at runtime. |
 | Replay records | Redis | A short window in which an old signed request could be replayed. Losing Redis entirely is safe — an empty replay store is a safe starting state. |
 
@@ -355,8 +394,9 @@ Two things to plan for rather than react to:
 - **`broker.selection_log` grows forever** — append-only, nothing removes rows, one
   row per discovery that produced offers, each carrying the full offer set as JSON.
   How long to keep them is your decision; nothing removes old rows for you.
-- **A restore brings back out-of-date health flags** — check the list (§3.2)
-  afterwards and clear any `healthy = false` that no longer reflects reality (§4.1).
+- **A restore brings back out-of-date health flags**, and they correct themselves
+  within one 30-second probe pass. Nothing to do; if a flag is still `false` after
+  a couple of minutes, the Exchange really is unreachable (§4.1).
 
 PostgreSQL and Redis are covered by their own operating guides.
 
@@ -366,7 +406,6 @@ PostgreSQL and Redis are covered by their own operating guides.
 
 - **Behind a TLS-terminating proxy, `RAMP_TRUST_PROXY_HEADERS=true` is
   required** — and forbidden anywhere else. [`CONFIGURATION.md`](CONFIGURATION.md) §4.
-- **An unhealthy Exchange never recovers on its own** — manual database update (§4.1).
 - **The identity key cannot be reloaded without a restart**, and there is no built-in
   way to persist one — you must supply `BROKER_ED25519_SEED` yourself.
 - **Withdrawing a key means editing a file by hand** — no tool, and no validation

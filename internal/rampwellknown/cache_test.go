@@ -65,7 +65,7 @@ func TestCache_GetAndAuthorizes(t *testing.T) {
 
 func TestCache_RoleAssert(t *testing.T) {
 	t.Parallel()
-	// The negative-cache path (404 → ErrNoManifest), including stickiness and
+	// The negative-cache path (404 → ErrNoDocument), including stickiness and
 	// expiry, is covered by cache_behaviors_test.go's
 	// TestCache_NegativeCacheStickyThenExpires.
 	origin := testutil.NewOrigin(testutil.MarshalManifest(

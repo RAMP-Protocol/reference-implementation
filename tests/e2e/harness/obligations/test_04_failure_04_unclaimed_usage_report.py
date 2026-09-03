@@ -65,6 +65,9 @@ import httpx
 import psycopg
 import pytest
 
+from ..connect_errors import assert_refused
+from ..reporting import REPORT_USAGE_PATH, report_body
+from ..exchanges import recipient_of
 from ..conftest import COMPOSE_FILE, StackURLs
 from ..httpsig_signer import load_keypair, sign_request
 from ..seed import (
@@ -73,11 +76,9 @@ from ..seed import (
     _resolve_pg_dsn,
 )
 
-
 # ADR-008 D5 — declare stack-isolation contract.
 pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 
-_REPORT_USAGE_PATH = "/ramp.v1.ExchangeService/ReportUsage"
 
 # The Connect-Go JSON error code that qualifies as "refusal". Pinned to the
 # one code the deployed path actually returns — the service layer's
@@ -128,32 +129,13 @@ def _snapshot_counts(dsn: str) -> tuple[int, int]:
 
 
 def _assert_refused(resp: httpx.Response, unknown_tx_id: str) -> None:
-    """Assert the response is a Connect-Go refusal, not a 2xx accept."""
-    assert resp.status_code >= httpx.codes.BAD_REQUEST, (
-        f"report for unclaimed transaction {unknown_tx_id} was NOT refused: "
-        f"status={resp.status_code} body={resp.text[:256]}"
-    )
-    # Connect-Go JSON errors always carry a code + message. The code is
-    # pinned to the one value the deployed path returns — see
-    # _REFUSAL_CODES above — so a stray 5xx without a body (or a shifted
-    # refusal layer) does not silently pass.
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        msg = (
-            f"expected Connect-Go JSON error body, got non-JSON for "
-            f"{unknown_tx_id}: {resp.text[:256]}"
-        )
-        raise AssertionError(msg) from exc
-    code = payload.get("code")
-    message = payload.get("message")
-    assert isinstance(code, str) and code in _REFUSAL_CODES, (
-        f"refusal code {code!r} not in {sorted(_REFUSAL_CODES)} for "
-        f"unclaimed tx {unknown_tx_id}: {payload}"
-    )
-    assert isinstance(message, str) and message, (
-        f"refusal missing message for unclaimed tx {unknown_tx_id}: {payload}"
-    )
+    """Assert the response is a Connect-Go refusal, not a 2xx accept.
+
+    The shared reader pins the code — see ``_REFUSAL_CODES`` above for which one
+    and why — so a refusal that moves to another layer is noticed here instead
+    of passing as "some 4xx".
+    """
+    assert_refused(resp, _REFUSAL_CODES, f"report for unclaimed transaction {unknown_tx_id}")
 
 
 def test_report_for_unclaimed_tx_is_refused_by_exchange(
@@ -200,14 +182,12 @@ def test_report_for_unclaimed_tx_is_refused_by_exchange(
     before_tx, before_agents = _snapshot_counts(dsn)
 
     unknown_tx_id = f"tx-never-accepted-{uuid.uuid4().hex}"
-    url = f"{compose_stack.exchange}{_REPORT_USAGE_PATH}"
-    body: dict[str, Any] = {
-        "ver": "0.3",
-        "idempotency_key": f"report-{uuid.uuid4().hex}",
-        "transaction_id": unknown_tx_id,
-        "billing_id": "",
-        "usage": {"consumed_quantity": 1, "function": ["ai_input"]},
-    }
+    url = f"{compose_stack.exchange}{REPORT_USAGE_PATH}"
+    body = report_body(
+        exchange=recipient_of(compose_stack.exchange),
+        transaction_id=unknown_tx_id,
+        consumed_quantity=1,
+    )
 
     resp = _post_signed_json(url, body)
     _assert_refused(resp, unknown_tx_id)

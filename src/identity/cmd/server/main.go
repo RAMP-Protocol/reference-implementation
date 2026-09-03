@@ -5,9 +5,9 @@
 // the only middleware is request-id correlation — there is no signature gate.
 //
 // The same binary always fronts developer sign-up — the OAuth authorization server,
-// the mandatory registration form, and identity provisioning. Sign-up is not
-// optional: the service requires IDENTITY_AUTH_ISSUER and the IDENTITY_OIDC_*
-// upstream credentials and refuses to start without them. A rotation scheduler runs
+// resource-owner consent, and identity provisioning. Sign-up is not optional: the
+// service requires IDENTITY_AUTH_ISSUER and the IDENTITY_OIDC_* upstream
+// credentials and refuses to start without them. A rotation scheduler runs
 // alongside for the process lifetime, sharing the same publisher.
 package main
 
@@ -116,26 +116,39 @@ func run(logger *slog.Logger) error {
 //
 // The adapter is MANDATORY: it is the identity service's agent-facing surface, so
 // a deployment that could not wire it is not a complete service and must not come
-// up. It needs both RAMP peers named — there is no separate on/off flag, and no
-// default URL for a missing half, because that would point an agent's signed
-// requests somewhere nobody chose. Naming neither or only one is a configuration
-// error that stops startup rather than silently disabling the adapter.
+// up. It needs the Broker named — there is no separate on/off flag and no default
+// URL, because a default would point an agent's signed requests somewhere nobody
+// chose. Leaving it unset is a configuration error that stops startup rather than
+// silently disabling the adapter.
+//
+// There is NO Exchange setting, and that is the design rather than an omission.
+// An account is per-Exchange, an agent names which one per call, and the endpoint
+// comes from that Exchange's own manifest — so there is nothing here to point
+// anywhere. A deployment that wants to limit which Exchanges are reachable sets
+// the optional allowlist below; that is a policy, not an address.
 func buildMCPConfig() (*app.MCPConfig, error) {
-	broker := runhttp.EnvOr("IDENTITY_MCP_BROKER_URL", "")
-	exchange := runhttp.EnvOr("IDENTITY_MCP_EXCHANGE_URL", "")
-	if broker == "" || exchange == "" {
-		return nil, fmt.Errorf(
-			"both IDENTITY_MCP_BROKER_URL and IDENTITY_MCP_EXCHANGE_URL are required "+
-				"(broker set: %t, exchange set: %t)", broker != "", exchange != "",
-		)
+	// Read through EnvTrimmed, like the allowlist eighteen lines below. "Is this
+	// variable set?" gets one answer per deployment: with EnvOr a value of spaces
+	// passed the check below and the service came up with a whitespace Broker URL,
+	// while the same mistake on the allowlist read as unset. One operator error,
+	// two behaviours, and nothing in the configuration file to show the difference.
+	broker := runhttp.EnvTrimmed("IDENTITY_MCP_BROKER_URL")
+	if broker == "" {
+		return nil, errors.New("IDENTITY_MCP_BROKER_URL is required")
 	}
 	itemBytes, callBytes, err := contentByteCaps()
 	if err != nil {
 		return nil, err
 	}
 	return &app.MCPConfig{
-		BrokerURL:   broker,
-		ExchangeURL: exchange,
+		BrokerURL: broker,
+		// Optional, and empty is the normal answer: the deployment speaks to any
+		// Exchange an agent names. Set it to confine the service to Exchanges the
+		// operator has a relationship with. It is NOT a required replacement for
+		// the Exchange URL this service used to be given — the point of the
+		// account tools taking a target per call is that there is nothing left to
+		// configure, and a policy an operator did not write is not one to invent.
+		ExchangeAllowlist: runhttp.EnvTrimmed("IDENTITY_MCP_EXCHANGE_ALLOWLIST"),
 		// Defaults to the scheme the agents' own directories are served on: the
 		// two are the same deployment choice (https in production, http for a
 		// local stack), and splitting them invites one to drift.

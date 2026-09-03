@@ -25,6 +25,9 @@ import psycopg
 import pytest
 
 from ramp_sdk.core import sign_offer_acceptance_jcs
+from ramp_sdk import ProtocolVersion
+from ..exchanges import recipient_of
+from ..discovery import discover_body
 from ..conftest import COMPOSE_FILE, StackURLs
 from ..edge_fetch import fetch_signed
 from ..httpsig_signer import load_keypair, sign_request
@@ -81,18 +84,14 @@ def test_agent_as_own_principal_lists_accepts_and_fetches_free_resource(
     """Agent-as-own-principal lists, accepts, and fetches a zero-price demo resource."""
     list_resp = _post_signed_json(
         f"{compose_stack.exchange}{_LIST_OFFERS_PATH}",
-        {
-            "ver": "1.0",
-            "id": f"q-{uuid.uuid4().hex[:8]}",
-            "requester": {
-                "id": EUR_AGENT_ID,
-                "domain": DEMO_PHILOSOPHY_DOMAIN,
-                "type": "REQUESTER_TYPE_AGENT",
-                "user_type": "academic",
-                "geography": "EU",
-            },
-            "uris": [_RESOURCE_URI],
-        },
+        discover_body(
+            agent_id=EUR_AGENT_ID,
+            uris=[_RESOURCE_URI],
+            exchange=recipient_of(compose_stack.exchange),
+            domain=DEMO_PHILOSOPHY_DOMAIN,
+            user_type="academic",
+            geography="EU",
+        ),
     )
     _assert_no_delegation_credentials_on_wire(list_resp)
     assert list_resp.status_code == httpx.codes.OK, (
@@ -135,7 +134,7 @@ def test_agent_as_own_principal_lists_accepts_and_fetches_free_resource(
     accept_resp = _post_signed_json(
         f"{compose_stack.exchange}{_ACCEPT_OFFER_PATH}",
         {
-            "ver": "1.0",
+            "ver": ProtocolVersion,
             "idempotency_key": tx_request_id,
             "requester": {
                 "id": EUR_AGENT_ID,

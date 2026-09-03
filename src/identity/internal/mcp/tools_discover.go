@@ -7,6 +7,8 @@ import (
 	"fmt"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/core"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -14,8 +16,7 @@ import (
 	"google.golang.org/protobuf/reflect/protorange"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/rampclient"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampreason"
 )
 
 // discoverInput asks for offers by URL, by free-form query, or both. At least one
@@ -56,6 +57,17 @@ type offerGroup struct {
 	// offer's signature covers these bytes, and editing any field — even
 	// re-ordering during a round-trip through a lossy model — invalidates it.
 	Offers []map[string]any `json:"offers"`
+	// Rejected names the offers that failed verification, and why. They are
+	// VISIBLE but not licensable: an agent that receives two offers where it
+	// expected three can tell a thin catalog from a signature that did not check
+	// out, which is otherwise indistinguishable from silence.
+	//
+	// The offer itself is deliberately NOT carried. An agent licenses by handing
+	// an offer back, and the purchase path does not yet re-verify what it is
+	// handed, so returning a rejected offer in full would hand back the one thing
+	// that must not be submitted. The id is enough to correlate it with a log
+	// line; the reason is enough to act on.
+	Rejected []rejectedOffer `json:"rejected,omitempty"`
 	// AbsenceReason explains an empty group: not in catalog, no offers,
 	// entitlement or budget absent, upstream briefly unavailable. A URL with
 	// nothing to sell is reported here rather than dropped, so the agent can tell
@@ -71,6 +83,18 @@ type offerGroup struct {
 	// never saw the field would have no way to tell a URL it asked for from one
 	// that was found for it.
 	DiscoveryMethod string `json:"discovery_method,omitempty"`
+}
+
+// rejectedOffer is an offer the verifier would not accept.
+type rejectedOffer struct {
+	// OfferID identifies which offer failed, so a group carrying several can be
+	// told apart. Empty when the rejected object carried no id at all, which is
+	// itself a signal worth passing on rather than hiding.
+	OfferID string `json:"offer_id,omitempty"`
+	// Reason is a stable token an agent can branch on: the signature did not
+	// verify, the offer had expired, no key could be resolved for the issuing
+	// exchange, or it carried fields this protocol version does not declare.
+	Reason string `json:"reason"`
 }
 
 // handleDiscover runs discovery through the Broker.
@@ -89,25 +113,39 @@ func (t *toolset) handleDiscover(
 		return nil, discoverOutput{}, errors.New("ramp_discover needs at least one uri or a query")
 	}
 	rpc := &rampv1.DiscoveryRequest{
-		Ver:       rampproto.Ver,
+		Ver:       helpers.ProtocolVersion,
 		Uris:      in.URIs,
 		Requester: t.requester(who.subdomain),
 	}
 	if in.Query != "" {
 		rpc.Query = &in.Query
 	}
-	resp, err := t.ramp.Resolve(who.outbound(ctx), rpc)
+	result, err := t.discovery.Resolve(t.callCtx(ctx, who), rpc)
 	if err != nil {
-		return nil, discoverOutput{}, rampError("ramp_discover", err)
+		return nil, discoverOutput{}, t.failed(ctx, who, "ramp_discover", err)
 	}
-	out, err := projectDiscovery(resp)
+	out, err := projectDiscovery(result)
 	if err != nil {
 		return nil, discoverOutput{}, err
 	}
 	out.RequestID = who.requestID
+	// Rejections are logged as well as returned. The agent needs them to read its
+	// own result; an operator needs them because a whole exchange's offers failing
+	// verification is a key-rotation or manifest problem on that exchange, which
+	// no single agent's view would ever make visible.
 	t.logger(ctx, who).InfoContext(ctx, "identity.mcp.discover",
-		"subdomain", who.subdomain, "uris", len(in.URIs), "groups", len(out.OfferGroups))
+		"subdomain", who.subdomain, "uris", len(in.URIs), "groups", len(out.OfferGroups),
+		"rejected", out.rejectedCount())
 	return nil, out, nil
+}
+
+// rejectedCount totals the offers verification refused across every group.
+func (o discoverOutput) rejectedCount() int {
+	n := 0
+	for _, g := range o.OfferGroups {
+		n += len(g.Rejected)
+	}
+	return n
 }
 
 // requester is the caller's RAMP identity as every tool sends it. Built in one
@@ -123,43 +161,107 @@ func (t *toolset) requester(subdomain string) *rampv1.Requester {
 	}
 }
 
-// projectDiscovery renders the response for the agent, carrying each Offer across
-// as the JSON object the Exchange signed rather than re-modelling it field by
-// field. A hand-written mirror would have to track every protocol change to stay
-// signature-faithful; passing the object through cannot drift.
-func projectDiscovery(resp *rampv1.DiscoveryResponse) (discoverOutput, error) {
+// projectDiscovery renders the verified result for the agent, carrying each
+// accepted Offer across as the JSON object the Exchange signed rather than
+// re-modelling it field by field. A hand-written mirror would have to track every
+// protocol change to stay signature-faithful; passing the object through cannot
+// drift.
+//
+// It reads the already-sorted result rather than the raw response, so only
+// offers that verified can reach the agent — the split is made upstream, in one
+// verifier, and this function has no way to widen it.
+func projectDiscovery(result core.DiscoveryResult) (discoverOutput, error) {
 	out := discoverOutput{
-		OfferGroups:   make([]offerGroup, 0, len(resp.GetOfferGroups())),
-		AbsenceReason: rampclient.EnumName(resp.GetAbsenceReason()),
+		OfferGroups:   make([]offerGroup, 0, len(result.Groups)),
+		AbsenceReason: rampreason.EnumPtrName(result.AbsenceReason),
 	}
-	for _, group := range resp.GetOfferGroups() {
-		offers, err := projectOffers(group.GetOffers())
+	for _, group := range result.Groups {
+		offers, err := projectOffers(group.Verified)
 		if err != nil {
 			return discoverOutput{}, err
 		}
 		out.OfferGroups = append(out.OfferGroups, offerGroup{
-			URI:             group.GetUri(),
+			URI:             group.URI,
 			Licensed:        len(offers) > 0,
 			Offers:          offers,
-			AbsenceReason:   rampclient.EnumName(group.GetAbsenceReason()),
-			DiscoveryMethod: rampclient.EnumName(group.GetDiscoveryMethod()),
+			Rejected:        projectRejected(group.Rejected),
+			AbsenceReason:   rampreason.EnumPtrName(group.AbsenceReason),
+			DiscoveryMethod: rampreason.EnumPtrName(group.DiscoveryMethod),
 		})
 	}
 	return out, nil
 }
 
-// projectOffers renders each Offer as a plain JSON object via protojson, so the
-// agent receives — and can hand back — the protocol's own encoding.
-func projectOffers(offers []*rampv1.Offer) ([]map[string]any, error) {
+// projectOffers renders each verified Offer as a plain JSON object via protojson,
+// so the agent receives — and can hand back — the protocol's own encoding.
+func projectOffers(offers []core.VerifiedOffer) ([]map[string]any, error) {
 	out := make([]map[string]any, 0, len(offers))
 	for _, offer := range offers {
-		obj, err := protoToMap(offer)
+		obj, err := protoToMap(offer.Offer())
 		if err != nil {
-			return nil, fmt.Errorf("ramp_discover: render offer %q: %w", offer.GetOfferId(), err)
+			return nil, fmt.Errorf("ramp_discover: render offer %q: %w", offer.Offer().GetOfferId(), err)
 		}
 		out = append(out, obj)
 	}
 	return out, nil
+}
+
+// projectRejected names each offer verification refused, and why.
+//
+// Only the id and the reason travel. The offer object stays behind: an agent
+// licenses by handing an offer back, and returning one that failed verification
+// would put the single object that must not be submitted into the agent's hands.
+func projectRejected(rejected []core.RejectedOffer) []rejectedOffer {
+	if len(rejected) == 0 {
+		return nil
+	}
+	out := make([]rejectedOffer, 0, len(rejected))
+	for _, r := range rejected {
+		out = append(out, rejectedOffer{
+			OfferID: r.Offer.GetOfferId(),
+			Reason:  rejectionReason(r.Reason),
+		})
+	}
+	return out
+}
+
+// rejectionReason maps a verifier failure onto a stable token.
+//
+// The token is what an agent branches on, so it is derived from the SDK's
+// sentinels rather than from the error text: a message can be reworded upstream
+// without notice, and an agent keying off prose would break silently when it
+// was. An unrecognised cause reports the class instead of leaking the text.
+//
+// Two things about the arms are load-bearing, and both were wrong when this was
+// first written, in ways no test could see because every case still produced a
+// token.
+//
+// The ORDER matters for unknown fields. An offer carrying a field this build
+// cannot render fails signature verification, and the SDK wraps BOTH sentinels
+// so a caller mapping a refusal to a denial reason resolves through the generic
+// one while a caller wanting the specific cause can still reach it. This is the
+// second kind of caller, so the specific arm has to be tested first — below the
+// signature arm it can never match.
+//
+// The EXPIRY sentinel comes from the verifier, not from the presented-offer
+// helper beside it. Those are two distinct values with different messages and
+// neither wraps the other, so matching the wrong one silently reports every
+// expired offer as unclassified.
+func rejectionReason(err error) string {
+	switch {
+	case err == nil:
+		return "unverified"
+	case errors.Is(err, helpers.ErrUnknownFields):
+		return "unknown_fields"
+	case errors.Is(err, helpers.ErrOfferSignatureInvalid):
+		return "signature_invalid"
+	case errors.Is(err, core.ErrOfferExpired):
+		return "offer_expired"
+	case errors.Is(err, helpers.ErrUnknownKey):
+		return "issuer_key_unresolved"
+	default:
+		return "unverified"
+	}
 }
 
 // protoToMap renders a protobuf message as the generic JSON object shape an MCP

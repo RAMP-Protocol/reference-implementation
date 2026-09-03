@@ -1,0 +1,13 @@
+-- Drop ramp.tenants.hmac_secret_ref. The column dates from the initial schema,
+-- where a delivery URL was believed to carry an HMAC-SHA256 signature made with
+-- a secret the Exchange shared with the CDN. No such secret was ever created.
+-- URL signing has always been asymmetric and selected per tenant by
+-- signing_scheme: Ed25519 verified by the edge worker, or RSA verified natively
+-- by CloudFront. Both read ed25519_key_ref or rsa_key_ref; neither reads this
+-- column.
+--
+-- The column is NOT NULL, so every INSERT has had to supply a value nothing
+-- would ever read -- production seeds, the staging seed script and every test
+-- fixture wrote a placeholder. Dropping it removes that obligation and removes
+-- a column whose name asserts a scheme this system does not implement.
+ALTER TABLE ramp.tenants DROP COLUMN hmac_secret_ref;

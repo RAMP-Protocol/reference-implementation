@@ -16,10 +16,10 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing/tigerbeetle"
 )
 
-const (
-	tbConfLedger uint32 = 840 // ISO 4217 USD; the conformance amounts are USD.
-	tbConfScale  uint8  = 8   // matches the adapter's default asset scale.
-)
+// tbConfLedger is the conformance ledger id: ISO 4217 USD; the conformance
+// amounts are USD. The asset scale is money.AssetScale, fixed for every
+// deployment.
+const tbConfLedger uint32 = 840
 
 var (
 	tbShared    *testutil.SharedTigerBeetle
@@ -90,7 +90,6 @@ func newTBAdapter(prefix string, holdTimeout time.Duration) (billing.Adapter, st
 		Client:      tbClient,
 		Ledger:      tbConfLedger,
 		Currency:    "USD",
-		AssetScale:  tbConfScale,
 		HoldTimeout: holdTimeout,
 		IDNamespace: ns,
 	})
@@ -116,5 +115,5 @@ func fundSeed(ctx context.Context, ns string, seed conformanceSeed) error {
 // bound to the conformance ledger + asset scale. Used by fundSeed and the
 // settlement-split assertions.
 func confLedger() tbtest.Ledger {
-	return tbtest.Ledger{Client: tbClient, ID: tbConfLedger, Scale: tbConfScale}
+	return tbtest.Ledger{Client: tbClient, ID: tbConfLedger}
 }

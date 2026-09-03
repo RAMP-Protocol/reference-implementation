@@ -17,7 +17,7 @@
     "expected.offer.data_as_of": "expected Offer.data_as_of as RFC3339; null asserts unset.",
     "expected.offer.terms_unchanged": "true asserts the projected Offer.terms set + order is identical to the metadata-free baseline for the same resource shape (entanglement invariant).",
     "expected.offer.price_unchanged": "true asserts Offer.pricing (model+rate+currency+unit) is identical to the metadata-free baseline (entanglement invariant).",
-    "expected.transact_parity": "true => the e2e MUST drive ExecuteTransaction for this offer and assert the reconstructed offer signature re-verifies (buildOffer at verifyOffer time reproduces identical metadata bytes). false/absent => not exercised."
+    "expected.transact_parity": "true => the e2e MUST drive ExecuteTransaction for this offer and assert the PRESENTED offer's signature re-verifies at execute (the signed bytes, metadata included, survive discovery -> presentation intact). false/absent => not exercised."
   },
   "requester_profiles": {
     "default": "no scopes (public). Used for every case unless the case names `requester`.",
@@ -256,7 +256,7 @@
     },
     {
       "file": "passthrough_baseline.jsonl",
-      "note": "ENTANGLEMENT/pass-through invariant pair. Both lines carry an IDENTICAL terms[] block (same license, same per_unit term, same quota). Line 1 additionally carries the full metadata payload; line 2 carries none. The e2e MUST assert that the SELECTED term and the price (model+rate+currency+unit) are IDENTICAL across the two resulting offers -- metadata is inert to licenseterm.Select. This is the core proof that adding metadata does not change which term/price is chosen.",
+      "note": "ENTANGLEMENT/pass-through invariant pair. Both lines carry an IDENTICAL terms[] block (same license, same per_unit term, same quota). Line 1 additionally carries the full metadata payload; line 2 carries none. The e2e MUST assert that the SELECTED term and the price (model+rate+currency+unit) are IDENTICAL across the two resulting offers -- metadata is inert to the Exchange's scope projection (selectTerms). This is the core proof that adding metadata does not change which term/price is chosen.",
       "cases": [
         {
           "line_number": 1,
@@ -299,7 +299,7 @@
     },
     {
       "file": "multiterm_scope_projection.jsonl",
-      "note": "ENTANGLEMENT invariant under scope projection. The resource carries TWO enumerated terms in this order: [0] premium (scopes:[\"subscription:premium\"], flat 9.99), [1] public (no scopes, flat 4.99). The SAME metadata must be emitted on the Offer regardless of which term licenseterm.Select projects for the requester. Run this line TWICE: once with the `premium` requester (selects term[0], price 9.99) and once with the `default` requester (term[0] filtered out, selects the public term, price 4.99). Metadata fields are identical in both offers; only the selected term/price differs -- driven by scopes ONLY, never by metadata.",
+      "note": "ENTANGLEMENT invariant under scope projection. The resource carries TWO enumerated terms in this order: [0] premium (scopes:[\"subscription:premium\"], flat 9.99), [1] public (no scopes, flat 4.99). The SAME metadata must be emitted on the Offer regardless of which term the Exchange's scope projection (selectTerms) keeps for the requester. Run this line TWICE: once with the `premium` requester (selects term[0], price 9.99) and once with the `default` requester (term[0] filtered out, selects the public term, price 4.99). Metadata fields are identical in both offers; only the selected term/price differs -- driven by scopes ONLY, never by metadata.",
       "cases": [
         {
           "line_number": 1,
@@ -346,7 +346,7 @@
         {
           "line_number": 1,
           "case_id": "transact_parity_full_meta",
-          "description": "Metadata-bearing line driven through the full push -> discover -> ExecuteTransaction path. After discovery returns the signed offer, the e2e calls ExecuteTransaction with that offer; the Exchange's verifyOffer reconstructs the offer via buildOffer and the signature MUST re-verify -- i.e. buildOffer reproduces byte-identical metadata (identity hashes, mutability, previews, attestations, ext, ext_critical, data_as_of) so the canonical signed bytes match. This is the signature-parity assertion that guards against metadata being included in discovery but dropped (or reordered) on reconstruction.",
+          "description": "Metadata-bearing line driven through the full push -> discover -> ExecuteTransaction path. After discovery returns the signed offer, the e2e calls ExecuteTransaction with that offer; the Exchange verifies the PRESENTED offer's exact signed bytes and the signature MUST re-verify -- i.e. the metadata the discovery path signed (identity hashes, mutability, previews, attestations, ext, ext_critical, data_as_of) reaches execute byte-identical. This is the signature-parity assertion that guards against metadata being included in discovery but dropped (or reordered) between signing and presentation.",
           "expected": {
             "parse": "ok",
             "push": "accepted",

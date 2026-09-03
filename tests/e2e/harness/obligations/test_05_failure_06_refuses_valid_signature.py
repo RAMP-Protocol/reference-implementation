@@ -37,6 +37,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from ramp_sdk import ProtocolVersion
 
 from ..conftest import StackURLs
 from ..httpsig_signer import load_keypair, sign_request
@@ -125,7 +126,11 @@ def test_valid_signature_is_not_refused_at_signature_layer(
        field would be a defect, though the practical case is a 401
        whose body names the spurious httpsig failure.
     """
-    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/regression-guard-valid.html"]}
+    body_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/regression-guard-valid.html"],
+    }
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)

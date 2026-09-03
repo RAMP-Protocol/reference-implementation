@@ -25,7 +25,11 @@ import (
 // Round-trip honesty: these are PERSISTENCE round-trips. The write leg drives the
 // full transport→service→repo→DB stack through the public RPC; the absence leg
 // reads back through repo.EvidenceRepo, the documented Testing-Doctrine §9 tier-2
-// fallback, because no evidence-read RPC exists yet.
+// fallback. The evidence read that now exists is the operator plane's
+// cross-tenant JSON endpoint on the internal listener, which is not the public
+// read surface the doctrine means — and it could not carry these assertions in
+// any case, because the cross-tenant probe below is exactly the tenant predicate
+// that endpoint does not apply.
 //
 // Where "absence" is actually asserted, and where it cannot be. A DENIED item
 // mints no transaction_id, so there is no evidence primary key to probe for it —
@@ -68,7 +72,7 @@ func assertNoEvidence(t *testing.T, h *testHarness, tenantID, txID string) {
 func TestExecuteTransaction_EvidenceIsNotReadableFromAnotherTenant(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/evidence-tenant-scope", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	resp, err := executeSingleItem(t, h, "tx-ev-tenant-scope", offer)
 	if err != nil {
@@ -121,7 +125,7 @@ func TestExecuteTransaction_MissingAgentAcceptanceIsRejected(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			offer := discoverOfferForURI(t, h, uri)
+			offer := discoverOffer(t, h, uri)
 			_, err := executeItems(t, h, tc.reqKey,
 				&rampv1.TransactionItem{Offer: offer, AgentAcceptance: tc.acceptance})
 			assertConnectError(t, err, connect.CodeInvalidArgument, tc.wantInMsg)
@@ -145,7 +149,7 @@ func TestExecuteTransaction_MissingAgentAcceptanceIsRejected(t *testing.T) {
 func TestExecuteTransaction_UnregisteredKeyAcceptanceLeavesNoEvidence(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/evidence-wrong-key", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const reqKey = "tx-ev-wrong-key"
 	requester := agentRequester("agent-test")
@@ -174,7 +178,7 @@ func TestExecuteTransaction_UnregisteredKeyAcceptanceLeavesNoEvidence(t *testing
 func TestExecuteTransaction_FreePathPersistsEvidence(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/evidence-free", "0")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	resp, err := executeSingleItem(t, h, "tx-ev-free", offer)
 	if err != nil {

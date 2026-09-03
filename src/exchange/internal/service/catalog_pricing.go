@@ -24,6 +24,21 @@ type PricingDoc struct {
 	UnitCost decimal.Decimal
 	Unit     string
 	EstQty   int32
+	// Metering is how usage is tracked for billing reconciliation, carried as a
+	// pointer so an absent value stays distinguishable from an explicit ONLINE.
+	// The protocol reads absent as ONLINE, which is also what MetersUsage below
+	// does; the distinction is kept so the offer we mint says exactly what the
+	// term said, and no more.
+	Metering *rampv1.PricingMetering
+}
+
+// MetersUsage reports whether a transaction under this price owes a usage
+// report. False only for a one-time perpetual sale (PRICING_METERING_NONE):
+// billing closes at ExecuteTransaction, so there is nothing to report later and
+// no obligation is minted. Absent metering reads as ONLINE per the protocol, so
+// a term that says nothing still meters.
+func (p PricingDoc) MetersUsage() bool {
+	return p.Metering == nil || *p.Metering != rampv1.PricingMetering_PRICING_METERING_NONE
 }
 
 // IsFree reports whether this resolved price is zero — the single predicate behind
@@ -79,6 +94,11 @@ func pricingDocFromPricing(p *rampv1.Pricing) (PricingDoc, error) {
 		Currency: p.GetCurrency(),
 		Unit:     p.GetUnit(),
 		EstQty:   p.GetEstimatedQuantity(),
+	}
+	if p.Metering != nil {
+		// Enum() returns a pointer to a copy, so the doc cannot observe a later
+		// mutation of the request message it came from.
+		doc.Metering = p.GetMetering().Enum()
 	}
 	if p.UnitCost != nil {
 		uc, ucErr := moneyOrZero(p.GetUnitCost())

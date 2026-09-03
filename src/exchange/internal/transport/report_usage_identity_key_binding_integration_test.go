@@ -61,12 +61,7 @@ func TestReportUsage_SignerKeyMustMatchCallerDirectory_ImpersonationRejected(t *
 		h.server.URL, connect.WithGRPC(),
 	)
 
-	_, err := impersonatingClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-impersonate",
-		TransactionId: txID,
-		BillingId:     billingID,
-		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
-	}))
+	_, err := impersonatingClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-impersonate", txID, billingID, &rampv1.Usage{ConsumedQuantity: 100})))
 	// keyA (victim's pinned key) != keyB (the proven signer) and the bounded re-pin
 	// does not change that → the identity↔key binding refuses with Unauthenticated
 	// before any obligation load.

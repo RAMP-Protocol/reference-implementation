@@ -7,6 +7,7 @@ import (
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/transport"
 )
@@ -38,7 +39,14 @@ func TestPushResources_MissingSignatureMiddleware_MapsToInternal(t *testing.T) {
 	// wiring fault. nil svc/registry are never reached on this branch.
 	h := transport.NewCatalogHandler(nil, nil)
 
+	// The handler is called directly, below the mount, so nothing checks the
+	// recipient here — the field is set only because a request without one is
+	// not a request this Exchange would ever see. Written out rather than built
+	// through the shared builder: this test carries no integration tag, and the
+	// builders do.
 	_, err := h.PushResources(context.Background(), connect.NewRequest(&rampv1.PushResourcesRequest{
+		Ver:      helpers.ProtocolVersion,
+		Exchange: harnessExchangeDomain,
 		CallerId: "caller.example",
 	}))
 	if err == nil {

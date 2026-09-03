@@ -5,6 +5,7 @@ package transport_test
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"strconv"
 	"testing"
 
 	connect "connectrpc.com/connect"
@@ -53,7 +54,7 @@ func mustWireRateFloat(t *testing.T, rate string) float64 {
 //	  is intact (the offer still builds and carries term-derived pricing).
 //
 //	PARITY: ExecuteTransaction on the comp-bearing offer succeeds — proving the
-//	  signed comp ext is reproduced byte-identically at tx-reconstruction
+//	  signed comp ext verifies at execute over the presented bytes
 //	  (canonicalOfferPayload covers Offer.Ext).
 //
 // It FAILS on current HEAD: the Exchange never reads supported_profiles on the
@@ -80,11 +81,7 @@ func TestComp_ProfileGatedPricingProjection(t *testing.T) {
 	}
 
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  []*rampv1.ResourceEntry{entry},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{entry})))
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -97,13 +94,13 @@ func TestComp_ProfileGatedPricingProjection(t *testing.T) {
 
 	// POSITIVE: profile-aware discover renders the comp ext.
 	compOffer := discoverCompOffer(t, h, uri)
-	assertCompPricingProjection(t, compOffer, term)
+	assertCompPricingProjection(t, compOffer, term, compPackageID(h, resourceID, 0))
 
 	// NEGATIVE: profile-free discover renders NO comp ext, base path intact.
 	baseOffer := singleOffer(t, h, uri)
 	assertNoCompProjection(t, baseOffer, term)
 
-	// PARITY: the signed comp ext survives tx-reconstruction.
+	// PARITY: the signed comp ext verifies unchanged at execute.
 	assertTransactParity(t, h, compOffer)
 }
 
@@ -114,7 +111,7 @@ func TestComp_ProfileGatedPricingProjection(t *testing.T) {
 //
 // scopes are the requester's entitlement scopes. Callers pass none when the term
 // under test carries none (seedPricedTerm), and pass one when the term is
-// scope-gated so licenseterm.Select keeps it.
+// scope-gated so the service's scope projection (selectTerms) keeps it.
 //
 // SHARED helper: used by the slice-1, slice-3, and slice-4 scenarios across the
 // comp_*_integration_test.go files; it stays in this base file so those siblings
@@ -130,11 +127,23 @@ func discoverCompOffer(t *testing.T, h *pushHarness, uri string, scopes ...strin
 	return offers[0]
 }
 
+// compPackageID derives the expected CoMP Package.id for a pushed entry: the
+// tenant-scoped resource id (tenant_id + ":" + the pushed content_id, or the
+// entry URI when no content_id was pushed) plus the selected term's ORIGINAL
+// stored index. The package id is resource-intrinsic — precomputed once at
+// snapshot rebuild — and independent of the per-offer random offer_id.
+//
+// SHARED helper: used by the comp_*_integration_test.go siblings; it stays in
+// this base file so they reuse one definition.
+func compPackageID(h *pushHarness, key string, index int) string {
+	return h.tenantID + ":" + key + "#" + strconv.Itoa(index)
+}
+
 // assertCompPricingProjection verifies the comp ext the profile-aware discover
 // emitted: a bare canonical CoMP V1 Package whose scope mirrors the selected
-// term's Pricing, whose id is "<resourceID>#0", and which a real CoMP parser
-// (comptest.Validate) accepts.
-func assertCompPricingProjection(t *testing.T, o *rampv1.Offer, term *rampv1.LicenseTerm) {
+// term's Pricing, whose id is wantID ("<resource_id>#<term-index>"), and which
+// a real CoMP parser (comptest.Validate) accepts.
+func assertCompPricingProjection(t *testing.T, o *rampv1.Offer, term *rampv1.LicenseTerm, wantID string) {
 	t.Helper()
 	compVal, ok := o.GetExt().GetFields()["comp"]
 	if !ok || compVal == nil {
@@ -147,10 +156,9 @@ func assertCompPricingProjection(t *testing.T, o *rampv1.Offer, term *rampv1.Lic
 	fields := comp.GetFields()
 
 	// Package.id == "<resource_id>#0" (Q8: <resource_id>#<term-index>). The
-	// resource id is the Offer's own id (tenant-scoped composite the agent
-	// transacts with), so derive the expectation from offer.OfferId — NOT the
-	// bare pushed content_id, which the catalog tenant-prefixes.
-	wantID := o.GetOfferId() + "#0"
+	// package id is resource-intrinsic — the caller derives wantID from the
+	// pushed content_id via compPackageID — and is unrelated to the offer's
+	// own offer_id, which is a random per-offer value.
 	if got := fields["id"].GetStringValue(); got != wantID {
 		t.Errorf("comp.id = %q, want %q", got, wantID)
 	}

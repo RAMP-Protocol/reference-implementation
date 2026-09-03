@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
+from ramp_sdk import ProtocolVersion
 
+from .constants import requester
 from .stack_urls import StackURLs
 from .relay import relay_execute
 from .signing import USD_AGENT_KEY_PATH, sign_post
@@ -37,10 +39,9 @@ def _canonical_resolve_body(body: dict[str, object]) -> dict[str, object]:
     # The pinned proto requires Requester.type != UNSPECIFIED on every message
     # carrying a Requester (enum not_in:[0]); the canonical DiscoveryRequest the
     # Broker decodes is no exception. Agent self-act → REQUESTER_TYPE_AGENT.
-    requester: dict[str, object] = {"id": body["agent_id"], "type": "REQUESTER_TYPE_AGENT"}
-    if body.get("domain") is not None:
-        requester["domain"] = body["domain"]
+    requester_obj = requester(str(body["agent_id"]), cast(str | None, body.get("domain")))
     out: dict[str, object] = {
+        "ver": ProtocolVersion,
         "id": f"rampreq-{uuid.uuid4().hex}",
         # Proto re-pin: DiscoveryRequest.idempotency_key now carries
         # min_len >= 1 (string.min_len). A resolve with an empty/absent key is
@@ -48,7 +49,7 @@ def _canonical_resolve_body(body: dict[str, object]) -> dict[str, object]:
         # the Broker — set a non-empty per-call key. Distinct from `id`
         # (correlation): idempotency_key is the dedup handle the proto requires.
         "idempotency_key": f"idem-{uuid.uuid4().hex}",
-        "requester": requester,
+        "requester": requester_obj,
         "nonce": uuid.uuid4().hex,
     }
     # budget_minor → constraints.period_budget (major units), inverting the
@@ -117,10 +118,11 @@ def resolve(
 def _first_offer(discovery_payload: dict[str, Any]) -> dict[str, Any]:
     """Pluck the ranked winner from a discovery ``DiscoveryResponse``.
 
-    Resolve is discovery-only: the winner is ``offerGroups[0].offers[0]`` —
-    a full signed Offer, ranked winner-first — and NO ``retrievalEndpoint`` is
-    minted (that is the execute phase). Reads the protojson camelCase
-    ``offerGroups``/``offers`` the Broker emits (``toDiscoveryResponse``).
+    Resolve is discovery-only: the winner is ``offer_groups[0].offers[0]`` —
+    a full signed Offer, ranked winner-first — and NO ``retrieval_endpoint`` is
+    minted (that is the execute phase). Reads the snake_case
+    ``offer_groups``/``offers`` the Broker emits (``toDiscoveryResponse``): the
+    wire is proto-JSON with proto field names, not the camelCase json_name alias.
     """
     groups = cast(list[dict[str, Any]], discovery_payload.get("offer_groups") or [])
     offers = [o for g in groups for o in cast(list[dict[str, Any]], g.get("offers") or [])]
@@ -139,11 +141,11 @@ def execute_first_offer(
     """Two-phase relay: Broker Resolve (discovery) then relay-execute.
 
     Phase 1 — Broker ``Resolve`` returns the ranked signed Offers in
-    ``offerGroups`` (discovery-only, R7; no signed URL). Phase 2 — the agent
+    ``offer_groups`` (discovery-only, R7; no signed URL). Phase 2 — the agent
     reflects the winning Offer onto an ExecuteTransaction, signs an
     ``AgentAcceptance`` over it, and relays it through the Broker
     (``relay_execute``; agent sig1 + Broker sig2) to the Exchange, which mints
-    the agent-bound ``retrievalEndpoint``. The same ``agent_id``/``key_path``
+    the agent-bound ``retrieval_endpoint``. The same ``agent_id``/``key_path``
     drives both phases so sig1's keyID == the requester identity == the
     acceptance key. Under re-package the agent signs the Broker relay route only;
     the Broker derives the Exchange target from the signed ``offer.exchange`` and

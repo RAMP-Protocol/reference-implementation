@@ -26,11 +26,13 @@
 // can express, and neither is negotiable — the parameter order is
 // keyid;alg;created;expires, and created is an injected value rather than now(),
 // which yaronf stamps itself with no override hook. The contract belongs to the
-// delivery edge, whose verifier is the SDK's TypeScript face, so a second base
-// builder is the cost of speaking it. The shared vectors
-// (testdata/pop-signature-base-vectors.json for the base,
-// testdata/pop-sign-vectors.json for the emitted headers) are what keep the two
-// builders from drifting apart unnoticed.
+// delivery edge, so a second base builder is the cost of speaking it.
+//
+// Only the VERIFYING half of that profile is left here. The signer moved to the
+// protocol SDK, which now emits these headers for every language, so what this
+// package keeps is the base builder a verifier needs and the shared vectors it
+// is pinned to (testdata/pop-signature-base-vectors.json). The header NAMES are
+// the SDK's — one wire header, one declaration.
 package httpsig
 
 import (

@@ -47,9 +47,48 @@ file next to it), and secrets go into a separate gitignored
     it does not own. If an earlier deployment managed these same names from
     somewhere else, remove those records first with that deployment's own
     tooling — otherwise the first apply fails on the existing records.
-- **SSH and your address** — same as the staging guide: `ssh_public_key`,
-  `ssh_ingress_cidr` (your `<ip>/32`), and `ssh_private_key_path` when the
-  key is not one your ssh client offers by default.
+- **SSH: one entry per operator** — same shape as the staging guide. One
+  `ssh_operators` entry per person, keyed by name:
+
+  ```hcl
+  ssh_operators = {
+    alice = {
+      public_key   = "ssh-ed25519 AAAA... alice@laptop"
+      source_cidrs = ["203.0.113.7/32"]
+    }
+  }
+  ```
+
+  **Two SSH settings, and they take opposite kinds of value.** `public_key` is
+  the one-line CONTENTS of the operator's `.pub` file, not a path to it — read
+  it with `cat ~/.ssh/id_ed25519.pub` and paste the whole line. Terraform
+  variable-definition files cannot call functions, so
+  `file("~/.ssh/id_ed25519.pub")` does not work in `terraform.tfvars`.
+  `RAMP_SSH_IDENTITY_FILE` is the opposite: a PATH, to the matching PRIVATE
+  key, set as an environment variable rather than a Terraform input. It MUST
+  resolve to an absolute path. `~` is NOT expanded inside a quoted assignment,
+  so write `$HOME` or the full path instead:
+
+  ```bash
+  export RAMP_SSH_IDENTITY_FILE="$HOME/.ssh/id_ed25519"   # NOT "~/.ssh/id_ed25519"
+  ```
+
+  Addresses are single hosts written as `/32`. Each key is installed with an
+  OpenSSH `from=` option carrying only that operator's own addresses, so one
+  operator's key cannot be used from another operator's address. The security
+  group opens the union; `from=` restricts each key inside it.
+
+  **Editing `ssh_operators` replaces the VM and destroys its data** — the map
+  is part of the instance's user data, so adding, removing, or re-keying an
+  operator recreates the instance. The Elastic IP survives; the root volume
+  does not.
+
+  **Everyone logs in as `ubuntu`. Per-operator keys are not per-operator
+  accounts.** Each key can be revoked on its own and each authentication is
+  attributable to a key, but once the session is open every operator is the
+  same Unix user, and shell history cannot be attributed to a person. If
+  per-person shell accountability is needed, the answer is a Unix account per
+  operator or Systems Manager session logging — this does not provide it.
 - **Container registry** — same as the staging guide: `image_registry`,
   `image_prefix` (lowercase), `image_tag`, and for private images
   `registry_username` plus `registry_password` in `secrets.auto.tfvars`.
@@ -58,6 +97,12 @@ file next to it), and secrets go into a separate gitignored
   is different here: its certificate comes from **ACM** (created by the
   stack in us-east-1, validated automatically over DNS in the same zone) —
   no email, no manual step.
+- **Outbound mail** — nothing to configure, but two gates open only after
+  the apply. The stack creates an Amazon SES domain identity, its three DKIM
+  records and a send-only credential, and hands them to Zitadel so developer
+  self-registration can deliver its confirmation code. SES then has to finish
+  verifying the domain, and a new SES account may only send to verified
+  recipients until AWS grants production access. See "Outbound mail" below.
 - **EXA API key (optional)** — enables the Broker's EXA-backed discovery.
   Goes into: `exa_api_key` in `secrets.auto.tfvars`. Without it the Broker
   still runs; only that discovery source is off.
@@ -158,6 +203,42 @@ Re-run BOTH commands (render, then build) after changing any hostname
 variable or `ramp_enforce_binding`, then apply again — the running edge only
 picks up what is in the zip.
 
+### This deployment runs with agent binding OFF
+
+`terraform.tfvars` sets `ramp_enforce_binding = "false"`, so this is the one
+place that fact is written down: the tfvars file is gitignored, and without
+this note the only record would be one operator's laptop.
+
+With the check enforced (the default everywhere else) the edge answers a signed
+URL only when the caller proves it holds the agent key the URL is bound to. The
+caller sends its Ed25519 public key in `x-ramp-agent-key` and signs the request
+per RFC 9421; the edge checks that the key's thumbprint equals the `agent_id`
+in the URL. A request without those headers is refused with 403 and the reason
+`missing_agent_key`. That makes a signed URL non-transferable — stealing the
+URL is useless without the private key.
+
+Turning it off makes the signed URL a bearer token. Anyone who obtains the URL
+can redeem it until it expires. The trade is that a plain HTTP client can fetch
+a demo article, which is what makes the delivery path demonstrable and
+debuggable by hand.
+
+This posture is for the demo only. Do not copy it to a deployment serving real
+publisher content.
+
+Confirm what is actually deployed — the variable, the rendered bundle config,
+and the running edge, in that order:
+
+```bash
+terraform output -raw ramp_enforce_binding          # expect: false
+grep -o 'RAMP_ENFORCE_BINDING[^,]*' lambda-edge-config.json
+curl -s -o /dev/null -w '%{http_code}\n' -A 'ClaudeBot/1.0' '<a fresh signed URL>'
+```
+
+The first two can disagree with the third: the output and the file describe
+what was rendered, the edge serves whatever its zip was built with. If the
+first two say `false` and a bare fetch still returns 403 with
+`missing_agent_key`, step 4 was skipped.
+
 ## Step 5 — second apply, with the edge
 
 ```bash
@@ -198,12 +279,22 @@ Exchange, not by the publisher hostname) and `/rsl.txt` answers an empty
 
 All four are the staging guide's steps 5–8, run with `STACK_DIR` pointing at
 the demo stack (exported at the top of this guide). Everything written there
-— the Zitadel bootstrap and its `FORCE=1` semantics, Google sign-in, the
-SMTP note, what seeding creates, how test money works, what the smoke check
-proves — applies unchanged:
+— the Zitadel bootstrap and its `FORCE=1` semantics, Google sign-in, what
+seeding creates, how test money works, what the smoke check proves — applies
+unchanged. The one part that does not is the staging guide's SMTP note: this
+stack configures a mail provider, so read "Outbound mail" below instead of
+its three manual workarounds.
+
+Run all four:
 
 ```bash
-deploy/terraform/scripts/bootstrap-identity.sh
+# To offer "Sign in with Google", pass the OAuth client to the bootstrap.
+# Omit both and the script skips federation, leaving local sign-in as the
+# only option. Nothing stores these — they exist only in this shell.
+GOOGLE_CLIENT_ID="<client id>.apps.googleusercontent.com" \
+GOOGLE_CLIENT_SECRET="<client secret>" \
+    deploy/terraform/scripts/bootstrap-identity.sh
+
 deploy/terraform/scripts/seed-staging.sh
 deploy/terraform/scripts/fund-staging-agent.sh
 deploy/terraform/scripts/smoke.sh
@@ -214,12 +305,106 @@ Two demo-specific notes:
 - The Google redirect URI from the staging guide's bootstrap section is
   `https://login.demo.<domain>/ui/login/login/externalidp/callback` here
   (print it with the same `terraform output` one-liner, swapping in this
-  stack's directory).
+  stack's directory). The hostname does not change when the VM is replaced,
+  so nothing has to be edited at Google after a rebuild. The identity
+  provider itself does not survive one — it is stored in Zitadel's database,
+  so re-supply both variables when you re-run the bootstrap.
 - The smoke check reads the edge's proof-of-possession posture back from
   this stack's `ramp_enforce_binding` output, so its bare-fetch expectation
   follows the deployment automatically. Remember the output describes what
   was RENDERED — if you changed the variable without re-doing step 4, the
   running edge still enforces whatever its zip was built with.
+
+## Outbound mail
+
+Developer self-registration sends a confirmation code, and the account stays
+unusable until the code is entered. This stack configures Zitadel to send
+that mail through Amazon SES.
+
+What Terraform creates, all in **us-east-1** whatever `aws_region` says:
+
+- an SES domain identity for `<domain>`;
+- three Easy DKIM CNAME records in the same Route 53 zone;
+- an IAM user whose only permission is `ses:SendRawEmail`, restricted to
+  that identity and to the exact sender address `noreply@<domain>`;
+- an access key for that user, whose key id is the SMTP username and whose
+  derived password is the SMTP password.
+
+Zitadel reads the settings when it creates its instance on the **first**
+start, and stores them in its own database. Two consequences:
+
+- Changing any of them means changing the VM's cloud-init user data, which
+  **replaces the VM and destroys every local volume** — Postgres, Zitadel,
+  Vault, TigerBeetle. Treat a mail-settings change as a full rebuild, then
+  re-run steps 6–9.
+- Editing the provider on a **running** instance is a different operation
+  entirely: Zitadel console → Default settings → Notifications → SMTP
+  provider. That edit does not survive a rebuild, and Terraform does not
+  know about it.
+
+Read the configured values back with:
+
+```bash
+# from stacks/demo-aws
+terraform output zitadel_smtp_host
+terraform output zitadel_smtp_from
+terraform output zitadel_smtp_username
+terraform output -raw zitadel_smtp_password
+```
+
+The SMTP password is stored in plain text in the local state file and in the
+VM's user data, the same as every other secret this stack generates.
+
+### Gate 1 — SES has to verify the domain
+
+A successful apply does not mean SES will send. It publishes the DKIM
+records; SES then has to see them. Until it does, every send fails.
+
+```bash
+aws ses get-identity-verification-attributes --region us-east-1 \
+    --identities "$(terraform output -raw zitadel_smtp_from | cut -d@ -f2)"
+aws sesv2 get-email-identity --region us-east-1 \
+    --email-identity "$(terraform output -raw zitadel_smtp_from | cut -d@ -f2)"
+```
+
+Wait for `VerifiedForSendingStatus: true` and `DkimAttributes.Status:
+SUCCESS`. This usually takes minutes but can take longer, and the VM can
+finish booting well before it.
+
+### Gate 2 — a new SES account is sandboxed
+
+In the sandbox, SES only delivers to recipients that are themselves verified
+in **us-east-1**. Sandbox status is per region, so verifying elsewhere does
+not help.
+
+To test before production access is granted, verify one address you control
+and register with that address:
+
+```bash
+aws sesv2 create-email-identity --region us-east-1 \
+    --email-identity you@example.com
+# then confirm the mail SES sends to that address
+```
+
+Request production access in the SES console for us-east-1, or with
+`aws sesv2 put-account-details`. Describe what the mail is: transactional
+identity messages, sent only to an address the recipient typed into a
+sign-up form, with the public application URL. AWS answers the request
+within about a day, longer if it asks for more detail.
+
+After approval, register with an address that is not verified and confirm
+both the mail and the sign-up flow work end to end. Check the SES sending
+statistics for rejections, bounces, or complaints.
+
+Publishing a DMARC TXT record at `_dmarc.<domain>` — starting with `p=none`,
+which only monitors — improves deliverability. Easy DKIM is enough to start,
+and a custom MAIL FROM domain is not needed here.
+
+### When mail does not arrive
+
+`deploy/zitadel/RUNBOOK.md` §3.4 covers diagnosis: reading the stored
+provider, sending a test message, and telling a Zitadel problem apart from
+an SES one.
 
 ## Verifying by hand
 
@@ -262,8 +447,10 @@ the smoke check.
    key on the agent's behalf.
 
 2. **Register and fund the agent.** Ask the assistant to register its agent
-   with the exchange (the `ramp_register` tool; `ramp_status` works too if
-   it is already registered). The reply carries the agent's `billing_ref` —
+   with the exchange, naming it: `ramp_register` takes the exchange's domain
+   and the registration details that exchange publishes a schema for.
+   `ramp_status` with the same domain works too if the agent is already
+   registered. The reply carries the agent's `billing_ref` —
    a random handle the Exchange minted. The canary article costs 9.99 EUR
    and a fresh agent's balance is empty, so credit that specific account:
 
@@ -312,6 +499,84 @@ the smoke check.
      side.
    - *Sign-in fails*: the Identity Service and Zitadel logs on the VM
      (`sudo docker compose -f /opt/ramp/docker-compose.yml logs identity zitadel`).
+
+## Reaching the admin plane and the database over SSH
+
+Two services are published on the VM's **loopback** interface: the Exchange's
+admin listener on `127.0.0.1:8082` and Postgres on `127.0.0.1:5432`. Nothing
+outside the VM can open them directly — the security group does not carry
+either port, and the containers bind loopback rather than a wildcard address.
+Reach them through an SSH tunnel:
+
+```bash
+# from stacks/demo-aws. Forwards both ports and stays in the foreground;
+# Ctrl-C closes the tunnel.
+$(terraform output -raw ssh_command) -N \
+    -L 8082:127.0.0.1:8082 \
+    -L 5432:127.0.0.1:5432
+```
+
+The `ssh_command` output selects no private key: it is `ssh ubuntu@<ip>` and
+nothing more. If your key is not one your ssh client tries by default, name it
+yourself — `RAMP_SSH_IDENTITY_FILE` is an environment variable the operator
+scripts read, not something Terraform puts into this output:
+
+```bash
+export RAMP_SSH_IDENTITY_FILE="$HOME/.ssh/id_ed25519"   # NOT "~/.ssh/id_ed25519"
+
+ssh -o IdentitiesOnly=yes -i "${RAMP_SSH_IDENTITY_FILE}" -N \
+    -L 8082:127.0.0.1:8082 \
+    -L 5432:127.0.0.1:5432 \
+    "ubuntu@$(terraform output -raw vm_public_ip)"
+```
+
+`IdentitiesOnly=yes` matters: without it ssh offers every key in your agent
+first, the server refuses each one that is not yours, and after enough refusals
+you get `Too many authentication failures` — which looks like a broken key
+rather than the wrong key being offered first.
+
+You must also connect from one of the addresses listed in your own
+`ssh_operators` entry. Another operator's address being open does not help you:
+each key carries an OpenSSH `from=` restriction holding only its own addresses.
+
+With that running, in a second terminal:
+
+```bash
+# Is the admin plane reachable? Read only the status line. 404 is the answer
+# you want: the request got through the tunnel AND past the allowlist, and the
+# admin router simply has no handler on "/". 403 means the allowlist rejected
+# the caller. "Connection refused" means the tunnel is not up.
+curl -si http://127.0.0.1:8082/ | head -1
+
+# The database. The password is in the stack's Terraform state.
+PGPASSWORD=$(terraform output -raw postgres_password) \
+    psql -h 127.0.0.1 -p 5432 -U ramp -d ramp
+```
+
+Two things about the admin listener are worth knowing before you debug a
+failure on it:
+
+- **It has no login.** The only control is a source-address allowlist,
+  `ADMIN_ALLOWED_CIDRS`. That is exactly why the port is bound to loopback and
+  kept out of the security group. Do not publish it on `0.0.0.0`.
+- **The allowlist holds the compose network's subnet, not `127.0.0.1`.**
+  Publishing a port makes Docker rewrite the source address to the compose
+  network's gateway, so the container never sees a loopback source. The stack
+  fills `ADMIN_ALLOWED_CIDRS` from the same `network_subnet` value the network
+  itself uses (default `172.28.0.0/24`), so the two stay in step when you
+  override it. The middleware reads the connection's source address and
+  ignores `X-Forwarded-For`, so no request header can widen the allowlist —
+  a `403` here means the address really is outside the CIDR. The listener's
+  own settings are documented in
+  [`src/exchange/CONFIGURATION.md`](../../../src/exchange/CONFIGURATION.md).
+
+The tunnel's main use is the evidence chain: given one transaction id it renders
+what the Exchange, the Broker and the edge each recorded about it, and
+re-verifies both signatures offline.
+[demo-evidence-chain.md](demo-evidence-chain.md) is written for the person you
+are demoing to: it walks them through buying an article over MCP, and then
+through rendering its chain if you grant them this tunnel. Its appendix lists
+the preflight checks that are yours rather than theirs.
 
 ## Where the edge logs are
 

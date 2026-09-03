@@ -10,9 +10,9 @@ import (
 	"time"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/app"
 )
@@ -29,16 +29,6 @@ import (
 
 const canonicalArticle = "https://news.example/articles/42"
 
-// allowLoopbackFetch opens the SDK's two guards so the httptest edge double is
-// reachable: SKIP_SSRF drops the dial-time address guard, ALLOW_INSECURE permits
-// its plaintext http scheme. The compose e2e stack sets the same pair, so the
-// production posture is exercised there rather than faked here.
-func allowLoopbackFetch(t *testing.T) {
-	t.Helper()
-	t.Setenv("SKIP_SSRF", "1")
-	t.Setenv("ALLOW_INSECURE", "1")
-}
-
 // deliveryResult is executeResult plus the delivery failures, which the base
 // shape deliberately does not carry.
 type deliveryResult struct {
@@ -49,6 +39,10 @@ type deliveryResult struct {
 		Reason  string `json:"reason"`
 		Message string `json:"message"`
 	} `json:"delivery_failures"`
+	// RequestID is the correlation id the call ran under, as the agent receives
+	// it. Mirrored here so a delivery test can compare it against what the edge
+	// saw — the two are the same id or the two sides' logs cannot be joined.
+	RequestID string `json:"request_id"`
 }
 
 // offerWithCanonicalURL is signedOffer carrying the resource identity the
@@ -101,14 +95,13 @@ func callToolRaw(
 // URL is bound to, and the content still comes back — which can only happen if
 // the key the service fetched with is the key it signed the acceptance with.
 func TestExecute_DeliversContentThroughAnEnforcingEdge(t *testing.T) {
-	allowLoopbackFetch(t)
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	edge := testutil.NewEdgeDouble(t, time.Now().Unix())
 	edge.SetBody([]byte("<html>the licensed article</html>"), "text/html; charset=utf-8")
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:               rampproto.Ver,
+		Ver:               helpers.ProtocolVersion,
 		AgentIdentityHash: a.Thumbprint,
 		Items:             []*rampv1.TransactionResultItem{deliveredItem("offer-1", edge.URLFor(a.Thumbprint))},
 	}
@@ -153,17 +146,16 @@ func TestExecute_DeliversContentThroughAnEnforcingEdge(t *testing.T) {
 // comment calls the single place the acceptance key and the fetch key could be
 // made to disagree.
 func TestExecute_FetchesAsTheCallingAgent(t *testing.T) {
-	allowLoopbackFetch(t)
 	f := newFixture(t)
-	bound := f.provision(t, "dev-one", acmeDetails)
-	caller := f.provision(t, "dev-two", acmeDetails)
+	bound := f.provision(t, "dev-one")
+	caller := f.provision(t, "dev-two")
 	if bound.Thumbprint == caller.Thumbprint {
 		t.Fatal("the two agents share a key; the fixture cannot tell them apart")
 	}
 
 	edge := testutil.NewEdgeDouble(t, time.Now().Unix())
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:   rampproto.Ver,
+		Ver:   helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{deliveredItem("offer-1", edge.URLFor(bound.Thumbprint))},
 	}
 
@@ -195,14 +187,13 @@ func TestExecute_FetchesAsTheCallingAgent(t *testing.T) {
 // content blocks suppresses the SDK's own JSON text block, so every client that
 // reads content[0].text would lose the delivery URLs. The handler re-adds it.
 func TestExecute_KeepsTheStructuredTextBlock(t *testing.T) {
-	allowLoopbackFetch(t)
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	edge := testutil.NewEdgeDouble(t, time.Now().Unix())
 	endpoint := edge.URLFor(a.Thumbprint)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:   rampproto.Ver,
+		Ver:   helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{deliveredItem("offer-1", endpoint)},
 	}
 
@@ -237,9 +228,8 @@ func TestExecute_KeepsTheStructuredTextBlock(t *testing.T) {
 // fails must be REPORTED, never turned into a failed call. The URL survives so
 // an agent that can reach the edge itself still has what it paid for.
 func TestExecute_PartialDeliveryFailureStillSucceeds(t *testing.T) {
-	allowLoopbackFetch(t)
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	edge := testutil.NewEdgeDouble(t, time.Now().Unix())
 	broken := testutil.NewEdgeDouble(t, time.Now().Unix())
@@ -247,7 +237,7 @@ func TestExecute_PartialDeliveryFailureStillSucceeds(t *testing.T) {
 		`{"error":"Agent binding check failed","reason":"pop_expired"}`)
 	brokenURL := broken.URLFor(a.Thumbprint)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{
 			deliveredItem("offer-1", edge.URLFor(a.Thumbprint)),
 			deliveredItem("offer-2", brokenURL),
@@ -296,14 +286,13 @@ func TestExecute_PartialDeliveryFailureStillSucceeds(t *testing.T) {
 // TestExecute_AllDeliveriesFailingStillSucceeds is the same invariant at its
 // limit: not one byte arrived, and the call still reports a completed purchase.
 func TestExecute_AllDeliveriesFailingStillSucceeds(t *testing.T) {
-	allowLoopbackFetch(t)
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	broken := testutil.NewEdgeDouble(t, time.Now().Unix())
 	broken.SetRefusal(http.StatusInternalServerError, "upstream is down")
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:   rampproto.Ver,
+		Ver:   helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{deliveredItem("offer-1", broken.URLFor(a.Thumbprint))},
 	}
 
@@ -333,14 +322,13 @@ func TestExecute_AllDeliveriesFailingStillSucceeds(t *testing.T) {
 // a service that fetched refused items eagerly. One hit, for the one licensed
 // item, is the real statement.
 func TestExecute_RefusedItemIsNeverFetched(t *testing.T) {
-	allowLoopbackFetch(t)
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	edge := testutil.NewEdgeDouble(t, time.Now().Unix())
 	denial := rampv1.DenialReason_DENIAL_REASON_OFFER_EXPIRED
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{
 			{OfferId: "offer-1", DenialReason: &denial},
 			deliveredItem("offer-2", edge.URLFor(a.Thumbprint)),
@@ -371,13 +359,12 @@ func TestExecute_RefusedItemIsNeverFetched(t *testing.T) {
 // canonical URL. The delivery URL minus its query is the content's true
 // location and carries no credential.
 func TestExecute_FallsBackToTheStrippedDeliveryURL(t *testing.T) {
-	allowLoopbackFetch(t)
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	edge := testutil.NewEdgeDouble(t, time.Now().Unix())
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:   rampproto.Ver,
+		Ver:   helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{deliveredItem("offer-1", edge.URLFor(a.Thumbprint))},
 	}
 
@@ -403,19 +390,18 @@ func TestExecute_FallsBackToTheStrippedDeliveryURL(t *testing.T) {
 // not reach the edge at all, and it must keep its URL, because the Exchange has
 // already charged for it and the agent may fetch it itself.
 func TestExecute_BudgetExhaustedIsReportedPerItem(t *testing.T) {
-	allowLoopbackFetch(t)
 	const itemCap = 64
-	f := newBoundedFixture(t, func(c *app.MCPConfig) {
+	f := newBoundedFixture(t, func(c *app.MCPConfig, _ peerSet) {
 		c.MaxContentBytes = itemCap
 		c.MaxCallContentBytes = itemCap // room for exactly one item
 	})
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	edge := testutil.NewEdgeDouble(t, time.Now().Unix())
 	edge.SetBody([]byte("tiny"), "text/plain")
 	endpoint := edge.URLFor(a.Thumbprint)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{
 			deliveredItem("offer-1", endpoint),
 			deliveredItem("offer-2", endpoint),
@@ -460,11 +446,10 @@ func TestExecute_BudgetExhaustedIsReportedPerItem(t *testing.T) {
 // reported rather than attempted, which is what keeps one slow publisher from
 // costing N × the per-fetch timeout.
 func TestExecute_CallDeadlineIsReportedPerItem(t *testing.T) {
-	allowLoopbackFetch(t)
-	f := newBoundedFixture(t, func(c *app.MCPConfig) {
+	f := newBoundedFixture(t, func(c *app.MCPConfig, _ peerSet) {
 		c.CallContentTimeout = 150 * time.Millisecond
 	})
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	edge := testutil.NewEdgeDouble(t, time.Now().Unix())
 	release := make(chan struct{})
@@ -475,7 +460,7 @@ func TestExecute_CallDeadlineIsReportedPerItem(t *testing.T) {
 	})
 	endpoint := edge.URLFor(a.Thumbprint)
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver: rampproto.Ver,
+		Ver: helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{
 			deliveredItem("offer-1", endpoint),
 			deliveredItem("offer-2", endpoint),
@@ -514,9 +499,8 @@ func TestExecute_CallDeadlineIsReportedPerItem(t *testing.T) {
 // request URL. Message text is what clients forward into their own diagnostics,
 // so it outlives the credential in it; the structured field does not.
 func TestExecute_DeliveryFailureMessageCarriesNoCredential(t *testing.T) {
-	allowLoopbackFetch(t)
 	f := newFixture(t)
-	a := f.provision(t, "dev-one", acmeDetails)
+	a := f.provision(t, "dev-one")
 
 	// A closed listener, so the fetch fails at dial and the cause is the *url.Error
 	// that carries the URL — the exact path that used to leak.
@@ -524,7 +508,7 @@ func TestExecute_DeliveryFailureMessageCarriesNoCredential(t *testing.T) {
 	endpoint := edge.URLFor(a.Thumbprint)
 	edge.Close()
 	f.broker.relayResp = &rampv1.TransactionResponse{
-		Ver:   rampproto.Ver,
+		Ver:   helpers.ProtocolVersion,
 		Items: []*rampv1.TransactionResultItem{deliveredItem("offer-1", endpoint)},
 	}
 

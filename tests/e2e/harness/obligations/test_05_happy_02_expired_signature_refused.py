@@ -38,6 +38,7 @@ from typing import Any
 
 import httpx
 import pytest
+from ramp_sdk import ProtocolVersion
 
 from ..conftest import StackURLs
 from ..httpsig_signer import load_keypair, sign_request
@@ -122,7 +123,11 @@ def test_expired_signature_is_refused_with_specific_reason(
     2. ``says the signature is expired`` — the refusal reason names
        the expired signature (token from the EXPIRED bucket).
     """
-    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/any.html"]}
+    body_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/any.html"],
+    }
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)
@@ -186,7 +191,11 @@ def test_future_created_signature_is_refused_with_specific_reason(
        the EXPIRED ∪ FUTURE-CREATED buckets, since both halves share
        a timestamp-window vocabulary).
     """
-    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/any.html"]}
+    body_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/any.html"],
+    }
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = load_keypair(CONTRIBUTOR_KEY_PATH)

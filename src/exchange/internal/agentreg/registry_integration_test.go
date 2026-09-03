@@ -248,7 +248,7 @@ func TestRegistry_HappyPath(t *testing.T) {
 //
 // Without it, the discovery_url arm is proven only by a handler test that feeds
 // the sentinel to a stub registry: that shows the handler renders the sentinel,
-// not that the registry produces it. Revert this arm to ErrMalformedManifest and
+// not that the registry produces it. Revert this arm to ErrMalformedDirectory and
 // the whole suite still passes, while the endpoint goes back to blaming a
 // manifest that was never fetched — the wrong diagnosis the split exists to end.
 func TestRegistry_DiscoveryURLNamingNoHostRefused(t *testing.T) {
@@ -269,8 +269,8 @@ func TestRegistry_DiscoveryURLNamingNoHostRefused(t *testing.T) {
 					"fetched, so blaming the manifest would send the caller to inspect a "+
 					"document that was never retrieved", agentID, badURL, err)
 			}
-			if errors.Is(err, agentreg.ErrMalformedManifest) {
-				t.Errorf("refusal also matches ErrMalformedManifest; the split is what "+
+			if errors.Is(err, agentreg.ErrMalformedDirectory) {
+				t.Errorf("refusal also matches ErrMalformedDirectory; the split is what "+
 					"gives this fault its own diagnosis (err=%v)", err)
 			}
 			if _, err := q.GetAgent(ctx, agentID); err == nil {
@@ -726,8 +726,8 @@ func TestRegistry_MalformedManifest(t *testing.T) {
 	rw.set(agentID, newRawOrigin(t, http.StatusOK, "{not valid ramp json").URL)
 
 	err := reg.RegisterFromDirectory(ctx, agentID, agentID)
-	if !errors.Is(err, agentreg.ErrMalformedManifest) {
-		t.Fatalf("want ErrMalformedManifest for a schema-invalid body, got %v", err)
+	if !errors.Is(err, agentreg.ErrMalformedDirectory) {
+		t.Fatalf("want ErrMalformedDirectory for a schema-invalid body, got %v", err)
 	}
 	if _, err := q.GetAgent(ctx, agentID); err == nil {
 		t.Fatal("no agent row should persist for a malformed manifest")

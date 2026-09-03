@@ -15,36 +15,35 @@
 package service
 
 import (
-	"context"
-	"crypto/ed25519"
 	"errors"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
 
-// verifyAgentAcceptance resolves the agent's registered Ed25519 key for
-// req.requester.id and verifies the body offer-acceptance signature against it,
-// returning the delivery-URL binding derived from THAT key (never the transport
-// caller / broker key). agentID is the already-resolved requester id.
+// verifyAgentAcceptance verifies the body offer-acceptance signature against
+// the request's agent key snapshot and returns the delivery-URL binding derived
+// from THAT key (never the transport caller / broker key).
+//
+// It takes the key rather than the agent id, and it is a plain function with no
+// service receiver and no context, so it CANNOT re-read the registry. Every
+// item in one request is therefore checked against the one snapshot
+// resolveAgent took — see agentKey for why a mid-request key rotation must not
+// be able to split a response across two of them.
 //
 // Error mapping (ADR-019):
-//   - unknown / unregistered agent          → KindNotFound (resolveAgentID owns
-//     this earlier; kept defensive here)
-//   - malformed stored key                  → KindInternal
+//   - no usable key in the snapshot          → KindInternal (agentKey.verifier)
 //   - ErrAcceptanceSignatureInvalid (wrong  → KindSignatureInvalid
 //     key / tampered binding)                 (DENIAL_REASON_SIGNATURE_INVALID)
-func (s *ExchangeService) verifyAgentAcceptance(
-	ctx context.Context, req *rampv1.TransactionRequest, agentID string,
+func verifyAgentAcceptance(
+	req *rampv1.TransactionRequest, key agentKey,
 ) (agentBinding, error) {
-	agent, err := s.agentAcceptanceKey(ctx, agentID)
+	pub, err := key.verifier()
 	if err != nil {
 		return agentBinding{}, err
 	}
-	pub := ed25519.PublicKey(agent.PublicKey)
 	// Items-only: the offer + acceptance are presented in items[0]
 	// (executeBatchItem re-projects each item onto a 1-item synthetic request).
 	item := req.GetItems()[0]
@@ -80,34 +79,35 @@ func (s *ExchangeService) verifyAgentAcceptance(
 	if err != nil {
 		return agentBinding{}, exchange.Wrap(exchange.KindInternal, err, "compute canonical acceptance bytes")
 	}
-	binding, err := agentBindingForKey(pub, agent.DiscoveryURL, acceptanceBytes)
+	binding, err := agentBindingForKey(key, acceptanceBytes)
 	if err != nil {
 		return agentBinding{}, err
 	}
 	return binding, nil
 }
 
-// agentAcceptanceKey loads the registered agent record whose Ed25519 key verifies
-// the acceptance. The id was already proven registered by resolveAgentID, so a
-// not-found here is a defensive NotFound; a stored key of the wrong length is an
-// internal invariant violation. The whole record is returned, not just the key,
-// because the success path also persists the agent's discovery URL as the
-// provenance of that key — the registry overwrites a rotated key in place and
-// keeps no history of where a retired one came from.
-func (s *ExchangeService) agentAcceptanceKey(ctx context.Context, agentID string) (repo.Agent, error) {
-	if s.agents == nil {
-		return repo.Agent{}, exchange.Newf(exchange.KindInternal, "service has no agents repo wired")
-	}
-	agent, err := s.agents.ByID(ctx, agentID)
+// verifyRequestAcceptance proves that the registered agent authorized the
+// complete ordered projection addressed to this Exchange. The canonical bytes
+// it returns are the authenticated request identity persisted by ClaimRequest.
+// It verifies against the same snapshot every item check uses, so the proof and
+// the items it covers can never be checked against different keys.
+func (s *ExchangeService) verifyRequestAcceptance(
+	req *rampv1.TransactionRequest, key agentKey,
+) (agentBinding, []byte, error) {
+	pub, err := key.verifier()
 	if err != nil {
-		if errors.Is(err, repo.ErrAgentNotFound) {
-			return repo.Agent{}, exchange.Newf(exchange.KindNotFound, "agent %q not registered", agentID)
-		}
-		return repo.Agent{}, exchange.Wrap(exchange.KindInternal, err, "lookup agent acceptance key")
+		return agentBinding{}, nil, err
 	}
-	if len(agent.PublicKey) != ed25519.PublicKeySize {
-		return repo.Agent{}, exchange.Newf(exchange.KindInternal,
-			"agent %q has a non-ed25519 registered key (%d bytes)", agentID, len(agent.PublicKey))
+	canonical, err := helpers.VerifyRequestAcceptanceProjection(
+		req, req.GetAgentRequestAcceptance(), s.cfg.Exchange, pub,
+	)
+	if err != nil {
+		return agentBinding{}, nil, exchange.Wrap(exchange.KindSignatureInvalid, err,
+			"verify agent request acceptance")
 	}
-	return agent, nil
+	binding, err := agentBindingForKey(key, nil)
+	if err != nil {
+		return agentBinding{}, nil, err
+	}
+	return binding, canonical, nil
 }

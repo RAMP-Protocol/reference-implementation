@@ -22,109 +22,44 @@ different rule fired.
 
 Pure subprocess work: no stack, no Docker, no database. The marks come from
 ``guard_harness.guard_marks``, whose docstring says why the isolation one is
-there.
+there. The fixture — the three documents, the scan roots, the tree builder —
+lives in ``deployment_docs``, because the suite guarding the release tool needs
+exactly the same one.
 """
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from .conftest import REPO_ROOT
-from .guard_harness import commit_all, guard_marks, init_scratch_repo, run_gate
-
-# REPO_ROOT rather than a parents[N] walk: inside the runner container the
-# harness sits at /runner/harness, which has fewer parents than the host layout,
-# and computing the walk here raises at import — killing collection for the whole
-# tier rather than this one module.
-_GATE = REPO_ROOT / "scripts" / "check-image-version.sh"
-
-# The gate reads these three and nothing else. Kept here rather than derived,
-# because deriving them from the tree would make the fixture agree with a bug in
-# the gate's own list.
-_DOCS = (
-    "src/exchange/DEPLOYMENT.md",
-    "src/broker/DEPLOYMENT.md",
-    "src/identity/DEPLOYMENT.md",
+from .deployment_docs import (
+    DECLARED_VERSION,
+    GATE,
+    SCAN_ROOTS,
+    build_tree,
+    copy_gate_into,
+    doc_body,
+    write_docs,
 )
+from .guard_harness import commit_all, guard_marks, run_gate
 
-# Every directory the gate refuses to run without. It dies on a missing scan
-# root rather than reporting a clean tree it never read.
-_SCAN_ROOTS = ("src", "docs", "deploy", ".github")
+_VERSION = DECLARED_VERSION
 
-_VERSION = "1.0.0-rc.1"
-
-pytestmark = guard_marks(skip_when=not _GATE.is_file())
-
-
-def _doc_body(service: str, version: str = _VERSION, declarations: int = 1) -> str:
-    """A miniature of one deployment document's section 3.
-
-    Only the shape the gate reads: the declaration, and one command that uses it
-    rather than a literal.
-    """
-    lines = ["# " + service.title(), "", "## 3. Build or pull the image", "", "```bash"]
-    lines += [f"VERSION={version}"] * declarations
-    lines += [
-        f"docker pull ghcr.io/ramp-protocol/{service}:$VERSION",
-        f"docker build -t ghcr.io/ramp-protocol/{service}:dev .",
-        f"docker pull ghcr.io/ramp-protocol/{service}@sha256:<the digest that printed>",
-        # The real documents carry an untagged reference in the sentence saying
-        # a pull without a version fails. It has no tag, so no rule applies to
-        # it — and a fixture without one would not prove that.
-        f"# docker pull ghcr.io/ramp-protocol/{service}   <- fails, there is no default tag",
-        "```",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def _copy_gate_into(root: Path) -> None:
-    """Put the shipped gate in the tree it is about to check.
-
-    The way the sibling guards do it: the tree under test carries the checker it
-    is checked with.
-    """
-    (root / "scripts").mkdir(parents=True, exist_ok=True)
-    shutil.copy(_GATE, root / "scripts" / _GATE.name)
-
-
-def _build_tree(root: Path) -> None:
-    """A tree with the three documents and every scan root the gate requires.
-
-    A real git repository, because the gate reads the tracked file list rather
-    than walking the filesystem — a plain directory would make it die, and every
-    case here would then pass for the wrong reason.
-    """
-    init_scratch_repo(root, branch="main", committer="image version guard")
-
-    for directory in _SCAN_ROOTS:
-        (root / directory).mkdir(parents=True, exist_ok=True)
-        # git tracks files, not directories, and the gate requires every scan
-        # root to exist and to hold something.
-        (root / directory / ".keep").write_text("")
-    for doc in _DOCS:
-        target = root / doc
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_doc_body(Path(doc).parent.name))
-
-    _copy_gate_into(root)
-    commit_all(root, "baseline")
+pytestmark = guard_marks(skip_when=not GATE.is_file())
 
 
 @pytest.fixture
 def tree(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
-    _build_tree(root)
+    build_tree(root, branch="main", committer="image version guard")
     return root
 
 
 def _run_gate(root: Path) -> subprocess.CompletedProcess[str]:
     """This gate's parameters. The mechanics are shared, and only these differ."""
-    return run_gate(root, _GATE.name)
+    return run_gate(root, GATE.name)
 
 
 def test_gate_passes_on_a_clean_tree(tree: Path) -> None:
@@ -236,13 +171,10 @@ def test_a_tree_that_is_not_a_git_repository_is_refused(tmp_path: Path) -> None:
     having examined nothing.
     """
     root = tmp_path / "plain"
-    for directory in _SCAN_ROOTS:
+    for directory in SCAN_ROOTS:
         (root / directory).mkdir(parents=True, exist_ok=True)
-    for doc in _DOCS:
-        target = root / doc
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_doc_body(Path(doc).parent.name))
-    _copy_gate_into(root)
+    write_docs(root)
+    copy_gate_into(root)
 
     proc = _run_gate(root)
 
@@ -254,7 +186,7 @@ def test_a_tree_that_is_not_a_git_repository_is_refused(tmp_path: Path) -> None:
 
 def test_a_document_with_no_declaration_is_rejected(tree: Path) -> None:
     """Deleting the declaration is how the reduction gets reverted."""
-    (tree / "src/broker/DEPLOYMENT.md").write_text(_doc_body("broker", declarations=0))
+    (tree / "src/broker/DEPLOYMENT.md").write_text(doc_body("broker", declarations=0))
 
     proc = _run_gate(tree)
 
@@ -264,7 +196,7 @@ def test_a_document_with_no_declaration_is_rejected(tree: Path) -> None:
 
 def test_a_document_with_two_declarations_is_rejected(tree: Path) -> None:
     """Two declarations is the half-done edit: one of them is already stale."""
-    (tree / "src/identity/DEPLOYMENT.md").write_text(_doc_body("identity", declarations=2))
+    (tree / "src/identity/DEPLOYMENT.md").write_text(doc_body("identity", declarations=2))
 
     proc = _run_gate(tree)
 
@@ -278,7 +210,7 @@ def test_one_document_declaring_a_different_version_is_rejected(tree: Path) -> N
     Every document is individually well-formed, so rules 1 and 2 both pass. Only
     comparing them across files catches it.
     """
-    (tree / "src/broker/DEPLOYMENT.md").write_text(_doc_body("broker", version="0.9.0"))
+    (tree / "src/broker/DEPLOYMENT.md").write_text(doc_body("broker", version="0.9.0"))
 
     proc = _run_gate(tree)
 

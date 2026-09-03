@@ -6,16 +6,23 @@ import (
 	"testing"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
 )
 
 // validBatchItem is the minimal item that clears validateBatchRequest's per-item
-// presence checks (offer signature + agent_acceptance signature), so the
-// envelope-level cases can isolate the field under test.
+// presence checks (offer signature, agent_acceptance signature, and the signed
+// canonical_url that binds the offer to a catalog entry), so the envelope-level
+// cases can isolate the field under test.
 func validBatchItem() *rampv1.TransactionItem {
+	canonicalURL := "https://publisher.example/articles/one"
 	return &rampv1.TransactionItem{
-		Offer:           &rampv1.Offer{OfferId: "offer-1", Signature: "sig-1"},
+		Offer: &rampv1.Offer{
+			OfferId:   "offer-1",
+			Signature: "sig-1",
+			Identity:  &rampv1.ResourceIdentity{CanonicalUrl: &canonicalURL},
+		},
 		AgentAcceptance: &rampv1.AgentAcceptance{Signature: "acc-sig"},
 	}
 }
@@ -30,6 +37,7 @@ func TestValidateBatchRequest_RejectsOverLongID(t *testing.T) {
 	t.Parallel()
 	s := &ExchangeService{}
 	req := &rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: strings.Repeat("x", maxIdempotencyKeyLen+1),
 		Requester:      &rampv1.Requester{Id: "agent-1"},
 		Items:          []*rampv1.TransactionItem{validBatchItem()},
@@ -61,6 +69,7 @@ func TestValidateBatchRequest_AcceptsBoundaryID(t *testing.T) {
 	t.Parallel()
 	s := &ExchangeService{}
 	req := &rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: strings.Repeat("x", maxIdempotencyKeyLen),
 		Requester:      &rampv1.Requester{Id: "agent-1"},
 		Items:          []*rampv1.TransactionItem{validBatchItem()},
@@ -98,6 +107,7 @@ func TestValidateBatchRequest_RejectsOverLongRequesterDomain(t *testing.T) {
 			t.Parallel()
 			s := &ExchangeService{}
 			req := &rampv1.TransactionRequest{
+				Ver:            helpers.ProtocolVersion,
 				IdempotencyKey: "tx-domain",
 				Requester:      &rampv1.Requester{Id: "agent-1", Domain: tc.domain},
 				Items:          []*rampv1.TransactionItem{validBatchItem()},
@@ -129,6 +139,7 @@ func TestValidateBatchRequest_AcceptsBoundaryRequesterDomain(t *testing.T) {
 	t.Parallel()
 	s := &ExchangeService{}
 	req := &rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: "tx-domain-boundary",
 		Requester: &rampv1.Requester{
 			Id:     "agent-1",
@@ -149,6 +160,7 @@ func TestValidateBatchRequest_RejectsEmptyItems(t *testing.T) {
 	t.Parallel()
 	s := &ExchangeService{}
 	req := &rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: "tx-empty",
 		Requester:      &rampv1.Requester{Id: "agent-1"},
 		Items:          nil,

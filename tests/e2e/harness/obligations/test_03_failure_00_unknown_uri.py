@@ -19,6 +19,8 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from ..exchanges import recipient_of
+from ..discovery import discover_body
 from ..conftest import StackURLs
 from ..seed import DEMO_MUSIC_DOMAIN, USD_AGENT_ID, SeededFixture
 from ..signing import sign_post
@@ -43,14 +45,12 @@ def test_unknown_uri_browse_empty_with_explanation(
     unknown_uri = f"http://{DEMO_MUSIC_DOMAIN}/lyrics/never-seeded-{uuid.uuid4().hex}.txt"
     resp = sign_post(
         f"{compose_stack.exchange}{_DISCOVER_PATH}",
-        body={
-            "requester": {
-                "id": USD_AGENT_ID,
-                "domain": DEMO_MUSIC_DOMAIN,
-                "type": "REQUESTER_TYPE_AGENT",
-            },
-            "uris": [unknown_uri],
-        },
+        body=discover_body(
+            agent_id=USD_AGENT_ID,
+            uris=[unknown_uri],
+            exchange=recipient_of(compose_stack.exchange),
+            domain=DEMO_MUSIC_DOMAIN,
+        ),
     )
     assert resp.status_code == httpx.codes.OK, (
         f"browse must answer 200 even on an unknown URI; got {resp.status_code}: {resp.text[:512]}"

@@ -4,10 +4,73 @@
 # seccomp=unconfined + io_uring, which rules out Fargate; a plain VM runs it
 # with the same flags as local development.
 
+locals {
+  # sort() for a stable plan diff; map iteration is already key-ordered.
+  ssh_source_cidrs = sort(distinct(flatten([
+    for o in var.ssh_operators : tolist(o.source_cidrs)
+  ])))
+
+  # Keyed by operator name so the output answers "who has access", not just
+  # "what lines exist". from= is what binds a key to its own addresses: the
+  # security group opens the union, and this refuses a key presented from
+  # someone else's address inside that union.
+  ssh_authorized_keys = {
+    for name, o in var.ssh_operators :
+    name => format("from=%q %s",
+      join(",", sort(tolist(o.source_cidrs))),
+    trimspace(o.public_key))
+  }
+
+  # yamlencode, not a template: from="..." carries quotes that would have to be
+  # escaped by hand inside YAML, and the values come from operator input. A YAML
+  # mistake here has no recovery path — after this change authorized_keys comes
+  # from the user data alone, and a malformed part leaves the instance
+  # unreachable while Terraform destroys the original in the same apply.
+  # yamlencode does the quoting itself, so malformed YAML cannot happen.
+  #
+  # allow_public_ssh_keys = false turns off cloud-init's import of keys from
+  # datasource metadata, which defaults to true. Removing key_name leaves AWS
+  # with nothing to supply today, so this changes no behaviour now. It states
+  # the invariant in the configuration instead of leaving it as a consequence
+  # of a deletion elsewhere in this file: authorized_keys comes from this user
+  # data alone.
+  ssh_cloud_config = "#cloud-config\n${yamlencode({
+    allow_public_ssh_keys = false
+    ssh_authorized_keys   = values(local.ssh_authorized_keys)
+  })}"
+
+  # EC2 caps user data at 16384 bytes BEFORE base64, and cloudinit_config
+  # returns the document already base64-encoded. Base64 of n bytes is
+  # 4*ceil(n/3) characters, so 16384 bytes is 21848 characters. Written once
+  # here and read by the precondition below and by the module's tests.
+  ec2_user_data_max_base64 = 21848
+}
+
 # Zones that are actually usable in the target region/account, so the subnet
 # can pick one without hardcoding a zone name (names vary per account/region).
 data "aws_availability_zones" "available" {
   state = "available"
+}
+
+data "cloudinit_config" "this" {
+  gzip          = true
+  base64_encode = true
+
+  # Parts are emitted in declaration order. Both are cloud-config and share no
+  # top-level key — write_files/runcmd on one side, ssh_authorized_keys and
+  # allow_public_ssh_keys on the other — so cloud-init's merge has nothing to
+  # resolve. Only a real boot confirms that, which is what the rehearsal does.
+  part {
+    content_type = "text/cloud-config"
+    filename     = "00-stack.yaml"
+    content      = var.user_data
+  }
+
+  part {
+    content_type = "text/cloud-config"
+    filename     = "10-ssh-operators.yaml"
+    content      = local.ssh_cloud_config
+  }
 }
 
 # Canonical's official Ubuntu 24.04 LTS amd64 image, newest build.
@@ -75,11 +138,14 @@ resource "aws_security_group" "this" {
   vpc_id      = aws_vpc.this.id
 
   ingress {
-    description = "SSH from the operator address only"
+    description = "SSH from the operator addresses only"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = [var.ssh_ingress_cidr]
+    # The union of every operator's addresses. The group cannot tell one
+    # operator's key from another's, so it is only half the control — the
+    # from= option on each authorized_keys line is the other half.
+    cidr_blocks = local.ssh_source_cidrs
   }
 
   ingress {
@@ -114,24 +180,34 @@ resource "aws_security_group" "this" {
   tags = { Name = "${var.name_prefix}-vm-sg" }
 }
 
-resource "aws_key_pair" "this" {
-  key_name   = "${var.name_prefix}-operator"
-  public_key = var.ssh_public_key
-
-  tags = { Name = "${var.name_prefix}-operator" }
-}
-
+# No aws_key_pair and no key_name on purpose. EC2 injects a key pair into
+# authorized_keys with no options, so it works from every address in the union
+# — one unrestricted line defeats every restricted line beside it. Every key
+# this instance accepts arrives through the cloud-init document below, carrying
+# its own from= restriction.
 resource "aws_instance" "this" {
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.this.id]
-  key_name               = aws_key_pair.this.key_name
 
   # cloud-init transparently un-gzips; gzip keeps the rendered config (compose
   # file, Caddyfile, key material) under EC2's 16 KB raw user-data limit.
-  user_data_base64            = base64gzip(var.user_data)
+  user_data_base64            = data.cloudinit_config.this.rendered
   user_data_replace_on_change = var.user_data_replace_on_change
+
+  lifecycle {
+    # A test asserts over the small fixture map its test file declares, and
+    # says nothing about the real ssh_operators in a stack's tfvars. Both
+    # halves of the document grow with real input, and the multipart MIME
+    # wrapper adds to both. This evaluates the actual deployed value on every
+    # plan, turning "the instance silently fails to launch" into a plan-time
+    # error — which matters because this stack has no break-glass path.
+    precondition {
+      condition     = length(data.cloudinit_config.this.rendered) < local.ec2_user_data_max_base64
+      error_message = "Rendered cloud-init exceeds EC2's 16 KB user-data limit — the instance would fail to launch"
+    }
+  }
 
   root_block_device {
     volume_type = "gp3"

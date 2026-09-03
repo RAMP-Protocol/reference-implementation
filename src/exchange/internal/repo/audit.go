@@ -10,9 +10,17 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
 )
 
-// AuditEntry is the domain view of an admin control-plane change to append. Actor
-// and RequestID are optional (nil → SQL NULL): v1 has no authenticated operator
-// identity, and request_id is absent only if no X-Request-ID reached the handler.
+// AuditEntry is the domain view of a control-plane change to append. Actor and
+// RequestID are optional (nil → SQL NULL): the admin plane has no authenticated
+// operator identity in v1, and request_id is absent only if no X-Request-ID
+// reached the handler.
+//
+// The log covers the admin RPCs and agent registration. Registration belongs
+// here for the same reason the admin setters do: it is a control-plane event
+// that creates an account and records which licensing terms were accepted, it
+// happens once and is never repeated, and nothing else in the system keeps a
+// dated record of it. Unlike the admin plane, registration HAS an authenticated
+// caller — the agent's verified directory identity — so its rows populate Actor.
 type AuditEntry struct {
 	LogID      string
 	Actor      *string
@@ -35,7 +43,7 @@ type AuditRecord struct {
 	CreatedAt  time.Time
 }
 
-// AuditRepo is the append-only admin audit log. Append takes an explicit pgx.Tx
+// AuditRepo is the append-only control-plane audit log. Append takes an explicit pgx.Tx
 // so the row commits in the same transaction as the setter it records
 // (Architecture Rule 7); ByTenant is the read path used for change
 // reconstruction and integration side-effect assertions.

@@ -62,14 +62,10 @@ func proxiedPush(t *testing.T, h *pushHarness, path string) error {
 	h.publishAgent(t, callerID, pub)
 
 	client := proxiedCatalogClient(t, h, callerID, priv)
-	_, err = client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.publisherDom, Path: path,
-			Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
-		}},
-	}))
+	_, err = client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+		Domain: h.publisherDom, Path: path,
+		Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
+	}})))
 	return err
 }
 
@@ -79,7 +75,7 @@ func proxiedPush(t *testing.T, h *pushHarness, path string) error {
 // per-contributor catalog gate verifies and the push lands. Protocol
 // round-trip: signed push RPC in, offer read back through DiscoverResources.
 func TestPushResources_ProxiedTLSTermination_VerifiesForwardedScheme(t *testing.T) {
-	h := newPushHarnessShaped(t, true)
+	h := newPushHarnessWith(t, pushHarnessOptions{trustProxyHeaders: true})
 	if err := proxiedPush(t, h, "/articles/proxied"); err != nil {
 		t.Fatalf("proxied push: %v", err)
 	}
@@ -109,7 +105,7 @@ func TestPushResources_DirectExposure_SpoofedForwardedProtoIgnored(t *testing.T)
 // signed over https and delivered over the proxied plain-HTTP leg clears the
 // gate and returns the offer a plain-shape push seeded.
 func TestExchangeRPC_ProxiedTLSTermination_VerifiesForwardedScheme(t *testing.T) {
-	h := newPushHarnessShaped(t, true)
+	h := newPushHarnessWith(t, pushHarnessOptions{trustProxyHeaders: true})
 	// Seed through the unproxied shape (no forwarded headers → rewrite is a
 	// no-op, schemes agree at http), so the assertion isolates the proxied leg.
 	callerID := "caller.example"
@@ -119,25 +115,14 @@ func TestExchangeRPC_ProxiedTLSTermination_VerifiesForwardedScheme(t *testing.T)
 		t.Fatalf("gen caller key: %v", err)
 	}
 	h.publishAgent(t, callerID, pub)
-	if _, err := h.signedCat(callerID, priv).PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.publisherDom, Path: "/articles/seeded",
-			Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
-		}},
-	})); err != nil {
+	if _, err := h.signedCat(callerID, priv).PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+		Domain: h.publisherDom, Path: "/articles/seeded",
+		Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
+	}}))); err != nil {
 		t.Fatalf("seed push: %v", err)
 	}
 
-	discovered, err := proxiedExchangeClient(t, h).DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.publisherDom + "/articles/seeded"},
-		Requester: &rampv1.Requester{
-			Id: h.discoverKeyID, Domain: "agent.example",
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	discovered, err := proxiedExchangeClient(t, h).DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(newRequester(h.discoverKeyID, "agent.example"), []string{"https://" + h.publisherDom + "/articles/seeded"})))
 	if err != nil {
 		t.Fatalf("proxied discover: %v", err)
 	}
@@ -152,13 +137,6 @@ func TestExchangeRPC_ProxiedTLSTermination_VerifiesForwardedScheme(t *testing.T)
 // rejected unauthenticated.
 func TestExchangeRPC_DirectExposure_SpoofedForwardedProtoIgnored(t *testing.T) {
 	h := newPushHarness(t)
-	_, err := proxiedExchangeClient(t, h).DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.publisherDom + "/articles/any"},
-		Requester: &rampv1.Requester{
-			Id: h.discoverKeyID, Domain: "agent.example",
-			Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	_, err := proxiedExchangeClient(t, h).DiscoverResources(h.ctx, connect.NewRequest(newResourceQuery(newRequester(h.discoverKeyID, "agent.example"), []string{"https://" + h.publisherDom + "/articles/any"})))
 	assertConnectCode(t, err, connect.CodeUnauthenticated)
 }

@@ -9,6 +9,7 @@ import (
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 )
 
 // TestPushResources_ImpersonationRejectedAsUnauthenticated proves the catalog
@@ -57,6 +58,8 @@ func TestPushResources_ImpersonationRejectedAsUnauthenticated(t *testing.T) {
 	h.publishAgent(t, attackerID, attackerPub)
 	attackerClient := h.signedCat(attackerID, attackerPriv)
 	if _, err := attackerClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
+		Exchange: harnessExchangeDomain,
+		Ver:      helpers.ProtocolVersion,
 		TenantId: h.tenantID,
 		CallerId: attackerID, // honest: signer == claimed identity
 		Entries: []*rampv1.ResourceEntry{{
@@ -80,6 +83,8 @@ func TestPushResources_ImpersonationRejectedAsUnauthenticated(t *testing.T) {
 	// victim.example. A priced term makes a successful push materialize a
 	// discoverable offer, giving the no-side-effect assertion a public read surface.
 	_, err = attackerClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
+		Exchange: harnessExchangeDomain,
+		Ver:      helpers.ProtocolVersion,
 		TenantId: h.tenantID,
 		CallerId: victimID, // forged: signer is attacker, claimed identity is victim
 		Entries: []*rampv1.ResourceEntry{{

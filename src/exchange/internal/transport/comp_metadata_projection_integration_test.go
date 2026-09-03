@@ -29,8 +29,8 @@ const metadataResourceProvenanceSource = "wordpress-plugin"
 // as a SINGLE Text media object, observed END-TO-END through DiscoverResources
 // only (no DB/internal access — Testing Doctrine pt 9). Per the Core Invariant the
 // media object is built ONLY from the rebuild-time snapshot's decoded metadata (no
-// clock, no requester), so discovery and tx-reconstruction render byte-identical
-// bytes (signature parity).
+// clock, no requester), so a rebuild renders the same bytes for the same stored
+// row.
 //
 // Two legs run through the public RPC surface:
 //
@@ -47,7 +47,7 @@ const metadataResourceProvenanceSource = "wordpress-plugin"
 //	  ext.resource_mutability=="RESOURCE_MUTABILITY_STATIC", ext.previews present);
 //	  and NO cattax/cat/language keys (no RAMP taxonomy source — matrix line 213).
 //	  comptest.Validate accepts the richer Package; assertTransactParity proves
-//	  the signed comp ext survives tx-reconstruction byte-identically.
+//	  the presented signed bytes (comp ext included) verify at execute.
 //
 //	EMPTY-MEDIA GUARD (sub-test): a publisher pushes an entry whose metadata
 //	  is PRESENT but carries ZERO projectable fields (only a non-promoted
@@ -88,11 +88,7 @@ func TestComp_ResourceMetadataProjection(t *testing.T) {
 	}
 
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  []*rampv1.ResourceEntry{entry},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{entry})))
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -106,7 +102,7 @@ func TestComp_ResourceMetadataProjection(t *testing.T) {
 	compOffer := discoverCompOffer(t, h, uri)
 	assertCompResourceMetadataProjection(t, compOffer)
 
-	// PARITY: the signed (now metadata-bearing) comp ext survives tx-reconstruction.
+	// PARITY: the signed (now metadata-bearing) comp ext verifies unchanged at execute.
 	assertTransactParity(t, h, compOffer)
 
 	// R1 — EMPTY-MEDIA GUARD as a distinct leg.
@@ -212,11 +208,7 @@ func assertCompEmptyMediaGuard(t *testing.T, h *pushHarness, callerID string, pr
 	}
 
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  []*rampv1.ResourceEntry{entry},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{entry})))
 	if err != nil {
 		t.Fatalf("push (empty-media): %v", err)
 	}
@@ -239,6 +231,6 @@ func assertCompEmptyMediaGuard(t *testing.T, h *pushHarness, callerID string, pr
 		t.Errorf("comp.scope.text present for non-projectable metadata (empty-media guard breached): %v", scope.GetFields()["text"])
 	}
 
-	// PARITY: the comp ext (no text[]) survives tx-reconstruction byte-identically.
+	// PARITY: the comp ext (no text[]) verifies unchanged at execute.
 	assertTransactParity(t, h, o)
 }

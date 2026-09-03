@@ -5,11 +5,11 @@ SAME sign-up an SDK-less developer would — register an OAuth client at identit
 start the authorize flow, log in through the real Zitadel UI headlessly, and let
 identity's /callback provision the agent. Provisioning mints the agent's Ed25519
 key in identity's Vault and hosts its WBA directory at ``<subdomain>.rampmcp.org``
-BEFORE the licensing form, so by the time the callback lands the agent can already
-sign RAMP requests — which is all the discover/execute/report tools need.
+by the time the callback lands, so the agent can already sign RAMP requests —
+which is all the discover/execute/report tools need.
 
 The bearer is then minted directly with the deterministic e2e token key
-(:func:`mint_bearer`) rather than by finishing the form → consent → token dance:
+(:func:`mint_bearer`) rather than by finishing the consent → token dance:
 identity verifies that self-minted token with the very same key it would have
 signed one with, so it is the same credential, and skipping the UI steps that add
 nothing to a discover/execute test keeps this driver from scraping more of
@@ -41,9 +41,25 @@ ALICE_PASSWORD = "Alice12345!"
 # it must be registered and echoed consistently through the authorize flow.
 _CLIENT_REDIRECT = "http://127.0.0.1:5599/callback"
 
-_SUB_RE = re.compile(r'<span class="sub">([^<]+)</span>')
+# The consent page renders two spans with class "sub" — the subdomain and the
+# redirect URI — so the id is what disambiguates them. The Go integration test
+# asserts this same fragment, so a template edit that breaks this regex fails
+# there first.
+_SUB_RE = re.compile(r'<span class="sub" id="agent-subdomain">([^<]+)</span>')
 _INPUT_RE = re.compile(r"(?s)<input\b[^>]*>")
 _FORM_ACTION_RE = re.compile(r'(?s)<form\b[^>]*\baction="([^"]+)"')
+
+
+def _body_excerpt(html: str, limit: int = 400) -> str:
+    """Return an excerpt of a render starting at <body>, for a failure message.
+
+    The consent page carries an inline stylesheet, so <body> does not start until
+    roughly 700 characters in and the subdomain span not until roughly 880. An
+    excerpt taken from the start of the document shows the doctype, the head and
+    half the CSS — never the markup a regex mismatch is about.
+    """
+    start = html.find("<body")
+    return html[start if start != -1 else 0 :][:limit]
 
 
 class SignupError(RuntimeError):
@@ -136,20 +152,26 @@ def _authorize(idc: httpx.Client, client_id: str, challenge: str) -> str:
 
 
 def _callback(idc: httpx.Client, code: str, state: str) -> None:
-    """GET /callback with the upstream code+state; expect a 302 onward to /form."""
+    """GET /callback with the upstream code+state; expect a 302 onward."""
     resp = idc.get("/callback", params={"code": code, "state": state})
     if resp.status_code != httpx.codes.FOUND:
         raise SignupError(f"callback: {resp.status_code} {resp.text[:256]}")
 
 
 def _scrape_subdomain(idc: httpx.Client) -> str:
-    """GET /form and read the minted subdomain the render shows."""
-    resp = idc.get("/form")
+    """GET /consent and read the minted subdomain the render shows.
+
+    The consent screen names the identity it is about to grant a client access
+    to, which is the same subdomain /callback just provisioned. It renders from
+    the sealed pending cookie alone, so it is readable at this point in the flow
+    without approving anything.
+    """
+    resp = idc.get("/consent")
     if resp.status_code != httpx.codes.OK:
-        raise SignupError(f"form GET: {resp.status_code} {resp.text[:256]}")
+        raise SignupError(f"consent GET: {resp.status_code} {resp.text[:256]}")
     m = _SUB_RE.search(resp.text)
     if not m:
-        raise SignupError(f"form render carried no subdomain: {resp.text[:400]}")
+        raise SignupError(f"consent render carried no subdomain: {_body_excerpt(resp.text)}")
     return m.group(1).strip()
 
 

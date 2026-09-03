@@ -14,12 +14,22 @@ keeps only what belongs to driving the publish tool: the miniature published tre
 the stand-in remote, and the invocation. A suite that guards some other script has
 this module to import from, and no reason to reach into that one.
 
+The guards that drive no script at all -- the ones that only read source under
+``tests/e2e/`` and report a shape -- share ``ast_scan`` instead: the tree walk, the
+exclusion set and the dict-key reader. Nothing here is useful to them, so a
+source-scan helper belongs there rather than in this module.
+
 A module of its own rather than something in ``conftest``: it takes no fixture
 arguments, and several modules import it at import time to build their marks
-before any test runs. It also imports nothing from this package, which is what
-would let ``conftest`` reach it directly — ``publish_harness`` reads ``REPO_ROOT``
-from ``conftest``, so ``conftest`` can only import that one from inside a function
-body.
+before any test runs. It also imports nothing from this package, so ``conftest``
+imports it at module top like anything else.
+
+That is true of ``publish_harness`` too, and it did not used to be.
+``conftest`` owned ``REPO_ROOT``, ``publish_harness`` read it from there, and
+``conftest`` could therefore only import ``publish_harness`` from inside a
+function body. ``REPO_ROOT`` now lives in ``_compose``; both modules read it
+from there and neither imports ``conftest`` at all. Test modules still import
+``conftest`` freely — they are leaves, and nothing imports them back.
 """
 
 from __future__ import annotations
@@ -117,21 +127,46 @@ def run_gate(
     root: Path,
     gate: str,
     *,
+    reads_root: bool = True,
     env: dict[str, str] | None = None,
     timeout: int = GATE_TIMEOUT,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the copy of ``gate`` that ``root`` carries, against ``root``.
+    """Run the copy of ``gate`` that ``root`` carries.
 
     The root is passed as an argument, never through the environment: an ambient
     variable that selects the tree a gate reads can redirect it in production too.
 
-    ``env`` exists only so one suite can put a deliberately broken scanner on
-    PATH — it selects which binary runs, never which tree is read. Leaving it at
-    ``None`` inherits the caller's environment, which is exactly what passing no
-    ``env`` at all would do.
+    ``reads_root`` says whether the gate SCANS a tree. Most do, and take --root
+    to say which. One does not: check-buildx.sh asks the local docker whether the
+    buildx plugin is installed, which is a property of the machine rather than of
+    a tree. Handing it a flag it does not parse would be a seam that looks
+    meaningful and is not, so it is not handed one. ``root`` still selects WHICH
+    COPY of the script runs, which is the runner's other job and the reason a
+    gate that reads no tree still belongs here.
+
+    Nothing enforces this for a gate that ignores unknown arguments, and that is
+    said rather than left to be assumed: set ``reads_root=True`` for the buildx
+    gate and its suite still passes, because a bash script that never reads "$@"
+    does not notice. The flag is a statement about the gate's contract, not a
+    check on it.
+
+    This parameter exists because the alternative was worse: the buildx suite
+    wrote its own subprocess call while importing this module's timeout and its
+    marks — reaching in for the constants and re-implementing the function that
+    uses them. That is the shape this module's docstring records happening once
+    already, when one gate runner grew an ``env`` parameter and a longer timeout
+    and the other two did not.
+
+    ``env`` exists only so one suite can put a deliberately broken scanner, or a
+    stub docker, on PATH — it selects which binary runs, never which tree is
+    read. Leaving it at ``None`` inherits the caller's environment, which is
+    exactly what passing no ``env`` at all would do.
     """
+    cmd = ["bash", str(root / "scripts" / gate)]
+    if reads_root:
+        cmd += ["--root", str(root)]
     return subprocess.run(
-        ["bash", str(root / "scripts" / gate), "--root", str(root)],
+        cmd,
         capture_output=True,
         text=True,
         check=False,

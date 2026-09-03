@@ -5,7 +5,6 @@ package transport_test
 import (
 	"crypto/ed25519"
 	"crypto/rand"
-	"strconv"
 	"testing"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
@@ -26,15 +25,15 @@ import (
 // headline term.
 //
 // Two terms ride on each resource in a fixed publisher (stored) order; the
-// requester's scopes drive which subset licenseterm.Select keeps; the headline
+// requester's scopes drive which subset selectTerms keeps; the headline
 // is the FIRST eligible term in stored order. The headline's
 // ORIGINAL stored index — not a per-offer ordinal, never a hardcoded 0 — must
 // appear in comp.id.
 //
 // It FAILS on current HEAD: comp_render.go hardcodes the package term-index to
 // literal 0 (applyCompProfile passes 0 to renderCompProfile), so comp.id is
-// ALWAYS "<offer>#0". LEG 1 selects a headline stored at index 1, so HEAD emits
-// "<offer>#0" where the matrix requires "<offer>#1" — an assertion failure, not
+// ALWAYS "<resource>#0". LEG 1 selects a headline stored at index 1, so HEAD emits
+// "<resource>#0" where the matrix requires "<resource>#1" — an assertion failure, not
 // a compile/collection error (every RPC and field it uses already exists).
 //
 // Per the slice's RESOLUTION the headline rule (D2, headline = first
@@ -62,11 +61,11 @@ func TestComp_MultitermTermIndex(t *testing.T) {
 	//
 	// Round-trip: write goes RPC(PushResources)->service->repo->DB; read goes
 	// RPC(DiscoverResources)->service->Select->comp render->RPC response, then
-	// the parity leg re-drives RPC(ExecuteTransaction)->verifyOffer->Select->
-	// comp render. Both legs traverse the full protocol surface; no leg observes
-	// state past a layer.
+	// the parity leg re-drives RPC(ExecuteTransaction), which verifies the
+	// presented signed offer bytes. Both legs traverse the full protocol
+	// surface; no leg observes state past a layer.
 	//
-	// HEAD emits comp.id "<offer>#0" (hardcoded), but the headline's original
+	// HEAD emits comp.id "<resource>#0" (hardcoded), but the headline's original
 	// stored index is 1 -> RED on comp.id. comp.scope.unitprice == 0.05 is
 	// correct on HEAD (pricing already derives from the PUBLIC headline term).
 	t.Run("primary_red_public_headline_stored_index_1", func(t *testing.T) {
@@ -79,8 +78,8 @@ func TestComp_MultitermTermIndex(t *testing.T) {
 		// DEFAULT requester: discoverCompOffer sends no requester scopes.
 		offer := discoverCompOffer(t, h, uri)
 
-		// Headline = PUBLIC at ORIGINAL stored index 1 -> comp.id "<offer>#1".
-		assertCompHeadline(t, offer, 1, 0.05)
+		// Headline = PUBLIC at ORIGINAL stored index 1 -> comp.id "<resource>#1".
+		assertCompHeadline(t, offer, compPackageID(h, uri, 1), 0.05)
 		assertTransactParity(t, h, offer)
 	})
 
@@ -88,7 +87,7 @@ func TestComp_MultitermTermIndex(t *testing.T) {
 	// [PREMIUM(0), PUBLIC(1)]. A PREMIUM requester (scopes=[subscription:premium])
 	// WITH the profile: Select keeps BOTH in stored order -> headline = PREMIUM
 	// at its ORIGINAL stored index 0. comp.scope.unitprice == 0.50 (premium) AND
-	// comp.id == "<offer>#0". offer.GetTerms() still carries BOTH eligible terms
+	// comp.id == "<resource>#0". offer.GetTerms() still carries BOTH eligible terms
 	// (non-loss).
 	t.Run("premium_headline_stored_index_0", func(t *testing.T) {
 		const path = "/articles/comp-premium-first-prem-req"
@@ -99,9 +98,9 @@ func TestComp_MultitermTermIndex(t *testing.T) {
 		uri := "https://" + h.publisherDom + path
 		offer := discoverCompOffer(t, h, uri, premiumScope)
 
-		// Headline = PREMIUM at ORIGINAL stored index 0 -> comp.id "<offer>#0",
+		// Headline = PREMIUM at ORIGINAL stored index 0 -> comp.id "<resource>#0",
 		// premium price $0.50.
-		assertCompHeadline(t, offer, 0, 0.50)
+		assertCompHeadline(t, offer, compPackageID(h, uri, 0), 0.50)
 		// Non-loss: both eligible terms ride on the canonical Offer.terms[].
 		if got := len(offer.GetTerms()); got != 2 {
 			t.Errorf("offer.terms count = %d, want 2 (both eligible terms ride on the offer)", got)
@@ -118,7 +117,7 @@ func TestComp_MultitermTermIndex(t *testing.T) {
 	// This PINS that the term-index fix does NOT change D2 and that there is no
 	// NEW cross-term bleed: comp reflects the D2 headline (PUBLIC), not the
 	// premium sibling the requester also unlocked. comp.scope.unitprice == 0.05
-	// (public) AND comp.id == "<offer>#0" (public at stored index 0). Correct on
+	// (public) AND comp.id == "<resource>#0" (public at stored index 0). Correct on
 	// HEAD already (headline index 0); guards the GREEN change against regressing
 	// D2.
 	t.Run("d2_bleed_guard_public_stored_first", func(t *testing.T) {
@@ -131,8 +130,8 @@ func TestComp_MultitermTermIndex(t *testing.T) {
 		offer := discoverCompOffer(t, h, uri, premiumScope)
 
 		// Headline = PUBLIC (stored first) at stored index 0 ->
-		// comp.id "<offer>#0", public price $0.05.
-		assertCompHeadline(t, offer, 0, 0.05)
+		// comp.id "<resource>#0", public price $0.05.
+		assertCompHeadline(t, offer, compPackageID(h, uri, 0), 0.05)
 		assertTransactParityScoped(t, h, offer, premiumScope)
 	})
 }
@@ -158,13 +157,14 @@ func premiumPricedTerm(scope string, rate float64) *rampv1.LicenseTerm {
 }
 
 // assertCompHeadline verifies the single comp package the profile-aware discover
-// emitted reflects the SELECTED headline term: comp.id == "<offer>#<wantIndex>"
-// (the headline's ORIGINAL stored publisher index, matrix Q8) and
+// emitted reflects the SELECTED headline term: comp.id == wantID
+// ("<resource_id>#<index>" with the headline's ORIGINAL stored publisher index,
+// matrix Q8, derived by the caller via compPackageID — the package id is
+// resource-intrinsic, not the offer's random per-offer offer_id) and
 // comp.scope.unitprice == wantRate (the headline term's price). It also asserts
 // the emitted comp Struct passes comptest.Validate (a real CoMP parser accepts
-// it). The resource id in comp.id is the Offer's own id (tenant-scoped
-// composite), so the expectation derives from offer.OfferId.
-func assertCompHeadline(t *testing.T, o *rampv1.Offer, wantIndex int, wantRate float64) {
+// it).
+func assertCompHeadline(t *testing.T, o *rampv1.Offer, wantID string, wantRate float64) {
 	t.Helper()
 	compVal, ok := o.GetExt().GetFields()["comp"]
 	if !ok || compVal == nil {
@@ -176,7 +176,6 @@ func assertCompHeadline(t *testing.T, o *rampv1.Offer, wantIndex int, wantRate f
 	}
 	fields := comp.GetFields()
 
-	wantID := o.GetOfferId() + "#" + strconv.Itoa(wantIndex)
 	if got := fields["id"].GetStringValue(); got != wantID {
 		t.Errorf("comp.id = %q, want %q (selected headline's ORIGINAL stored index, matrix Q8)", got, wantID)
 	}

@@ -1,13 +1,19 @@
 # RAMP Demo Catalog Manifest
 
-This manifest is the **contract** the Phase-2 e2e test author asserts against.
-Every resource below is produced from the three JSONL feeds in this directory
-(`philosophy.jsonl`, `music.jsonl`, `sfx.jsonl`) via the real ingestion path
-(`ParseJSONL` → `mapRecord` → `licenseterm.Normalize` → `licenseterm.Validate`
-→ `CatalogService.PushResources`). All 22 records / 26 terms parse, map, and
-validate with **zero warnings and zero hard rejects** against the registered
-RAMP vocab pinned in `go.mod` (`github.com/RAMP-Protocol/protocol`
-`v0.1.1-0.20260613002045-86c796277a57`).
+This manifest describes the **demo catalog**. Every resource below is produced
+from the three JSONL feeds in this directory (`philosophy.jsonl`, `music.jsonl`,
+`sfx.jsonl`) via the real ingestion path (`ParseJSONL` → `mapRecord`, which
+canonicalizes each term through the SDK's `helpers.NormalizeLicenseTerm` →
+`CatalogService.PushResources`, where the Exchange runs the SDK's
+`helpers.ValidateLicenseTerm`). All 22 records / 26 terms parse, map, and
+validate with zero warnings and zero hard rejects against the registered RAMP
+vocab pinned in `go.mod`.
+
+The e2e suite does **not** read these feeds. It owns its own copy under
+`tests/e2e/harness/fixtures/catalog/`, so the two sets are free to diverge: a
+demo wants one currency and a tidy story, a test suite wants the awkward
+combinations. Changing a price or a term here does not change any test
+expectation.
 
 Content files live under `deploy/content/demo/<publisher>/...` at paths that
 match the `path` column below (the Phase-2 origin container serves that tree).
@@ -40,35 +46,35 @@ obligation.
 | demo.ramp-protocol.org | /articles/philosophers/socrates.txt | text/plain | 1 | FREE; fn[ai-input+search]; PROHIBIT[ai-train]; user[academic]; geo[EU] |
 | demo.ramp-protocol.org | /articles/philosophers/plato.txt | text/plain | 2 | (a) FREE; fn[ai-input+ai-index+search]; PROHIBIT[ai-train]; user[academic]; geo[EU,EEA] **\|\|** (b) PER_UNIT 0.03/accesses EUR; user[commercial_entity]; geo[EU]; quota 5000 accesses/daily; obl:attribution(on_use, backlink) |
 | demo.ramp-protocol.org | /articles/philosophers/aristotle.txt | text/plain | 1 | FLAT 7.50 EUR; fn[ai-input+ai-index]; PROHIBIT[ai-train]; geo[EU]; obl:attribution(on_use, backlink) |
-| demo.ramp-protocol.org | /articles/philosophers/epicurus.txt | text/plain | 1 | PER_UNIT 0.0001/characters USD; fn[ai-input]; PROHIBIT[ai-train]; user[individual]; geo[US,GB] |
+| demo.ramp-protocol.org | /articles/philosophers/epicurus.txt | text/plain | 1 | PER_UNIT 0.0001/characters EUR; fn[ai-input]; PROHIBIT[ai-train]; user[individual]; geo[US,GB] |
 | demo.ramp-protocol.org | /articles/philosophers/heraclitus.txt | text/plain | 1 | FREE; fn[ai-input+search+research]; PROHIBIT[ai-train]; geo[EU] |
 | demo.ramp-protocol.org | /articles/philosophers/parmenides.txt | text/plain | 1 | reference_only / subscription (scopes: subscription:premium); pricing free EUR; license uri required |
-| demo.ramp-protocol.org | /articles/philosophers/democritus.txt | text/plain | 1 | FLAT 6.00 GBP; fn[ai-input+ai-index]; geo[GB]; obl:attribution(on_use) + obl:notice(on_distribution) |
-| demo.ramp-protocol.org | /articles/philosophers/pythagoras.txt | text/plain | 1 | PER_UNIT 0.00002/tokens GBP; fn[ai-input+ai-index]; user[commercial_entity]; geo[GB,EU]; quota 2000000 tokens/daily; obl:contribution(on_use, royalty) |
-| demo.ramp-protocol.org | /articles/philosophers/zeno-of-citium.txt | text/plain | 2 | (a) FREE; fn[ai-input+research+search]; PROHIBIT[ai-train]; user[academic]; geo[EU] **\|\|** (b) PER_UNIT 0.04/accesses USD; user[commercial_entity]; geo[EU,US]; quota 10000 accesses/monthly |
+| demo.ramp-protocol.org | /articles/philosophers/democritus.txt | text/plain | 1 | FLAT 6.00 EUR; fn[ai-input+ai-index]; geo[GB]; obl:attribution(on_use) + obl:notice(on_distribution) |
+| demo.ramp-protocol.org | /articles/philosophers/pythagoras.txt | text/plain | 1 | PER_UNIT 0.00002/tokens EUR; fn[ai-input+ai-index]; user[commercial_entity]; geo[GB,EU]; quota 2000000 tokens/daily; obl:contribution(on_use, royalty) |
+| demo.ramp-protocol.org | /articles/philosophers/zeno-of-citium.txt | text/plain | 2 | (a) FREE; fn[ai-input+research+search]; PROHIBIT[ai-train]; user[academic]; geo[EU] **\|\|** (b) PER_UNIT 0.04/accesses EUR; user[commercial_entity]; geo[EU,US]; quota 10000 accesses/monthly |
 | demo.ramp-protocol.org | /articles/philosophers/thales-of-miletus.txt | text/plain | 1 | **CANARY** · FLAT 9.99 EUR; fn[ai-input+ai-index+search]; PROHIBIT[ai-train]; geo[EU]; obl:attribution(on_use, backlink) |
 
 ## Resource → terms (music.jsonl · Harmonia Records · `music.demo.ramp-protocol.org`)
 
 | Domain | Path | Content-Type | #Terms | Terms summary |
 |--------|------|--------------|--------|---------------|
-| music.demo.ramp-protocol.org | /lyrics/midnight-harbour.txt | text/plain | 2 | (a) FREE; fn[ai-input+search]; PROHIBIT[ai-train]; user[academic]; geo[EU,GB] **\|\|** (b) PER_UNIT 0.05/accesses GBP; fn[ai-input+ai-index+tts]; user[commercial_entity]; geo[EU,GB]; quota 2000 accesses/daily; obl:attribution(on_use, backlink) |
-| music.demo.ramp-protocol.org | /lyrics/paper-satellites.txt | text/plain | 1 | FLAT 3.50 USD; fn[ai-input+ai-index]; PROHIBIT[ai-train]; geo[US]; obl:attribution(on_use, backlink) |
-| music.demo.ramp-protocol.org | /lyrics/ferrograph-blues.txt | text/plain | 1 | reference_only / subscription (scopes: subscription:catalog); pricing free USD |
-| music.demo.ramp-protocol.org | /tracks/aurora-drift.json | application/json | 1 | PER_UNIT 0.002/streams USD; fn[ai-input+sync+stream]; PROHIBIT[ai-train]; user[commercial_entity]; geo[EU,US,GB]; quota 50000 accesses/monthly; obl:contribution(on_use, royalty) |
+| music.demo.ramp-protocol.org | /lyrics/midnight-harbour.txt | text/plain | 2 | (a) FREE; fn[ai-input+search]; PROHIBIT[ai-train]; user[academic]; geo[EU,GB] **\|\|** (b) PER_UNIT 0.05/accesses EUR; fn[ai-input+ai-index+tts]; user[commercial_entity]; geo[EU,GB]; quota 2000 accesses/daily; obl:attribution(on_use, backlink) |
+| music.demo.ramp-protocol.org | /lyrics/paper-satellites.txt | text/plain | 1 | FLAT 3.50 EUR; fn[ai-input+ai-index]; PROHIBIT[ai-train]; geo[US]; obl:attribution(on_use, backlink) |
+| music.demo.ramp-protocol.org | /lyrics/ferrograph-blues.txt | text/plain | 1 | reference_only / subscription (scopes: subscription:catalog); pricing free EUR |
+| music.demo.ramp-protocol.org | /tracks/aurora-drift.json | application/json | 1 | PER_UNIT 0.002/streams EUR; fn[ai-input+sync+stream]; PROHIBIT[ai-train]; user[commercial_entity]; geo[EU,US,GB]; quota 50000 accesses/monthly; obl:contribution(on_use, royalty) |
 | music.demo.ramp-protocol.org | /tracks/copper-mile.json | application/json | 1 | FLAT 4.00 EUR; fn[ai-input+ai-index+sync]; user[non_profit]; geo[EU]; obl:notice(on_distribution) |
-| music.demo.ramp-protocol.org | /tracks/static-garden.json | application/json | 1 | PER_UNIT 0.01/minutes GBP; fn[ai-input+stream+sync]; PROHIBIT[ai-train]; user[commercial_entity]; geo[GB]; quota 1000 accesses/daily |
+| music.demo.ramp-protocol.org | /tracks/static-garden.json | application/json | 1 | PER_UNIT 0.01/minutes EUR; fn[ai-input+stream+sync]; PROHIBIT[ai-train]; user[commercial_entity]; geo[GB]; quota 1000 accesses/daily |
 
 ## Resource → terms (sfx.jsonl · FoleyWorks · `sfx.demo.ramp-protocol.org`)
 
 | Domain | Path | Content-Type | #Terms | Terms summary |
 |--------|------|--------------|--------|---------------|
 | sfx.demo.ramp-protocol.org | /sfx/rain-on-tin-roof.json | application/json | 1 | FREE; fn[ai-input+search]; PROHIBIT[ai-train]; user[individual]; geo[EU,US,GB]; obl:attribution(on_use, backlink) |
-| sfx.demo.ramp-protocol.org | /sfx/wooden-door-creak.json | application/json | 1 | PER_UNIT 0.25/accesses USD; fn[ai-input+sync+reproduce]; user[commercial_entity]; geo[EU,US,GB]; quota 500 accesses/daily; obl:contribution(on_distribution, royalty) |
-| sfx.demo.ramp-protocol.org | /sfx/sci-fi-door-whoosh.json | application/json | 1 | FLAT 12.00 USD; fn[ai-input+sync+modify+reproduce]; PROHIBIT[ai-train]; geo[EU,US,GB]; obl:attribution(on_use) |
+| sfx.demo.ramp-protocol.org | /sfx/wooden-door-creak.json | application/json | 1 | PER_UNIT 0.25/accesses EUR; fn[ai-input+sync+reproduce]; user[commercial_entity]; geo[EU,US,GB]; quota 500 accesses/daily; obl:contribution(on_distribution, royalty) |
+| sfx.demo.ramp-protocol.org | /sfx/sci-fi-door-whoosh.json | application/json | 1 | FLAT 12.00 EUR; fn[ai-input+sync+modify+reproduce]; PROHIBIT[ai-train]; geo[EU,US,GB]; obl:attribution(on_use) |
 | sfx.demo.ramp-protocol.org | /sfx/footsteps-gravel.json | application/json | 1 | reference_only / subscription (scopes: subscription:library); pricing free EUR |
-| sfx.demo.ramp-protocol.org | /sfx/thunder-rumble.json | application/json | 2 | (a) FREE; fn[ai-input+search]; PROHIBIT[ai-train]; user[academic]; geo[EU] **\|\|** (b) PER_UNIT 0.15/accesses GBP; fn[ai-input+sync+reproduce]; user[commercial_entity]; geo[EU,GB]; quota 750 accesses/daily; obl:notice(on_distribution) |
-| sfx.demo.ramp-protocol.org | /sfx/typewriter-keystroke.json | application/json | 1 | PER_UNIT 0.10/accesses USD; fn[ai-input+sync+reproduce+modify]; user[commercial_entity]; geo[US]; quota 250 accesses/hourly |
+| sfx.demo.ramp-protocol.org | /sfx/thunder-rumble.json | application/json | 2 | (a) FREE; fn[ai-input+search]; PROHIBIT[ai-train]; user[academic]; geo[EU] **\|\|** (b) PER_UNIT 0.15/accesses EUR; fn[ai-input+sync+reproduce]; user[commercial_entity]; geo[EU,GB]; quota 750 accesses/daily; obl:notice(on_distribution) |
+| sfx.demo.ramp-protocol.org | /sfx/typewriter-keystroke.json | application/json | 1 | PER_UNIT 0.10/accesses EUR; fn[ai-input+sync+reproduce+modify]; user[commercial_entity]; geo[US]; quota 250 accesses/hourly |
 
 ## Variety matrix (coverage proof)
 
@@ -79,8 +85,8 @@ obligation.
 | Pricing | PER_UNIT | epicurus, pythagoras, plato(b), zeno(b), aurora-drift, static-garden, midnight-harbour(b), wooden-door-creak, thunder-rumble(b), typewriter-keystroke |
 | Pricing | reference_only / subscription | parmenides (subscription:premium), ferrograph-blues (subscription:catalog), footsteps-gravel (subscription:library) |
 | Currency | EUR | socrates, plato, aristotle, heraclitus, parmenides, thales, copper-mile, footsteps-gravel, thunder-rumble(a) |
-| Currency | USD | epicurus, zeno(b), paper-satellites, ferrograph-blues, aurora-drift, rain-on-tin-roof, wooden-door-creak, sci-fi-door-whoosh, typewriter-keystroke |
-| Currency | GBP | democritus, pythagoras, midnight-harbour, static-garden, thunder-rumble(b) |
+| Currency | EUR | epicurus, zeno(b), paper-satellites, ferrograph-blues, aurora-drift, rain-on-tin-roof, wooden-door-creak, sci-fi-door-whoosh, typewriter-keystroke |
+| Currency | EUR | democritus, pythagoras, midnight-harbour, static-garden, thunder-rumble(b) |
 | Restriction: geo | EU-only | socrates, aristotle, heraclitus, copper-mile, thunder-rumble(a), zeno(a) |
 | Restriction: geo | US-only / US-incl | epicurus(US,GB), paper-satellites(US), typewriter-keystroke(US) |
 | Restriction: geo | EEA | plato(a) (geo[EU,EEA]) |
@@ -104,9 +110,10 @@ obligation.
 Every `functions`, `user_types`, `geos`, pricing `model`/`unit`, quota
 `metric`/`window`, and obligation `kind`/`trigger` token in the three feeds is
 a registered canonical token in the pinned protocol module. There are **no
-unregistered tokens** anywhere in the catalog — a clean dry-run through the
-production `licenseterm.Validate` surface produced zero lint warnings and zero
-hard rejects across all 26 terms.
+unregistered tokens** anywhere in the catalog — a clean run through the SDK's
+`helpers.ValidateLicenseTerm`, the ingest-tier check the Exchange runs on every
+pushed term, produced zero lint warnings and zero hard rejects across all 26
+terms (`src/exchange/internal/ingest/demo_feeds_test.go` asserts this).
 
 Subscription pricing is modeled as `reference_only` semantics with a
 `subscription:*` scope and `free` pricing (the proto's closed pricing model set

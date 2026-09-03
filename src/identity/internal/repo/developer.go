@@ -45,8 +45,10 @@ func (r *PgxDeveloperRepo) BySubject(ctx context.Context, issuer, subject string
 	return toDeveloper(row), nil
 }
 
-// BySubdomain resolves a developer by its minted subdomain — the read-back path a
-// later Register step uses to forward the licensing fields.
+// BySubdomain resolves a developer by its minted subdomain. It is the presence gate
+// for the RAMP commercial overlay: the publisher serves an agent's role marker exactly
+// when this returns a row, so account.ErrNotFound becomes a 404 and
+// account.ErrUnavailable becomes a 503.
 func (r *PgxDeveloperRepo) BySubdomain(ctx context.Context, subdomain string) (account.Developer, error) {
 	row, err := r.q.GetDeveloperBySubdomain(ctx, subdomain)
 	if err != nil {
@@ -80,25 +82,6 @@ func (r *PgxDeveloperRepo) Reserve(ctx context.Context, d account.Developer) (ac
 	return toDeveloper(row), nil
 }
 
-// CompleteRegistration stores the three licensing fields and flips
-// registration_complete for (issuer, subject).
-func (r *PgxDeveloperRepo) CompleteRegistration(
-	ctx context.Context, issuer, subject string, d account.LicensingDetails,
-) (account.Developer, error) {
-	row, err := r.q.CompleteDeveloperRegistration(ctx, sqlc.CompleteDeveloperRegistrationParams{
-		OidcIssuer:          issuer,
-		OidcSubject:         subject,
-		LegalEntity:         d.LegalEntity,
-		Address:             d.Address,
-		JurisdictionCountry: d.JurisdictionCountry,
-	})
-	if err != nil {
-		return account.Developer{}, mapReadErr(err, account.ErrNotFound, account.ErrUnavailable,
-			fmt.Sprintf("complete developer %q/%q", issuer, subject))
-	}
-	return toDeveloper(row), nil
-}
-
 // mapReadErr translates a read/update persistence error to domain sentinels: no
 // row to notFound, a transient outage to unavailable, anything else wrapped with
 // context. Shared by the developer, oauth, and card repos so the same mapping is
@@ -114,11 +97,15 @@ func mapReadErr(err error, notFound, unavailable error, what string) error {
 	}
 }
 
-// mapWriteErr translates a write persistence error: a transient outage to the given
-// unavailable sentinel, anything else wrapped with context. Unlike mapReadErr there
-// is no not-found case — a write does not "miss" a row. Callers return their zero
-// value alongside it. Shared by the developer and oauth write paths so the outage
-// mapping is not re-inlined per write.
+// mapWriteErr translates a persistence error with NO not-found case: a transient
+// outage to the given unavailable sentinel, anything else wrapped with context.
+// Callers return their zero value alongside it.
+//
+// Every write is such a case — a write does not "miss" a row — and so is a
+// multi-row read, which answers an absent set with an empty slice rather than
+// pgx.ErrNoRows. That is why the registration notes' List reaches for this and
+// not mapReadErr: for it, "this agent has registered nowhere" is an answer.
+// mapReadErr is for the single-row reads, where a miss is a distinct outcome.
 func mapWriteErr(err error, unavailable error, what string) error {
 	if isUnavailable(err) {
 		return unavailable
@@ -138,14 +125,10 @@ func uniqueConstraint(err error) string {
 
 func toDeveloper(row sqlc.IdentityDeveloperAccount) account.Developer {
 	return account.Developer{
-		Issuer:               row.OidcIssuer,
-		Subject:              row.OidcSubject,
-		Email:                row.Email,
-		Subdomain:            row.Subdomain,
-		LegalEntity:          row.LegalEntity,
-		Address:              row.Address,
-		JurisdictionCountry:  row.JurisdictionCountry,
-		RegistrationComplete: row.RegistrationComplete,
+		Issuer:    row.OidcIssuer,
+		Subject:   row.OidcSubject,
+		Email:     row.Email,
+		Subdomain: row.Subdomain,
 	}
 }
 

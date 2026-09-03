@@ -65,9 +65,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
+
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/delivery"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/exchacct"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/token"
 )
 
@@ -91,29 +93,53 @@ const (
 // reconnects; nothing but the session's own liveness depends on it.
 const SessionTimeout = 10 * time.Minute
 
-// Config wires the MCP adapter. Every field is required: an adapter with no token
-// issuer cannot authenticate, with no RAMP client cannot act, with no developer
-// store cannot register, and with no issuer URL cannot tell a client where to sign
-// in.
+// Config wires the MCP adapter. Every collaborator is required, and validate()
+// below is the enumeration: an adapter with no token issuer cannot
+// authenticate, with no account service cannot register, with no RAMP client
+// cannot buy, and with no issuer URL cannot tell a client where to sign in.
+//
+// Two kinds of field are exempt, and both mean something when left unset.
+// ExchangeAllowed is nil for a deployment that reaches every Exchange, which is
+// what an unset allowlist says. The three size and time bounds default, so a
+// caller states only the ones it wants moved.
 type Config struct {
 	// Tokens verifies the inbound bearer. It is the same issuer the sign-in flow
 	// mints with, so a token is accepted here exactly when it was issued by us,
 	// for us, and is still live.
 	Tokens *token.Issuer
 
-	// RAMP is the outbound leg — the Connect clients, signed per request as the
+	// RAMP is the relay purchase, and only that: it goes to the Broker's relay
+	// route rather than to the ExchangeService RPC the SDK's Execute calls, which
+	// is why this package still sends it itself. Signed per request as the
 	// authenticated agent. Typed as the narrow port this package actually calls
-	// (see ports.go); *rampclient.Client satisfies it.
+	// (see ports.go for why the seam is declared here); *rampclient.Client
+	// satisfies it.
+	//
+	// Registration and account status are NOT on this port. They travel through
+	// Accounts below, which owns the workflow they belong to. This is the field a
+	// reader opens Config to see what the adapter is wired with, so it says where
+	// the other two went rather than leaving a reader to find out from ports.go.
 	RAMP rampCaller
 
-	// Developers reads the caller's account so register can forward the licensing
-	// fields collected at sign-up. Read-only by type: this adapter has no business
-	// creating accounts.
-	Developers developerReader
+	// Discovery resolves offers through the Broker and returns them already
+	// verified. Separate from RAMP because the SDK serves it (see ports.go).
+	Discovery discoverer
+
+	// Reports files a usage report with the Exchange that issued the offer.
+	// Separate from RAMP for the same reason as Discovery.
+	Reports reporter
+
+	// Accounts opens and reports the caller's Exchange accounts. It owns the
+	// requirements read, the pre-check, the send and the local note; the two
+	// account tools are decode-call-render over it.
+	Accounts *exchacct.Service
+
+	// ExchangeAllowed is the deployment's Exchange policy. Optional: nil permits
+	// every Exchange, which is the same answer an unset allowlist gives.
+	ExchangeAllowed exchangeAllowed
 
 	// Content fetches licensed bytes from the delivery edge, signed as the calling
-	// agent. Typed as the narrow port this package calls (see ports.go);
-	// *delivery.Fetcher satisfies it.
+	// agent. Typed as the narrow port this package calls (see ports.go).
 	//
 	// Required, like everything else here. ramp_execute promises the content, so
 	// an adapter wired without a fetcher cannot honour its own contract — and
@@ -180,7 +206,10 @@ func New(cfg Config) (*Server, error) {
 	cfg = cfg.withDefaults()
 	tools := &toolset{
 		ramp:                cfg.RAMP,
-		developers:          cfg.Developers,
+		discovery:           cfg.Discovery,
+		reports:             cfg.Reports,
+		accounts:            cfg.Accounts,
+		exchangeAllowed:     cfg.ExchangeAllowed,
 		content:             cfg.Content,
 		callTimeout:         cfg.CallTimeout,
 		maxCallContentBytes: cfg.MaxCallContentBytes,
@@ -216,8 +245,12 @@ func (c Config) validate() error {
 		return errors.New("mcp: Config.Tokens is required")
 	case c.RAMP == nil:
 		return errors.New("mcp: Config.RAMP is required")
-	case c.Developers == nil:
-		return errors.New("mcp: Config.Developers is required")
+	case c.Discovery == nil:
+		return errors.New("mcp: Config.Discovery is required")
+	case c.Reports == nil:
+		return errors.New("mcp: Config.Reports is required")
+	case c.Accounts == nil:
+		return errors.New("mcp: Config.Accounts is required")
 	case c.Content == nil:
 		return errors.New("mcp: Config.Content is required")
 	case c.IssuerURL == "":
@@ -253,7 +286,7 @@ func (c Config) withDefaults() Config {
 		c.MaxCallContentBytes = DefaultMaxCallContentBytes
 	}
 	if c.MaxItemContentBytes <= 0 {
-		c.MaxItemContentBytes = delivery.DefaultMaxBytes
+		c.MaxItemContentBytes = resolvers.DefaultMaxContentBytes
 	}
 	return c
 }

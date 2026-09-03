@@ -27,6 +27,25 @@
 // is captured by the Window func; the signing bytes are otherwise identical
 // across callers.
 //
+// The SDK ships a Window pair under the same two names, and this package's
+// exists for one difference: the monotonic one here CAPS its drift, so a
+// signature can never outlive twice its TTL however fast requests arrive. The
+// SDK's does not, and above one request per second the uncapped bump compounds
+// until the cutoff runs permanently ahead of the clock — which turns the
+// short-lifetime control off without failing anything. The cap is written once,
+// in MonotonicWindow below, with the arithmetic that explains it.
+//
+// Which signers take which is worth stating, because the split is real and not
+// everyone is on this side of it. The identity service's two outbound legs take
+// the pair from here — the SDK-backed client and the hand-written one. The
+// Broker's exchange client and the Exchange's catalog push call the SDK's, so
+// they sign without the bound — knowingly, since moving them changes two
+// services' signing behaviour and belongs with the work that verifies it rather
+// than with the caller that noticed. Capping the SDK's is the resolution that
+// would retire the difference altogether; until then the two are not
+// interchangeable, and which pair a signer takes is a property of that signer
+// rather than a rule this package can state for everyone.
+//
 // Two signing branches share that Window, and they source created differently:
 //
 //   - A plain outbound /ramp.* request is signed with
@@ -45,7 +64,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,14 +76,6 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig"
 )
-
-// ErrUnusableKey is returned when the key a request would be signed with cannot
-// be used: wrong length, or carrying a keyid that does not identify it. It is
-// distinct from an error the KeySource itself returned (custody down, no active
-// key, an unauthenticated caller), which is wrapped through unchanged so the
-// caller can still match on the custody sentinels — the two call for different
-// answers, an outage being retryable where malformed key material is not.
-var ErrUnusableKey = errors.New("ramphttpsig: unusable signing key")
 
 // Window returns the RFC 9421 (created, expires) cutoffs (unix seconds) to stamp
 // on the next outbound signature. It is invoked once per signed request. Both
@@ -257,7 +267,7 @@ func New(
 	if t.keys != nil {
 		return t, nil
 	}
-	static, err := completeKey(AgentKey{Directory: directory, Private: priv})
+	static, err := CompleteKey(AgentKey{Directory: directory, Private: priv})
 	if err != nil {
 		return nil, err
 	}
@@ -265,11 +275,17 @@ func New(
 	return t, nil
 }
 
-// completeKey validates key material and derives the keyid as the RFC 7638
+// CompleteKey validates key material and derives the keyid as the RFC 7638
 // thumbprint of the key's public half, so the keyid on the wire always identifies
 // the key that actually signed and cannot drift from it. Construction and the
 // per-request path share it, which is what keeps a KeySource held to the same
 // standard as a statically-supplied key.
+//
+// Exported because this transport is no longer the only outbound leg resolving a
+// key through a KeySource: the SDK-backed legs build their signer from the same
+// custody source and would otherwise skip this, leaving one service with two
+// outbound paths that answer differently about whether a keyid identifies its
+// key. The rule belongs to whoever owns outbound signing keys, which is here.
 //
 // The thumbprint is derived on EVERY call, including when the caller already
 // supplied one, and a supplied keyid that disagrees is refused. Trusting the
@@ -279,7 +295,7 @@ func New(
 // write there would put a keyid on the wire that resolves at the origin to a
 // different public key — every signature rejected, and nothing on this side
 // noticing.
-func completeKey(key AgentKey) (AgentKey, error) {
+func CompleteKey(key AgentKey) (AgentKey, error) {
 	if len(key.Private) != ed25519.PrivateKeySize {
 		return AgentKey{}, fmt.Errorf(
 			"%w: key for %q is %d bytes, want an %d-byte ed25519 private key",
@@ -372,12 +388,21 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 // caller — aborts the request: sending it unsigned would present the agent to the
 // origin as an anonymous bot, which is the failure this transport exists to
 // prevent.
+//
+// Both failures carry ErrNoSigningKey alongside their own cause, and this
+// function is where that happens because it is the one point both pass through:
+// a caller that wants to know "could this request be signed at all" asks one
+// question rather than enumerating the ways the answer can be no.
 func (t *Transport) resolveKey(ctx context.Context) (AgentKey, error) {
 	key, err := t.keys(ctx)
 	if err != nil {
-		return AgentKey{}, fmt.Errorf("ramphttpsig: resolve signing key: %w", err)
+		return AgentKey{}, fmt.Errorf("%w: resolve signing key: %w", ErrNoSigningKey, err)
 	}
-	return completeKey(key)
+	key, err = CompleteKey(key)
+	if err != nil {
+		return AgentKey{}, fmt.Errorf("%w: %w", ErrNoSigningKey, err)
+	}
+	return key, nil
 }
 
 // buffer drains req.Body into memory and re-seats Body, GetBody, ContentLength,

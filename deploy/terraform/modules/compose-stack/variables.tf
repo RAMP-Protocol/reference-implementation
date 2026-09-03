@@ -261,6 +261,22 @@ variable "default_tenant_domain" {
   }
 }
 
+variable "default_agent_credit" {
+  description = "EXCHANGE_DEFAULT_AGENT_CREDIT for the Exchange: one-time welcome credit granted to each newly registered agent. The value is in WHOLE units of the ledger currency, not minor units — \"100\" on the default EUR ledger grants EUR 100.00 to each new agent, not 100 cents. The default \"0\" disables the grant. This env variable is the sole owner of the default tenant's stored credit value: every Exchange boot overwrites the stored value with it, so changing the credit means re-applying and restarting the stack, and a value edited into the database by hand does not survive a restart."
+  type        = string
+  default     = "0"
+  nullable    = false
+
+  # The Exchange accepts only a plain decimal with at most 8 fraction digits
+  # (the ledger asset scale) and STOPS THE BOOT on anything else — exponents,
+  # negative values, currency symbols, thousands separators. This check moves
+  # that boot failure to `terraform plan`.
+  validation {
+    condition     = can(regex("^[0-9]+(\\.[0-9]{1,8})?$", var.default_agent_credit))
+    error_message = "default_agent_credit must be a plain decimal with at most 8 fraction digits (e.g. \"0\", \"100\", \"9.99\") — anything else stops the Exchange boot. The unit is whole currency units of the ledger currency: \"100\" grants 100.00, not 1.00."
+  }
+}
+
 variable "broker_identity_key_pem" {
   description = "Broker identity private key (PEM with a raw 64-byte ed25519 payload — the shape gen-staging-keys.sh derives into keys/broker-identity-key.pem, NOT what openssl writes), delivered to the VM as a key file and read via BROKER_ED25519_KEY_FILE. A DIFFERENT key from broker_relay_key_json: the Broker publishes this one's public half in its WBA directory with a 90-day validity window, so it must be stable across restarts. The Broker refuses to boot without it rather than mint a throwaway that invalidates the window it just published. A key file rather than a BROKER_ED25519_SEED env value on purpose: the rendered compose file is world-readable on the VM, the per-service key directory is not."
   type        = string
@@ -289,5 +305,128 @@ variable "broker_identity_key_pem" {
     # header/footer lines, count the base64 characters.
     condition     = length(join("", regexall("[A-Za-z0-9+/=]", replace(var.broker_identity_key_pem, "/-----[A-Z0-9 ]+-----/", "")))) == 88
     error_message = "broker_identity_key_pem's payload must be exactly 64 raw bytes (88 base64 characters) — the ed25519 seed||public shape the Broker's loader requires. A truncated paste or a PKCS#8 body fails this."
+  }
+}
+
+# ── Zitadel outbound mail ────────────────────────────────────────────────────
+# Zitadel reads these ONLY when it creates its instance on the very first
+# start (its FirstInstance setup step). Changing them later has no effect on a
+# running instance — the stored provider is edited through the Zitadel console
+# or its Admin API instead. Because the values travel in the rendered compose
+# file, and that file is the VM's cloud-init user data, changing any of them
+# replaces the VM and rebuilds the whole deployment from empty.
+#
+# Left null the deployment has no mail provider: Zitadel cannot send the
+# confirmation code self-registration needs.
+
+variable "smtp_host" {
+  description = "SMTP relay as host:port (e.g. \"email-smtp.us-east-1.amazonaws.com:587\"). Null disables outbound mail. Zitadel reads this only when it first creates its instance."
+  type        = string
+  default     = null
+
+  validation {
+    # The port is required, not optional: Zitadel's SMTP client dials the
+    # string as given and does not default to 25/587, so a bare hostname
+    # fails at send time — long after the apply that introduced it.
+    condition     = var.smtp_host == null ? true : can(regex("^[A-Za-z0-9.-]+:[0-9]{1,5}$", var.smtp_host))
+    error_message = "smtp_host must be host:port with a numeric port (e.g. email-smtp.us-east-1.amazonaws.com:587). Zitadel dials this string verbatim and supplies no default port."
+  }
+}
+
+variable "smtp_user" {
+  description = "SMTP username. For Amazon SES this is the IAM access key id of the sending user."
+  type        = string
+  default     = null
+}
+
+variable "smtp_password" {
+  description = "SMTP password. For Amazon SES this is the region-derived SMTP password (aws_iam_access_key.<name>.ses_smtp_password_v4), NOT the raw secret access key."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "smtp_from" {
+  description = "Envelope and header sender address. Must be an address the relay is allowed to send as — for SES, one under the verified identity."
+  type        = string
+  default     = null
+
+  validation {
+    # Shape plus an explicit CR/LF ban: the value is interpolated into the
+    # compose file and then into a mail header, where an embedded newline
+    # would let a bad value inject a second header.
+    condition     = var.smtp_from == null ? true : can(regex("^[^@\\s]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$", var.smtp_from))
+    error_message = "smtp_from must be a single email address with no whitespace or line breaks."
+  }
+}
+
+variable "smtp_from_name" {
+  description = "Display name shown next to the sender address. Null renders the address alone."
+  type        = string
+  default     = null
+
+  validation {
+    # Same header-injection reasoning as smtp_from, with a length cap that
+    # keeps the rendered YAML line reasonable.
+    condition     = var.smtp_from_name == null ? true : (length(var.smtp_from_name) <= 78 && !can(regex("[\r\n]", var.smtp_from_name)))
+    error_message = "smtp_from_name must be at most 78 characters and contain no line breaks."
+  }
+}
+
+variable "exchange_registration_schema" {
+  description = "JSON Schema the Exchange publishes as account_registration.data_schema and enforces on Register. Pass the schema as a JSON STRING (build it with jsonencode). Unset publishes no schema and registration accepts any payload. Publishing a schema IS the enforcement switch: a registration that does not conform is refused from the moment this is set."
+  type        = string
+  default     = null
+
+  validation {
+    # The Exchange REFUSES TO BOOT on a schema it cannot use — deliberate, so
+    # an operator never believes a requirement is published while it is not.
+    # That makes a typo here a demo outage, so catch unparseable JSON at plan
+    # time instead of at first boot.
+    condition     = var.exchange_registration_schema == null || can(jsondecode(var.exchange_registration_schema))
+    error_message = "exchange_registration_schema must be a JSON string. The Exchange refuses to boot on a schema it cannot parse, so a malformed value here takes the deployment down rather than degrading."
+  }
+}
+
+variable "exchange_terms_uri" {
+  description = "URI of the terms document the Exchange publishes as account_registration.terms_uri. Point it at an immutable, revisioned path (…/terms/revision-1.txt), never a mutable one: registrations accepted under a revision must still resolve once the next revision exists."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.exchange_terms_uri == null || can(regex("^https://", var.exchange_terms_uri))
+    error_message = "exchange_terms_uri must be an https:// URI — a registering client fetches it to read the terms it is accepting."
+  }
+}
+
+variable "exchange_terms_digest" {
+  description = "Digest of the terms document the Exchange publishes as account_registration.terms_digest and holds registering clients to. It must equal the digest of the bytes actually SERVED — derive it with filesha256() over the same file passed in exchange_terms_documents rather than writing it by hand."
+  type        = string
+  default     = null
+
+  validation {
+    # The format the protocol pins for this field.
+    condition     = var.exchange_terms_digest == null || can(regex("^(sha256:[0-9a-f]{64}|sha384:[0-9a-f]{96}|sha512:[0-9a-f]{128})$", var.exchange_terms_digest))
+    error_message = "exchange_terms_digest must be sha256:<64 hex>, sha384:<96 hex> or sha512:<128 hex>, lowercase."
+  }
+}
+
+variable "exchange_terms_documents" {
+  description = "Terms documents Caddy serves under /terms/ on the Exchange hostname: filename => content. A MAP rather than a single document because every revision you have published must stay online — a digest of a deleted document identifies nothing. Adding a revision later is one entry here plus one digest line, with no Caddy change. Empty serves nothing and leaves the rendered Caddyfile and compose bundle byte-identical to a deployment without this feature."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    # The map KEYS are the half that reaches configuration verbatim: each one
+    # becomes a cloud-init write_files path under /opt/ramp/exchange-terms and
+    # is served from that directory. The documents themselves travel base64,
+    # so the filename is the only part landing in rendered config as-is. Same
+    # restriction static_wba_directories puts on its hostname keys, and for
+    # the same reason.
+    condition = alltrue([
+      for name in keys(var.exchange_terms_documents) :
+      can(regex("^[A-Za-z0-9][A-Za-z0-9._-]*$", name)) && !strcontains(name, "..")
+    ])
+    error_message = "Every exchange_terms_documents key must be a plain filename: letters, digits, then letters, digits, dots, underscores or hyphens. No directory separators, no .., no whitespace, no control characters — the key becomes a cloud-init file path."
   }
 }

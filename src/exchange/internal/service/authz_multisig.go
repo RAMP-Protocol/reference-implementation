@@ -67,24 +67,24 @@ func classifyTransportChain(verified []helpers.VerifiedRequest) transportChain {
 // to mintSignedURL / persist. Any rejection is audited through logOutcome before
 // it returns, matching every other execute authz outcome.
 func (s *ExchangeService) authorizeExecute(
-	ctx context.Context, req *rampv1.TransactionRequest, agentID string, tenant repo.Tenant,
+	ctx context.Context, req *rampv1.TransactionRequest, agent resolvedAgent, tenant repo.Tenant,
 ) (Caller, agentBinding, error) {
 	chain := classifyTransportChain(helpers.AllSignaturesFromContext(ctx))
-	auditCaller := Caller{KeyID: agentID, Kind: CallerAgent, AgentID: agentID}
+	auditCaller := Caller{KeyID: agent.id, Kind: CallerAgent, AgentID: agent.id}
 	if relayErr := s.authorizeTransportRelay(ctx, chain, tenant); relayErr != nil {
 		relayCaller := Caller{KeyID: chain.brokerKey, Kind: CallerBroker}
-		s.logOutcome(ctx, "execute_transaction", "REJECTED_AUTHZ", relayCaller, &tenant, agentID, "", relayErr)
+		s.logOutcome(ctx, "execute_transaction", "REJECTED_AUTHZ", relayCaller, &tenant, agent.id, "", relayErr)
 		return Caller{}, agentBinding{}, relayErr
 	}
 	// The authoritative agent identity is the BODY acceptance key, not the
-	// transport chain. Verify it and bind the delivery URL to its RFC 7638
-	// thumbprint. Computed before billing so a bad-acceptance failure reserves
-	// no funds.
-	binding, err := s.verifyAgentAcceptance(ctx, req, agentID)
+	// transport chain. Verify it against the request's ONE key snapshot and bind
+	// the delivery URL to its RFC 7638 thumbprint. Computed before billing so a
+	// bad-acceptance failure reserves no funds.
+	binding, err := verifyAgentAcceptance(req, agent.key)
 	if err != nil {
 		var de *exchange.Error
 		if errors.As(err, &de) {
-			s.logOutcome(ctx, "execute_transaction", "REJECTED_AUTHZ", auditCaller, &tenant, agentID, "", de)
+			s.logOutcome(ctx, "execute_transaction", "REJECTED_AUTHZ", auditCaller, &tenant, agent.id, "", de)
 		}
 		return Caller{}, agentBinding{}, err
 	}

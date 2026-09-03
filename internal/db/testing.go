@@ -180,6 +180,21 @@ func OpenForTest(tb testing.TB, ctx context.Context, dsn string) *pgxpool.Pool {
 	return pool
 }
 
+// AcquireTestDSN resets the shared Postgres to its migrated baseline and returns
+// its DSN. It is what a test wants when it drives the database through something
+// that opens its own connection — a migration test stepping the schema, a probe —
+// rather than through a pool the test holds. A test that wants the pool calls
+// AcquireTestDB, which is this plus OpenForTest.
+//
+// The reset-at-start contract is AcquireTestDB's, and it is written there.
+func AcquireTestDSN(tb testing.TB, ctx context.Context, pg *SharedPostgres) string {
+	tb.Helper()
+	if err := pg.Reset(ctx); err != nil {
+		tb.Fatalf("reset shared db: %v", err)
+	}
+	return pg.DSN
+}
+
 // AcquireTestDB resets the shared Postgres to its migrated baseline and returns a
 // fresh pool bound to it. Call it exactly once per test, at the start of setup:
 // Reset drops and recreates the shared database, so a second call within the same
@@ -188,8 +203,5 @@ func OpenForTest(tb testing.TB, ctx context.Context, dsn string) *pgxpool.Pool {
 // must run serially — Reset cannot overlap a sibling (see SharedPostgres).
 func AcquireTestDB(tb testing.TB, ctx context.Context, pg *SharedPostgres) *pgxpool.Pool {
 	tb.Helper()
-	if err := pg.Reset(ctx); err != nil {
-		tb.Fatalf("reset shared db: %v", err)
-	}
-	return OpenForTest(tb, ctx, pg.DSN)
+	return OpenForTest(tb, ctx, AcquireTestDSN(tb, ctx, pg))
 }

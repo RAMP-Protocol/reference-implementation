@@ -53,8 +53,8 @@ func assertRelayErrorField(t *testing.T, detail *rampv1.ErrorDetail, key, want s
 // the body parses cleanly and the request fails ONLY on the empty-items guard.
 func (e relayTestEnv) emptyItemsBody(t *testing.T) []byte {
 	t.Helper()
-	body, err := protojson.Marshal(&rampv1.TransactionRequest{
-		Ver:            "0.3",
+	body, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: "tx-empty-items",
 		Requester: &rampv1.Requester{
 			Id:     e.agentKID,
@@ -90,8 +90,8 @@ func (e relayTestEnv) itemMissingExchangeBody(t *testing.T) []byte {
 	if err != nil {
 		t.Fatalf("SignOfferAcceptance: %v", err)
 	}
-	body, err := protojson.Marshal(&rampv1.TransactionRequest{
-		Ver:            "0.3",
+	body, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: idem,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{{

@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	connect "connectrpc.com/connect"
-	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 )
 
@@ -29,7 +28,7 @@ const defaultCallerBillingRef = "billing-agent-test"
 // broker caller is refused.
 func registerCaller(t *testing.T, ctx context.Context, client rampconnect.ExchangeServiceClient) string {
 	t.Helper()
-	resp, err := client.Register(ctx, connect.NewRequest(&rampv1.RegisterRequest{Ver: "1.0"}))
+	resp, err := client.Register(ctx, connect.NewRequest(newRegisterRequest(nil)))
 	if err != nil {
 		t.Fatalf("register caller: %v", err)
 	}

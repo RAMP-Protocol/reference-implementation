@@ -28,6 +28,7 @@ from typing import Any
 
 import httpx
 import pytest
+from ramp_sdk import ProtocolVersion
 
 from ..conftest import StackURLs
 from ..httpsig_signer import load_keypair, sign_request
@@ -104,12 +105,20 @@ def test_tampered_body_is_refused_with_digest_mismatch(
        the digest mismatch with a token from the DIGEST bucket.
     """
     # Sign body A — the digest header commits to A's bytes.
-    body_a_obj = {"requester": {}, "uris": ["http://edge:8787/premium/article-a.html"]}
+    body_a_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/article-a.html"],
+    }
     body_a = json.dumps(body_a_obj, separators=(",", ":")).encode()
 
     # The wire payload is body B — different URI, different bytes,
     # different SHA-256. The signature still commits to body A.
-    body_b_obj = {"requester": {}, "uris": ["http://edge:8787/premium/article-b.html"]}
+    body_b_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/article-b.html"],
+    }
     body_b = json.dumps(body_b_obj, separators=(",", ":")).encode()
     assert body_a != body_b, "pre-condition: tampered body must differ from signed body"
 

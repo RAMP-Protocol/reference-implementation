@@ -16,7 +16,7 @@ import (
 // TestExecuteTransaction_UnregisteredAgentPaidDenied drives a PAID transaction
 // from an agent whose agents row carries no billing_ref (the skipRegister harness).
 // The service denies it BEFORE Authorize (ADR-021 D5 / decision D1): the item is
-// denied in-body with DENIAL_REASON_BILLING_REF_INACTIVE, no transaction row is
+// denied in-body with DENIAL_REASON_ACCOUNT_NOT_REGISTERED, no transaction row is
 // persisted, and no billing hold is taken (Authorize is never reached).
 func TestExecuteTransaction_UnregisteredAgentPaidDenied(t *testing.T) {
 	h, rec := newRecordingHarnessWith(t, harnessOptions{skipRegister: true})
@@ -25,7 +25,7 @@ func TestExecuteTransaction_UnregisteredAgentPaidDenied(t *testing.T) {
 
 	const idem = "tx-unregistered-paid"
 	resp, err := executeSingleItem(t, h, idem, offer)
-	assertItemDenied(t, resp, err, rampv1.DenialReason_DENIAL_REASON_BILLING_REF_INACTIVE)
+	assertItemDenied(t, resp, err, rampv1.DenialReason_DENIAL_REASON_ACCOUNT_NOT_REGISTERED)
 
 	// No side effect: the denial persisted no transaction_log row (same tier-2
 	// repo read the sibling negative tests use — no public transaction-read RPC

@@ -41,9 +41,10 @@ import (
 //   - Quota{accesses, 1000, DAILY}        -> "quota:accesses" (no canonical V1 field)
 //   - Obligation{NOTICE, ON_USE}          -> "obligation:notice" — a non-ATTRIBUTION
 //     obligation kind (the citation crosswalk is ATTRIBUTION-only). NOTICE is used
-//     in place of SHARE_ALIKE because SHARE_ALIKE without scope_license is a hard
-//     ingest reject (licenseterm.Validate); NOTICE ingests cleanly and is still a
-//     non-ATTRIBUTION kind, satisfying the slice's "obligation:<kind>" requirement.
+//     in place of SHARE_ALIKE because SHARE_ALIKE without scope_license is refused
+//     at the wire (protovalidate's obligation.share_alike.requires_scope_license
+//     rule); NOTICE ingests cleanly and is still a non-ATTRIBUTION kind,
+//     satisfying the slice's "obligation:<kind>" requirement.
 //   - Scopes=["entitlement:full"]         -> "scope:entitlement:full"
 //
 // All tokens satisfy ingest CEL: "martians" / "ai-train" are open-vocab restriction
@@ -115,7 +116,7 @@ var wantUnmapped = []string{
 // term (seedUnmappedTerm) carries the mapped (GEOGRAPHY=US) + unmapped (FUNCTION, an
 // UNRECOGNIZED-token USER_TYPE, a quota, a NOTICE obligation, an entitlement scope)
 // construct set. The test discovers it WITH SupportedProfiles=["ramp-comp-v1"] and
-// the term's entitlement scope (so licenseterm.Select keeps the scope-bearing term)
+// the term's entitlement scope (so selectTerms keeps the scope-bearing term)
 // and asserts four properties through the public RPC surface:
 //
 //	(1) FLAG: comp.ext.ramp_unmapped == wantUnmapped EXACTLY (sorted, deduped,
@@ -131,8 +132,8 @@ var wantUnmapped = []string{
 //	    opaque comp Package.ext, so a real CoMP parser still accepts the Package.
 //
 //	(4) PARITY: ExecuteTransaction on this comp-bearing offer succeeds — the
-//	    deterministic (sorted) ramp_unmapped list reproduces byte-identically at
-//	    tx-reconstruction, so the signature re-verifies.
+//	    presented signed bytes (the sorted ramp_unmapped list included) verify
+//	    at execute.
 //
 // It FAILS on current HEAD: renderCompProfile (comp_render.go) emits no
 // comp.ext.ramp_unmapped key at all (citationFromObligations is ATTRIBUTION-only,
@@ -159,11 +160,7 @@ func TestComp_UnmappedConstructsFlag(t *testing.T) {
 	}
 
 	client := h.signedCat(callerID, priv)
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries:  []*rampv1.ResourceEntry{entry},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{entry})))
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -180,8 +177,8 @@ func TestComp_UnmappedConstructsFlag(t *testing.T) {
 	assertCompRampUnmapped(t, compOffer)
 	assertUnmappedNonLoss(t, compOffer)
 
-	// PARITY: the signed (now ramp_unmapped-bearing) comp ext survives
-	// tx-reconstruction under the same entitlement scope.
+	// PARITY: the signed (now ramp_unmapped-bearing) comp ext verifies unchanged
+	// at execute, presented by a requester carrying the same entitlement scope.
 	assertTransactParityScoped(t, h, compOffer, "entitlement:full")
 }
 

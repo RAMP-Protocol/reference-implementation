@@ -15,20 +15,26 @@ import (
 	"time"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/offerkeys"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/agentsign"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/delivery"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/exchacct"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/exchpolicy"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/exchreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/keystore"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/mcp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/oauthserver"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/oidcup"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/publisher"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/rampclient"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/rampsdk"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/repo"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/session"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/signup"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/token"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/transport"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -52,14 +58,26 @@ type Config struct {
 // MCPConfig wires the RAMP adapter — the MCP endpoint and its tools. It is
 // MANDATORY: the RAMP adapter is the identity service's agent-facing surface, so
 // Build fails closed when it is absent rather than serving a directory-and-sign-up
-// server that no agent can act through. BrokerURL and ExchangeURL are required;
-// the rest take defaults.
+// server that no agent can act through. BrokerURL is required; the rest take
+// defaults.
+//
+// There is no Exchange origin here. An account is per-Exchange, the agent names
+// which one per call, and the endpoint comes from that Exchange's own manifest —
+// so a configured origin would be a second answer to a question the protocol
+// already answers, and there is nowhere for one to be passed in.
 type MCPConfig struct {
 	// BrokerURL is the Broker's Connect origin, where discovery goes.
 	BrokerURL string
-	// ExchangeURL is the Exchange origin holding the agents' accounts, where
-	// register and status go.
-	ExchangeURL string
+	// ExchangeAllowlist confines this deployment to a set of Exchanges: a
+	// comma-separated list of bare domains. Empty permits every Exchange, which
+	// is how this service behaved before the lever existed.
+	//
+	// See exchpolicy for why the lever exists, which outbound legs it governs and
+	// which two it cannot. That rationale is stated there and not restated here:
+	// this copy had already drifted from it inside one commit, disagreeing about
+	// what the SSRF guard stops.
+	ExchangeAllowlist string
+
 	// WellKnownScheme is the scheme for /.well-known/ramp.json fetches. A usage
 	// report goes to the Exchange that issued the offer — identified in the offer
 	// by domain only — so the client fetches that domain's manifest to discover
@@ -122,6 +140,14 @@ func Build(cfg Config) (http.Handler, *publisher.Service, error) {
 	if cfg.MCP == nil {
 		return nil, nil, errors.New("app: MCP is required — the RAMP adapter is a mandatory part of the identity service")
 	}
+	// Checked here rather than left to the first user. Build reads the Exchange
+	// policy onto a log line while assembling the adapter, which is reached before
+	// mcp.New validates its own config — so without this check a nil Logger is a
+	// nil-pointer panic at that line instead of the error this function promises.
+	if cfg.Logger == nil {
+		return nil, nil, errors.New(
+			"app: Logger is required — the boot lines are written before anything is served")
+	}
 	clk := cfg.Clock
 	if clk == nil {
 		clk = clock.System{}
@@ -130,6 +156,7 @@ func Build(cfg Config) (http.Handler, *publisher.Service, error) {
 		Keys:            cfg.Keys,
 		Cards:           repo.NewCardRepo(cfg.Pool),
 		Revocations:     repo.NewRevocationRepo(cfg.Pool),
+		Registrations:   repo.NewDeveloperRepo(cfg.Pool),
 		WellKnownScheme: cfg.WellKnownScheme,
 		TTL:             cfg.DirectoryTTL,
 		Clock:           clk,
@@ -160,6 +187,105 @@ func Build(cfg Config) (http.Handler, *publisher.Service, error) {
 	return transport.NewServer(cfg.Logger, handler, cfg.Health, opts...), svc, nil
 }
 
+// outboundPosture is what every leg this service dials shares: the one guarded
+// client, the one endpoint resolver, and the deployment's Exchange policy.
+//
+// Grouped rather than passed as three arguments because they are one decision.
+// Each is deliberately built ONCE and handed to several consumers, and the
+// reason is the same each time — a second construction is a second answer, and
+// on the account leg a second answer to "where does this Exchange live" sends a
+// signed registration somewhere the operator never chose.
+type outboundPosture struct {
+	guarded   *http.Client
+	endpoints connect.EndpointResolver
+	allow     *exchpolicy.Allowlist
+}
+
+// buildOutboundPosture assembles what this service's outbound legs share, and
+// fails the boot on a policy it cannot parse.
+func buildOutboundPosture(cfg Config, clk clock.Clock) (outboundPosture, error) {
+	// ONE guarded client for the three outbound hops that FETCH from a host an
+	// offer or an agent named: the offer-key directory lookup, the endpoint
+	// resolver's manifest read, and the registration-requirements read. Built here
+	// rather than defaulted inside each package because this is the only place
+	// that can show the service's outbound posture at all — three constructions
+	// would be three connection pools to the same hosts and three reads of the
+	// SSRF environment, with no file naming the set.
+	//
+	// It is not every hop that reaches such a host. The usage report, the account
+	// RPCs and the delivery fetch go to addresses those lookups return, and they
+	// dial under the SDK's guard too — composed by cloning a base transport, so
+	// they carry their own pools. The POLICY is what is shared: the SDK reads
+	// SKIP_SSRF and ALLOW_INSECURE from the environment, once per construction, in
+	// this process, so the guard cannot mean one thing on one leg and another on
+	// the next.
+	guarded := resolvers.NewGuardedClientFromEnv()
+
+	// The deployment's Exchange policy. Parsed here so a malformed entry stops the
+	// boot, and read back on one log line so an operator checks what was PARSED
+	// rather than what they believe they set.
+	allow, err := exchpolicy.New(cfg.MCP.ExchangeAllowlist)
+	if err != nil {
+		return outboundPosture{}, fmt.Errorf("app: %w", err)
+	}
+	cfg.Logger.Info("identity.mcp.exchange_policy",
+		"allowlist", allow.Domains(), "permits_any", allow.Empty())
+
+	// The ONE endpoint resolver every Exchange-facing leg shares. A usage report
+	// and an account call resolve through the same manifest cache and the same
+	// same-host rule, so the two cannot come to disagree about where an Exchange
+	// lives.
+	//
+	// Allow is the policy overlay, and it sits here because the SDK consults it
+	// BEFORE any fetch — so no leg that routes through a resolver can be sent to a
+	// domain the deployment excluded, whatever its own call site checks.
+	endpoints := resolvers.NewWellKnownEndpointResolver(resolvers.WellKnownOptions{
+		HTTP: guarded,
+		// Now comes from the injected clock so the manifest cache's freshness
+		// window reads the same time source as the signature window, rather than
+		// reading the wall clock behind the port's back.
+		Now:    clk.Now,
+		Scheme: cfg.MCP.WellKnownScheme,
+		Allow:  allow.Permits,
+	})
+	return outboundPosture{guarded: guarded, endpoints: endpoints, allow: allow}, nil
+}
+
+// buildAccountService composes the Exchange-account workflow: what a target
+// Exchange asks of a registration, the signed call that opens or reports one,
+// and the local note behind the no-argument status.
+//
+// The requirements reader is built here rather than inside the service because
+// it needs the ONE guarded client the outbound posture carries — the manifest
+// host comes from an authenticated agent's tool argument, so that read is a
+// request-derived address and has to dial under the same guard as every other
+// leg that fetches from a host somebody named.
+func buildAccountService(
+	cfg Config, clk clock.Clock, posture outboundPosture, ramp exchacct.Caller,
+) (*exchacct.Service, error) {
+	requirements, err := exchreg.New(exchreg.Config{
+		Fetch:   posture.guarded,
+		Scheme:  cfg.MCP.WellKnownScheme,
+		Timeout: cfg.MCP.CallTimeout,
+		Allow:   posture.allow.Permits,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("app: exchange registration requirements: %w", err)
+	}
+	accounts, err := exchacct.New(exchacct.Config{
+		Requirements: requirements,
+		Caller:       ramp,
+		// The service gets the narrow note log, never a handle that could reach a
+		// developer's own record.
+		Notes: repo.NewExchangeRegistrationRepo(cfg.Pool),
+		Clock: clk,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("app: exchange accounts: %w", err)
+	}
+	return accounts, nil
+}
+
 // buildMCPServer composes the RAMP adapter: key custody is reached through the
 // same VaultStore the rest of the service uses, wrapped in the agentsign resolver
 // that turns an authenticated caller into the key its outbound requests are signed
@@ -179,11 +305,29 @@ func buildMCPServer(cfg Config, clk clock.Clock) (*mcp.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("app: agentsign: %w", err)
 	}
+	// Resolved once, here, because TWO consumers need the same number: the fetcher
+	// enforces it per body, and the MCP layer's call budget subtracts it to decide
+	// whether the next item could still fit. Letting each side default
+	// independently is how they would come to disagree.
+	maxItemBytes := cfg.MCP.MaxContentBytes
+	if maxItemBytes <= 0 {
+		maxItemBytes = resolvers.DefaultMaxContentBytes
+	}
+	posture, err := buildOutboundPosture(cfg, clk)
+	if err != nil {
+		return nil, err
+	}
+
 	ramp, err := rampclient.New(rampclient.Config{
-		Signer:       signer.Source(),
-		BrokerURL:    cfg.MCP.BrokerURL,
-		ExchangeURL:  cfg.MCP.ExchangeURL,
-		Scheme:       cfg.MCP.WellKnownScheme,
+		Keys:      signer.Source(),
+		BrokerURL: cfg.MCP.BrokerURL,
+		Endpoints: posture.endpoints,
+		// The account RPCs dial a host the CALLER named, so they dial guarded —
+		// and the guard goes UNDER the RFC 9421 signer, which is why this is a
+		// transport rather than the finished client two lines up. Same policy as
+		// that client: the SDK reads the SSRF environment on each construction, in
+		// this process, so the two cannot mean different things.
+		ExchangeBase: resolvers.NewGuardedTransport(nil),
 		Timeout:      cfg.MCP.CallTimeout,
 		SignatureTTL: cfg.MCP.SignatureTTL,
 		Clock:        clk,
@@ -191,34 +335,48 @@ func buildMCPServer(cfg Config, clk clock.Clock) (*mcp.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("app: ramp client: %w", err)
 	}
-	// The SAME key source the RAMP client signs offer acceptances with. That is
-	// the whole security argument for fetching content here: the Exchange binds
-	// each delivery URL to the key that signed the acceptance, so presenting a key
-	// resolved any other way would be presenting a different key, and the edge
-	// would refuse it. This is the one place the two could be made to disagree.
-	// Resolved once, here, because TWO consumers need the same number: the fetcher
-	// enforces it per body, and the MCP layer's call budget subtracts it to decide
-	// whether the next item could still fit. Letting each side default
-	// independently is how they would come to disagree.
-	maxItemBytes := cfg.MCP.MaxContentBytes
-	if maxItemBytes <= 0 {
-		maxItemBytes = delivery.DefaultMaxBytes
-	}
-	content, err := delivery.New(delivery.Config{
-		Keys:     signer.Source(),
-		Timeout:  cfg.MCP.FetchTimeout,
-		MaxBytes: maxItemBytes,
-		TTL:      cfg.MCP.PoPTTL,
-		Clock:    clk,
+
+	// The SDK legs take the SAME key source the RAMP client signs offer
+	// acceptances with. That is the whole security argument for fetching content
+	// here: the Exchange binds each delivery URL to the key that signed the
+	// acceptance, so presenting a key resolved any other way would be presenting a
+	// different key, and the edge would refuse it. This is the one place the two
+	// could be made to disagree.
+	sdk, err := rampsdk.New(rampsdk.Config{
+		Keys:      signer.Source(),
+		BrokerURL: cfg.MCP.BrokerURL,
+		Endpoints: posture.endpoints,
+		// Offers arrive from a Broker that did not mint them, and the agent on the
+		// other end of a tool call runs no verifier of its own. Resolving each
+		// issuing Exchange's key is what lets discovery check them on its behalf.
+		OfferKeys: offerkeys.New(offerkeys.Config{
+			Client: posture.guarded,
+			Scheme: cfg.MCP.WellKnownScheme,
+			Clk:    clk,
+		}),
+		Timeout:      cfg.MCP.CallTimeout,
+		SignatureTTL: cfg.MCP.SignatureTTL,
+		PoPTTL:       cfg.MCP.PoPTTL,
+		FetchTimeout: cfg.MCP.FetchTimeout,
+		MaxBytes:     maxItemBytes,
+		Clock:        clk,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("app: content fetcher: %w", err)
+		return nil, fmt.Errorf("app: ramp sdk: %w", err)
 	}
+	accounts, err := buildAccountService(cfg, clk, posture, ramp)
+	if err != nil {
+		return nil, err
+	}
+
 	srv, err := mcp.New(mcp.Config{
-		Tokens:     cfg.Auth.Tokens,
-		RAMP:       ramp,
-		Developers: repo.NewDeveloperRepo(cfg.Pool),
-		Content:    content,
+		Tokens:          cfg.Auth.Tokens,
+		RAMP:            ramp,
+		Discovery:       sdk,
+		Reports:         sdk,
+		Content:         sdk,
+		Accounts:        accounts,
+		ExchangeAllowed: posture.allow.Permits,
 		// The call-scoped bounds. MaxItemContentBytes is the SAME resolved number
 		// the fetcher got, so mcp.Config.validate can refuse a per-item cap that
 		// exceeds the batch budget at startup instead of collapsing every batch to

@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/connectserver"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -39,12 +41,31 @@ type capturedHeaders struct {
 	sig       string
 	body      []byte
 	requestID string
+	// manifests counts /.well-known/ramp.json fetches the Exchange served. It is
+	// how a test tells routing-from-the-manifest apart from routing-from-the-
+	// registry now that both name the same origin: a broker that read the
+	// registry's endpoint column would never fetch this document at all.
+	manifests int
 }
 
 func (c *capturedHeaders) set(sigInput, sig string, body []byte, requestID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sigInput, c.sig, c.body, c.requestID = sigInput, sig, body, requestID
+}
+
+// recordManifest counts one well-known fetch.
+func (c *capturedHeaders) recordManifest() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.manifests++
+}
+
+// manifestFetches reports how many times the Exchange served its own manifest.
+func (c *capturedHeaders) manifestFetches() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.manifests
 }
 
 func (c *capturedHeaders) get() (string, string, []byte) {
@@ -115,7 +136,10 @@ type relayTestEnv struct {
 	mockExch     *mockExchange
 	captured     *capturedHeaders
 	logs         *lockedBuffer
-	exchangeRepo repo.ExchangeRepo
+	exchangeRepo *repo.PgxExchangeRepo
+	// endpoints is the SAME resolver the relay routes through, exposed so a test
+	// can build a health refresher that probes the endpoint the relay will use.
+	endpoints *resolvers.WellKnownEndpointResolver
 }
 
 // newRelayTestEnv wires the relay suite onto the mock Exchange stub. Doctrine
@@ -151,13 +175,13 @@ func newRelayTestEnvShaped(t *testing.T, trustProxyHeaders bool) relayTestEnv {
 	brokerKID := rwtestutil.MustThumbprint(t, brokerPub)
 
 	mockExch, captured, exchangeURL := startCapturingExchange(t)
-	// Re-package routing: offer.exchange is the exchange's fetchable
-	// canonical domain (host:port), and the broker resolves it to the endpoint the
-	// exchange advertises in its OWN /.well-known/ramp.json (top-level endpoint).
-	// The manifest provider's host:port IS the canonical domain, so the
-	// resolver fetches it directly with no host rewrite.
-	provider := startEndpointManifestProvider(t, exchangeURL)
-	exchangeDom := strings.TrimPrefix(provider.URL, "http://")
+	// Re-package routing: offer.exchange is the exchange's fetchable canonical
+	// domain (host:port), and the broker resolves it to the endpoint the exchange
+	// advertises in its OWN /.well-known/ramp.json (top-level endpoint). The
+	// Exchange serves that manifest itself, so the canonical domain and the
+	// advertised endpoint name one origin — the resolver fetches it directly with
+	// no host rewrite, and the anchoring rule is satisfied by construction.
+	exchangeDom := strings.TrimPrefix(exchangeURL, "http://")
 	exchangeRepo := seedRelayRegistry(t, ctx, exchangeDom, exchangeURL)
 
 	// Broker outbound signing transport. With NO incoming Signature header on the
@@ -205,6 +229,7 @@ func newRelayTestEnvShaped(t *testing.T, trustProxyHeaders bool) relayTestEnv {
 		captured:     captured,
 		logs:         logs,
 		exchangeRepo: exchangeRepo,
+		endpoints:    endpoints,
 	}
 }
 
@@ -218,7 +243,27 @@ func startCapturingExchange(t *testing.T) (*mockExchange, *capturedHeaders, stri
 	mockExch := &mockExchange{signedURL: "https://cdn.example/signed?url=1"}
 	captured := &capturedHeaders{}
 	exMux := http.NewServeMux()
-	path, connectHandler := rampv1connect.NewExchangeServiceHandler(mockExch)
+	// The Exchange serves its OWN /.well-known/ramp.json, advertising the origin
+	// that served it — production's shape, and the only one the endpoint resolver
+	// accepts: an endpoint must be on the host and port that served the manifest,
+	// or a subdomain of that host. A separate provider process would advertise a
+	// second origin and be refused before the relay ever dialled it.
+	exMux.HandleFunc("/.well-known/ramp.json", func(w http.ResponseWriter, r *http.Request) {
+		captured.recordManifest()
+		_, _ = w.Write(rwtestutil.ExchangeManifest(r.Host, "http://"+r.Host))
+	})
+	// The codec a real Exchange serves through, so this stand-in answers the
+	// Broker in the spelling the Broker will actually receive. Without it the
+	// double replies in the camelCase alias and the relay's decode is exercised
+	// against a wire form no Exchange produces.
+	path, connectHandler := rampv1connect.NewExchangeServiceHandler(mockExch,
+		connect.WithCodec(connectserver.EmitUnpopulatedJSONCodec()))
+	// The liveness probe the broker's registry health refresher polls, mounted
+	// for the same reason startMockExchange mounts it: without the route every
+	// probe reads a 404 and the refresher marks the whole fixture permanently
+	// down. It is also the only lever a test has to take this Exchange down,
+	// which is what the relay's down-endpoint coverage drives.
+	exMux.HandleFunc("GET /healthz", mockExch.serveHealthz)
 	exMux.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		_ = r.Body.Close()
@@ -236,7 +281,7 @@ func startCapturingExchange(t *testing.T) (*mockExchange, *capturedHeaders, stri
 // and registers the mock Exchange as the sole allowlisted endpoint via the
 // production repository surface (repo.UpsertFromBootstrap) — the SSRF allowlist
 // source.
-func seedRelayRegistry(t *testing.T, ctx context.Context, domain, exchangeURL string) repo.ExchangeRepo {
+func seedRelayRegistry(t *testing.T, ctx context.Context, domain, exchangeURL string) *repo.PgxExchangeRepo {
 	t.Helper()
 	pool := acquireTestDB(t, ctx)
 	exchangeRepo := repo.NewExchangeRepo(pool)
@@ -539,9 +584,7 @@ func TestExchangeRelay_RejectsUnregisteredExchangeDomain(t *testing.T) {
 		t.Errorf("Exchange was called %d times for an unregistered offer.exchange, want 0",
 			env.mockExch.executeCalls)
 	}
-	if !strings.Contains(env.logs.String(), "REJECTED_ENDPOINT") {
-		t.Errorf("unregistered domain emitted no REJECTED_ENDPOINT audit log; got: %s", env.logs.String())
-	}
+	assertRelayAudit(t, env.logs.String(), "REJECTED_ENDPOINT")
 }
 
 // TestExchangeRelay_RejectsUnregisteredExchangeDomain_CarriesFieldMetadata pins
@@ -608,14 +651,14 @@ func TestExchangeRelay_BoundsOversizedBody(t *testing.T) {
 		Name:   stringPtr("https://pub.example/" + strings.Repeat("a", 80*1024)),
 	}
 	txReq := &rampv1.TransactionRequest{
-		Ver:            "0.3",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: "tx-oversized",
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{{
 			Offer: &rampv1.Offer{OfferId: "offer-1", Exchange: env.exchangeDom},
 		}},
 	}
-	body, err := protojson.Marshal(txReq)
+	body, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(txReq)
 	if err != nil {
 		t.Fatalf("marshal oversized TransactionRequest: %v", err)
 	}
@@ -665,7 +708,7 @@ func TestExchangeRepo_NormalizesEndpointOnStore(t *testing.T) {
 		t.Errorf("UpsertFromBootstrap returned endpoint %q, want normalized %q", stored.Endpoint, want)
 	}
 
-	list, err := exchangeRepo.List(ctx)
+	list, err := exchangeRepo.ListUnblocked(ctx)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

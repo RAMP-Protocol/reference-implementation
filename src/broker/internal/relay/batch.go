@@ -8,8 +8,8 @@
 // group's offer_ids while the other groups' results stand.
 //
 // Trust is a WHOLE-REQUEST admission gate: every distinct offer.exchange must
-// be registry-trusted, well-known-resolvable, AND pass the post-resolve
-// registry SSRF check BEFORE any fan-out side effect. If ANY group fails, the
+// be registry-trusted, well-known-resolvable, AND still routable (trust not
+// withdrawn, last health probe passed) BEFORE any fan-out side effect. If ANY group fails, the
 // whole request is rejected with zero fan-out. A trusted-but-unreachable
 // exchange, by contrast, yields per-item denials at fan-out time (non-atomic).
 //
@@ -31,10 +31,10 @@ import (
 	"strconv"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
-	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampcost"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/ramproute"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/broker"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
@@ -84,11 +84,12 @@ func NewBatch(core Core, endpoints EndpointResolver, exchange ExecuteCaller) Bat
 }
 
 // ResolveGroups groups the items by offer.exchange (preserving original order
-// within each group) and resolves+trust+SSRF-checks every distinct exchange.
-// It rejects the WHOLE request (returning the typed error, auditing the
-// rejected endpoint) if any item lacks an offer.exchange or any exchange is
-// untrusted/unresolvable/off-allowlist — the trust admission gate runs to
-// completion BEFORE any fan-out side effect.
+// within each group) and resolves+trust+admission-checks every distinct
+// exchange. It rejects the WHOLE request if any item lacks an offer.exchange or
+// any exchange is untrusted, unresolvable, withdrawn or down — the gate runs to
+// completion BEFORE any fan-out side effect. Refusals are audited where their
+// reason is known: resolution failures here, registry verdicts in the admission
+// mapping both routes share.
 func (b Batch) ResolveGroups(
 	ctx context.Context, bd Boundary, txReq *rampv1.TransactionRequest,
 ) ([]Group, *broker.Error) {
@@ -109,9 +110,8 @@ func (b Batch) ResolveGroups(
 
 	groups := make([]Group, 0, len(order))
 	for _, domain := range order {
-		endpoint, err := b.resolveGroupEndpoint(ctx, domain)
+		endpoint, err := b.resolveGroupEndpoint(ctx, bd, domain)
 		if err != nil {
-			b.core.Audit(ctx, bd, "REJECTED_ENDPOINT", domain, err)
 			return nil, err
 		}
 		groups = append(groups, Group{domain: domain, endpoint: endpoint, items: byDomain[domain]})
@@ -119,55 +119,147 @@ func (b Batch) ResolveGroups(
 	return groups, nil
 }
 
-// resolveGroupEndpoint resolves ONE group's domain to its endpoint (trust +
-// well-known via ResolveExchangeEndpoint) AND re-checks it against the
-// registry SSRF allowlist (Core.EndpointAllowed) — the same post-resolve guard
-// the discover admission applies. Returns a typed broker.Error so the caller
-// owns the whole-request rejection.
-func (b Batch) resolveGroupEndpoint(ctx context.Context, domain string) (string, *broker.Error) {
-	endpoint, err := b.ResolveExchangeEndpoint(ctx, domain)
+// resolveGroupEndpoint decides whether the relay may deal with ONE group's
+// exchange at all, and only then resolves where that exchange is.
+//
+// The order is the point. Every refusal is settled from the registry row alone,
+// so all of them are answered before the broker sends the exchange a single
+// byte. A withdrawn exchange used to have its well-known fetched and only then
+// be refused, which contradicted the registry's own rule that a BLOCKED row gets
+// no traffic at all. It also let a resolution failure win the race: if the
+// withdrawn exchange was unreachable too, the agent got a retryable "try again"
+// for a decision the operator had already made permanently, filed under the
+// SSRF-shaped audit action, while the discover route answered the same row
+// finally and without a fetch.
+//
+// The audit sits here rather than in the caller because only here is the reason
+// known. A caller auditing every failure alike had to pick one action, and it
+// picked REJECTED_ENDPOINT — which records an address the operator never
+// authorized, the shape an SSRF attempt takes. Every execute relay is a batch,
+// so that filed every routine outage under the attack-shaped record.
+//
+// The admission is read off the row the trust gate already fetched by DOMAIN,
+// not a second lookup keyed on the resolved endpoint. The endpoint comes from
+// the Exchange's own well-known and the resolver has vetted it as anchored to
+// that domain; keying on it instead made the decision depend on the registry's
+// endpoint column agreeing with the well-known, so an Exchange with a stale
+// column was refused as unregistered while discovery served it.
+func (b Batch) resolveGroupEndpoint(
+	ctx context.Context, bd Boundary, domain string,
+) (string, *broker.Error) {
+	ex, err := b.trustedExchange(ctx, domain)
 	if err != nil {
+		// Nothing is resolved yet, so every audit here can only name the domain;
+		// every other relay audit names the resolved endpoint. The action comes
+		// from the error's Kind, so a registry fault on the broker's side is not
+		// recorded against the exchange.
+		b.core.Audit(ctx, bd, AuditAction(err), domain, err)
 		return "", err
 	}
-	allowed, aerr := b.core.EndpointAllowed(ctx, endpoint)
-	if aerr != nil {
-		return "", broker.Wrapf(broker.KindInternal, aerr, "exchange registry")
+	// Named by the domain for the same reason: the refusal is decided before
+	// anything is resolved, so there is no endpoint to name yet.
+	if rerr := b.core.RefuseAdmission(ctx, bd, admissionOf(ex), domain); rerr != nil {
+		return "", rerr
 	}
-	if !allowed {
-		return "", UnregisteredEndpointError(endpoint)
+	if terr := refuseUntrustedForExecute(ex); terr != nil {
+		b.core.Audit(ctx, bd, "REJECTED_AUTHZ", domain, terr)
+		return "", terr
+	}
+	endpoint, err := b.resolveAdvertisedEndpoint(ctx, domain)
+	if err != nil {
+		b.core.Audit(ctx, bd, AuditAction(err), domain, err)
+		return "", err
 	}
 	return endpoint, nil
 }
 
-// ResolveExchangeEndpoint resolves ONE offer.exchange domain to its advertised
-// Exchange endpoint: the TRUST allowlist gate (GetByDomain — a signed offer
-// from an Exchange the registry does not trust is refused) followed by the
-// endpoint from THAT exchange's own /.well-known/ramp.json (the Offer.exchange
-// routing invariant; the registry never supplies the endpoint). The
-// post-resolve registry SSRF re-check stays with Core.EndpointAllowed.
-func (b Batch) ResolveExchangeEndpoint(ctx context.Context, domain string) (string, *broker.Error) {
-	if _, err := b.core.exchanges.GetByDomain(ctx, domain); err != nil {
+// refuseUntrustedForExecute is the EXECUTE-side trust gate: money only moves to
+// an exchange an operator reviewed.
+//
+// Separate from the registry's routability verdict on purpose. That verdict
+// answers blocked, down or live — the health question, one answer for every
+// caller — and cannot express this one, because DISCOVERED and VERIFIED are
+// equally live and owe different answers on different operations. A DISCOVERED
+// exchange is one the broker found named in some publisher's ramp.json and
+// nobody has approved; it may quote prices, which is comparison shopping and
+// costs nothing, and it may not be paid. Anyone who can edit a publisher's
+// ramp.json can otherwise put themselves in the payment path.
+//
+// Settled, not retryable: the answer changes when an operator promotes the
+// exchange, which no amount of retrying brings about. The offending identity
+// rides as typed metadata under "field", the same axis the trust gate above it
+// uses — the domain, not a resolved endpoint, because none was resolved.
+func refuseUntrustedForExecute(ex repo.Exchange) *broker.Error {
+	if ex.TrustLevel == repo.TrustLevelVerified || ex.TrustLevel == repo.TrustLevelPreferred {
+		return nil
+	}
+	return broker.Newf(broker.KindInvalidArgument,
+		"offer.exchange %q is registered but not approved for transactions", ex.Domain).
+		WithField("offer.exchange")
+}
+
+// trustedExchange is the TRUST allowlist gate: a signed offer naming an
+// Exchange the registry does not know is refused. Its row carries the
+// admission decision.
+func (b Batch) trustedExchange(ctx context.Context, domain string) (repo.Exchange, *broker.Error) {
+	ex, err := b.core.exchanges.GetByDomain(ctx, domain)
+	if err != nil {
 		if errors.Is(err, repo.ErrNotFound) {
 			// Trust gate: a signed offer naming an Exchange the registry does
 			// not know. Distinct axis (domain, not resolved endpoint) and
 			// message from the SSRF-gate reject, so it keeps its own
 			// constructor; the offending identity rides as typed metadata
 			// under "field" (ADR-019) rather than only in the Message string.
-			return "", broker.Newf(broker.KindInvalidArgument,
+			return repo.Exchange{}, broker.Newf(broker.KindInvalidArgument,
 				"offer.exchange %q is not a registered exchange", domain).
 				WithField("offer.exchange")
 		}
-		return "", broker.Wrapf(broker.KindInternal, err, "exchange registry")
+		return repo.Exchange{}, broker.Wrapf(broker.KindInternal, err, "exchange registry")
 	}
+	return ex, nil
+}
+
+// resolveAdvertisedEndpoint reads ONE trusted Exchange's own well-known for the
+// origin it advertises — the Offer.exchange routing invariant. The registry is
+// a trust allowlist plus a cache of that address, kept current by the
+// refresher.
+func (b Batch) resolveAdvertisedEndpoint(ctx context.Context, domain string) (string, *broker.Error) {
 	endpoint, err := b.endpoints.ResolveEndpoint(ctx, domain)
 	if err != nil {
+		// Classified by CAUSE, and the default arm is the retryable one, so every
+		// VERDICT has to be named here. Reaching a manifest is a network
+		// operation, and a DNS blip or a 500 from an otherwise healthy Exchange is
+		// transient — reporting that as invalid-argument would tell an agent its
+		// offer is bad when the offer is fine.
+		//
+		// The three sentinels below are the opposite case. Two of them mean the
+		// manifest WAS read and either advertises no endpoint at all or advertises
+		// one the resolver refuses — a host or port that is not the one serving
+		// the manifest, or an endpoint carrying userinfo. The third means the
+		// manifest was never reached because the domain is not a usable host, and
+		// it belongs here for the same reason even though nothing was read: a
+		// value that is not a host does not become one on a later attempt. The
+		// registry's domain column carries no constraint that would keep such a
+		// value out.
+		//
+		// The set is the resolver contract's, and this is the relay's answer to
+		// it. The same resolver's other caller — the discovery fan-out — names
+		// none of the three: every resolution failure there marks the domain
+		// unhealthy and the URL reaches the agent as "not in catalog", a reason
+		// about the catalog for a cause that has nothing to do with one. That is a
+		// separate defect in a separate function, and fixing it needs a decision
+		// this file cannot make, because no absence reason the protocol defines
+		// carries "the Exchange advertises an endpoint we refuse".
 		kind := broker.KindUpstreamUnavailable
-		if errors.Is(err, resolvers.ErrNoEndpoint) {
+		if ramproute.IsVerdict(err) {
 			kind = broker.KindInvalidArgument
 		}
 		return "", broker.Wrapf(kind, err, "resolve offer.exchange %q via well-known", domain)
 	}
-	return endpoint, nil
+	// Canonicalized before it becomes a dial target and a signature base: a
+	// manifest may advertise a trailing slash, and the double-slash @target-uri
+	// would then fail sig1 verification upstream.
+	return repo.CanonicalEndpoint(endpoint), nil
 }
 
 // FanOut sends ONE broker-signed sub-request per exchange group and merges the
@@ -186,11 +278,14 @@ func (b Batch) FanOut(
 	resultByOffer := map[string]*rampv1.TransactionResultItem{}
 	var agentHash string
 	for _, g := range groups {
+		// Ver is echoed, never stamped: the agent authored and signed the request
+		// this sub-request is projected from, so the version stays the agent's.
 		sub := &rampv1.TransactionRequest{
-			Ver:            txReq.GetVer(),
-			IdempotencyKey: txReq.GetIdempotencyKey(),
-			Requester:      txReq.GetRequester(),
-			Items:          g.items,
+			Ver:                    txReq.GetVer(),
+			IdempotencyKey:         txReq.GetIdempotencyKey(),
+			Requester:              txReq.GetRequester(),
+			Items:                  g.items,
+			AgentRequestAcceptance: txReq.GetAgentRequestAcceptance(),
 		}
 		resp, err := b.exchange.ExecuteTransaction(ctx, g.endpoint, sub)
 		if err != nil {
@@ -262,7 +357,7 @@ func mergeResults(
 		merged = append(merged, unavailableItem(offerID))
 	}
 	return &rampv1.TransactionResponse{
-		Ver:               rampproto.Ver,
+		Ver:               helpers.ProtocolVersion,
 		Items:             merged,
 		AgentIdentityHash: agentHash,
 	}

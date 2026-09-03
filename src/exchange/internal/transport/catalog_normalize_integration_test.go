@@ -63,8 +63,9 @@ func TestPushResources_NormalizeRoundTrip(t *testing.T) {
 			// interceptor (restriction.permitted.format) rejects whitespace at the
 			// wire before the handler canonicalizer runs, so a " de " pushed
 			// directly through the RPC is contractually invalid (see the negative
-			// in catalog_protovalidate_e2e_test.go). Whitespace trimming stays
-			// proven at the unit level by licenseterm.TestNormalize.
+			// in catalog_protovalidate_e2e_test.go). Whitespace trimming is the
+			// SDK helper's, pinned by the protocol module's license-term vector
+			// corpus (its fold list).
 			name:          "geography uppercases",
 			path:          "/normalize/geography",
 			kind:          rampv1.RestrictionKind_RESTRICTION_KIND_GEOGRAPHY,
@@ -145,15 +146,11 @@ func TestPushResources_NormalizeIdempotentRepush(t *testing.T) {
 // accepted — the shared arrange step for the normalize scenarios.
 func pushOneTerm(t *testing.T, h *pushHarness, client rampconnect.CatalogServiceClient, callerID, path string, term *rampv1.LicenseTerm) {
 	t.Helper()
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: callerID,
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.publisherDom,
-			Path:   path,
-			Terms:  []*rampv1.LicenseTerm{term},
-		}},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+		Domain: h.publisherDom,
+		Path:   path,
+		Terms:  []*rampv1.LicenseTerm{term},
+	}})))
 	if err != nil {
 		t.Fatalf("push %s: %v", path, err)
 	}

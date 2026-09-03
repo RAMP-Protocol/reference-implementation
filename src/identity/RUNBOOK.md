@@ -98,7 +98,7 @@ end. It arrives or is created as the `X-Request-ID` header and is passed outboun
 | `identity.mcp.delivery_failed` | WARN | The agent's purchase went through, but this service could not fetch one of the bought items from the publisher's edge. **The Exchange has already charged for it.** The line names the `subdomain`, the `offer_id` and the reason; the agent was handed the same failure with the delivery link intact, so it can try again. |
 | `identity.oauthserver.*` (outage) | WARN | A backend was unavailable during sign-up; the caller got `503`. |
 | `identity.mcp.register` / `.status` / `.discover` / `.execute` / `.report` | INFO | One agent tool call. One line per call, naming the agent. |
-| `identity.oauthserver.register.ok` / `.signin.ok` / `.registration.complete` / `.consent.approved` | INFO | One sign-up step completed. Together these are the audit record of who signed up and which agent software registered itself. |
+| `identity.oauthserver.register.ok` / `.signin.ok` / `.consent.approved` | INFO | One sign-up step completed. Together these are the audit record of who signed up and which agent software registered itself. |
 | `identity.rotation.rotated` / `.pruned` | INFO | A key was replaced, or a retired one erased. Routine. |
 | `identity.revoke` | INFO | A key was revoked. Carries `subdomain`, `thumbprint` and `as_of` — **this is the audit record of the revocation**. |
 | `identity listening` | INFO | Start-up finished. |
@@ -137,7 +137,7 @@ into whatever monitoring you already run.
 | Sign-ups fail halfway through, only sometimes | `IDENTITY_SESSION_KEY` unset and the service restarted mid-flow | Set the key ([`DEPLOYMENT.md`](DEPLOYMENT.md) §7). |
 | **A revoked key still verifies** | Two delays add up: this service republishes the revocation within `IDENTITY_DIRECTORY_TTL` (default 5 minutes), and the Broker and the Exchange each notice on their own revocation refresh (about every 5 minutes; their library's default, not set here) | Wait roughly ten minutes end to end. This is expected, not a fault — §4.2. |
 | Agent calls fail with a signature error at the Broker | The agent's directory does not serve the key it signed with, or clocks disagree | Read the agent's directory (§3.2) and check the signing key is in it; check time sync on both hosts. The Broker keeps no key list of its own — it fetches this directory on demand, and re-fetches when it meets a key fingerprint it does not know, so a rotation normally corrects itself. |
-| An agent's purchases are refused | Its account is inactive or was never created | Have it call `ramp_status`; the answer says which. Activation is §4.2. |
+| An agent's purchases are refused | Its account at that Exchange is inactive or was never created | Have it call `ramp_status` naming that Exchange; the answer says which. Activation is §4.2. |
 | **A delivery URL worked for someone who should not have it** | The edge that served it accepts the URL on its own, without asking for proof of the agent's key | The Exchange binds each delivery URL to the agent's key, and this service proves possession of that key when it fetches. An edge that checks the binding refuses the bare URL; one that does not still accepts it until it expires — §6. Keep URL lifetimes short on such edges. |
 | Rotation stopped entirely, no per-agent errors | The `identity.rotation.list_subdomains_failed` line names a Vault problem | §3.2, then Vault's runbook. |
 | Two instances are running | Not supported — §4.1 | Scale back to one. |
@@ -152,7 +152,7 @@ docker compose logs identity | grep '"request_id":"<ID>"'
 # they handled. Start here, then follow it outward.
 ```
 
-**Read one agent's three published documents**
+**Read one agent's four published documents**
 
 ```bash
 AGENT=agent-ovx4iigs.agents.example
@@ -166,7 +166,21 @@ curl -s "https://$AGENT/.well-known/signature-agent-card.json"
 
 curl -s "https://$AGENT/.well-known/ramp-key-revocations.json"
 # Expect: this agent's revoked keys. Empty is normal.
+
+curl -s "https://$AGENT/.well-known/ramp.json"
+# Expect: {"ver":"1.0","role":"ROLE_AGENT","domain":"<the host you asked for>"}
+# This is the RAMP commercial overlay every participant serves. For an agent it
+# carries the role and nothing else — no keys. Those are in the key directory above.
 ```
+
+The four documents come from different sources, so they can disagree, and which pair
+disagrees tells you where to look:
+
+| Symptom | What it means |
+|---|---|
+| `ramp.json` 200, key directory 404 | The account exists but has **no currently valid key**. The directory publishes only keys whose validity window covers now, so this covers a sign-up that did not finish minting the key, a key that has expired, one that was destroyed, and one whose `not_before` is still in the future. List the agent's keys (below) to tell them apart. |
+| Key directory 200, `ramp.json` 404 | Keys exist for a subdomain that no developer account claims. Nothing in sign-up produces this; suspect a manual operation or a partial delete. |
+| Everything 404 | The host is not a registered agent, or it is not a single-label child of the zone. Check the zone (§8). |
 
 If DNS is not yet pointing where you expect, address the service directly and set the
 name by hand — the service selects the agent from the `Host` header alone:
@@ -271,10 +285,18 @@ instance and make its restart fast.
 **Registering and activating an agent.** This is self-service by design — an operator
 is not involved until the last step.
 
-1. The developer opens the sign-up flow and signs in through your OIDC provider.
-2. They complete the registration form. The service gives them a subdomain
-   (`agent-` plus eight characters, inside your identity zone), generates a key with a
-   one-year lifetime, stores it in Vault, and publishes the public half.
+1. The developer opens the sign-up flow and signs in through your OIDC provider. As
+   soon as that sign-in returns, the service provisions the identity: it gives them a
+   subdomain (`agent-` plus eight characters, inside your identity zone), generates a
+   key with a one-year lifetime, stores it in Vault, and publishes the public half.
+   Sign-up asks for no business details — those are supplied per Exchange in step 4,
+   because each Exchange decides what it wants.
+2. They then approve the application that started the sign-in. Approval releases the
+   authorization code and nothing else, because the identity already exists. A
+   developer who clicks Deny still has the subdomain, the Vault key and the published
+   agent card from step 1 — only the application is left without access. So an
+   operator who finds a provisioned identity that no client ever used is looking at a
+   denied or abandoned consent, not at a fault.
 3. Confirm the identity is live:
    ```bash
    curl -s -o /dev/null -w '%{http_code}\n' \
@@ -282,8 +304,12 @@ is not involved until the last step.
    # Expect: 200
    ```
 4. The agent connects to `/mcp` with its access token and calls **`ramp_register`**,
-   which creates its account on the Exchange. Calling it twice is safe.
-5. The agent calls **`ramp_status`** to see whether that account is active.
+   naming the Exchange it wants an account at and supplying the registration
+   details that Exchange asks for. Accounts are per-Exchange, so an agent buying
+   from several registers at each. Calling it twice for one Exchange is safe.
+5. The agent calls **`ramp_status`** with that Exchange to see whether the account
+   is active, or with no argument for the list of Exchanges this service has
+   registered it at.
 6. **Activation is an Exchange-side decision, applied with SQL.** Whether a new agent
    is active immediately is a per-tenant setting there. The procedure is in
    [`src/exchange/RUNBOOK.md`](../exchange/RUNBOOK.md) §4.2 — this service creates the
@@ -386,6 +412,37 @@ nothing runs them; escalate instead. The reasons are in
 
 Always deploy a specific tag, never `latest`.
 
+**One-off after the release that drops the developer business columns.** That release
+removes `legal_entity`, `address` and `jurisdiction_country` from
+`identity.developer_account` — the operator business details sign-up used to collect.
+`DROP COLUMN` is a catalog change: Postgres stops returning the columns, but the values
+stay in the table's files until the rows are rewritten. Once the release is up and you
+are not going to roll it back, rewrite the table:
+
+```bash
+psql "$IDENTITY_DSN" -c "VACUUM FULL identity.developer_account"
+```
+
+This takes an ACCESS EXCLUSIVE lock, so sign-up and the developer read block while it
+runs. The table holds one row per developer, so on any realistic deployment that is
+seconds — but run it in a maintenance window rather than at peak.
+
+The rewrite does nothing about copies taken earlier. Every base backup and WAL segment
+from before it still carries the values, so decide on those deliberately: either let
+them age out of your retention window, or delete them if the point was that the data is
+gone.
+
+There is a third copy, and it is not in this service. Before the account tools took an
+Exchange argument, sign-up forwarded these same columns to the Exchange as the register
+payload. The Exchange stores `legal_entity` and `jurisdiction_country` in typed columns
+of `sor.agent_accounts` and the flat `address` key under that table's `extra` JSONB, so
+any account opened before that change has a copy sitting there under the same names. On
+a deployment that runs both services it is yours to delete. At an Exchange someone else
+runs it is not an operation you perform — it is a request you send them, and you cannot
+report it done until they answer.
+
+Until all three are settled, "we no longer hold it" is not yet true.
+
 ---
 
 ## 5. Backup and recovery
@@ -396,12 +453,40 @@ and they are not equally replaceable.
 | What | Where | If you lose it |
 |---|---|---|
 | **Agent private keys** | Vault | **Unrecoverable.** Every agent loses its identity and must sign up again, and every offer it had accepted becomes unusable. This is the one that matters. |
-| Agent cards, revocations, developer accounts, OAuth records | PostgreSQL (`identity` schema) | The keys survive in Vault, but the service can no longer say who owns them or which are revoked. **A lost revocation list quietly brings back a key you revoked** — re-run those revocations from your incident records. |
+| Agent cards, revocations, developer accounts, OAuth records, exchange-registration notes | PostgreSQL (`identity` schema) | The keys survive in Vault, but the service can no longer say who owns them or which are revoked. **A lost revocation list quietly brings back a key you revoked** — re-run those revocations from your incident records. |
 | Access tokens agents currently hold | Nowhere — they are signed, not stored | Nothing to lose. Agents sign in again. |
 
 Both stores have their own operating guides:
 [`deploy/storage/vault/RUNBOOK.md`](../../deploy/storage/vault/RUNBOOK.md) §5 and
 [`deploy/storage/postgres/RUNBOOK.md`](../../deploy/storage/postgres/RUNBOOK.md) §5.
+
+**What the service records about registrations.** When an agent registers at an
+Exchange through `ramp_register`, this service keeps one note: **the Exchange's
+domain and when the registration was last confirmed.** It keeps nothing from the
+registration details the agent submitted — those are the operator's business data
+(legal entity, billing contact, tax identifiers, whatever a given Exchange asks
+for), and this service neither logs them nor stores them. A dump of that table
+therefore shows which Exchanges an agent does business with, and nothing about
+who that operator is.
+
+**The one exception, stated because a promise with an unstated exception is worse
+than no promise.** When an Exchange refuses a registration, that Exchange's own
+refusal text is written to the `identity.mcp.call_failed` line, truncated to 300
+bytes. The text is written by the Exchange, not by this service — but an Exchange
+that quotes a submitted value back into its refusal puts that value on the line,
+and a short one (a VAT number, a billing contact) fits inside the bound. The
+bound removes the case that matters most, an Exchange echoing the whole payload
+back; it is not redaction. If that matters for a deployment, the question to ask
+is which Exchanges it speaks to, not what this service logs.
+
+The note exists for one purpose: answering `ramp_status` when the agent names no
+Exchange, so it can list where it has registered without a network call. It is a
+hint rather than a record — it misses a registration made outside this adapter,
+and it can name an account the Exchange has since closed, which is why a status
+call naming an Exchange is the authoritative answer and this list is marked as
+not. It lives exactly as long as the agent's own account record: the notes are
+tied to it by a foreign key that cascades, so removing an agent removes them and
+there is no separate step to remember.
 
 Three things to plan for rather than react to:
 

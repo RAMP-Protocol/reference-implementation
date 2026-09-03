@@ -7,6 +7,7 @@ import (
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 )
 
 // TestReportUsage_CrossTenantRejected exercises the authz boundary: agent-A
@@ -25,12 +26,7 @@ func TestReportUsage_CrossTenantRejected(t *testing.T) {
 	// Stand up a second tenant + agent under the same Exchange.
 	_, agentBClient := h.addTenant(t, "tenantb", "agent-b")
 
-	_, err := agentBClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-cross",
-		TransactionId: txID,
-		BillingId:     billingID,
-		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
-	}))
+	_, err := agentBClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-cross", txID, billingID, &rampv1.Usage{ConsumedQuantity: 100})))
 	assertConnectError(t, err, connect.CodePermissionDenied, "may not act")
 	// State stays PENDING — no audit row from this call.
 	assertObligationState(t, h, txID, "PENDING", "")
@@ -44,12 +40,7 @@ func TestReportUsage_BrokerRelay_Allowed(t *testing.T) {
 	h.enableBrokerRelay(t, h.tenantID)
 	brokerClient := h.addCaller(t, "broker-trusted", "BROKER")
 
-	resp, err := brokerClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-broker-ok",
-		TransactionId: txID,
-		BillingId:     billingID,
-		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
-	}))
+	resp, err := brokerClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-broker-ok", txID, billingID, &rampv1.Usage{ConsumedQuantity: 100})))
 	if err != nil {
 		t.Fatalf("broker relay (allowed): %v", err)
 	}
@@ -68,12 +59,7 @@ func TestReportUsage_BrokerRelay_Denied(t *testing.T) {
 	// Deliberately do NOT call h.enableBrokerRelay — tenant's flag stays false.
 	brokerClient := h.addCaller(t, "broker-untrusted", "BROKER")
 
-	_, err := brokerClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-broker-no",
-		TransactionId: txID,
-		BillingId:     billingID,
-		Usage:         &rampv1.Usage{ConsumedQuantity: 100},
-	}))
+	_, err := brokerClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-broker-no", txID, billingID, &rampv1.Usage{ConsumedQuantity: 100})))
 	assertConnectError(t, err, connect.CodePermissionDenied, "broker")
 	assertObligationState(t, h, txID, "PENDING", "")
 }
@@ -99,12 +85,12 @@ func TestExecuteTransaction_CrossTenantRejected(t *testing.T) {
 	_, agentBClient := h.addTenant(t, "tenantc", "agent-c")
 
 	const txID = "tx-cross"
-	requester := &rampv1.Requester{Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT}
+	requester := newRequester("agent-test", "agent.example")
 	// Falsely claim to be agent-test while supplying an acceptance signed by a
 	// key that is NOT agent-test's registered key.
 	forged := mintWrongKeyAcceptanceFor(t, offer, requester, txID)
 	resp, err := agentBClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", IdempotencyKey: txID,
+		Ver: helpers.ProtocolVersion, IdempotencyKey: txID,
 		Requester: requester,
 		Items:     []*rampv1.TransactionItem{{Offer: offer, AgentAcceptance: forged}},
 	}))

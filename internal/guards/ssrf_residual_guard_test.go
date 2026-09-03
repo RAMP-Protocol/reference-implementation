@@ -37,18 +37,10 @@ var residualSSRFGuard = regexp.MustCompile(
 // the app (internal/rampwellknown/guard.go and its callers must be gone).
 func TestNoResidualHandRolledSSRFGuard(t *testing.T) {
 	t.Parallel()
-	root := repoRoot(t)
-	for _, rel := range appSourceFiles(t, root) {
-		src, err := os.ReadFile(filepath.Join(root, rel))
-		if err != nil {
-			t.Fatalf("read %s: %v", rel, err)
-		}
-		if residualSSRFGuard.Match(src) {
-			t.Errorf("%s still carries hand-rolled SSRF-guard code — construct the client "+
-				"from the SDK factory resolvers.NewGuardedClientFromEnv() and delete "+
-				"internal/rampwellknown/guard.go", rel)
-		}
-	}
+	assertNoMatchOutsideAllowlist(t, residualSSRFGuard, nil,
+		"still carries hand-rolled SSRF-guard code — construct the client "+
+			"from the SDK factory resolvers.NewGuardedClientFromEnv() and delete "+
+			"internal/rampwellknown/guard.go")
 }
 
 // TestSSRFGuardFileStaysDeleted fails while the deleted disease home reappears.

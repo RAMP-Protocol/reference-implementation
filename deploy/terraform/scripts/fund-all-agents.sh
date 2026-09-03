@@ -4,13 +4,27 @@
 # through the Identity Service and their fresh agents need a balance without
 # a per-agent command.
 #
-# Per the operator-only balance policy this stays operator tooling: the
-# operator runs it, the commands are printed before they run, and no service
-# ever credits an account on its own. It is safe to re-run at any moment —
-# during a demo, on a loop — because each credit's transfer id is derived
-# from (billing_ref, amount, label), exactly as in fund-staging-agent.sh:
-# agents already funded under this label are no-ops, newly signed-up agents
-# get their money. To top everyone up a second time, change FUND_LABEL.
+# Per the operator-mediated balance policy this stays operator tooling: the
+# operator runs it and the commands are printed before they run. The one
+# service-side credit that exists is the tenant-configured default credit the
+# Register flow grants a new agent (ADR-009 amendment 2026-08-13, disabled at
+# the default of 0). This sweep ADDS money on top of that grant: an agent that
+# was granted 1 EUR at Register and is then swept for 100 EUR ends at 101 EUR.
+# It is safe to re-run at any moment — during a demo, on a loop: the transfer
+# id is derived from (billing_ref, amount, label), so agents already funded
+# under the same label AND amount are no-ops while newly signed-up agents get
+# their money. To top everyone up a second time, change FUND_LABEL or AMOUNT.
+#
+# Do NOT set FUND_LABEL=service-welcome here. That reserved label derives its
+# transfer id from the billing ref alone, with no amount in it, and shares one
+# ledger slot with the Register grant (see fund-staging-agent.sh). The sweep
+# can never claim that slot first — it finds agents by reading billing_ref
+# from ramp.agents, and a billing ref only exists after Register, which is
+# exactly when the grant takes the slot. Every sweep transfer would be
+# rejected as a duplicate id while the script still reported success, because
+# its verification only requires credits_posted > 0 and the grant already
+# satisfies that. The label stays reachable for its one real use: prefunding a
+# named agent through fund-staging-agent.sh before a manual activation.
 #
 # How it works: reads every non-null billing_ref from the Exchange's
 # ramp.agents table over SSH (the same documented operator-SQL path the seed
@@ -21,7 +35,8 @@
 # Env (all optional):
 #   STACK_DIR    default deploy/terraform/stacks/staging-aws
 #   AMOUNT       euros to add per agent, default 100
-#   FUND_LABEL   names this sweep, default "welcome" — change it to top up again
+#   FUND_LABEL   names this sweep, default "initial" — the same default
+#                fund-staging-agent.sh uses; change it to top up again
 #   LEDGER       passed through to fund-staging-agent.sh (default there: 978)
 #
 # Usage:
@@ -30,11 +45,11 @@
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/staging-env.sh"
-FUND_LABEL="${FUND_LABEL:-welcome}"
+FUND_LABEL="${FUND_LABEL:-initial}"
 
 command -v terraform >/dev/null 2>&1 || { echo "missing: terraform" >&2; exit 2; }
 
-read -r -a SSH_CMD <<< "$(tf_out ssh_command)"
+load_ssh_cmd
 
 LIST_SQL="SELECT DISTINCT billing_ref FROM ramp.agents WHERE billing_ref IS NOT NULL ORDER BY billing_ref;"
 echo "== list registered agents (read-only, via ${SSH_CMD[*]}) =="

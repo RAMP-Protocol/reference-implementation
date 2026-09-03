@@ -44,7 +44,7 @@ L0/L1 are reusable across every RAMP role in every language; L2/L3 are language-
 The SDK serves two audiences at two altitudes, stacked (never competing):
 
 - **Low tier — the protocol SDK (control).** L0 + L1 + the L2 client/server interceptors. Verb-level, no orchestration, no state. This is what **our own components** (Broker, Exchange, MCP, Edge) and any OSS implementor build on — they own the flow and want the protocol mechanics, nothing more.
-- **High tier — the agent SDK (convenience).** The L2 agent-convenience surface (`fetch`) for **external agent developers** who want one call. It MAY offer auto-budget, auto-report, and registry caching — but only via **injected stores** (`BudgetStore` / `ReportSink` / `RegistryCache` interfaces, easy defaults provided): the application owns the state, the SDK orchestrates. It is **opt-in**; drop to the low tier for full control. This reconciles the convenience of the prior "Agent SDK" design (now superseded) with the state-ownership boundary (§3) — the prior design owned state by default; this one injects it.
+- **High tier — the agent SDK (convenience).** The L2 agent-convenience surface (`fetch`) for **external agent developers** who want one call. It MAY offer auto-budget, auto-report, and registry caching — but only via **injected stores** (`BudgetStore` / `ReportSink` / `RegistryCache` interfaces, easy defaults provided): the application owns the state, the SDK orchestrates. It is **opt-in**; drop to the low tier for full control. This reconciles the convenience of the prior "Agent SDK" design with the state-ownership boundary (§3) — that design owned state by default; this one injects it. What was superseded is the state-owning version, which no longer exists: the agent-SDK design material is the live companion to this ADR, and the 2026-08-07 addendum names what each half owns.
 
 ### 3. The SDK never owns state; it makes state *operations* trivial
 
@@ -61,7 +61,7 @@ The rule of thumb: **if there is a long-running process, the application owns it
 
 Today the agent selects and commits on **unverified** offers. Servers verify their inbound traffic (Exchange: RFC 9421 + offer signature, but only *at execute* — too late to inform selection; Edge: signed-URL + PoP), but the **Broker does not verify the offers it relays** from the Exchange, and the **MCP/agent verifies nothing it receives**. A malicious broker or a MITM can therefore steer the agent's selection with doctored terms that only fail much later at execute. The SDK closes this gap structurally:
 
-- **Split logic from resolution.** The verification **logic** is L1 — pure `(message, pubkey) → ok`. The key **resolution** is an injected `KeyResolver` ("give me the verifying key for this Exchange/keyid"). The SDK ships a default `WellKnownKeyResolver` (fetch `/.well-known/ramp.json` + in-memory TTL cache); the application injects its own for a private registry, a preloaded set, a proxy, or mTLS. The same interface serves the client `Verifier` and the server's verify interceptor. The server-side pieces already exist to reuse (`internal/httpsig` — incl. `keyresolver.go`, `internal/rampwellknown`, `src/exchange/internal/signing`; on the TS side the edge now consumes `@ramp-protocol/sdk-l1/verify` and `/pop`).
+- **Split logic from resolution.** The verification **logic** is L1 — pure `(message, pubkey) → ok`. The key **resolution** is an injected `KeyResolver` ("give me the verifying key for this Exchange/keyid"). The SDK ships `WBAKeyResolver` for this — per-host Web Bot Auth directory fetch, RFC 7638 thumbprint match, validity windows, revocation, guarded client (corrected 2026-08-07: this originally named `WellKnownKeyResolver` fetching `ramp.json`, which is the fixed-URL `kid`-matched JWKS face and resolves nothing against a WBA directory; identity keys left `ramp.json` after this was written); the application injects its own for a private registry, a preloaded set, a proxy, or mTLS. The same interface serves the client `Verifier` and the server's verify interceptor. The server-side pieces already exist to reuse (`internal/httpsig` — incl. `keyresolver.go`, `internal/rampwellknown`, `src/exchange/internal/signing`; on the TS side the edge now consumes `@ramp-protocol/sdk-l1/verify` and `/pop`).
 - **Verify-everything, fail-closed, by default strict.** The SDK verifies each returned object **before** handing it back. "Can't consume an unverified offer" is made structural: `discover`/`resolve` return `{ verified, rejected }` — the application acts on `verified`; `rejected` (offer + reason) is *visible* but the execute path refuses it. Strictness is configurable, but turning verification **off is a loud, named opt-out** (`WithVerification(Off)`), never silent; acting on a rejected offer requires an explicit `.unsafe()`.
 - **One `Verifier` + one `KeyResolver` serves all three roles** — server inbound, edge delivery, client received-offers — and closes the missing one. It *unifies* existing verification surface rather than adding a new one. Scope of "everything": (1) offer signatures (*the gap*), (2) signed-URL (the client can pre-check), (3) content attestations (hash / third-party — a *separate* guarantee: content integrity vs offer authenticity).
 
@@ -160,3 +160,77 @@ The one load-bearing invariant: RFC 9421 canonicalization and RFC 7638/money for
 **Why not `protovalidate-{es,python}` at runtime.** It re-introduces a runtime CEL engine + dependency per language. The same cross-field coverage is achieved by compiling those rules into hand-authored, corpus-guarded Pydantic/Zod predicates — idiomatic, dependency-free, and keyed to one source of truth (the corpus). Revisit only if the hand-authored surface grows unmaintainable.
 
 This refines §1 (L0) and §8: L0 validation is corpus-guarded and JSON-Schema-derived for per-field rules, extended by a semi-deterministic agent-maintained cross-field layer in Pydantic/Zod — full field-and-cross-field parity across languages, without a CEL runtime.
+
+---
+
+## Addendum (2026-08-07) — the verb list was the agent's, and it hid four roles
+
+**Context.** §1 scopes the L2 low tier by method set — "Methods mirror the
+protocol (`discover / execute / report / resolve / fetch`)". That list is the
+**agent's**, and only the agent's. Nothing else in this ADR says what any other
+consumer needs, so no other role has a definition of done.
+
+The consequence showed up as a pattern rather than a bug. Gaps were found by
+whoever tripped over them: the missing client verbs, the absent catalog client,
+the account calls still hand-rolled in the platform's identity service. Each was
+reported as its own oversight; they are one omission seen four times. The list is
+also incomplete for the agent — `dispute`, `register` and `getAccountStatus` are
+agent calls and appear nowhere in it.
+
+**Refinement — score the SDK by integration role, not by verb set.** There are
+five, and they are not equally served:
+
+| Role | What it needs from the SDK |
+|---|---|
+| **Edge / enforcement** | Verify a signed URL, verify the delivery proof on the GET, resolve the keys for both |
+| **Agent** | Sign requests, find offers, verify them, buy, download, report usage, dispute |
+| **Account setup** | Register, read account status |
+| **Publisher** | Push, remove and refresh catalogue entries, prove domain control, validate terms before sending |
+| **Exchange operator** | Serve the RPCs: verify inbound signatures, validate, emit typed errors |
+
+A role is complete when someone in it can do their whole job through the SDK
+without re-deriving protocol mechanics — not when some subset of verbs exists.
+
+**Every protocol RPC belongs to exactly one role.** That rule is what makes the
+model checkable: an RPC mapping to no role is a hole, not an exemption. Applying
+it caught one immediately — `RequestDomainVerification` and
+`ConfirmDomainVerification` belong to publisher onboarding and had no client and
+no handler anywhere, which is how they stayed invisible while five roles were
+counted. `dispute` is likewise an agent verb and was missing from the old list.
+
+Per-language status is deliberately **not** recorded here. It changes with the
+next commit that lands a verb, and nobody edits an accepted ADR when one ships;
+it lives in the SDK design material, which is where it can be kept true. What
+belongs here is the durable half — the roles, their needs, and the completeness
+rule.
+
+The observation that prompted this: **the one role that is nearly complete is the
+one that was built SDK-first.** The edge worker imports the SDK's verify, proof
+and thumbprint modules rather than carrying copies — and the one need it does
+carry itself, key resolution, is exactly where that role is unfinished. Every
+other role was built application-first and back-ported, or not built at all. That
+correlation, not the individual gaps, is the finding.
+
+**What the SDK owes the publisher role is the message, its validation and the
+call — not the catalogue sources.** JSONL, sitemaps, RSL, a crawl or a CMS plugin
+are separate products that converge on `PushResources`.
+
+**The enforcement half** is tracked separately, and the obvious form of it is too
+weak. "Fail when a protocol RPC has no client verb" is an existence check: it
+cannot see the edge role, which has no RPCs at all; it cannot see a missing
+*server* handler, which is the exchange-operator gap; and it passes a verb that
+exists but cannot do its job — Go's `Execute` ships and sends neither `Requester`
+nor `AgentAcceptance`, so a reference Exchange refuses it.
+
+Since the completeness rule above is behavioural, the gate has to be too: key it
+on a passing integration test per verb rather than on the symbol existing, and
+give the two non-client roles their own check — the edge role against its verify
+surface, the exchange-operator role against its server bindings.
+
+The role definitions are recorded here, rather than only in the design material
+that expands them, because the gate checks against them and this document is the
+one that travels.
+
+This refines §1 and §2: the low tier's scope is "every role can do its whole job
+through the SDK without re-deriving protocol mechanics", and the verb list in §1
+is one role's instance of that, not the definition.

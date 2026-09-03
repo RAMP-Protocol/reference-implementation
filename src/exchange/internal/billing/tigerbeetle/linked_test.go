@@ -25,6 +25,17 @@ func TestLinkedOutcome(t *testing.T) {
 		{"already_posted", tb.TransferPendingTransferAlreadyPosted, LinkedPendingResolved, false},
 		{"already_voided", tb.TransferPendingTransferAlreadyVoided, LinkedPendingResolved, false},
 		{"expired", tb.TransferPendingTransferExpired, LinkedPendingResolved, false},
+		{"exists_different_amount", tb.TransferExistsWithDifferentAmount, LinkedExistsMismatch, false},
+		{"exists_different_flags", tb.TransferExistsWithDifferentFlags, LinkedExistsMismatch, false},
+		{"exists_different_debit", tb.TransferExistsWithDifferentDebitAccountID, LinkedExistsMismatch, false},
+		{"exists_different_credit", tb.TransferExistsWithDifferentCreditAccountID, LinkedExistsMismatch, false},
+		{"exists_different_pending", tb.TransferExistsWithDifferentPendingID, LinkedExistsMismatch, false},
+		{"exists_different_ud128", tb.TransferExistsWithDifferentUserData128, LinkedExistsMismatch, false},
+		{"exists_different_ud64", tb.TransferExistsWithDifferentUserData64, LinkedExistsMismatch, false},
+		{"exists_different_ud32", tb.TransferExistsWithDifferentUserData32, LinkedExistsMismatch, false},
+		{"exists_different_timeout", tb.TransferExistsWithDifferentTimeout, LinkedExistsMismatch, false},
+		{"exists_different_ledger", tb.TransferExistsWithDifferentLedger, LinkedExistsMismatch, false},
+		{"exists_different_code", tb.TransferExistsWithDifferentCode, LinkedExistsMismatch, false},
 		{"unexpected", tb.TransferPendingTransferNotFound, 0, true},
 	}
 	for _, tc := range tests {

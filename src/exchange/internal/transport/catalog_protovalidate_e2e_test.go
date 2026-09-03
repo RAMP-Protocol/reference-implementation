@@ -16,8 +16,9 @@ import (
 // rejection NO service guard owns. The Pricing message carries buf.validate CEL
 // (ramp.proto Pricing: PER_UNIT⇒unit, FREE⇒rate 0); the interceptor runs BEFORE
 // the handler, so a CEL violation fails the WHOLE RPC with InvalidArgument —
-// distinct from the per-entry accepted/rejected verdict the licenseterm service
-// guards return. Without the interceptor in startExchangeServer (RAMP-obtjf)
+// distinct from the per-entry verdict the service's gate chain (the SDK's
+// ingest-tier term checks and the Exchange-owned gates) returns. Without the
+// interceptor in startExchangeServer (RAMP-obtjf)
 // these requests reached the handler and produced a different outcome than
 // production, making the harness only a partial mirror.
 //
@@ -43,7 +44,7 @@ func TestPushResources_ProtovalidateOwnedReject(t *testing.T) {
 		{
 			// pricing.per_unit.requires_unit: PER_UNIT with no unit is a
 			// structural CEL violation the interceptor rejects before the
-			// licenseterm guards run.
+			// service's ingest-tier term checks run.
 			name:    "PER_UNIT without unit fails protovalidate",
 			path:    "/protovalidate/per-unit-no-unit",
 			pricing: &rampv1.Pricing{Model: rampv1.PricingModel_PRICING_MODEL_PER_UNIT, Rate: "0.05", Currency: "USD"},
@@ -57,11 +58,13 @@ func TestPushResources_ProtovalidateOwnedReject(t *testing.T) {
 		},
 		{
 			// restriction.permitted.format: a whitespace/control-char token is a
-			// structural CEL violation rejected at the wire BEFORE the licenseterm
-			// canonicalizer (which would trim it) runs. The trimming itself stays
-			// proven by licenseterm.TestNormalize; through the RPC the contract
-			// requires already-clean tokens — a publisher must canonicalize before
-			// pushing (the ingest mapper does, via licenseterm.Normalize).
+			// structural CEL violation rejected at the wire BEFORE the service
+			// canonicalizes tokens (the SDK's NormalizeResourceEntry, which would
+			// trim it). The trimming itself is the SDK's, pinned by the protocol
+			// module's license-term vector corpus (its fold list); through the RPC
+			// the contract requires already-clean tokens — a publisher must
+			// canonicalize before pushing (the ingest mapper does, via
+			// helpers.NormalizeLicenseTerm).
 			name:         "whitespace restriction token fails protovalidate",
 			path:         "/protovalidate/restriction-whitespace",
 			pricing:      pricedUnit,
@@ -71,19 +74,15 @@ func TestPushResources_ProtovalidateOwnedReject(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-				TenantId: h.tenantID,
-				CallerId: callerID,
-				Entries: []*rampv1.ResourceEntry{{
-					Domain: h.publisherDom,
-					Path:   tc.path,
-					Terms: []*rampv1.LicenseTerm{{
-						Semantics:    rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
-						Pricing:      tc.pricing,
-						Restrictions: tc.restrictions,
-					}},
+			_, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, callerID, []*rampv1.ResourceEntry{{
+				Domain: h.publisherDom,
+				Path:   tc.path,
+				Terms: []*rampv1.LicenseTerm{{
+					Semantics:    rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
+					Pricing:      tc.pricing,
+					Restrictions: tc.restrictions,
 				}},
-			}))
+			}})))
 			// The interceptor fails the whole RPC — not a 200 with rejected=1.
 			assertConnectCode(t, err, connect.CodeInvalidArgument)
 			// And nothing persisted: the rejected push leaves zero offers.
@@ -104,18 +103,12 @@ func TestPushResources_ProtovalidateOwnedReject(t *testing.T) {
 // locking the format contract on both request shapes the overhaul unified.
 func TestDiscoverResources_ProtovalidateRejectsWhitespaceAcceptableRestriction(t *testing.T) {
 	h := newPushHarness(t)
-	_, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.publisherDom + "/protovalidate/acceptable-whitespace"},
-		Requester: &rampv1.Requester{
-			Id:     "agent-discover",
-			Domain: "agent.example",
-			Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-		AcceptableRestrictions: []*rampv1.AcceptableRestriction{{
-			Axis:   rampv1.RestrictionKind_RESTRICTION_KIND_GEOGRAPHY,
-			Values: []string{" de "},
-		}},
-	}))
+	query := newResourceQuery(newRequester("agent-discover", "agent.example"),
+		[]string{"https://" + h.publisherDom + "/protovalidate/acceptable-whitespace"})
+	query.AcceptableRestrictions = []*rampv1.AcceptableRestriction{{
+		Axis:   rampv1.RestrictionKind_RESTRICTION_KIND_GEOGRAPHY,
+		Values: []string{" de "},
+	}}
+	_, err := h.exchange.DiscoverResources(h.ctx, connect.NewRequest(query))
 	assertConnectCode(t, err, connect.CodeInvalidArgument)
 }

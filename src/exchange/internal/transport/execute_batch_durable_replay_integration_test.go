@@ -10,6 +10,7 @@ import (
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
@@ -101,20 +102,19 @@ func TestExecuteTransaction_DurableReplayAfterRestartReturnsOriginalResult(t *te
 	h := newTestHarness(t)
 	ctx := h.ctx
 	uri := seedResourceWithRate(t, h, "/articles/durable-idem", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const idem = "tx-durable-idem"
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-test", "agent.example")
 	req := &rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: idem,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{
 			{Offer: offer, AgentAcceptance: signAcceptanceFor(t, h.callerPriv, offer, requester, idem)},
 		},
 	}
+	req.AgentRequestAcceptance = signRequestAcceptanceFor(t, h.callerPriv, req)
 
 	// Leg 1 (server #1): the original request succeeds — HTTP 200, one item, a
 	// signed retrieval endpoint, no per-item denial. Persists the transaction_log

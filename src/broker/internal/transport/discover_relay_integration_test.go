@@ -18,6 +18,7 @@ import (
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+	"github.com/RAMP-Protocol/protocol/sdk/go/resolvers"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
@@ -25,6 +26,7 @@ import (
 	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/replay"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/xclient"
 )
@@ -45,6 +47,14 @@ type discoverRelayTestEnv struct {
 	mockExch    *mockExchange
 	captured    *capturedHeaders
 	logs        *lockedBuffer
+	// exchangeRepo and endpoints are the registry and the endpoint resolver a
+	// test needs to build the production health refresher over this fixture.
+	// The discover handler itself takes neither: its target arrives in a
+	// request header, so it resolves nothing. The refresher does, and it has to
+	// probe through the SAME resolver production wires it to, or the test
+	// proves a health flag nobody reads.
+	exchangeRepo *repo.PgxExchangeRepo
+	endpoints    *resolvers.WellKnownEndpointResolver
 	// signatureAgent is written onto the agent's request BEFORE signing, so the
 	// signature covers it. Empty leaves the SDK's own binding in place (it sets the
 	// header to "" when absent), which is what every relay test that does not care
@@ -88,7 +98,17 @@ func newDiscoverRelayTestEnvResolvedBy(
 	brokerKID := rwtestutil.MustThumbprint(t, brokerPub)
 
 	mockExch, captured, exchangeURL := startCapturingExchange(t)
-	exchangeRepo := seedRelayRegistry(t, ctx, "mp.acme.example", exchangeURL)
+	// The registered domain is the Exchange's own host, the shape production
+	// requires: the endpoint resolver reads /.well-known/ramp.json from the
+	// registered domain, and the Exchange serves that document itself. A
+	// registry row naming some other domain would resolve nowhere, so the
+	// health refresher could never measure this Exchange.
+	exchangeRepo := seedRelayRegistry(t, ctx, strings.TrimPrefix(exchangeURL, "http://"), exchangeURL)
+	// The unguarded client is what a loopback httptest Exchange needs; see the
+	// same note on the execute-relay fixture.
+	endpoints := resolvers.NewWellKnownEndpointResolver(
+		resolvers.WellKnownOptions{Scheme: "http", HTTP: http.DefaultClient},
+	)
 
 	relayKey := &xclient.RelayKey{KeyID: brokerKID, Private: brokerPriv}
 	signingRT, err := xclient.NewSigningTransport(nil, relayKey, "broker.test.example", 30*time.Second, clock.System{})
@@ -98,7 +118,8 @@ func newDiscoverRelayTestEnvResolvedBy(
 	xpool := xclient.NewPool(&http.Client{Transport: signingRT})
 
 	var resolver helpers.KeyResolver = helpers.NewStaticKeyResolver(
-		map[string]ed25519.PublicKey{agentKID: agentPub})
+		map[string]ed25519.PublicKey{agentKID: agentPub},
+	)
 	if makeResolver != nil {
 		resolver = makeResolver(agentKID, agentPub)
 	}
@@ -121,6 +142,9 @@ func newDiscoverRelayTestEnvResolvedBy(
 		mockExch:    mockExch,
 		captured:    captured,
 		logs:        logs,
+
+		exchangeRepo: exchangeRepo,
+		endpoints:    endpoints,
 	}
 }
 
@@ -129,16 +153,26 @@ func newDiscoverRelayTestEnvResolvedBy(
 // is the authoritative discovery responder), so the query needs no full shape.
 func (e discoverRelayTestEnv) queryBody(t *testing.T) []byte {
 	t.Helper()
+	return e.queryBodyFor(t, "https://acme.example/article-42")
+}
+
+// queryBodyFor is queryBody for a chosen URL. A test that sends two requests in
+// one run needs it: the agent's signature is deterministic over the body and
+// the second-resolution timestamp, so two identical bodies sent inside one
+// second carry the same sig1 and the second is a replay.
+func (e discoverRelayTestEnv) queryBodyFor(t *testing.T, uri string) []byte {
+	t.Helper()
 	q := &rampv1.ResourceQuery{
-		Ver:  "0.3",
-		Uris: []string{"https://acme.example/article-42"},
+		Exchange: "exchange.example",
+		Ver:      helpers.ProtocolVersion,
+		Uris:     []string{uri},
 		Requester: &rampv1.Requester{
 			Id:     e.agentKID,
 			Domain: "agent.example",
 			Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
 		},
 	}
-	body, err := protojson.Marshal(q)
+	body, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(q)
 	if err != nil {
 		t.Fatalf("marshal ResourceQuery: %v", err)
 	}
@@ -152,7 +186,28 @@ func (e discoverRelayTestEnv) queryBody(t *testing.T) []byte {
 // routing header (to drive the missing-target rejection).
 func (e discoverRelayTestEnv) signedDiscoverRequest(t *testing.T, body []byte, setEndpointHeader bool) *http.Request {
 	t.Helper()
-	discURL := e.exchangeURL + rampv1connect.ExchangeServiceDiscoverResourcesProcedure
+	header := e.exchangeURL
+	if !setEndpointHeader {
+		header = ""
+	}
+	return e.signedDiscoverRequestNaming(t, body, e.exchangeURL, header)
+}
+
+// signedDiscoverRequestNaming builds the same request against an arbitrary
+// target: the agent signs sig1 over signTarget's discover URL and the routing
+// header names headerEndpoint (empty leaves the header off).
+//
+// The two are separate arguments because the SSRF tests need them to be the
+// SAME value and still not be the registered Exchange. The relay rebuilds the
+// signature base from the header, so a test that signed against the registered
+// Exchange and then overwrote the header would be sending a request whose
+// signature does not verify — it would be refused as unsigned, and would never
+// reach the registry check it exists to drive.
+func (e discoverRelayTestEnv) signedDiscoverRequestNaming(
+	t *testing.T, body []byte, signTarget, headerEndpoint string,
+) *http.Request {
+	t.Helper()
+	discURL := signTarget + rampv1connect.ExchangeServiceDiscoverResourcesProcedure
 	signReq, err := http.NewRequest(http.MethodPost, discURL, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("create sign request: %v", err)
@@ -179,8 +234,8 @@ func (e discoverRelayTestEnv) signedDiscoverRequest(t *testing.T, body []byte, s
 		t.Fatalf("create relay request: %v", err)
 	}
 	relayReq.Header = signReq.Header.Clone()
-	if setEndpointHeader {
-		relayReq.Header.Set("X-RAMP-Exchange-Endpoint", e.exchangeURL)
+	if headerEndpoint != "" {
+		relayReq.Header.Set("X-RAMP-Exchange-Endpoint", headerEndpoint)
 	}
 	return relayReq
 }
@@ -424,6 +479,11 @@ func TestDiscoverRelay_MissingRoutingHeader_CarriesFieldMetadata(t *testing.T) {
 	}
 }
 
+// metadataEndpoint is the cloud-instance metadata address, standing in for any
+// target a caller might try to steer the broker's signed POST onto. It is not in
+// the registry, which is the whole assertion.
+const metadataEndpoint = "http://169.254.169.254"
+
 // TestDiscoverRelay_RejectsUnregisteredExchangeEndpoint verifies the SSRF gate:
 // a request whose X-RAMP-Exchange-Endpoint names an endpoint NOT in the broker's
 // registry is rejected (400, REJECTED_ENDPOINT) and never relayed — a caller
@@ -431,8 +491,11 @@ func TestDiscoverRelay_MissingRoutingHeader_CarriesFieldMetadata(t *testing.T) {
 func TestDiscoverRelay_RejectsUnregisteredExchangeEndpoint(t *testing.T) {
 	env := newDiscoverRelayTestEnv(t)
 	body := env.queryBody(t)
-	req := env.signedDiscoverRequest(t, body, true)
-	req.Header.Set("X-RAMP-Exchange-Endpoint", "http://169.254.169.254")
+	// Signed against the metadata address it names, not against the registered
+	// Exchange. The relay verifies the agent before it answers anything about the
+	// registry, so a request whose signature covers a different target is refused
+	// as unsigned and never reaches this gate.
+	req := env.signedDiscoverRequestNaming(t, body, metadataEndpoint, metadataEndpoint)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -447,9 +510,10 @@ func TestDiscoverRelay_RejectsUnregisteredExchangeEndpoint(t *testing.T) {
 	if env.mockExch.discoverCalls != 0 {
 		t.Errorf("Exchange was called %d times for an unregistered endpoint, want 0", env.mockExch.discoverCalls)
 	}
-	if !strings.Contains(env.logs.String(), "REJECTED_ENDPOINT") {
-		t.Errorf("unregistered endpoint emitted no REJECTED_ENDPOINT audit log; got: %s", env.logs.String())
-	}
+	// Matched exactly, not as a substring: REJECTED_ENDPOINT_DOWN records a
+	// registered exchange whose probe failed, and a loose match would accept it
+	// here — the opposite of what this test asserts.
+	assertRelayAudit(t, env.logs.String(), "REJECTED_ENDPOINT")
 }
 
 // TestDiscoverRelay_RejectsUnregisteredExchangeEndpoint_CarriesResolvedEndpointMetadata
@@ -469,15 +533,14 @@ func TestDiscoverRelay_RejectsUnregisteredExchangeEndpoint(t *testing.T) {
 func TestDiscoverRelay_RejectsUnregisteredExchangeEndpoint_CarriesResolvedEndpointMetadata(t *testing.T) {
 	env := newDiscoverRelayTestEnv(t)
 	body := env.queryBody(t)
-	req := env.signedDiscoverRequest(t, body, true)
-	req.Header.Set("X-RAMP-Exchange-Endpoint", "http://169.254.169.254")
+	req := env.signedDiscoverRequestNaming(t, body, metadataEndpoint, metadataEndpoint)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("send to broker: %v", err)
 	}
 	detail := readBrokerErrorDetail(t, resp, http.StatusBadRequest)
-	assertRelayErrorField(t, detail, "resolved_endpoint", "http://169.254.169.254")
+	assertRelayErrorField(t, detail, "resolved_endpoint", metadataEndpoint)
 
 	if env.mockExch.discoverCalls != 0 {
 		t.Errorf("Exchange was called %d times for an unregistered endpoint, want 0", env.mockExch.discoverCalls)
@@ -493,15 +556,16 @@ func TestDiscoverRelay_BoundsOversizedBody(t *testing.T) {
 	env := newDiscoverRelayTestEnv(t)
 
 	q := &rampv1.ResourceQuery{
-		Ver:  "0.3",
-		Uris: []string{"https://acme.example/" + strings.Repeat("a", 80*1024)},
+		Exchange: "exchange.example",
+		Ver:      helpers.ProtocolVersion,
+		Uris:     []string{"https://acme.example/" + strings.Repeat("a", 80*1024)},
 		Requester: &rampv1.Requester{
 			Id:     env.agentKID,
 			Domain: "agent.example",
 			Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
 		},
 	}
-	body, err := protojson.Marshal(q)
+	body, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(q)
 	if err != nil {
 		t.Fatalf("marshal oversized ResourceQuery: %v", err)
 	}

@@ -7,14 +7,29 @@ sensible default, and where secrets go.
 Secrets (marked **sensitive**) belong in a gitignored `secrets.auto.tfvars`
 or `TF_VAR_*` environment variables — never in committed files.
 
+## SSH access — two things to know before you edit `ssh_operators`
+
+**Editing `ssh_operators` replaces the VM and destroys its data.** The map is
+part of the instance's user data, so adding, removing, or re-keying an operator
+recreates the instance. The Elastic IP survives, so DNS does not have to follow;
+everything on the root volume does not. Do not add an operator on the morning of
+a demo.
+
+**Everyone logs in as `ubuntu`. Per-operator keys are not per-operator
+accounts.** Each key can be revoked on its own and each authentication is
+attributable to a key, but once the session is open every operator is the same
+Unix user, and shell history cannot be attributed to a person. If per-person
+shell accountability is needed, the answer is a Unix account per operator or
+Systems Manager session logging — this change does not provide it.
+
+
 ## stacks/staging-aws
 
 ### Required
 
 | Variable | Sensitive | What it is |
 |---|---|---|
-| `ssh_public_key` | | OpenSSH public key for the VM's `ubuntu` user |
-| `ssh_ingress_cidr` | | Your address as a /32 — SSH is closed to everyone else (open ranges like 0.0.0.0/0, and anything wider than /8, are rejected) |
+| `ssh_operators` | | Operators allowed to SSH in, keyed by name: `{ alice = { public_key = "ssh-ed25519 AAAA... alice@laptop", source_cidrs = ["203.0.113.7/32"] } }`. Two mechanisms, both required — the security group opens the union of every operator's addresses, and an OpenSSH `from=` option on each installed key refuses that key from any address that is not its own. `public_key` is the one-line contents of the `.pub` file, not a path to it. Addresses are single hosts as `/32`. See the note below the tables |
 | `cloudflare_api_token` | yes | DNS:Edit + Workers Routes:Edit (zone), Workers Scripts:Edit (account) |
 | `cloudflare_account_id` | | Cloudflare account id |
 | `cloudflare_zone_id` | | Zone id of `domain` |
@@ -29,7 +44,6 @@ or `TF_VAR_*` environment variables — never in committed files.
 | `aws_region` / `aws_profile` | `us-east-1` / null | Null profile uses your default AWS credentials |
 | `name_prefix` | `ramp-staging` | AWS resource naming |
 | `instance_type` | `t3.large` | amd64 only — Graviton types are rejected |
-| `ssh_private_key_path` | null | Adds `-i <path>` to the `ssh_command` output when the key is not a default one; the key never leaves your machine |
 | `image_registry` / `image_tag` | `registry.gitlab.com` / `latest` | Registry switch happens here |
 | `registry_username` / `registry_password` | null | Only for private registries; password is **sensitive** |
 | `exchange_subdomain` … `publisher_subdomain` | `exchange`, `broker`, `mcp`, `login`, `origin`, `demo` | Hostname labels under `domain`. `mcp` (`identity_subdomain`) also owns a wildcard record: agent directories are published at `<agent-slug>.mcp.<domain>` |
@@ -107,3 +121,12 @@ own stack. `modules/compose-stack` additionally exposes `extra_databases`
 (multi-exchange topologies), `broker_id`, and `network_subnet` (override the
 compose network's default 172.28.0.0/24 when it collides with the host's
 existing networks; TigerBeetle takes host 10 of the subnet).
+
+`network_subnet` also becomes the Exchange's `ADMIN_ALLOWED_CIDRS`, which is
+the only access control on the admin listener. The published admin port makes
+Docker rewrite each caller's source address to the compose network's gateway,
+so the allowlist has to cover the network's own range and `127.0.0.1` would
+match nothing. Both the admin listener (host port 8082) and Postgres (host
+port 5432) are published on the VM's loopback interface only, so they are
+reachable through an SSH tunnel and not from the internet — the commands are
+in [deploy-demo-aws.md](deploy-demo-aws.md).

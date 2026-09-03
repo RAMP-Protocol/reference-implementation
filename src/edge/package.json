@@ -23,7 +23,7 @@
     "serve:miniflare": "node scripts/serve-miniflare.mjs"
   },
   "dependencies": {
-    "@ramp-protocol/sdk-l1": "git+https://github.com/RAMP-Protocol/protocol.git#104d867aa9a15a316723af6c3dd61d73ed490363",
+    "@ramp-protocol/sdk-l1": "git+https://github.com/RAMP-Protocol/protocol.git#5a2674e6617202a792a8e57362fce32cb5d2db7e",
     "hono": "^4.7.0",
     "zod": "^3.24.0"
   },

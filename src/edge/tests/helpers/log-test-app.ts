@@ -18,8 +18,16 @@ interface SpyLike {
 // recordsFor pulls the structured payloads of the console records whose event
 // name matches — the one observation helper both console-spy suites share, so
 // "find the record for event X" cannot drift between them.
+//
+// The payload argument is a JSON string, not an object: the worker serializes
+// it so every runtime writes the same bytes to its log. Parsing here means the
+// suites keep asserting against a plain object, and a payload that stopped
+// being valid JSON — the one defect this shape exists to prevent — fails the
+// tests rather than passing them.
 export function recordsFor(spy: SpyLike, event: string): unknown[] {
-  return spy.mock.calls.filter((call) => call[0] === event).map((call) => call[1]);
+  return spy.mock.calls
+    .filter((call) => call[0] === event)
+    .map((call) => JSON.parse(call[1] as string));
 }
 
 // spyOnDenyLogs installs spies on BOTH console levels a decision may touch.
@@ -29,6 +37,18 @@ export function recordsFor(spy: SpyLike, event: string): unknown[] {
 // take both spies from here and assert errorSpy was never called.
 export function spyOnDenyLogs() {
   return {
+    warnSpy: vi.spyOn(console, 'warn').mockImplementation(() => {}),
+    errorSpy: vi.spyOn(console, 'error').mockImplementation(() => {}),
+  };
+}
+
+// spyOnAllLogs installs spies on every level a decision may touch. The
+// delivery suite needs all three: it asserts the info record exists on an
+// authorized delivery AND that no record of any level accompanies it, and that
+// a denial emits no info record — neither half is checkable with one spy.
+export function spyOnAllLogs() {
+  return {
+    infoSpy: vi.spyOn(console, 'info').mockImplementation(() => {}),
     warnSpy: vi.spyOn(console, 'warn').mockImplementation(() => {}),
     errorSpy: vi.spyOn(console, 'error').mockImplementation(() => {}),
   };

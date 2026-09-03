@@ -5,8 +5,10 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"log/slog"
+	"net/http"
 
 	"github.com/RAMP-Protocol/protocol/sdk/go/core"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
@@ -14,10 +16,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/offerkeys"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/offerkeys"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/probe"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/xclient"
 )
 
 // newDiscoveryEndpointResolver builds the SINGLE well-known endpoint resolver
@@ -39,6 +44,18 @@ func newDiscoveryEndpointResolver() *resolvers.WellKnownEndpointResolver {
 		HTTP:   resolvers.NewGuardedClientFromEnv(),
 		Scheme: runhttp.EnvOr("RAMP_WELLKNOWN_SCHEME", "https"),
 	})
+}
+
+// newHealthProbeClient builds the registry health refresher's probe client from
+// the same SDK guarded factory every other broker fetch uses. The refresher
+// dials the address an exchange advertises about ITSELF and writes that address
+// back to the endpoint column, and the discover relay's allowlist compares a
+// caller-supplied endpoint against exactly that column — so an unguarded probe
+// would let a registered domain that resolves to a private or metadata address
+// answer /healthz, turn its row live, and enter the allowlist. Named here rather
+// than inlined at the call site so the wiring test can assert what it returns.
+func newHealthProbeClient() *http.Client {
+	return resolvers.NewGuardedClientFromEnv()
 }
 
 // newOfferVerifier builds the fail-closed offer Verifier the resolve core sorts
@@ -94,4 +111,45 @@ func setupRegistryRepos(
 		return nil, nil, fmt.Errorf("registry bootstrap: %w", err)
 	}
 	return exchangeRepo, logRepo, nil
+}
+
+// brokerIdentity is everything derived from BROKER_DOMAIN: the signed outbound
+// relay leg, the keys the Broker publishes for peers to verify it, and the
+// check that refuses a request addressed to somebody else. One domain, one
+// place it is read, so the three cannot come to disagree about who this Broker
+// is.
+type brokerIdentity struct {
+	relay    *xclient.Pool
+	ownKeys  *transport.KeyRegistry
+	audience *rampaudience.Interceptor
+}
+
+func setupRelayAndKeys(logger *slog.Logger, brokerDomain string) (brokerIdentity, error) {
+	relayHTTP, relayKey, err := newRelayHTTPClient(logger, brokerDomain)
+	if err != nil {
+		return brokerIdentity{}, fmt.Errorf("broker relay signing: %w", err)
+	}
+	var own []ed25519.PublicKey
+	if relayKey != nil {
+		// The served WBA directory publishes this key with a validity window
+		// stamped from the signer clock at each document build. Verifiers
+		// address it by its RFC 7638 thumbprint, not a broker-prefixed kid.
+		own = append(own, relayKey.Private.Public().(ed25519.PublicKey))
+	}
+	ownKeys, err := transport.NewKeyRegistry(own...)
+	if err != nil {
+		return brokerIdentity{}, fmt.Errorf("broker own-key registry: %w", err)
+	}
+	// Built at boot rather than per request, so a misconfigured BROKER_DOMAIN
+	// stops the process instead of surfacing to callers as an internal error
+	// that names nothing an operator can act on.
+	audience, err := rampaudience.NewInterceptor(brokerDomain)
+	if err != nil {
+		return brokerIdentity{}, err
+	}
+	return brokerIdentity{
+		relay:    xclient.NewPool(relayHTTP),
+		ownKeys:  ownKeys,
+		audience: audience,
+	}, nil
 }

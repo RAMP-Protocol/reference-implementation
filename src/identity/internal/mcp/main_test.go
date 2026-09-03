@@ -16,7 +16,10 @@ import (
 )
 
 // The MCP adapter needs BOTH backends the identity service runs on: Vault holds
-// the agents' signing keys, Postgres holds the developer accounts register reads.
+// the agents' signing keys, and Postgres holds the accounts a sign-up provisions
+// plus the notes of where each agent has been registered. No tool reads a
+// developer record any more — register sends what the AGENT supplies — so the
+// second backend is here for provisioning and for those notes.
 // Both come up once per package via the shared helper; per-test isolation is a
 // Postgres Snapshot/Restore plus a Vault mount reset, and DB-touching tests run
 // serially.

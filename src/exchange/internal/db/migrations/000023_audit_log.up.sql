@@ -8,7 +8,12 @@
 -- the same transaction as each successful setter, after the rows-affected check,
 -- so a no-op / unknown-tenant call leaves no row.
 --
--- actor is nullable and coarse (there is no authenticated operator identity yet);
+-- Agent registration writes here too. It is a control-plane event that creates an
+-- account and records which licensing terms were accepted, it happens once per
+-- account, and nothing else keeps a dated record of it. Unlike the admin plane it
+-- has an authenticated caller, so those rows carry an actor.
+--
+-- actor is nullable and coarse (the admin plane has no operator identity yet);
 -- source_addr is the caller's peer address; action names the RPC; detail is the
 -- JSONB of applied values; request_id correlates with the X-Request-ID logs. No
 -- FK on tenant_id: the log is an independent append-only record of the id, not a

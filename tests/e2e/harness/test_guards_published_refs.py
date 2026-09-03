@@ -85,15 +85,20 @@ _WAIVED_VIOLATION = (
     "# published-ref-allow: illustrating the escape hatch\n"
     "# see docs/design/design-exchange.md for the layering\n"
 )
-# A doc the publish tool puts ON the public tree even though this repo does not
-# build it. Citing one is resolvable and must NOT be rejected.
-_INHERITED_CITATION = "# the deployment walkthrough is in docs/HANDOFF-aws-demo.md\n"
 # There is deliberately NO constant here for the doc the publish stages out of
-# this tree, unlike the inherited one above. The two cases that need it read it
-# from the shared definition inside their own bodies, and both halves of that
-# matter: transcribing the name would keep the cases passing after the entry had
-# been renamed, and reading it at module scope would fail at import wherever
-# scripts/ is absent, which pytest answers by aborting the whole session.
+# this tree. The two cases that need it read it from the shared definition
+# inside their own bodies, and both halves of that matter: transcribing the name
+# would keep the cases passing after the entry had been renamed, and reading it
+# at module scope would fail at import wherever scripts/ is absent, which pytest
+# answers by aborting the whole session.
+#
+# The gate also subtracts INHERIT_FROM_MAIN when deriving bare basenames, so a
+# citation of an inherited doc is resolvable too. That half had its own case
+# while the retired aws-demo handoff gave INHERIT_FROM_MAIN a docs/-shaped
+# entry; with the array down to LICENSE and README.md the subtraction has no
+# member the basename sweep can see, so there is nothing real for a case to
+# pin. If a docs/ entry ever returns to INHERIT_FROM_MAIN, reinstate the case:
+# cite the entry from a published file and assert the gate accepts it.
 
 
 def _build_tree(root: Path) -> None:
@@ -197,23 +202,6 @@ def test_gate_flags_a_bare_filename(tmp_path: Path) -> None:
 
     assert proc.returncode == 1, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "docker-compose.yml:1:" in proc.stdout, proc.stdout
-
-
-def test_gate_accepts_a_citation_of_an_inherited_doc(tmp_path: Path) -> None:
-    """A doc the publish PUTS on the public tree is resolvable, not dangling.
-
-    The basename derivation sweeps in every ``docs/*.md`` outside
-    ``docs/architecture``, which includes the aws-demo handoff — a file this repo
-    does not build but the publish inherits onto the public branch. Subtracting
-    the inherited set is what keeps citing one legal, and nothing else in this
-    suite notices if that subtraction is removed.
-    """
-    _build_tree(tmp_path)
-    (tmp_path / "docker-compose.yml").write_text(_INHERITED_CITATION)
-
-    proc = _run_gate(tmp_path)
-
-    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
 
 
 def test_gate_accepts_a_citation_of_an_allowlisted_doc(tmp_path: Path) -> None:

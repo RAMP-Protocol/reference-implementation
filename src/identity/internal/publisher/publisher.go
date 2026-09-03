@@ -1,7 +1,8 @@
 // Package publisher is the Identity Service's service layer: it turns an agent's
-// stored keys and card metadata into the two published documents, caches them per
-// subdomain, and owns presence, staleness, and invalidation policy. Transport is a
-// thin HTTP adapter over it; the rotation work depends on this package —
+// stored keys, card metadata, revocations, and account row into the four documents
+// published on its subdomain, caches them per subdomain, and owns presence,
+// staleness, and invalidation policy. Transport is a thin HTTP adapter over it;
+// the rotation work depends on this package —
 // not on transport — for the Invalidate hook, so the dependency runs downward
 // (transport → publisher → keystore/repo/directory), never up.
 package publisher
@@ -70,12 +71,13 @@ type KeySource interface {
 	List(ctx context.Context, subdomain string) ([]keystore.Key, error)
 }
 
-// Config wires a Service. Keys, Cards, and Revocations are required; the rest take
-// defaults.
+// Config wires a Service. Keys, Cards, Revocations, and Registrations are required;
+// the rest take defaults.
 type Config struct {
-	Keys        KeySource
-	Cards       directory.CardReader
-	Revocations directory.RevocationReader
+	Keys          KeySource
+	Cards         directory.CardReader
+	Revocations   directory.RevocationReader
+	Registrations Registrations
 	// WellKnownScheme is the URL scheme used to build the per-subdomain
 	// revocation_url advertised in each agent's directory
 	// (<scheme>://<subdomain>/.well-known/ramp-key-revocations.json). It is
@@ -92,12 +94,13 @@ type Config struct {
 
 // Service builds, caches, and serves an agent's documents by subdomain.
 type Service struct {
-	keys        KeySource
-	cards       directory.CardReader
-	revocations directory.RevocationReader
-	scheme      string // URL scheme for each agent's advertised, host-anchored revocation_url
-	ttl         time.Duration
-	clock       clock.Clock
+	keys          KeySource
+	cards         directory.CardReader
+	revocations   directory.RevocationReader
+	registrations Registrations
+	scheme        string // URL scheme for each agent's advertised, host-anchored revocation_url
+	ttl           time.Duration
+	clock         clock.Clock
 
 	buildTimeout time.Duration
 
@@ -107,46 +110,6 @@ type Service struct {
 
 	genMu sync.Mutex
 	gen   map[string]uint64 // subdomain -> invalidation generation
-}
-
-// docSet holds one agent's two built documents. Either may be nil: an agent can
-// hold keys before its card is written, or the reverse — each is absent from its
-// own source, independent of the other. keyExpiry is the earliest NotAfter among
-// the published keys, used to clamp the cache entry so an expired key cannot linger
-// a full TTL past its window.
-type docSet struct {
-	wba        []byte
-	card       []byte
-	revocation []byte
-	keyExpiry  time.Time
-
-	// Per-document backend availability. A document is nil either because it is ABSENT
-	// (404) or because its backend was DOWN (503); these flags tell the two apart per
-	// route, so one backend's outage 503s only the documents it owns. In particular a
-	// Vault outage 503s the directory without sinking the revocation list, which is
-	// pure-Postgres and must stay servable during exactly that outage.
-	wbaUnavail  bool
-	cardUnavail bool
-	revUnavail  bool
-}
-
-// empty reports whether the agent is absent from every source — no directory, no
-// card, and nothing revoked. Only a wholly-unknown subdomain is empty; an agent whose
-// last key was destroyed but which still has revocations to report is present, so its
-// revocation list keeps being served (a consumer holding a cached directory must still
-// learn the key is dead) and it stays out of the negative cache.
-func (d *docSet) empty() bool { return d.wba == nil && d.card == nil && d.revocation == nil }
-
-// unavailable reports whether any document's backend was down during the build. Such a
-// docSet is NOT cached: a 503 is a transient condition to retry on the next request,
-// never a state to pin for the whole TTL (which would keep 503ing after the backend
-// recovered).
-func (d *docSet) unavailable() bool { return d.wbaUnavail || d.cardUnavail || d.revUnavail }
-
-// entry is a cached docSet with the instant it stops being served.
-type entry struct {
-	docs    *docSet
-	expires time.Time
 }
 
 // New builds a Service, applying defaults for TTL, NegativeTTL, and Clock. It fails
@@ -160,6 +123,9 @@ func New(cfg Config) (*Service, error) {
 	}
 	if cfg.Revocations == nil {
 		return nil, errors.New("publisher: Config.Revocations is required")
+	}
+	if cfg.Registrations == nil {
+		return nil, errors.New("publisher: Config.Registrations is required")
 	}
 	ttl := cfg.TTL
 	if ttl <= 0 {
@@ -182,9 +148,11 @@ func New(cfg Config) (*Service, error) {
 		scheme = "https"
 	}
 	return &Service{
-		keys:         cfg.Keys,
-		cards:        cfg.Cards,
-		revocations:  cfg.Revocations,
+		keys:          cfg.Keys,
+		cards:         cfg.Cards,
+		revocations:   cfg.Revocations,
+		registrations: cfg.Registrations,
+
 		scheme:       scheme,
 		ttl:          ttl,
 		clock:        clk,
@@ -334,7 +302,7 @@ func (s *Service) readGen(subdomain string) uint64 {
 	return s.gen[subdomain]
 }
 
-// build assembles the three published documents from their own sources. A backend
+// build assembles the four published documents from their own sources. A backend
 // outage for ONE document does not sink the others — it is recorded as that document's
 // unavailability and the pass continues — so a Vault outage still yields the
 // Postgres-backed revocation list, which is exactly the moment an operator's revocation
@@ -364,6 +332,14 @@ func (s *Service) build(ctx context.Context, subdomain string) (*docSet, error) 
 		return nil, err
 	}
 	ds.revUnavail = unavail
+
+	// The overlay reads only the account row, so its presence does not depend on any
+	// document built above and this call may sit anywhere in the pass.
+	unavail, err = s.buildManifest(ctx, subdomain, ds)
+	if err != nil {
+		return nil, err
+	}
+	ds.manifestUnavail = unavail
 	return ds, nil
 }
 

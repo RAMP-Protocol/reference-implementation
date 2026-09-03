@@ -110,3 +110,8 @@ docs/.obsidian/
 
 # Runtime artifact written by the cross-container revocation e2e (test_revocation_channel).
 tests/e2e/harness/revocations/revocations.json
+
+# Beads: the Dolt server is the source of truth. .beads/metadata.json was
+# git-tracked, so a branch checkout restored its pre-Dolt SQLite stub and bd
+# silently opened an empty database — hiding all 5279 issues. Never track it.
+.beads/

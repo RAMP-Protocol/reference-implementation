@@ -3,7 +3,6 @@
 package transport_test
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -17,13 +16,14 @@ import (
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/offerkeys"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/budget"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/exa"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/offerkeys"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/probe"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/repo"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/resolve"
@@ -39,6 +39,16 @@ type fixture struct {
 	// the single-exchange suites.
 	exchange2 *mockExchange
 	logger    *slog.Logger
+	// logs is non-nil only when fixtureOpts.captureLogs is set. It holds every
+	// record the fixture's logger emitted, including the request-scoped ones the
+	// handler writes through reqctx, so a test can assert on a log line the
+	// service is REQUIRED to leave behind (e.g. why an exchange was skipped).
+	logs *testutil.LogCapture
+	// endpoints is the SAME resolver instance the resolve handler routes
+	// through. The health refresher must probe the endpoint routing will use,
+	// so a test that drives both halves has to hand them one resolver; two
+	// instances could disagree and the test would not notice.
+	endpoints *fakeEndpointResolver
 	// pool is the live pgx pool bound to the shared migrated Postgres the
 	// resolve handler writes through. The selection-audit test reuses it to
 	// build a SelectionLogRepo for its tier-2 read leg (same DB, same
@@ -66,6 +76,10 @@ type fixtureOpts struct {
 	// verify/reject verdict is controlled. nil keeps the default (Off-mode
 	// pass-through for the legacy 'sig-x' fixtures).
 	verifier resolve.OfferVerifier
+	// captureLogs swaps the fixture's discard logger for a capturing one and
+	// exposes it as fixture.logs. Off by default so the suite stays quiet; a
+	// test turns it on when the log record itself is the behavior under test.
+	captureLogs bool
 }
 
 // secondaryProvider parameterises the second publisher domain + its exchange's
@@ -85,6 +99,10 @@ type secondaryProvider struct {
 func newFixture(tb testing.TB, ctx context.Context, opts fixtureOpts) *fixture {
 	tb.Helper()
 	logger := testutil.DiscardLogger()
+	var logs *testutil.LogCapture
+	if opts.captureLogs {
+		logs, logger = testutil.NewLogCapture()
+	}
 	pool := acquireTestDB(tb, ctx)
 	redisClient := acquireTestRedis(tb, ctx)
 
@@ -154,6 +172,10 @@ func newFixture(tb testing.TB, ctx context.Context, opts fixtureOpts) *fixture {
 	var exchange2 *mockExchange
 	if sec := opts.secondary; sec != nil {
 		exchange2 = &mockExchange{
+			// Its own identity, not the primary's: the second exchange is what
+			// makes "each leg names the exchange it is going to" testable, and it
+			// can only refuse a leg meant for its sibling if it knows who it is.
+			domain:            sec.exchangeDomain,
 			offerUnitCost:     sec.offerCost,
 			signedURL:         "https://edge2.example/signed?tok=def",
 			offerID:           sec.offerID,
@@ -223,6 +245,7 @@ func newFixture(tb testing.TB, ctx context.Context, opts fixtureOpts) *fixture {
 	budgetSvc := budget.NewRedis(redisClient, 0,
 		clock.NewDeterministic(time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)))
 
+	endpoints := &fakeEndpointResolver{byDomain: endpointsByDomain}
 	resolver := resolve.NewService(resolve.Deps{
 		Exchanges: exchangeRepo,
 		Log:       logRepo,
@@ -235,11 +258,19 @@ func newFixture(tb testing.TB, ctx context.Context, opts fixtureOpts) *fixture {
 		// well-known (registry = trust allowlist only). The fake maps the registered
 		// exchange domain to the mock Exchange URL, as the real resolver would from
 		// the exchange's /.well-known/ramp.json.
-		Endpoints: &fakeEndpointResolver{byDomain: endpointsByDomain},
+		Endpoints: endpoints,
 		Verifier:  verifier,
 	})
-	return &fixture{resolveHandler: resolver, exchange: exSrv, exchange2: exchange2, logger: logger, pool: pool}
+	return &fixture{
+		resolveHandler: resolver, exchange: exSrv, exchange2: exchange2,
+		logger: logger, logs: logs, endpoints: endpoints, pool: pool,
+	}
 }
+
+// requesterDomain is the agent domain every DiscoveryRequest in these tests
+// carries. It names where an agent's key directory would be fetched from, and
+// nothing here exercises that fetch, so one value serves the whole package.
+const requesterDomain = "agent.example"
 
 // reqOpts carries the optional DiscoveryRequest fields the resolve tests vary.
 type reqOpts struct {
@@ -260,7 +291,16 @@ type reqOpts struct {
 // (major units) the same way the production handler inverts it.
 func buildDiscoveryRequest(agentID string, o reqOpts) *rampv1.DiscoveryRequest {
 	req := &rampv1.DiscoveryRequest{
-		Requester: &rampv1.Requester{Id: agentID, Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+		Ver: helpers.ProtocolVersion,
+		Requester: &rampv1.Requester{
+			Id: agentID,
+			// A fixed, valid value, independent of agentID. The domain is a bare
+			// host on the wire and an empty one is refused, so every request needs
+			// one; the identity-gate tests vary the ID and would otherwise be
+			// refused for the shape of a field they are not testing.
+			Domain: requesterDomain,
+			Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
+		},
 	}
 	if o.query != "" {
 		q := o.query
@@ -403,13 +443,34 @@ func TestResolve_RefusalKeepsZeroValuedFieldsOnJSONWire(t *testing.T) {
 	if got := resp.Msg.GetAbsenceReason(); got != rampv1.OfferAbsenceReason_OFFER_ABSENCE_REASON_NOT_IN_CATALOG {
 		t.Fatalf("absence_reason = %v, want NOT_IN_CATALOG (refusal path)", got)
 	}
-	// The load-bearing assertion: the empty offer_groups survives on the JSON wire
-	// as an explicit [], proving the EmitUnpopulated codec is active exactly as in
-	// production. Without WithEmitUnpopulated the key would be omitted entirely.
-	// (The codec emits proto field names, so the wire key is snake_case.)
-	if !bytes.Contains(capture.body, []byte(`"offer_groups"`)) {
-		t.Fatalf("offer_groups omitted from JSON wire — harness is NOT wiring EmitUnpopulated like production; body=%s", capture.body)
-	}
+	// The codec decides two things at once, and each assertion below reads one.
+	//
+	// AssertWireCarries reads PRESENCE: the empty offer_groups survives on the
+	// JSON wire as an explicit [], which is what EmitUnpopulated does and what
+	// default protojson omits entirely. It resolves the name against the
+	// descriptor first, so renaming the field in the contract fails as a test
+	// naming a field that does not exist rather than as a codec problem.
+	//
+	// AssertCanonicalWireNames reads the field NAMES, and on this path the field
+	// that carries it is absence_reason — not offer_groups. Measured both ways
+	// against this mount: with the codec the body is
+	//
+	//	{"ver":"1.0","offer_groups":[],"absence_reason":"...","ext":null,"ext_critical":[]}
+	//
+	// and with the stock codec it is {"ver":"1.0","absenceReason":"..."}. A refusal
+	// leaves offer_groups empty, so losing the codec drops it from the wire
+	// entirely and it has no spelling left to report — which is exactly why the
+	// presence check above is the one that catches that drift. absence_reason is
+	// declared with explicit presence and set on this path, so it survives under
+	// either codec and is what the walk actually reads. The narrower drift it
+	// catches is a codec that still emits unpopulated fields but no longer pins
+	// UseProtoNames.
+	//
+	// Both report rather than stop, so a body that is wrong in both ways says so
+	// in both ways instead of hiding the second finding behind the first.
+	body := capture.Body(t)
+	testutil.AssertWireCarries(t, body, resp.Msg, "offer_groups")
+	testutil.AssertCanonicalWireNames(t, body, resp.Msg)
 }
 
 func TestResolve_BudgetExhausted(t *testing.T) {

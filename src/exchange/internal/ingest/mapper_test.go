@@ -7,9 +7,8 @@ import (
 	"time"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"google.golang.org/protobuf/proto"
-
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/licenseterm"
 )
 
 func loadFixture(t *testing.T) []Record {
@@ -147,10 +146,11 @@ func TestMapRecordGoldenReferenceOnly(t *testing.T) {
 }
 
 // TestMappedTermsPassValidate is the contract proof: every term produced from
-// every fixture record passes licenseterm.Validate with no hard error.
+// every fixture record passes the SDK's ingest-tier check
+// (helpers.ValidateLicenseTerm, the one the Exchange runs on a push) with no
+// hard error and no warning.
 func TestMappedTermsPassValidate(t *testing.T) {
 	records := loadFixture(t)
-	vocab := licenseterm.NewInMemoryVocab()
 
 	total := 0
 	for ri, rec := range records {
@@ -160,9 +160,9 @@ func TestMappedTermsPassValidate(t *testing.T) {
 		}
 		for ti, term := range entry.GetTerms() {
 			total++
-			warnings, err := licenseterm.Validate(term, vocab)
+			warnings, err := helpers.ValidateLicenseTerm(term)
 			if err != nil {
-				t.Errorf("record[%d] term[%d] failed Validate: %v", ri, ti, err)
+				t.Errorf("record[%d] term[%d] failed ValidateLicenseTerm: %v", ri, ti, err)
 			}
 			if len(warnings) > 0 {
 				t.Errorf("record[%d] term[%d] produced warnings (all fixture tokens are registered): %v", ri, ti, warnings)
@@ -431,5 +431,61 @@ func TestMapRecordRejectsNonObjectClaims(t *testing.T) {
 	}}
 	if _, err := mapRecord(rec); err == nil {
 		t.Fatal("expected error for non-object attestation claims, got nil")
+	}
+}
+
+// TestMapRecordMetering covers the feed's metering token over the closed enum
+// set, plus the two boundary behaviours that matter.
+//
+// An omitted token must leave the field unset rather than stamping an explicit
+// ONLINE: Pricing rides inside the offer's signature-covered bytes, so writing a
+// default onto every term would change the canonical bytes of every offer whose
+// feed says nothing about metering. Absent already reads as ONLINE downstream.
+//
+// "none" is the one value with a behavioural consequence — it is what tells the
+// Exchange the transaction owes no usage report and mints no obligation — so a
+// feed that cannot express it leaves a perpetual-licence publisher accumulating
+// overdue obligations for content nobody owes a report on.
+func TestMapRecordMetering(t *testing.T) {
+	cases := map[string]struct {
+		token string
+		want  *rampv1.PricingMetering
+	}{
+		"omitted leaves the field unset": {token: "", want: nil},
+		"online":                         {token: "online", want: rampv1.PricingMetering_PRICING_METERING_ONLINE.Enum()},
+		"offline_self_reported":          {token: "offline_self_reported", want: rampv1.PricingMetering_PRICING_METERING_OFFLINE_SELF_REPORTED.Enum()},
+		"none":                           {token: "none", want: rampv1.PricingMetering_PRICING_METERING_NONE.Enum()},
+		"case and spacing are tolerated": {token: "  NONE  ", want: rampv1.PricingMetering_PRICING_METERING_NONE.Enum()},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			entry, err := mapRecord(pricedRecord(&Pricing{
+				Model: "flat", Rate: "1.00", Currency: "EUR", Metering: tc.token,
+			}))
+			if err != nil {
+				t.Fatalf("mapRecord: %v", err)
+			}
+			got := entry.GetTerms()[0].GetPricing().Metering
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("metering = %v, want unset — an explicit default would change "+
+					"the signed bytes of every offer whose feed omits the field", *got)
+			case tc.want != nil && got == nil:
+				t.Errorf("metering unset, want %v", *tc.want)
+			case tc.want != nil && *got != *tc.want:
+				t.Errorf("metering = %v, want %v", *got, *tc.want)
+			}
+		})
+	}
+}
+
+// TestMapRecordRejectsUnknownMetering asserts an unrecognised token is an error
+// rather than a silent fallback. Defaulting would be the dangerous direction:
+// a publisher who misspells "none" would get metered terms, an obligation on
+// every execute, and agents blocked for reports they were never told to file.
+func TestMapRecordRejectsUnknownMetering(t *testing.T) {
+	rec := pricedRecord(&Pricing{Model: "flat", Rate: "1.00", Currency: "EUR", Metering: "sometimes"})
+	if _, err := mapRecord(rec); err == nil {
+		t.Fatal("expected an error for an unknown metering token, got nil")
 	}
 }

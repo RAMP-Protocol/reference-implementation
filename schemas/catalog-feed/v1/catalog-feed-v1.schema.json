@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ramp-protocol.org/schemas/catalog-feed/v1/catalog-feed-v1.schema.json",
   "title": "RAMP catalog feed v1 — one feed line",
-  "description": "JSON Schema (Draft 2020-12) for ONE LINE of a RAMP catalog feed. A feed is a JSON-Lines file: one resource per line, and the file as a whole is not a JSON document, so this schema is applied per line rather than to the file. It describes the line shape the reference ingester accepts — the union of what the parser decodes and what the mapper then validates — plus the per-line shape rules protovalidate applies at the CatalogService.PushResources boundary. Registry membership (function / user-type / geography / metering / quota tokens) and every stateful server gate are deliberately outside this schema; see the sidecar README. The parser is authoritative: this schema is a derived view and no automated check currently holds the two together.",
+  "description": "JSON Schema (Draft 2020-12) for ONE LINE of a RAMP catalog feed. A feed is a JSON-Lines file: one resource per line, and the file as a whole is not a JSON document, so this schema is applied per line rather than to the file. It describes the line shape the reference ingester accepts — the union of what the parser decodes and what the mapper then validates — plus the per-line shape rules protovalidate applies at the CatalogService.PushResources boundary. Registry membership (function / user-type / geography / metering / quota tokens) and every stateful server gate are deliberately outside this schema; see the sidecar README. The parser is authoritative: this schema is a derived view of it. Three checks hold parts of the two together. The field sets are compared against the Go structs the parser decodes, in both directions, and every object is required to be closed, because an open object makes that comparison prove nothing. The committed example feed and the sample publisher feed must both validate against this schema, and the example must then survive parse and mapping. And a corpus of envelope violations must be refused both by this schema and by the SDK's ValidateResourceEntry, so a rule dropped from the schema surfaces as a line the SDK refuses and the schema admits; every envelope bound this schema carries has a case in that corpus, and the metering vocabulary has its own accept and reject cases run through both sides. Two things the checks do NOT reach. A bound the wire TIGHTENS: a case built to break the old bound breaks the tighter one too, so both sides still refuse it and nothing fails. And the rest of the value rules — the remaining patterns, the cross-field pricing conditionals and registry membership — which are authored here independently of the mapper that enforces them. Where the two disagree anywhere the checks do not reach, the ingester is right and the schema is a bug.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,6 +13,8 @@
     "domain": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 260,
+      "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?$",
       "description": "Publisher domain. The Exchange derives the owning tenant from this value via the UNIQUE tenants.domain mapping; a caller-supplied tenant_id that disagrees is rejected, never honored.",
       "examples": [
         "publisher.example"
@@ -21,6 +23,8 @@
     "path": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^/[^?#\\x00-\\x20\\x7f]*$",
       "description": "Resource path, including the leading slash. The catalog URI is scheme://domain+path.",
       "examples": [
         "/article/how-photosynthesis-works"
@@ -28,6 +32,7 @@
     },
     "title": {
       "type": "string",
+      "maxLength": 512,
       "description": "Human-readable title. Surfaces on the offer."
     },
     "license": {
@@ -40,30 +45,33 @@
       "items": {
         "$ref": "#/$defs/Term"
       },
-      "description": "Declared licensing offers. Each element becomes one ramp.v1.LicenseTerm. A line carrying no terms is ACCEPTED and stored, but produces no offer at discovery. More than 32 terms rejects the entry with reason too_many_terms."
+      "description": "Declared licensing offers. Each element becomes one ramp.v1.LicenseTerm. A line carrying no terms is ACCEPTED and stored, but produces no offer at discovery. More than 32 terms violates a wire rule on ramp.v1.ResourceEntry.terms: the Exchange refuses the whole submission at the RPC boundary, before any line is classified, so no per-line reason is produced for it."
     },
     "content_id": {
       "type": "string",
+      "maxLength": 255,
       "description": "Stable publisher-side identifier. When present it is the upsert key, so two lines sharing a content_id collapse to one catalog row (last write wins). When absent the URI is the key."
     },
     "word_count": {
       "type": "integer",
-      "minimum": -2147483648,
+      "minimum": 0,
       "maximum": 2147483647,
       "description": "Word count. Carried as ResourceEntry audit metadata; never an input to term or price selection."
     },
     "estimated_quantity": {
       "type": "integer",
-      "minimum": -2147483648,
+      "minimum": 0,
       "maximum": 2147483647,
       "description": "Estimated quantity in the metering unit. For text this is roughly word_count * 1.32."
     },
     "content_hash": {
       "type": "string",
+      "maxLength": 255,
       "description": "Digest of the resource body. Surfaces as Offer.identity.content_hash. No format constraint is applied — it is pass-through metadata."
     },
     "hash_method": {
       "type": "string",
+      "maxLength": 64,
       "description": "Algorithm that produced content_hash. Surfaces as Offer.identity.hash_method."
     },
     "source": {
@@ -81,6 +89,7 @@
     },
     "provenance_source": {
       "type": "string",
+      "maxLength": 260,
       "description": "Free-text origin of the metadata, e.g. a CMS plugin or an upstream aggregator."
     },
     "provenance_timestamp": {
@@ -109,6 +118,7 @@
     },
     "attestations": {
       "type": "array",
+      "maxItems": 64,
       "items": {
         "$ref": "#/$defs/Attestation"
       },
@@ -117,7 +127,7 @@
   },
   "allOf": [
     {
-      "$comment": "A REFERENCE_ONLY term delegates to its license document, so that document must be identified. protovalidate CEL licenseterm.reference_only.requires_license_uri.",
+      "$comment": "A REFERENCE_ONLY term delegates to its license document, so that document must be identified. protovalidate CEL license_term.reference_only.requires_uri.",
       "if": {
         "required": [
           "terms"
@@ -235,7 +245,7 @@
         },
         "prohibited_functions": {
           "$ref": "#/$defs/TokenList",
-          "description": "Prohibited function tokens. Must not intersect functions."
+          "description": "Prohibited function tokens. Must not intersect functions, and must not intersect them once registered aliases and letter case are folded: \"scrape\" here with \"crawl\" in functions is one token in both lists, and is refused whether the fold happens in your client or at the Exchange."
         },
         "user_types": {
           "$ref": "#/$defs/TokenList",
@@ -251,6 +261,7 @@
         },
         "quotas": {
           "type": "array",
+          "maxItems": 64,
           "items": {
             "$ref": "#/$defs/Quota"
           },
@@ -258,6 +269,7 @@
         },
         "obligations": {
           "type": "array",
+          "maxItems": 64,
           "items": {
             "$ref": "#/$defs/Obligation"
           },
@@ -313,6 +325,12 @@
         "currency": {
           "type": "string",
           "description": "ISO 4217 currency code, e.g. \"EUR\"."
+        },
+        "metering": {
+          "type": "string",
+          "pattern": "^(?:[Oo][Nn][Ll][Ii][Nn][Ee]|[Oo][Ff][Ff][Ll][Ii][Nn][Ee]_[Ss][Ee][Ll][Ff]_[Rr][Ee][Pp][Oo][Rr][Tt][Ee][Dd]|[Nn][Oo][Nn][Ee])?$",
+          "$comment": "Case-insensitive, like model. Written out rather than as a lowercase const so an uppercase value is accepted here exactly as the ingester accepts it, instead of failing validation and then being ingested successfully.",
+          "description": "How usage is tracked for billing reconciliation: online, offline_self_reported or none. Applies to every pricing model \u2014 it says how consumption is counted, not what it costs. Omitted, or empty, reads as online, which is what an absent value means in the protocol. none marks a one-time perpetual sale: the Exchange mints no reporting obligation for it, so the agent owes no usage report and accumulates no overdue rows. Matched case-insensitively; lowercase is the canonical spelling."
         }
       },
       "allOf": [

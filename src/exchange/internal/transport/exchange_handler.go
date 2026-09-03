@@ -10,16 +10,23 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
 )
 
-// MaxRPCReadBytes caps the size of a single request message the Exchange's
-// Connect handlers will read from a caller (wired via connect.WithReadMaxBytes).
+// MaxRPCReadBytes caps what a single request can make an Exchange mount read.
 // It is a coarse backstop against pathologically large bodies on ANY RPC: a
 // valid request signature authenticates a caller, it does not license them to
 // stream an unbounded body into the service. 1 MiB comfortably fits a real
 // registration and normal RPC traffic (signed offers, transactions) while
 // bounding the worst case. The Register RPC additionally applies a tighter,
 // semantic bound on registration_data itself at the service layer — this is the
-// outer wall, that is the inner one. Wired identically in the production server
-// (cmd/server/main.go) and the integration harness so the two never drift.
+// outer wall, that is the inner one.
+//
+// It bounds two quantities on each mount, because a caller can exhaust the
+// server through either: the raw HTTP body a verifier buffers before it knows
+// who is calling, and the decompressed Connect message the handler decodes. On
+// the ExchangeService mount both come from connectserver.WithMaxRequestBytes in
+// ExchangeMountOptions; on the raw catalog mount the body bound is the capture
+// in CatalogSignatureMiddleware and the message bound is connect.WithReadMaxBytes
+// in CatalogMountOptions. The production server and the integration harness
+// call the same two providers, so the two never drift.
 const MaxRPCReadBytes = 1 << 20 // 1 MiB
 
 // ExchangeHandler adapts ExchangeService to the generated
@@ -53,7 +60,7 @@ func (h *ExchangeHandler) ExecuteTransaction(
 ) (*connect.Response[rampv1.TransactionResponse], error) {
 	out, err := h.svc.ExecuteTransaction(ctx, req.Msg)
 	if err != nil {
-		return nil, executeTxError(err)
+		return nil, executeTxError(err, h.svc.ExchangeDomain())
 	}
 	return connect.NewResponse(out), nil
 }
@@ -64,7 +71,9 @@ func (h *ExchangeHandler) Register(
 	ctx context.Context,
 	req *connect.Request[rampv1.RegisterRequest],
 ) (*connect.Response[rampv1.RegisterResponse], error) {
-	out, err := h.svc.Register(ctx, req.Msg)
+	// The peer address is passed explicitly because audit_log.source_addr is NOT
+	// NULL and only the transport can see it — the same shape the admin RPCs use.
+	out, err := h.svc.Register(ctx, req.Msg, req.Peer().Addr)
 	if err != nil {
 		return nil, registerError(err)
 	}

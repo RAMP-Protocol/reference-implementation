@@ -26,7 +26,7 @@ func setupFeeTest(t *testing.T) (context.Context, sqlc.Querier, string) {
 	// tenant prerequisite is seeded via the sqlc InsertTenant query (the same
 	// surface sibling Exchange tests use), not a raw SQL string.
 	if _, err := q.InsertTenant(ctx, sqlc.InsertTenantParams{
-		TenantID: feeTestTenantID, Domain: "publisher.example", HmacSecretRef: "h", Ed25519KeyRef: "k",
+		TenantID: feeTestTenantID, Domain: "publisher.example", Ed25519KeyRef: "k",
 		ReportingPolicy: []byte(`{}`), SigningScheme: sqlc.RampSigningSchemeED25519,
 	}); err != nil {
 		t.Fatalf("seed tenant: %v", err)
@@ -131,7 +131,7 @@ func TestFeeOverrideTenantIsolation(t *testing.T) {
 	ctx, q, tenantA := setupFeeTest(t)
 	const tenantB = "t2"
 	if _, err := q.InsertTenant(ctx, sqlc.InsertTenantParams{
-		TenantID: tenantB, Domain: "sibling.example", HmacSecretRef: "h", Ed25519KeyRef: "k",
+		TenantID: tenantB, Domain: "sibling.example", Ed25519KeyRef: "k",
 		ReportingPolicy: []byte(`{}`), SigningScheme: sqlc.RampSigningSchemeED25519,
 	}); err != nil {
 		t.Fatalf("seed tenant B: %v", err)

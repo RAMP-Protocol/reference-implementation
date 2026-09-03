@@ -11,6 +11,7 @@ import (
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/oklog/ulid/v2"
 
 	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
@@ -30,27 +31,17 @@ func TestFreeAdapter_DropInForExchangeService(t *testing.T) {
 	ctx := h.ctx
 
 	// Seed catalog via CatalogService.
-	if _, err := h.catalogClient.PushResources(ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-free",
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.tenantDomain, Path: "/articles/free",
-			// A priced term is required for an offer; the FreeAdapter
-			// ignores the amount but the entry still needs a real term to price.
-			Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
-		}},
-	})); err != nil {
+	if _, err := h.catalogClient.PushResources(ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-free", []*rampv1.ResourceEntry{{
+		Domain: h.tenantDomain, Path: "/articles/free",
+		// A priced term is required for an offer; the FreeAdapter
+		// ignores the amount but the entry still needs a real term to price.
+		Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
+	}}))); err != nil {
 		t.Fatalf("push: %v", err)
 	}
 
 	// Discover to get the signed offer.
-	discovered, err := h.exchangeClient.DiscoverResources(ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.tenantDomain + "/articles/free"},
-		Requester: &rampv1.Requester{
-			Id: "agent-free", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	discovered, err := h.exchangeClient.DiscoverResources(ctx, connect.NewRequest(newResourceQuery(newRequester("agent-free", "agent.example"), []string{"https://" + h.tenantDomain + "/articles/free"})))
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -60,12 +51,9 @@ func TestFreeAdapter_DropInForExchangeService(t *testing.T) {
 	}
 	offer := offers[0]
 
-	requester := &rampv1.Requester{
-		Id: "agent-free", Domain: "agent.example",
-		Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-free", "agent.example")
 	execResp, err := h.exchangeClient.ExecuteTransaction(ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver: "1.0", IdempotencyKey: "tx-free",
+		Ver: helpers.ProtocolVersion, IdempotencyKey: "tx-free",
 		Requester: requester,
 		Items: []*rampv1.TransactionItem{
 			{Offer: offer, AgentAcceptance: signAcceptanceFor(t, h.callerPriv, offer, requester, "tx-free")},

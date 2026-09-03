@@ -26,47 +26,42 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 	// ConsumedQuantity.
 	smokeEstimated := int32(50)
 	smokeUnit := "accesses"
-	pushResp, err := h.catalogClient.PushResources(ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.tenantDomain,
-			Path:   "/articles/hello",
-			Terms: []*rampv1.LicenseTerm{{
-				Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
-				Pricing: &rampv1.Pricing{
-					Model:             rampv1.PricingModel_PRICING_MODEL_PER_UNIT,
-					Rate:              "0.05",
-					Currency:          "USD",
-					Unit:              &smokeUnit,
-					EstimatedQuantity: &smokeEstimated,
-				},
-			}},
+	pushResp, err := h.catalogClient.PushResources(ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{{
+		Domain: h.tenantDomain,
+		Path:   "/articles/hello",
+		Terms: []*rampv1.LicenseTerm{{
+			Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
+			Pricing: &rampv1.Pricing{
+				Model:             rampv1.PricingModel_PRICING_MODEL_PER_UNIT,
+				Rate:              "0.05",
+				Currency:          "USD",
+				Unit:              &smokeUnit,
+				EstimatedQuantity: &smokeEstimated,
+			},
 		}},
-	}))
+	}})))
 	if err != nil {
 		t.Fatalf("push: %v", err)
 	}
 	if pushResp.Msg.GetAccepted() != 1 {
 		t.Fatalf("accepted = %d", pushResp.Msg.GetAccepted())
 	}
+	// The catalog plane stamps the envelope version too. Asserted here because
+	// this response used to go out with an empty ver and nothing noticed: the
+	// structural guards only check that SOME value is set, so a wrong-namespace
+	// constant would satisfy them. As above, the literal is the expected side.
+	if got := pushResp.Msg.GetVer(); got != "1.0" {
+		t.Errorf("PushResources response Ver = %q, want %q", got, "1.0")
+	}
 
 	// 2. DiscoverResources.
-	discovered, err := h.exchangeClient.DiscoverResources(ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{"https://" + h.tenantDomain + "/articles/hello"},
-		Requester: &rampv1.Requester{
-			Id:     "agent-test",
-			Domain: "agent.example",
-			Type:   rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
+	discovered, err := h.exchangeClient.DiscoverResources(ctx, connect.NewRequest(newResourceQuery(newRequester("agent-test", "agent.example"), []string{"https://" + h.tenantDomain + "/articles/hello"})))
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}
-	// Version-skew fix: the Exchange MUST stamp Ver = "1.0" on the RAMP responses
-	// it emits. Assert the literal (not rampproto.Ver) so a regression in the
-	// constant fails here instead of echoing whatever value it currently holds.
+	// The Exchange MUST stamp Ver = "1.0" on the RAMP responses it emits. Assert
+	// the literal, never helpers.ProtocolVersion, so a regression in the constant
+	// fails here instead of echoing whatever value it currently holds.
 	if got := discovered.Msg.GetVer(); got != "1.0" {
 		t.Errorf("DiscoverResources response Ver = %q, want %q", got, "1.0")
 	}
@@ -107,13 +102,14 @@ func TestSmoke_PushDiscoverExecuteReport(t *testing.T) {
 	assertTransactionLogged(t, ctx, h, "tx-1"+":"+offer.GetOfferId())
 
 	// 4. ReportUsage marks obligation RECEIVED.
-	if _, err := h.exchangeClient.ReportUsage(ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-1",
-		TransactionId: item.GetTransactionId(),
-		BillingId:     item.GetBillingId(),
-		Usage:         &rampv1.Usage{ConsumedQuantity: 42, Function: []string{"ai_input"}},
-	})); err != nil {
+	reportResp, err := h.exchangeClient.ReportUsage(ctx, connect.NewRequest(newUsageReport("r-1", item.GetTransactionId(), item.GetBillingId(), &rampv1.Usage{ConsumedQuantity: 42, Function: []string{"ai_input"}})))
+	if err != nil {
 		t.Fatalf("report: %v", err)
+	}
+	// Same reason as the push response: this one also used to ship an empty ver,
+	// and the response was previously discarded so nothing could have seen it.
+	if got := reportResp.Msg.GetVer(); got != "1.0" {
+		t.Errorf("ReportUsage response Ver = %q, want %q", got, "1.0")
 	}
 
 	assertObligationState(t, h, item.GetTransactionId(), "RECEIVED", "VALIDATED")

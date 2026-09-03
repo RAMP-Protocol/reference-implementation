@@ -9,14 +9,29 @@ import (
 	"context"
 )
 
-const listActiveExchanges = `-- name: ListActiveExchanges :many
+const listUnblockedExchanges = `-- name: ListUnblockedExchanges :many
 SELECT exchange_id, domain, endpoint, trust_level, healthy, supported_profiles, priority, last_health_check, created_at, updated_at FROM broker.exchanges
- WHERE healthy = TRUE AND trust_level != 'BLOCKED'
- ORDER BY priority DESC, trust_level
+ WHERE trust_level != 'BLOCKED'
+ ORDER BY priority DESC, trust_level, exchange_id
 `
 
-func (q *Queries) ListActiveExchanges(ctx context.Context) ([]BrokerExchange, error) {
-	rows, err := q.db.Query(ctx, listActiveExchanges)
+// ListUnblockedExchanges returns every exchange the operator has not BLOCKED,
+// INCLUDING the ones currently marked unhealthy, and carries the healthy flag
+// on each row so a caller decides for itself what to do with a down exchange.
+// That is the whole registry read surface on purpose: a query that pre-filtered
+// healthy rows could not tell "the operator never registered this" apart from
+// "it is registered and down", and those two need different answers. The health
+// refresher must see down rows or it could never probe one back to life; the
+// relay allowlist must see them to refuse a down exchange with a retryable
+// error instead of claiming it was never registered.
+// BLOCKED rows stay excluded for every caller. The operator withdrew trust from
+// them, so the broker sends them no traffic at all, a health probe included.
+// exchange_id closes the ordering. Priority and trust_level do not break every
+// tie, so two rows equal on both came back in whichever order the planner chose,
+// and a caller reading position-dependent answers off this list got a different
+// one on each call.
+func (q *Queries) ListUnblockedExchanges(ctx context.Context) ([]BrokerExchange, error) {
+	rows, err := q.db.Query(ctx, listUnblockedExchanges)
 	if err != nil {
 		return nil, err
 	}

@@ -62,6 +62,16 @@ type fixture struct {
 	trust  *helpers.StaticKeyResolver
 	keys   *keystore.VaultStore
 	signUp *signup.Service
+	// pool is the service's own database handle, kept so a test can close it and
+	// drive a store outage through the tools. On the two account legs the only
+	// thing behind it is the note store — the bearer is a signed token and the
+	// signing key comes from Vault — so closing it fails exactly the note reads
+	// and writes and nothing else.
+	pool *pgxpool.Pool
+	// logs holds what the service recorded, for the cases where the record IS the
+	// property: a failure the agent is told one thing about and the operator
+	// another can only be checked by reading both halves.
+	logs *testutil.LogCapture
 }
 
 // newFixture builds the service through the production composition root
@@ -72,12 +82,55 @@ func newFixture(t *testing.T) *fixture {
 	return newBoundedFixture(t, nil)
 }
 
+// peerSet is the RAMP doubles a config hook may need to name.
+//
+// The hook runs after the peers exist and before the service is built, which is
+// the only window in which their ephemeral 127.0.0.1 ports can be written into
+// the configuration. A setting that names an Exchange — the deployment's
+// allowlist — cannot be expressed without them.
+type peerSet struct {
+	broker   *rampPeer
+	exchange *rampPeer
+	issuer   *rampPeer
+}
+
 // newBoundedFixture is newFixture with a hook on the adapter's config, so a test
 // can drive the CALL-scoped bounds — the batch budget and the call deadline — at
 // values small enough to reach. Both of those govern agent-facing reason tokens
 // that no test could produce while the limits were compiled-in constants.
-func newBoundedFixture(t *testing.T, mut func(*app.MCPConfig)) *fixture {
+//
+// It fails the test on a configuration the service refuses. Use buildFixture
+// where the refusal IS the property under test.
+func newBoundedFixture(t *testing.T, mut func(*app.MCPConfig, peerSet)) *fixture {
 	t.Helper()
+	f, err := buildFixture(t, mut)
+	if err != nil {
+		t.Fatalf("app.Build: %v", err)
+	}
+	return f
+}
+
+// buildFixture is newBoundedFixture returning the composition root's error
+// instead of failing on it.
+//
+// It exists because some settings are refused at START-UP, and a fixture that
+// could only succeed cannot drive that. The refusal is the service's real
+// behaviour on a misconfiguration, so it is asserted through the same
+// production root as everything else rather than by unit-testing the parser and
+// assuming the wiring calls it.
+func buildFixture(t *testing.T, mut func(*app.MCPConfig, peerSet)) (*fixture, error) {
+	t.Helper()
+	// Armed for EVERY fixture, not by the tests that happen to notice they need
+	// it. Every peer here is an httptest server on loopback speaking plaintext
+	// http, and every outbound Exchange leg — the account RPCs, the report, the
+	// manifest reads behind both — now dials under the SDK's guard. A fixture
+	// that left these unset would refuse each of those, so this is the fixture's
+	// own precondition rather than a per-test opt-in.
+	//
+	// It must run before app.Build, because the SDK reads the two flags when it
+	// constructs a guarded transport, not when it dials. And t.Setenv is why no
+	// test that builds a fixture may be parallel.
+	testutil.AllowLoopbackFetch(t)
 	ctx := t.Context()
 	if err := sharedVault.Reset(ctx); err != nil {
 		t.Fatalf("reset vault: %v", err)
@@ -108,18 +161,27 @@ func newBoundedFixture(t *testing.T, mut func(*app.MCPConfig)) *fixture {
 	}
 
 	mcpCfg := &app.MCPConfig{
-		BrokerURL:       broker.URL(),
-		ExchangeURL:     exchange.URL(),
+		BrokerURL: broker.URL(),
+		// No Exchange is configured, and there is nowhere left to configure one.
+		// Each peer is reached by the domain a tool call names, resolved through
+		// the manifest that peer serves about itself — which is why every peer
+		// here publishes one.
 		WellKnownScheme: "http",
 	}
 	if mut != nil {
-		mut(mcpCfg)
+		mut(mcpCfg, peerSet{broker: broker, exchange: exchange, issuer: issuer})
 	}
+
+	// Captured rather than discarded, for every test rather than a variant that
+	// opts in. What a service records is part of what it does, and a capture the
+	// suite always holds is what lets a test assert it without a second fixture
+	// shape to keep in step with this one.
+	logs, logger := testutil.NewLogCapture()
 
 	handler, _, err := app.Build(app.Config{
 		Pool:            pool,
 		Keys:            store,
-		Logger:          testutil.DiscardLogger(),
+		Logger:          logger,
 		BaseDomain:      baseZone,
 		DirectoryTTL:    publisher.DefaultTTL,
 		WellKnownScheme: "http",
@@ -134,16 +196,16 @@ func newBoundedFixture(t *testing.T, mut func(*app.MCPConfig)) *fixture {
 		MCP: mcpCfg,
 	})
 	if err != nil {
-		t.Fatalf("app.Build: %v", err)
+		return nil, err
 	}
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 
 	return &fixture{
 		srv: srv, tokens: tokens, broker: broker, exchange: exchange, issuer: issuer,
-		trust: trust, keys: store,
+		trust: trust, keys: store, logs: logs, pool: pool,
 		signUp: newSignUp(t, pool, store, clk),
-	}
+	}, nil
 }
 
 // newSignUp builds the provisioning service the fixture arranges agents through.
@@ -156,10 +218,11 @@ func newSignUp(
 ) *signup.Service {
 	t.Helper()
 	svc, err := publisher.New(publisher.Config{
-		Keys:        store,
-		Cards:       repo.NewCardRepo(pool),
-		Revocations: repo.NewRevocationRepo(pool),
-		Clock:       clk,
+		Keys:          store,
+		Cards:         repo.NewCardRepo(pool),
+		Revocations:   repo.NewRevocationRepo(pool),
+		Registrations: repo.NewDeveloperRepo(pool),
+		Clock:         clk,
 	})
 	if err != nil {
 		t.Fatalf("publisher.New: %v", err)
@@ -181,6 +244,30 @@ func newSignUp(
 	return signUp
 }
 
+// registerArgsAt is a well-formed ramp_register call at exchange.
+//
+// One invariant, stated once: the arguments are past every LOCAL check — the
+// domain is a bare one this deployment permits, and the payload satisfies the
+// schema the peers publish. So a refusal a test observes came from the Exchange
+// rather than from the tool layer, and a success reached the Exchange rather
+// than stopping short of it. Written inline at each call site, that invariant is
+// carried by nothing, and an edit to one map can turn a test about an Exchange's
+// refusal into a test about a local pre-check with no assertion noticing.
+func registerArgsAt(exchange string) map[string]any {
+	return map[string]any{
+		"exchange": exchange,
+		"fields":   map[string]any{"company_name": "Acme GmbH"},
+	}
+}
+
+// registerArgs is registerArgsAt at the fixture's own Exchange, which is where
+// every test registers except the two that deliberately name one peer while
+// contrasting it with another. Those two write the expansion out and say why.
+func registerArgs(t *testing.T, f *fixture) map[string]any {
+	t.Helper()
+	return registerArgsAt(f.exchange.Domain(t))
+}
+
 // agent is one provisioned developer: the subdomain that identifies it, and the
 // bearer token that authenticates it to the MCP endpoint.
 type agent struct {
@@ -189,12 +276,12 @@ type agent struct {
 	Token      string
 }
 
-// provision creates a developer identified upstream by subject, completes its
-// registration with the licensing details, and publishes its active key to the
-// peers' trust store so a signature it makes verifies there. The subdomain is
-// whatever sign-up minted — the test reads it back rather than dictating it,
-// because the mapping from OIDC identity to subdomain is the service's to make.
-func (f *fixture) provision(t *testing.T, subject string, details signup.FormInput) agent {
+// provision creates a developer identified upstream by subject and publishes its
+// active key to the peers' trust store so a signature it makes verifies there. The
+// subdomain is whatever sign-up minted — the test reads it back rather than
+// dictating it, because the mapping from OIDC identity to subdomain is the
+// service's to make.
+func (f *fixture) provision(t *testing.T, subject string) agent {
 	t.Helper()
 	ctx := t.Context()
 	claims := oidcup.Claims{
@@ -203,16 +290,9 @@ func (f *fixture) provision(t *testing.T, subject string, details signup.FormInp
 		Email:   subject + "@acme.example",
 		Name:    "Dev " + subject,
 	}
-	subdomain, _, err := f.signUp.SignIn(ctx, claims)
+	subdomain, err := f.signUp.SignIn(ctx, claims)
 	if err != nil {
 		t.Fatalf("sign in %s: %v", subject, err)
-	}
-	_, verr, err := f.signUp.CompleteRegistration(ctx, claims.Issuer, claims.Subject, details)
-	if err != nil {
-		t.Fatalf("complete registration %s: %v", subject, err)
-	}
-	if verr != nil {
-		t.Fatalf("complete registration %s rejected the form: %v", subject, verr.Fields)
 	}
 	key, err := f.keys.Active(ctx, subdomain)
 	if err != nil {

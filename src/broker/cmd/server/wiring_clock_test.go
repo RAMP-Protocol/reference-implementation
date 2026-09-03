@@ -12,8 +12,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +25,10 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 )
 
 func TestNewOfferVerifier_ExpiryDrivenByInjectedClock(t *testing.T) {
@@ -40,24 +42,22 @@ func TestNewOfferVerifier_ExpiryDrivenByInjectedClock(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		doc := map[string]any{"keys": []map[string]string{{
-			"kty": "OKP", "crv": "Ed25519", "use": "sig", "alg": "EdDSA",
-			"x":          base64.RawURLEncoding.EncodeToString(pub),
-			"not_before": "2000-01-01T00:00:00Z",
-			"not_after":  "2100-01-01T00:00:00Z",
-		}}}
-		if err := json.NewEncoder(w).Encode(doc); err != nil {
-			t.Errorf("encode wba doc: %v", err)
-		}
+		// Built through the shared key builder, which stamps the RFC 8037 JWK
+		// header quartet in exactly one place. A literal here is a second copy of
+		// that quartet, unchecked against the schema.
+		_, _ = w.Write(rwtestutil.MarshalWBA(rwtestutil.WBAFile(rampwellknown.NewKey(
+			pub,
+			time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC),
+			time.Date(2100, time.January, 1, 0, 0, 0, 0, time.UTC),
+		))))
 	}))
 	defer srv.Close()
 
-	// The wiring builds its SDK-guarded fetch client + scheme from env; drop both
-	// SDK guards (SKIP_SSRF for the loopback address, ALLOW_INSECURE for the http
-	// scheme) and point the scheme at the local WBA server (the same knobs the e2e
-	// stack uses).
-	t.Setenv("SKIP_SSRF", "true")
-	t.Setenv("ALLOW_INSECURE", "true")
+	// The wiring builds its SDK-guarded fetch client and scheme from the
+	// environment, so the loopback opt-outs go in before it is built.
+	testutil.AllowLoopbackFetch(t)
+	// The scheme is this test's own knob, not part of that pair: it points the
+	// wiring at the local WBA server, the same value the e2e stack sets.
 	t.Setenv("RAMP_WELLKNOWN_SCHEME", "http")
 
 	u, err := url.Parse(srv.URL)

@@ -73,7 +73,7 @@ than replaced by the default.
 | `IDENTITY_OIDC_CLIENT_SECRET` | **Required** (or the `_FILE` form) | The matching client secret. | `<secret>` |
 | `IDENTITY_OIDC_CLIENT_SECRET_FILE` | Alternative to the inline form | As above. | `/secrets/oidc_client_secret` |
 | `IDENTITY_MCP_BROKER_URL` | **Required** | The Broker that agent discovery and purchases are relayed to. | `https://broker.example` |
-| `IDENTITY_MCP_EXCHANGE_URL` | **Required** | The Exchange that holds agents' accounts, used by the account tools. | `https://exchange.example` |
+| `IDENTITY_MCP_EXCHANGE_ALLOWLIST` | Optional | The Exchanges this deployment will speak to, as a comma-separated list of bare domains. Empty means every Exchange, which is how the service behaves with it unset. What it does and does not cover is below. | `exchange.example,exchange-b.example:8081` |
 | `VAULT_ADDR` | Optional, **set it** | The address of Vault. Read by the Vault client library, not by this service, so an unset value silently defaults to `https://127.0.0.1:8200` — see §4. | `https://vault.internal:8200` |
 | `VAULT_TOKEN` | Optional, **set it** | The Vault token this service authenticates with. A token is the only authentication method implemented. | `<token>` |
 | `IDENTITY_KV_MOUNT` | Optional | Which Vault secrets engine holds the keys. Default `secret`. | `ramp-agents` |
@@ -133,16 +133,57 @@ start-up failure, not a warning:
 
 ### The MCP endpoint has no off switch
 
-`IDENTITY_MCP_BROKER_URL` and `IDENTITY_MCP_EXCHANGE_URL` are both required and there
-is no flag to disable the endpoint. Naming neither, or only one, stops start-up:
+`IDENTITY_MCP_BROKER_URL` is required and there is no flag to disable the endpoint.
+Leaving it unset stops start-up:
 
 ```
-{"level":"ERROR","msg":"identity.exit","err":"mcp config: both IDENTITY_MCP_BROKER_URL and IDENTITY_MCP_EXCHANGE_URL are required (broker set: false, exchange set: false)"}
+{"level":"ERROR","msg":"identity.exit","err":"mcp config: IDENTITY_MCP_BROKER_URL is required"}
 ```
 
 This is deliberate. The MCP endpoint is the only way an agent uses this service, so a
-deployment that could not be told where to send agent traffic is not a working
+deployment that could not be told where to send discovery traffic is not a working
 deployment, and coming up in that state would look healthy while serving nobody.
+
+### There is no Exchange to configure, and one optional policy over them
+
+The account tools take the Exchange as an argument. `ramp_register` requires one,
+`ramp_status` takes one optionally, and both name it the way `ramp_report` already
+did: the **bare domain** the Exchange publishes about itself — `exchange.example`,
+or `exchange.example:8081` where a port is part of its identity. The endpoint is then
+read from that Exchange's own `/.well-known/ramp.json`, fetched through the
+SSRF-guarded client, and an endpoint advertised on some other host is refused.
+
+So there is nothing here to point at an Exchange. An account is per-Exchange, an
+agent that licenses from several needs an account at each, and which one a call is
+for is the agent's choice rather than a deployment's.
+
+`IDENTITY_MCP_EXCHANGE_ALLOWLIST` is what a deployment gets instead. It is a policy,
+not an address: set it and this service refuses to sign and send to a domain outside
+it; leave it unset and every Exchange is reachable, which is what a deployment that
+does not care wants. A mistyped entry **stops start-up** rather than being dropped —
+a policy silently narrower than the one you wrote would first show up as a refused
+registration, long after the edit. Writing out the default HTTPS port stops start-up
+for the same reason: an entry such as `exchange.example:443` can never be matched,
+because the check below the tools compares the canonical spelling of a domain and
+that spelling drops `:443`. Write the bare host. Every other port is compared as you
+wrote it — `exchange-b.example:8081` works. What the service parsed is logged once at
+boot:
+
+```
+{"level":"INFO","msg":"identity.mcp.exchange_policy","allowlist":["exchange.example"],"permits_any":false}
+```
+
+**What it covers, and what it cannot.** It governs the three legs where this service
+picks an Exchange and sends that Exchange a request signed with an agent's key:
+`ramp_register`, `ramp_status`, and the usage report. It does **not** govern two
+others, and neither is something an allowlist could decide:
+
+- `ramp_execute` goes through the Broker's relay, and the Broker hands the purchase
+  to the Exchange named in the offer it is executing. There is no domain here to hold
+  against a list.
+- Verifying an offer means fetching the issuing Exchange's published key. That reads
+  a public document rather than sending anything the agent signed, and refusing to
+  verify would not stop the offer — only stop this service noticing a forged one.
 
 ### `IDENTITY_AUTH_ISSUER` decides more than its name suggests
 
@@ -241,7 +282,7 @@ network. Several of their settings are deliberately unsafe:
 | `IDENTITY_WELLKNOWN_SCHEME: "http"` | The test network has no certificates. | Agent identities would be published as `http` addresses, and every party that fetches them would do so unencrypted. |
 | `SKIP_SSRF: "true"` | Test services live on private addresses the guard blocks. | Removes the protection against the service being steered into your internal network. |
 | `ALLOW_INSECURE: "true"` | Same reason. | Same consequence. |
-| `sslmode=disable` in the DSN | The database is on the same private bridge. | Database traffic, including credentials, in the clear. |
+| `sslmode=disable` in the DSN | The database is on the same private bridge. | Correct only while the connection stays on one host. On a network you do not control exclusively TLS is required: without it every row travels in the clear, and what the login exposes depends on the cluster's authentication method ([`deploy/storage/postgres/CONFIGURATION.md`](../../deploy/storage/postgres/CONFIGURATION.md) §2.3). |
 | `VAULT_TOKEN: "root"` against a `-dev` Vault | The test Vault starts unsealed with a fixed token and no storage. | It keeps nothing across a restart and grants unlimited access. Every agent key in it would be lost on restart and readable by anyone who reached it. |
 | `IDENTITY_TOKEN_SIGNING_KEY: "AAAA…"` | A fixed value so tests can create their own tokens. | It is published in this repository. Anyone could sign a token that this service accepts as any agent. |
 | `IDENTITY_BASE_DOMAIN: "rampmcp.org"` | The zone the test stack resolves internally. | Not a domain you control. |
@@ -264,7 +305,6 @@ IDENTITY_OIDC_CLIENT_SECRET_FILE=/secrets/oidc_client_secret
 IDENTITY_SESSION_KEY=<fill in — see DEPLOYMENT.md §7>
 IDENTITY_TOKEN_SIGNING_KEY=<fill in — see DEPLOYMENT.md §7>
 IDENTITY_MCP_BROKER_URL=https://broker.example
-IDENTITY_MCP_EXCHANGE_URL=https://exchange.example
 VAULT_ADDR=https://vault.internal:8200
 VAULT_TOKEN=<fill in — see deploy/storage/vault/DEPLOYMENT.md §5>
 IDENTITY_KV_MOUNT=ramp-agents

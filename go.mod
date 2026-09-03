@@ -4,9 +4,8 @@ go 1.26
 
 require (
 	connectrpc.com/connect v1.19.1
-	connectrpc.com/validate v0.6.0
 	filippo.io/edwards25519 v1.2.0
-	github.com/RAMP-Protocol/protocol v0.1.1-0.20260731084709-104d867aa9a1
+	github.com/RAMP-Protocol/protocol v0.1.1-0.20260903111425-5a2674e66172
 	github.com/armon/go-radix v1.0.0
 	github.com/aws/aws-sdk-go-v2/feature/cloudfront/sign v1.9.21
 	github.com/coreos/go-oidc/v3 v3.20.0
@@ -14,6 +13,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/moby/moby/api v1.54.1
 	github.com/modelcontextprotocol/go-sdk v1.6.1
@@ -36,6 +36,7 @@ require (
 )
 
 require (
+	connectrpc.com/validate v0.6.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/goccy/go-json v0.10.3 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
@@ -69,8 +70,8 @@ require (
 )
 
 require (
-	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260415201107-50325440f8f2.1 // indirect
-	buf.build/go/protovalidate v1.2.0 // indirect
+	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260415201107-50325440f8f2.1
+	buf.build/go/protovalidate v1.2.0
 	cel.dev/expr v0.25.1 // indirect
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect

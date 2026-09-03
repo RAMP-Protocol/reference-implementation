@@ -3,7 +3,7 @@
 //
 // The URL is protocol-opaque: ADR-002 deliberately places no structural
 // constraint on the buyer's key-hosting location — it may be an enterprise
-// {buyer_domain}/.well-known/ramp.json, a platform-hosted
+// {buyer_domain}/.well-known/http-message-signatures-directory, a platform-hosted
 // {platform}/buyers/{customer}/keys, a KMS/wallet provider URL, or any
 // other HTTPS resource the subscriber's contract names. This package
 // therefore takes a URL and treats it as a JWKS bag with no path-shape

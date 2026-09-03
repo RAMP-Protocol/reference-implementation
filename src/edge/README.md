@@ -45,9 +45,13 @@ The decision uses these inputs, in priority order — the first match wins:
 2. **The search-crawler allow list** — User-Agent patterns for Googlebot,
    Bingbot, DuckDuckBot, Applebot (but not Applebot-Extended, Apple's AI
    crawler), YandexBot. Free pass-through.
-3. **The AI-bot deny list** — User-Agent patterns for GPTBot, ClaudeBot,
-   Google-Extended and other AI crawlers, plus generic bot/crawler/spider
-   markers. These get the 403 with the link that explains how to buy access.
+3. **The AI-bot deny list** — User-Agent patterns for the known AI crawlers,
+   for generic robot markers, and for the user-initiated assistant fetchers
+   (a human asked for the page, but AI access to paid content is licensed all
+   the same). The full built-in list is in
+   [`CONFIGURATION.md`](CONFIGURATION.md) §3.3 — it is deliberately not
+   repeated here. These get the 403 with the link that explains how to buy
+   access.
 4. **No User-Agent at all** counts as a bot (normal browsers always send
    one). Anything else is a human and passes.
 

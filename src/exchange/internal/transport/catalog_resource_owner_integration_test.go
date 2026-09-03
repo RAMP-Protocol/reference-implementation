@@ -49,11 +49,7 @@ func readCatalog(t *testing.T, h *testHarness) []repo.CatalogEntry {
 // on the catalog entry. The default harness manifest stub attests harnessResourceOwner.
 func TestPushResources_PersistsResourceOwnerID(t *testing.T) {
 	h := newTestHarness(t)
-	resp, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries:  []*rampv1.ResourceEntry{{Domain: h.tenantDomain, Path: "/article-1"}},
-	}))
+	resp, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{{Domain: h.tenantDomain, Path: "/article-1"}})))
 	if err != nil {
 		t.Fatalf("PushResources: %v", err)
 	}
@@ -75,14 +71,10 @@ func TestPushResources_PersistsResourceOwnerID(t *testing.T) {
 // payee is never inferred. Drives a two-entry batch through the public RPC.
 func TestPushResources_RejectsMissingResourceOwner(t *testing.T) {
 	h := newTestHarnessWith(t, harnessOptions{manifests: contributorOnlyManifests{caller: "agent-test"}})
-	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries: []*rampv1.ResourceEntry{
-			{Domain: h.tenantDomain, Path: "/a"},
-			{Domain: h.tenantDomain, Path: "/b"},
-		},
-	}))
+	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{
+		{Domain: h.tenantDomain, Path: "/a"},
+		{Domain: h.tenantDomain, Path: "/b"},
+	})))
 	if err == nil {
 		t.Fatal("expected PushResources to be rejected for missing resource_owner_id")
 	}
@@ -115,7 +107,6 @@ func TestPushResources_ResourceOwnerGroupsDomains(t *testing.T) {
 	if _, err := h.queries.InsertTenant(h.ctx, sqlc.InsertTenantParams{
 		TenantID:        tenant2,
 		Domain:          domain2,
-		HmacSecretRef:   "unused",
 		Ed25519KeyRef:   "unused",
 		ReportingPolicy: []byte(`{}`),
 		SigningScheme:   sqlc.RampSigningSchemeED25519,
@@ -126,10 +117,7 @@ func TestPushResources_ResourceOwnerGroupsDomains(t *testing.T) {
 
 	push := func(tenantID, domain, path string) {
 		t.Helper()
-		if _, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-			TenantId: tenantID, CallerId: "agent-test",
-			Entries: []*rampv1.ResourceEntry{{Domain: domain, Path: path}},
-		})); err != nil {
+		if _, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(newPushRequest(tenantID, "agent-test", []*rampv1.ResourceEntry{{Domain: domain, Path: path}}))); err != nil {
 			t.Fatalf("push %s: %v", domain, err)
 		}
 	}

@@ -9,51 +9,8 @@ import (
 	"context"
 )
 
-const completeDeveloperRegistration = `-- name: CompleteDeveloperRegistration :one
-UPDATE identity.developer_account
-SET legal_entity = $3,
-    address = $4,
-    jurisdiction_country = $5,
-    registration_complete = true,
-    updated_at = now()
-WHERE oidc_issuer = $1 AND oidc_subject = $2
-RETURNING oidc_issuer, oidc_subject, email, subdomain, legal_entity, address, jurisdiction_country, registration_complete, created_at, updated_at
-`
-
-type CompleteDeveloperRegistrationParams struct {
-	OidcIssuer          string `json:"oidc_issuer"`
-	OidcSubject         string `json:"oidc_subject"`
-	LegalEntity         string `json:"legal_entity"`
-	Address             string `json:"address"`
-	JurisdictionCountry string `json:"jurisdiction_country"`
-}
-
-func (q *Queries) CompleteDeveloperRegistration(ctx context.Context, arg CompleteDeveloperRegistrationParams) (IdentityDeveloperAccount, error) {
-	row := q.db.QueryRow(ctx, completeDeveloperRegistration,
-		arg.OidcIssuer,
-		arg.OidcSubject,
-		arg.LegalEntity,
-		arg.Address,
-		arg.JurisdictionCountry,
-	)
-	var i IdentityDeveloperAccount
-	err := row.Scan(
-		&i.OidcIssuer,
-		&i.OidcSubject,
-		&i.Email,
-		&i.Subdomain,
-		&i.LegalEntity,
-		&i.Address,
-		&i.JurisdictionCountry,
-		&i.RegistrationComplete,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
 const getDeveloperBySubdomain = `-- name: GetDeveloperBySubdomain :one
-SELECT oidc_issuer, oidc_subject, email, subdomain, legal_entity, address, jurisdiction_country, registration_complete, created_at, updated_at FROM identity.developer_account
+SELECT oidc_issuer, oidc_subject, email, subdomain, created_at FROM identity.developer_account
 WHERE subdomain = $1
 `
 
@@ -65,18 +22,13 @@ func (q *Queries) GetDeveloperBySubdomain(ctx context.Context, subdomain string)
 		&i.OidcSubject,
 		&i.Email,
 		&i.Subdomain,
-		&i.LegalEntity,
-		&i.Address,
-		&i.JurisdictionCountry,
-		&i.RegistrationComplete,
 		&i.CreatedAt,
-		&i.UpdatedAt,
 	)
 	return i, err
 }
 
 const getDeveloperBySubject = `-- name: GetDeveloperBySubject :one
-SELECT oidc_issuer, oidc_subject, email, subdomain, legal_entity, address, jurisdiction_country, registration_complete, created_at, updated_at FROM identity.developer_account
+SELECT oidc_issuer, oidc_subject, email, subdomain, created_at FROM identity.developer_account
 WHERE oidc_issuer = $1 AND oidc_subject = $2
 `
 
@@ -93,12 +45,7 @@ func (q *Queries) GetDeveloperBySubject(ctx context.Context, arg GetDeveloperByS
 		&i.OidcSubject,
 		&i.Email,
 		&i.Subdomain,
-		&i.LegalEntity,
-		&i.Address,
-		&i.JurisdictionCountry,
-		&i.RegistrationComplete,
 		&i.CreatedAt,
-		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -106,7 +53,7 @@ func (q *Queries) GetDeveloperBySubject(ctx context.Context, arg GetDeveloperByS
 const reserveDeveloper = `-- name: ReserveDeveloper :one
 INSERT INTO identity.developer_account (oidc_issuer, oidc_subject, email, subdomain)
 VALUES ($1, $2, $3, $4)
-RETURNING oidc_issuer, oidc_subject, email, subdomain, legal_entity, address, jurisdiction_country, registration_complete, created_at, updated_at
+RETURNING oidc_issuer, oidc_subject, email, subdomain, created_at
 `
 
 type ReserveDeveloperParams struct {
@@ -129,12 +76,7 @@ func (q *Queries) ReserveDeveloper(ctx context.Context, arg ReserveDeveloperPara
 		&i.OidcSubject,
 		&i.Email,
 		&i.Subdomain,
-		&i.LegalEntity,
-		&i.Address,
-		&i.JurisdictionCountry,
-		&i.RegistrationComplete,
 		&i.CreatedAt,
-		&i.UpdatedAt,
 	)
 	return i, err
 }

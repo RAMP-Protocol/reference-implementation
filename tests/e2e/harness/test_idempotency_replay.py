@@ -45,6 +45,7 @@ import psycopg
 import pytest
 
 from ramp_sdk.core import sign_offer_acceptance_jcs
+from ramp_sdk import ProtocolVersion
 
 from .broker_client import resolve
 from .conftest import COMPOSE_FILE, StackURLs
@@ -145,7 +146,7 @@ def _execute_direct_with_key(
     return sign_post(
         f"{exchange_url}{_EXECUTE_PATH}",
         body={
-            "ver": "1.0",
+            "ver": ProtocolVersion,
             "idempotency_key": idempotency_key,
             "requester": {
                 "id": agent_id,

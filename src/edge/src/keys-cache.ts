@@ -25,6 +25,8 @@
 // Fastly E2E shim wraps it with raw-bytes + a manual parser. Neither the verify
 // primitive nor zod is referenced here.
 
+import { logRecord } from './log.js';
+
 export interface KeyCache<K> {
   resolve(keyid: string | undefined): Promise<K | undefined>;
   refresh(): Promise<void>;
@@ -153,7 +155,7 @@ export function createKeyCache<K, J>(deps: KeyCacheDeps<K, J>): KeyCache<K> {
       // single-flight de-duplicates concurrent loads, so one fetch serves
       // many requests — naming any single request would be misleading. The
       // directory URL is the correlating fact instead.
-      console.error('edge.keys.load_failed', {
+      logRecord('error', 'edge.keys.load_failed', {
         message: err instanceof Error ? err.message : String(err),
         wba_url: deps.wbaUrl,
       });

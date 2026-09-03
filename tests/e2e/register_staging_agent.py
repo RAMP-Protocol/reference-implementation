@@ -28,6 +28,17 @@ Preconditions the Exchange enforces, in the order you will hit them:
 2. The tenant named by EXCHANGE_DEFAULT_TENANT must exist, because Register
    reads its agent-activation policy. The stack points that at the publisher
    hostname the seed creates the tenant under.
+3. Where the Exchange publishes a registration schema, registration_data must
+   conform to it. Publishing a schema is what turns this check on, so an
+   Exchange that publishes none accepts whatever is sent.
+4. Where the Exchange publishes a terms digest, the request must echo it. An
+   absent echo and a stale one are refused identically, so this script reads
+   the digest fresh on every run rather than holding one.
+
+Gates 3 and 4 are reached only on an agent's FIRST registration. Once an agent
+carries a billing_ref the short-circuit below returns the stored response
+before either is consulted, which is why re-running this against an
+already-registered agent proves nothing about them.
 
 stdout carries the billing_ref and nothing else, so a shell can capture it.
 Everything informational goes to stderr.
@@ -39,15 +50,48 @@ import os
 import sys
 from pathlib import Path
 
+import httpx
+from ramp_sdk import ProtocolVersion
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "tests" / "e2e"))
 
+from harness.exchanges import recipient_of  # noqa: E402
 from harness.signing import sign_post  # noqa: E402
 
 REGISTER_PATH = "/ramp.v1.ExchangeService/Register"
+MANIFEST_PATH = "/.well-known/ramp.json"
 
-# Protocol version on the wire, matching every other harness producer.
-RAMP_VER = "1.0"
+# The operator this smoke agent registers on behalf of. The Exchange may publish
+# a schema naming the members it wants; where it does, this is the one it
+# requires. Fictional, like the rest of the demo cast.
+SMOKE_AGENT_LEGAL_ENTITY = "Meridian Research Collective"
+
+
+def _fresh_terms_digest(exchange_url: str) -> str | None:
+    """Return the Exchange's currently published terms digest, or None.
+
+    Fetched fresh on every run, never cached. The protocol requires this: a
+    client cannot tell locally that a digest has gone stale, and a warm cache
+    would make it retry a value the Exchange has already started refusing until
+    the cache expired. Registration happens once per Exchange, so the extra
+    request costs nothing.
+
+    An Exchange that publishes no digest gets no echo. Sending one anyway is
+    not an error — the Exchange ignores a digest it cannot verify against a
+    document it never published — but omitting it keeps the request honest.
+    """
+    url = f"{exchange_url}{MANIFEST_PATH}"
+    resp = httpx.get(url, timeout=30.0, headers={"Cache-Control": "no-cache"})
+    if resp.status_code != 200:
+        msg = f"manifest fetch failed: {url} -> {resp.status_code} {resp.text[:256]}"
+        raise SystemExit(msg)
+
+    manifest = resp.json()
+    # terms_digest is a TOP-LEVEL manifest member, a sibling of terms_uri —
+    # only data_schema sits under account_registration. Connect's JSON codec
+    # emits lowerCamelCase; accept the proto spelling too.
+    return manifest.get("termsDigest") or manifest.get("terms_digest") or None
 
 
 def _require_env(name: str) -> str:
@@ -60,19 +104,39 @@ def _require_env(name: str) -> str:
 
 def main() -> None:
     exchange_url = _require_env("RAMP_STAGING_EXCHANGE_URL").rstrip("/")
+    # The registration names the Exchange it is meant for. Normally that is the
+    # host of the URL it is sent to, because an Exchange is reached at its own
+    # identity. RAMP_STAGING_EXCHANGE names it directly for the deployments
+    # where it is not: a staging Exchange reached through a tunnel arrives here
+    # as a loopback port, which the mapper resolves against the LOCAL compose
+    # stack and cannot answer for — and this script has no other way to say
+    # which Exchange is on the far end.
+    exchange = os.environ.get("RAMP_STAGING_EXCHANGE", "") or recipient_of(exchange_url)
     key_path = Path(_require_env("RAMP_STAGING_AGENT_KEY"))
     if not key_path.is_file():
         msg = f"agent key not found: {key_path} — run gen-staging-keys.sh"
         raise SystemExit(msg)
 
+    terms_digest = _fresh_terms_digest(exchange_url)
+    if terms_digest:
+        print(f"accepting terms {terms_digest}", file=sys.stderr)
+
     url = f"{exchange_url}{REGISTER_PATH}"
     print(f"registering billing account via {url}", file=sys.stderr)
 
-    resp = sign_post(
-        url,
-        body={"ver": RAMP_VER, "registration_data": {"environment": "staging"}},
-        key_path=key_path,
-    )
+    # registration_data carries the operator's business details. Where the
+    # Exchange publishes a schema it is checked against it, and a member the
+    # schema does not name is refused along with a missing required one — so
+    # this sends exactly what a published schema asks for and nothing extra.
+    body: dict[str, object] = {
+        "ver": ProtocolVersion,
+        "exchange": exchange,
+        "registration_data": {"legal_entity": SMOKE_AGENT_LEGAL_ENTITY},
+    }
+    if terms_digest:
+        body["terms_digest"] = terms_digest
+
+    resp = sign_post(url, body=body, key_path=key_path)
     if resp.status_code != 200:
         msg = f"register failed: {resp.status_code} {resp.text[:512]}"
         raise SystemExit(msg)

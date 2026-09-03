@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
@@ -24,8 +25,9 @@ func serveExchangeAndAdmin(
 	pool *pgxpool.Pool,
 	queries *sqlc.Queries,
 	wrapped http.Handler,
+	audience *rampaudience.Interceptor,
 ) error {
-	adminHandler, err := buildAdminHandler(logger, pool, queries)
+	adminHandler, err := buildAdminHandler(logger, pool, queries, audience)
 	if err != nil {
 		return err
 	}
@@ -43,7 +45,11 @@ func serveExchangeAndAdmin(
 // integration harness both call. The admin plane is deliberately NOT wrapped by
 // WrapPublicSurface and NOT mounted through the connectserver verify seam: it has no
 // verified signer; the network allowlist is the only gate (ADR-022).
-func buildAdminHandler(logger *slog.Logger, pool *pgxpool.Pool, queries *sqlc.Queries) (http.Handler, error) {
+func buildAdminHandler(
+	logger *slog.Logger, pool *pgxpool.Pool, queries *sqlc.Queries, audience *rampaudience.Interceptor,
+) (http.Handler, error) {
 	adminSvc := service.NewAdminServiceFromPool(pool, queries)
-	return transport.WrapAdminSurface(logger, adminSvc, runhttp.EnvOr("ADMIN_ALLOWED_CIDRS", ""))
+	evidenceSvc := service.NewEvidenceReadService(queries)
+	return transport.WrapAdminSurface(
+		logger, adminSvc, evidenceSvc, runhttp.EnvOr("ADMIN_ALLOWED_CIDRS", ""), audience)
 }

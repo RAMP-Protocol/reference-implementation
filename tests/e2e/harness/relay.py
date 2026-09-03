@@ -36,6 +36,8 @@ from typing import Any
 import httpx
 
 from ramp_sdk.core import sign_offer_acceptance_jcs
+from ramp_sdk import ProtocolVersion
+from .constants import AGENT_DOMAIN, requester
 from .httpsig_signer import load_keypair
 from .signing import (
     AGENT_E2E_KEY_PATH,
@@ -118,7 +120,18 @@ def relay_execute_batch(
     """
     idem = idempotency_key or f"tx-{uuid.uuid4().hex}"
     _, priv = load_keypair(key_path)
-    requester = {"id": agent_id, "domain": domain, "type": "REQUESTER_TYPE_AGENT"}
+    # No top-level recipient: an execute states it per item, inside each
+    # Exchange-signed offer.
+    #
+    # The domain is resolved ONCE, here, because it is used twice: on the wire
+    # and inside each signed acceptance. Defaulting it in only one of the two
+    # made a caller that named none send "agent.example" while signing over an
+    # empty value — the SDK omits an empty requester_domain from the signed
+    # payload, the Exchange recomputes that payload from the wire requester, and
+    # the bytes differ. The Exchange then answers a signature error for a
+    # request whose signature is fine.
+    domain = domain or AGENT_DOMAIN
+    requester_obj = requester(agent_id, domain)
 
     items: list[dict[str, Any]] = []
     for offer in offers:
@@ -142,9 +155,9 @@ def relay_execute_batch(
         )
 
     body: dict[str, Any] = {
-        "ver": "1.0",
+        "ver": ProtocolVersion,
         "idempotency_key": idem,
-        "requester": requester,
+        "requester": requester_obj,
         "items": items,
     }
     payload = json.dumps(body, separators=(",", ":")).encode()

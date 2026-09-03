@@ -10,35 +10,38 @@ from __future__ import annotations
 
 import os
 import subprocess
-import time
 from collections.abc import Iterator
 from pathlib import Path
-import httpx
+
 import pytest
 
-from ._compose import resolve_host_port
+from ._compose import COMPOSE_FILE, REPO_ROOT, resolve_host_port
+from .exchanges import (
+    EXCHANGE_A_INTERNAL_URL,
+    EXCHANGE_B_INTERNAL_URL,
+    EXCHANGE_C_INTERNAL_URL,
+)
 from .lambda_edge import wait_ready as wait_lambda_ready
+from .mcp_session import (
+    await_identity,
+    mcp_session_agent,
+    mcp_session_bearer,
+    require_in_network,
+)
+
+from .readiness import wait_healthy
 
 # Re-export: the existing tests import StackURLs from conftest; its home is
 # stack_urls.py so non-pytest consumers (smoke_staging.py) can import it
 # without touching a pytest-convention file.
+from .publish_harness import make_public_remote, make_source_repo
 from .stack_urls import StackURLs
 
 
-def _resolve_compose_file() -> Path:
-    """Locate docker-compose.e2e.yml.
-
-    Inside the runner container we bind-mount it at RAMP_E2E_COMPOSE_FILE.
-    From the repo root (host run) it lives three dirs up from this file.
-    """
-    env_path = os.environ.get("RAMP_E2E_COMPOSE_FILE")
-    if env_path:
-        return Path(env_path)
-    return Path(__file__).resolve().parents[3] / "docker-compose.e2e.yml"
-
-
-COMPOSE_FILE = _resolve_compose_file()
-REPO_ROOT = COMPOSE_FILE.parent
+# COMPOSE_FILE and REPO_ROOT are resolved in _compose.py, beside the port lookup
+# that reads them, and re-exported here under the names every suite already
+# imports.
+__all__ = ["COMPOSE_FILE", "REPO_ROOT"]
 
 
 def _resolve_stack_urls(compose_file: Path) -> StackURLs:
@@ -56,9 +59,9 @@ def _resolve_stack_urls(compose_file: Path) -> StackURLs:
     # ephemeral host port mapped to container port 80.
     if os.environ.get("RAMP_E2E_IN_NETWORK") == "1":
         return StackURLs(
-            exchange="http://exchange:8081",
-            exchange_b="http://exchange-b:8081",
-            exchange_c="http://exchange-c:8081",
+            exchange=EXCHANGE_A_INTERNAL_URL,
+            exchange_b=EXCHANGE_B_INTERNAL_URL,
+            exchange_c=EXCHANGE_C_INTERNAL_URL,
             broker="http://broker:8082",
             edge="http://edge:80",
             aws_edge="http://aws-edge:80",
@@ -88,23 +91,6 @@ def _resolve_stack_urls(compose_file: Path) -> StackURLs:
 def _compose(*args: str) -> None:
     cmd = ["docker", "compose", "-f", str(COMPOSE_FILE), *args]
     subprocess.run(cmd, check=True, cwd=REPO_ROOT)
-
-
-def _wait_healthy(url: str, timeout_seconds: float = 90.0) -> None:
-    """Poll ``url`` until it returns 2xx or timeout."""
-    deadline = time.monotonic() + timeout_seconds
-    last_err: str | None = None
-    while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(url, timeout=2.0)
-            if 200 <= resp.status_code < 300:
-                return
-            last_err = f"{resp.status_code} {resp.text[:128]}"
-        except (httpx.HTTPError, OSError) as exc:
-            last_err = str(exc)
-        time.sleep(1.0)
-    msg = f"{url} not healthy after {timeout_seconds}s (last: {last_err})"
-    raise TimeoutError(msg)
 
 
 @pytest.fixture(scope="session")
@@ -138,20 +124,20 @@ def compose_stack() -> Iterator[StackURLs]:
         _compose("up", "-d", "--build")
     try:
         urls = _resolve_stack_urls(COMPOSE_FILE)
-        _wait_healthy(f"{urls.exchange}/healthz")
+        wait_healthy(f"{urls.exchange}/healthz")
         # Multi-exchange topology: exchange-b/c must be reachable too.
-        _wait_healthy(f"{urls.exchange_b}/healthz")
-        _wait_healthy(f"{urls.exchange_c}/healthz")
-        _wait_healthy(f"{urls.broker}/healthz")
-        _wait_healthy(f"{urls.edge}/healthz")
-        _wait_healthy(f"{urls.aws_edge}/healthz")
+        wait_healthy(f"{urls.exchange_b}/healthz")
+        wait_healthy(f"{urls.exchange_c}/healthz")
+        wait_healthy(f"{urls.broker}/healthz")
+        wait_healthy(f"{urls.edge}/healthz")
+        wait_healthy(f"{urls.aws_edge}/healthz")
         # Fastly Compute (Viceroy) has no /healthz; its readiness probe is the
         # well-known manifest. Docker reports the container healthy once its
         # internal 127.0.0.1 probe passes, but Viceroy may not yet be bound on
         # the bridge interface — so PushResources-driven manifest fetches from
         # the Exchange to fastly-edge race connection-refused for the first few
         # seconds on a cold stack. Wait on the bridge-reachable URL too.
-        _wait_healthy(f"{urls.fastly_edge}/.well-known/ramp.json")
+        wait_healthy(f"{urls.fastly_edge}/.well-known/ramp.json")
         # The Lambda runtime emulator serves no GET route at all — readiness is
         # an actual function invocation, so it needs its own poller.
         wait_lambda_ready(urls.lambda_edge)
@@ -331,13 +317,55 @@ def publish_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     ``publish_harness`` so both can request it by name without re-exporting a
     fixture, which pytest reads as a redefinition.
     """
-    # Imported inside the body on purpose: publish_harness reads REPO_ROOT from
-    # this module, so importing it at the top would be circular.
-    from .publish_harness import make_public_remote, make_source_repo
-
     source = tmp_path / "source"
     bare = tmp_path / "public.git"
     worktree = tmp_path / "worktree"
     make_source_repo(source)
     make_public_remote(bare, source)
     return source, bare, worktree
+
+
+@pytest.fixture(scope="session")
+def identity_ready(compose_stack: StackURLs) -> StackURLs:
+    """Skip unless the MCP endpoint is reachable, then wait for it to answer.
+
+    The order is the point: the skip comes first so a host run leaves without
+    touching anything, and the wait comes before any caller mints a bearer.
+    Returns the stack, so a test taking this does not also have to take
+    ``compose_stack`` to reach the endpoint it just waited for.
+
+    Session-scoped because the endpoint does not become unready again once it has
+    answered. Per test, the poll ran for every one of the eight consumers: seven
+    reach it through ``mcp_bearer``, and the bearer-less negative takes it
+    directly.
+    """
+    require_in_network(compose_stack)
+    await_identity(compose_stack)
+    return compose_stack
+
+
+@pytest.fixture(scope="session")
+def mcp_agent(identity_ready: StackURLs) -> str:
+    """The one agent this session's MCP suites act as, signed up once.
+
+    Session-scoped because sign-up is the expensive half of the flow and repeating
+    it bought nothing. ``mcp_session_agent`` owns that rationale — what the flow
+    costs, what stays idempotent across a repeat and what does not — and this
+    fixture only binds it to a session and to the readiness poll above.
+    """
+    return mcp_session_agent(identity_ready)
+
+
+@pytest.fixture
+def mcp_bearer(mcp_agent: str) -> str:
+    """A bearer for that agent, minted per test.
+
+    Per test rather than per session because the bearer's TTL is ten minutes and
+    a long run would outlive one. Minting makes no network call, so this is the
+    cheap half.
+
+    Separate from ``identity_ready`` rather than folded into it because the
+    bearer-less negative needs the readiness half and must not have this one — it
+    would be asking for a credential it exists to prove it can do without.
+    """
+    return mcp_session_bearer(mcp_agent)

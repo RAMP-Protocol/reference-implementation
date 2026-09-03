@@ -266,9 +266,45 @@ func TestAgentsRegister_BodyOverLimit(t *testing.T) {
 	}
 }
 
-func TestAgentsRegister_UpstreamFetchFailure(t *testing.T) {
+// TestAgentsRegister_AbsentDirectoryIsRefusedAsPermanent drives a real 404 from a
+// real origin through the real registry. The origin ANSWERED, so nothing failed
+// to fetch — the agent publishes no key directory at the address it gave, and it
+// will publish none on the next attempt either.
+//
+// This case used to be named "upstream fetch failure" and asserted 502, which
+// told the caller to retry. The two other paths into the same registry
+// (service.mapLazyRegisterError and the catalog self-signup handler) called the
+// identical 404 a permanent caller fault through agentreg.IsCallerFault and
+// answered 401. One fault, two opposite instructions to the same operator.
+func TestAgentsRegister_AbsentDirectoryIsRefusedAsPermanent(t *testing.T) {
 	fx := setupRegisterFixture(t, transport.AgentsRegisterOptions{})
 	fx.origin.setStatus(http.StatusNotFound)
+	body, _ := json.Marshal(map[string]string{
+		"agent_id":      fx.agentID,
+		"discovery_url": fx.agentID,
+	})
+	resp := postRegister(t, fx, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (a 502 tells the caller to retry a 404 that will not change)",
+			resp.StatusCode)
+	}
+	out := decodeBody(t, resp)
+	msg, _ := out["error"].(string)
+	if msg == "" {
+		t.Fatalf("missing error body: %v", out)
+	}
+	if strings.Contains(msg, "failed to fetch") {
+		t.Errorf("error %q blames the fetch, which succeeded and returned 404", msg)
+	}
+}
+
+// TestAgentsRegister_UpstreamFetchFailure is the control for the test above: the
+// origin is reachable and broken rather than answering "no such document", so the
+// next attempt genuinely may succeed and 502 is the honest answer. The two cases
+// must not collapse into one status.
+func TestAgentsRegister_UpstreamFetchFailure(t *testing.T) {
+	fx := setupRegisterFixture(t, transport.AgentsRegisterOptions{})
+	fx.origin.setStatus(http.StatusInternalServerError)
 	body, _ := json.Marshal(map[string]string{
 		"agent_id":      fx.agentID,
 		"discovery_url": fx.agentID,

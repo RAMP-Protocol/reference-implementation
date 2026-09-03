@@ -50,7 +50,8 @@ type PersistTxIntent struct {
 	TenantID string
 	AgentID  string
 
-	// Catalog binding (resource_id and offer_id are the same value for v1)
+	// Catalog binding: resource_id is the resolved catalog entry; offer_id is
+	// the presented signed offer's own per-offer UUID. Distinct values.
 	ResourceID string
 	OfferID    string
 
@@ -90,6 +91,26 @@ type TransactionRepo interface {
 	// production read path for observing a persisted transaction by its id —
 	// the surface tests assert through instead of a raw transaction_log SELECT.
 	ByID(ctx context.Context, transactionID string) (TransactionRecord, error)
+	// ClaimRequest durably claims (agentID, idempotencyKey) for the item set
+	// itemsDigest identifies, before any item bills or persists. won=true means
+	// this call inserted the claim (a fresh request). won=false means the key
+	// was already claimed by this agent; storedDigest is the digest of the item
+	// set it was first used with, so the caller can tell an exact retry from a
+	// reuse with different items. The claim is what ties a retried request to
+	// its original now that offer_id is a random per-offer UUID — the derived
+	// per-item keys of a re-discovered offer never match the original rows.
+	ClaimRequest(
+		ctx context.Context, agentID, idempotencyKey string, itemsDigest []byte,
+	) (won bool, storedDigest []byte, err error)
+	// FinalizeRequest stores the finalized request-level response payload on
+	// the claim, write-once: a claim whose payload is already set is left
+	// untouched and won=false is returned (the first finalization is
+	// immutable; the caller must then read and serve the stored winner). The
+	// affected-row count is the won signal — it is never ignored.
+	FinalizeRequest(ctx context.Context, agentID, idempotencyKey string, responsePayload []byte) (won bool, err error)
+	// RequestResponse returns the finalized response payload stored on the
+	// claim, or nil when the claim does not exist or has not been finalized.
+	RequestResponse(ctx context.Context, agentID, idempotencyKey string) ([]byte, error)
 }
 
 // ErrTransactionNotFound signals an idempotency probe miss.
@@ -174,6 +195,58 @@ func (r *transactionRepo) ByID(ctx context.Context, transactionID string) (Trans
 		return TransactionRecord{}, fmt.Errorf("get transaction by id: %w", err)
 	}
 	return transactionFromRow(row)
+}
+
+func (r *transactionRepo) ClaimRequest(
+	ctx context.Context, agentID, idempotencyKey string, itemsDigest []byte,
+) (bool, []byte, error) {
+	rows, err := r.q.InsertTransactionRequestClaim(ctx, sqlc.InsertTransactionRequestClaimParams{
+		AgentID: agentID, IdempotencyKey: idempotencyKey, ItemsDigest: itemsDigest,
+	})
+	if err != nil {
+		return false, nil, fmt.Errorf("claim transaction request: %w", err)
+	}
+	if rows == 1 {
+		return true, nil, nil
+	}
+	// Lost the insert: the claim already exists. Claims are append-only, so the
+	// read-after-lost-insert cannot miss.
+	claim, err := r.q.GetTransactionRequestClaim(ctx, sqlc.GetTransactionRequestClaimParams{
+		AgentID: agentID, IdempotencyKey: idempotencyKey,
+	})
+	if err != nil {
+		return false, nil, fmt.Errorf("read transaction request claim: %w", err)
+	}
+	return false, claim.ItemsDigest, nil
+}
+
+func (r *transactionRepo) FinalizeRequest(
+	ctx context.Context, agentID, idempotencyKey string, responsePayload []byte,
+) (bool, error) {
+	// Guarded on response_payload IS NULL: zero rows affected means the claim
+	// is already finalized (a concurrent finalizer won) or absent.
+	rows, err := r.q.FinalizeTransactionRequestClaim(ctx, sqlc.FinalizeTransactionRequestClaimParams{
+		AgentID: agentID, IdempotencyKey: idempotencyKey, ResponsePayload: responsePayload,
+	})
+	if err != nil {
+		return false, fmt.Errorf("finalize transaction request claim: %w", err)
+	}
+	return rows == 1, nil
+}
+
+func (r *transactionRepo) RequestResponse(
+	ctx context.Context, agentID, idempotencyKey string,
+) ([]byte, error) {
+	claim, err := r.q.GetTransactionRequestClaim(ctx, sqlc.GetTransactionRequestClaimParams{
+		AgentID: agentID, IdempotencyKey: idempotencyKey,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read transaction request claim response: %w", err)
+	}
+	return claim.ResponsePayload, nil
 }
 
 func transactionFromRow(row sqlc.RampTransactionLog) (TransactionRecord, error) {

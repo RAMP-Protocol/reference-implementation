@@ -2,6 +2,8 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"strconv"
 
 	"google.golang.org/protobuf/types/known/structpb"
@@ -70,4 +72,66 @@ func nestedJSON(v *structpb.Value) (string, bool) {
 		return "", false
 	}
 	return string(raw), true
+}
+
+// noJSONFormMember reports the first registration_data member holding a value
+// with no JSON representation, as a dotted/indexed path ("ratio",
+// "address.lat", "scores[2]"), or ok=false when it finds none.
+//
+// It DECIDES NOTHING. The verdict is the SDK's — helpers.CheckRegistrationDataStruct
+// owns which payloads are refused and in what order — and this walk runs only
+// after that verdict is Uncanonicalizable, to say WHERE. The SDK reports the
+// class but not the member, and the member is the only part of the refusal that
+// tells a caller which of its up-to-64 members to look at.
+//
+// Because it only describes, it is safe for it to find nothing: the caller falls
+// back to naming the class. It must never do the reverse and claim a member the
+// SDK accepted, which is why it is called on the refusal path alone.
+//
+// It reads the raw Struct for the reason the SDK's check does. AsMap renders a
+// non-finite double as the Go string "NaN", "Infinity" or "-Infinity", and an
+// unset kind as nil, so neither value is still visible after the conversion.
+//
+// Which member is named when a payload holds more than one is not fixed: Go
+// randomizes map iteration, and the refusal identifies one offending member
+// rather than listing them all.
+func noJSONFormMember(s *structpb.Struct) (string, bool) {
+	for k, v := range s.GetFields() {
+		if rest, ok := noJSONFormValue(v); ok {
+			return k + rest, true
+		}
+	}
+	return "", false
+}
+
+// noJSONFormValue is noJSONFormMember's recursion. It returns the path SUFFIX
+// below the value it was handed, so each caller prepends its own key or index.
+// A leaf hit returns an empty suffix. Recursion depth is bounded by the
+// protocol's nesting limit, which the SDK's verdict has already applied.
+//
+// The two leaf hits are the two members of the class. A non-finite double is one
+// of them. The other is a Value with NO member of its kind oneof set, which the
+// type switch sees as a nil kind — that arm is why the switch is written over
+// the oneof wrapper rather than over v.GetKind()'s concrete types alone.
+func noJSONFormValue(v *structpb.Value) (string, bool) {
+	switch kind := v.GetKind().(type) {
+	case nil:
+		return "", true
+	case *structpb.Value_NumberValue:
+		n := kind.NumberValue
+		return "", math.IsNaN(n) || math.IsInf(n, 0)
+	case *structpb.Value_StructValue:
+		for k, f := range kind.StructValue.GetFields() {
+			if rest, ok := noJSONFormValue(f); ok {
+				return "." + k + rest, true
+			}
+		}
+	case *structpb.Value_ListValue:
+		for i, e := range kind.ListValue.GetValues() {
+			if rest, ok := noJSONFormValue(e); ok {
+				return fmt.Sprintf("[%d]%s", i, rest), true
+			}
+		}
+	}
+	return "", false
 }

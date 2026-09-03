@@ -30,6 +30,7 @@ from typing import Any
 
 import httpx
 import pytest
+from ramp_sdk import ProtocolVersion
 
 from ..conftest import StackURLs
 from ..httpsig_signer import generate_random_keypair, sign_request
@@ -95,7 +96,11 @@ def test_unknown_signer_is_refused_with_specific_reason(
        unknown signer with a two-category match
        (unknown-ness × key-naming).
     """
-    body_obj = {"requester": {}, "uris": ["http://edge:8787/premium/any.html"]}
+    body_obj = {
+        "ver": ProtocolVersion,
+        "requester": {},
+        "uris": ["http://edge:8787/premium/any.html"],
+    }
     body = json.dumps(body_obj, separators=(",", ":")).encode()
 
     kid, priv = generate_random_keypair("ghost-agent-not-in-any-ramp-json")

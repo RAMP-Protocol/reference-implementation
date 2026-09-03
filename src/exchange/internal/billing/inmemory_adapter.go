@@ -82,9 +82,13 @@ type InMemoryAdapter struct {
 	// committed transaction (idempotency_key is UNIQUE); durable unbounded-volume
 	// idempotency is the persisted adapter's (TigerBeetle) responsibility, not
 	// the demo-tier in-memory adapter's. Per-entry size is bounded by boundKey.
-	opSeen   map[string]struct{}
-	nextIdx  uint64
-	idPrefix string
+	opSeen map[string]struct{}
+	// creditSeen records applied Credit idempotency keys. The key ALONE is the
+	// dedup anchor (no billing_ref in the map key), mirroring the persisted
+	// adapter where the key alone derives the ledger transfer id.
+	creditSeen map[string]struct{}
+	nextIdx    uint64
+	idPrefix   string
 }
 
 // InMemoryOptions seeds an InMemoryAdapter.
@@ -97,15 +101,16 @@ type InMemoryOptions struct {
 // NewInMemoryAdapter creates an adapter with the given seed state.
 func NewInMemoryAdapter(opts InMemoryOptions) *InMemoryAdapter {
 	a := &InMemoryAdapter{
-		balances:  map[string]Amount{},
-		quotas:    map[string]int64{},
-		reserved:  map[string]reservation{},
-		recorded:  map[string]recordedTx{},
-		refunded:  map[string]*big.Rat{},
-		refundLog: map[string][]RefundEntry{},
-		authSeen:  map[string]string{},
-		opSeen:    map[string]struct{}{},
-		idPrefix:  opts.IDPrefix,
+		balances:   map[string]Amount{},
+		quotas:     map[string]int64{},
+		reserved:   map[string]reservation{},
+		recorded:   map[string]recordedTx{},
+		refunded:   map[string]*big.Rat{},
+		refundLog:  map[string][]RefundEntry{},
+		authSeen:   map[string]string{},
+		opSeen:     map[string]struct{}{},
+		creditSeen: map[string]struct{}{},
+		idPrefix:   opts.IDPrefix,
 	}
 	if a.idPrefix == "" {
 		a.idPrefix = "bill-"
@@ -162,7 +167,7 @@ func (a *InMemoryAdapter) markOpDone(billingID, op, key string) {
 // the freshly registered agent exists for subsequent balance reads. A repeat
 // call — or a ref that already holds a (possibly funded) balance — is a no-op
 // success: the existing balance is never reset. The zero balance is denominated
-// in USD, the demo tier's currency.
+// in DemoCurrency, this tier's currency.
 func (a *InMemoryAdapter) EnsureAgentAccount(_ context.Context, billingRef string) error {
 	if billingRef == "" {
 		return errEmptyBillingRef
@@ -170,8 +175,50 @@ func (a *InMemoryAdapter) EnsureAgentAccount(_ context.Context, billingRef strin
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, ok := a.balances[billingRef]; !ok {
-		a.balances[billingRef] = Amount{Value: new(big.Rat), Currency: "USD"}
+		a.balances[billingRef] = Amount{Value: new(big.Rat), Currency: DemoCurrency}
 	}
+	return nil
+}
+
+// Credit grants a one-time credit to the account's balance, creating the
+// account in the amount's currency when it does not exist yet. A replay of an
+// already-applied idempotency key is a no-op success regardless of amount —
+// the first credit wins, mirroring the persisted adapter's key-derived ledger
+// transfer id.
+//
+// Two currency rules apply, and they catch different faults. The shared gate
+// rejects an amount that is not in the deployment currency. The check below
+// rejects a credit in the deployment currency against a balance denominated in
+// something else — a balance this adapter can only hold if a caller seeded one
+// directly. Without the second check a USD grant would pass the gate and be
+// added into a EUR balance, leaving a total whose currency label is a lie.
+func (a *InMemoryAdapter) Credit(
+	_ context.Context, billingRef string, amount Amount, idempotencyKey string,
+) error {
+	if err := validateCreditArgs(billingRef, amount, idempotencyKey, DemoCurrency); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, done := a.creditSeen[boundKey(idempotencyKey)]; done {
+		return nil
+	}
+	bal, ok := a.balances[billingRef]
+	if !ok {
+		bal = Amount{Value: new(big.Rat), Currency: amount.Currency}
+	}
+	// Deliberately a plain error, not ErrInvalidAmount: the credit is valid and
+	// the stored balance is not, so this is invalid server state rather than a
+	// caller fault. ErrInvalidAmount maps to a 4xx and would blame the Register
+	// caller for a seed it never supplied; a plain error falls through to
+	// KindInternal.
+	if bal.Currency != amount.Currency {
+		return fmt.Errorf("billing: account currency %q does not match credit currency %q",
+			bal.Currency, amount.Currency)
+	}
+	bal.Value.Add(bal.Value, amount.Value)
+	a.balances[billingRef] = bal
+	a.creditSeen[boundKey(idempotencyKey)] = struct{}{}
 	return nil
 }
 

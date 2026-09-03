@@ -35,7 +35,8 @@ func verifyPKCE(challenge, verifier string) bool {
 }
 
 // sameToken reports, in constant time, whether two opaque tokens are equal — used
-// for the form CSRF check so the compare leaks no timing signal about the token.
+// for the consent screen's CSRF check so the compare leaks no timing signal about
+// the token.
 func sameToken(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }

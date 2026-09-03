@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/directory"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/publisher"
 )
 
@@ -58,6 +59,7 @@ type stubDocs struct {
 func (s stubDocs) Directory(_ context.Context, _ string) ([]byte, error)  { return s.body, s.err }
 func (s stubDocs) Card(_ context.Context, _ string) ([]byte, error)       { return s.body, s.err }
 func (s stubDocs) Revocation(_ context.Context, _ string) ([]byte, error) { return s.body, s.err }
+func (s stubDocs) Manifest(_ context.Context, _ string) ([]byte, error)   { return s.body, s.err }
 
 func TestServe_StatusMapping(t *testing.T) {
 	t.Parallel()
@@ -71,32 +73,47 @@ func TestServe_StatusMapping(t *testing.T) {
 		{"unavailable -> 503", stubDocs{err: publisher.ErrUnavailable}, http.StatusServiceUnavailable},
 		{"other -> 500", stubDocs{err: context.DeadlineExceeded}, http.StatusInternalServerError},
 	}
+	// Every mounted route shares one serve helper, so the mapping is driven through
+	// each of them: a route wired to the wrong media type, or added without going
+	// through that helper, fails here rather than in an integration run.
+	paths := []string{
+		rampwellknown.WBAPath, directory.CardPath,
+		rampwellknown.RevocationPath, rampwellknown.Path,
+	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			h := NewHandler("rampmcp.org", tc.svc, 300*time.Second)
-			mux := http.NewServeMux()
-			h.RegisterRoutes(mux)
-			srv := httptest.NewServer(mux)
-			defer srv.Close()
+		for _, path := range paths {
+			t.Run(tc.name+" "+path, func(t *testing.T) {
+				t.Parallel()
+				h := NewHandler("rampmcp.org", tc.svc, 300*time.Second)
+				mux := http.NewServeMux()
+				h.RegisterRoutes(mux)
+				srv := httptest.NewServer(mux)
+				defer srv.Close()
 
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+rampwellknown.WBAPath, nil)
-			if err != nil {
-				t.Fatalf("new request: %v", err)
-			}
-			req.Host = "agent-123.rampmcp.org"
-			resp, err := srv.Client().Do(req)
-			if err != nil {
-				t.Fatalf("do: %v", err)
-			}
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode != tc.wantStatus {
-				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
-			}
-			if tc.wantStatus == http.StatusOK && resp.Header.Get("Cache-Control") == "" {
-				t.Error("Cache-Control missing on a 200")
-			}
-		})
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+path, nil)
+				if err != nil {
+					t.Fatalf("new request: %v", err)
+				}
+				req.Host = "agent-123.rampmcp.org"
+				resp, err := srv.Client().Do(req)
+				if err != nil {
+					t.Fatalf("do: %v", err)
+				}
+				defer func() { _ = resp.Body.Close() }()
+				if resp.StatusCode != tc.wantStatus {
+					t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+				}
+				if tc.wantStatus != http.StatusOK {
+					return
+				}
+				if resp.Header.Get("Cache-Control") == "" {
+					t.Error("Cache-Control missing on a 200")
+				}
+				if resp.Header.Get("Content-Type") == "" {
+					t.Error("Content-Type missing on a 200")
+				}
+			})
+		}
 	}
 }
 

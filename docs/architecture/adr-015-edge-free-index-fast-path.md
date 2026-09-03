@@ -1,6 +1,6 @@
 # ADR-015 — Edge Free-Index Fast Path (Web Bot Auth)
 
-**Status:** Accepted (2026-06-15). Demonstrated on the reference implementation, branch `feature/free-index-path` (PR #2): the WBA verifier, the signed-purpose coverage keystone, and the paid-vs-free ledger collapse are realized for real; D4/D7/D8/D9/D10 are simplified, stubbed, or deferred for the demo (see §Realization status). First production targets: identity & interop (Web Bot Auth) plus a new edge/ingestion epic derived from this ADR. Builds on ADR-014 (Universal Licensing Core), ADR-012 (Edge Delivery-Log), ADR-011 (three-way reconciliation), ADR-009 (identity boundary), ADR-002 (two-Biscuit model).
+**Status:** Accepted (2026-06-15). Demonstrated on the reference implementation, branch `feature/free-index-path` (PR #2): the WBA verifier, the signed-purpose coverage keystone, and the paid-vs-free ledger collapse are realized for real; D4/D7/D8/D9/D10 are simplified, stubbed, or deferred for the demo (see §Realization status). First production targets: identity & interop (Web Bot Auth) plus a new edge/ingestion epic derived from this ADR. Builds on ADR-014 (Universal Licensing Core), ADR-012 (Edge Delivery-Log), ADR-011 (three-way reconciliation), ADR-009 (identity boundary), ADR-002 (two-Biscuit model). · **D8's "no signed-URL HMAC" names a scheme that was never implemented** — see the amendment at the end of `## Decision`.
 
 ---
 
@@ -118,6 +118,23 @@ Mechanically: broad patterns carry the bulk (`/questions/*` → free-index); a p
 **Example.** Two pushed resources, both `free` for indexing. Resource A is the plain shape → folded into the free pattern, served at the edge in one request. Resource B adds an `ATTRIBUTION` obligation → not the plain shape, so the projection lists it as an exception; the edge does not fast-path it, and it goes through the full RAMP cycle, where the attribution obligation is presented, accepted, and recorded via `UsageReport`.
 
 **Consequence — fast-path coverage is proportional to policy uniformity.** A publisher with one uniform free-index policy gets near-total edge coverage; one who attaches bespoke obligations/scopes/restrictions per resource gets more exceptions and less shortcut. This is a healthy incentive — the simpler the free grant, the cheaper it is to serve at scale — and the projection should surface it: report exception count (and the resulting fast-path coverage ratio) per domain at onboarding so a publisher sees the cost of fidelity.
+
+#### Amendment (2026-09-02) — the free fast path has no signed URL at all
+
+D8 describes a free-tier access as carrying "no `transaction_id`, no signed-URL HMAC". No
+signed URL in this system has ever carried an HMAC. URL signing is asymmetric and selected
+per tenant by `tenants.signing_scheme`: Ed25519 verified by the edge worker, or RSA verified
+natively by CloudFront. The delivery endpoint holds public keys only. See the 2026-09-02
+amendment to **ADR-012** for the same correction across that ADR's three decisions.
+
+The correction to D8 is stronger than swapping one primitive for another. What distinguishes
+a free-index serve is not that its signed URL uses a weaker signature — it is that **there is
+no signed URL**. The fast path is entered before any URL verification happens, which is why
+the edge branches on the presence of a `sig` parameter first: a request without one is a
+candidate for the free path or the bot gate, and never reaches the verifier. D8's substance
+is unaffected; the phrase to read is "no signed URL", and the reason the free record's
+evidence rests on the bot's own RFC 9421 signature rather than on anything the Exchange
+minted is exactly that no Exchange-minted artifact exists on this path.
 
 ---
 

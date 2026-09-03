@@ -9,12 +9,12 @@ import (
 )
 
 type Querier interface {
-	CompleteDeveloperRegistration(ctx context.Context, arg CompleteDeveloperRegistrationParams) (IdentityDeveloperAccount, error)
 	// Single-use redemption: flips consumed atomically and returns the row only on the
 	// first redemption. A second attempt matches no row (NOT consumed is false) and
 	// yields pgx.ErrNoRows. Expiry is returned, not enforced here, so the caller checks
 	// it against the same clock that minted expires_at.
 	ConsumeAuthzCode(ctx context.Context, codeHash string) (IdentityOauthAuthzCode, error)
+	ForgetExchangeRegistration(ctx context.Context, arg ForgetExchangeRegistrationParams) error
 	// Peek at a code without consuming it, so /token can validate every binding
 	// (expiry, client_id, redirect_uri, PKCE) BEFORE it burns the code. A row is
 	// returned whether or not it is already consumed; an unknown code yields
@@ -28,6 +28,32 @@ type Querier interface {
 	GetOAuthClient(ctx context.Context, clientID string) (IdentityOauthClient, error)
 	GetRevocation(ctx context.Context, subdomain string) (GetRevocationRow, error)
 	IssueAuthzCode(ctx context.Context, arg IssueAuthzCodeParams) (IdentityOauthAuthzCode, error)
+	// Ordered by domain because that is how the list is presented, and capped by the
+	// same number the write path enforces.
+	//
+	// The cap is a backstop rather than the bound: RecordExchangeRegistration keeps
+	// the set at or under it, so this LIMIT never truncates a set that path produced.
+	// It is here so the read cannot become unbounded if rows ever arrive by another
+	// route.
+	//
+	ListExchangeRegistrations(ctx context.Context, arg ListExchangeRegistrationsParams) ([]ListExchangeRegistrationsRow, error)
+	// Writes the note and, in the same statement, drops this agent's oldest notes
+	// past the cap.
+	//
+	// The exchange is a value an authenticated agent chooses per call, and with no
+	// allowlist configured the key space is the whole DNS namespace. So the note set
+	// is somewhere a caller can make this table grow, and it is bounded the same way
+	// every caller-influenced store in this service is: keep the most recent, drop
+	// the rest.
+	//
+	// One statement, so there is no read-then-write to make atomic. The two halves
+	// need care about visibility: a data-modifying CTE runs against the snapshot
+	// taken at the start of the statement, so the DELETE cannot see the row the
+	// INSERT just wrote. That is why `keep` selects the cap MINUS ONE most recent
+	// OTHER notes and the DELETE excludes this exchange outright — the row being
+	// written is kept by construction rather than by being found.
+	//
+	RecordExchangeRegistration(ctx context.Context, arg RecordExchangeRegistrationParams) error
 	RegisterOAuthClient(ctx context.Context, arg RegisterOAuthClientParams) (IdentityOauthClient, error)
 	ReserveDeveloper(ctx context.Context, arg ReserveDeveloperParams) (IdentityDeveloperAccount, error)
 	// Append thumbprint to the subdomain's revoked set and advance as_of to a value

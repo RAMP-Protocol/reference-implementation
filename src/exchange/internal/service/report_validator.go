@@ -35,30 +35,43 @@ const timestampSkewPast = 5 * time.Second
 const toleranceScale = 1_000_000
 
 // ReportInput carries every input ValidateUsageReport consumes. Pure data; no DB access.
-// Exchange is the configured exchange domain (cfg.Exchange) so the
-// validator can refuse reports addressed at a different exchange.
+//
+// It carries no exchange domain. Whether the report names THIS Exchange is
+// decided before the handler runs, by the recipient interceptor mounted on the
+// Connect surface, because that question has to be answered before any database
+// lookup: the identifiers this struct is built from are themselves loaded from
+// the obligation the report claims. A report that reaches here has already named
+// us correctly.
 type ReportInput struct {
 	Obligation    repo.Obligation
 	TransactionID string
 	BillingID     string
 	CreatedAt     time.Time
 	Report        *rampv1.UsageReport
-	Now           time.Time
-	Exchange      string
+	// Now is the service clock's instant. Its only remaining use is the
+	// timestamp skew check — no check here compares it against the deadline.
+	Now time.Time
 }
 
-// ValidateUsageReport runs the seven RAMP §3.2 #4 + L6-remainder checks in
-// protocol order. Returns (repo.ValidationOutcomeValidated, nil) on success and
+// ValidateUsageReport runs the RAMP §3.2 #4 checks in protocol order: required
+// fields, quantity tolerance, billing_id and timestamp. Whether the
+// report names this Exchange is not among them — see ReportInput above for where
+// that is decided and why it cannot be decided here. Returns (repo.ValidationOutcomeValidated, nil) on success and
 // (outcome, *exchange.Error) on the first failing check.
+//
+// The reporting window is deliberately NOT among the checks. Rejecting a report
+// for arriving after its deadline left the obligation PENDING, and a PENDING
+// obligation past its deadline is what the execute gate refuses on — so an agent
+// that missed one window could neither report nor transact, with no way back.
+// A report is now accepted whatever the time, which is what gives the gate a
+// remedy the agent can actually apply. Lateness stays visible: received_at and
+// deadline sit on the same row and are written from the same clock.
 //
 // The validator is a pure function (no struct receiver, no state, no allocations
 // on the happy path) so the service can call it without wiring a dep and tests
 // drive it without constructing a fixture.
 func ValidateUsageReport(in ReportInput) (repo.ValidationOutcome, *exchange.Error) {
 	if out, err := validateRequiredFields(in); err != nil {
-		return out, err
-	}
-	if out, err := validateWindow(in); err != nil {
 		return out, err
 	}
 	if out, err := validateTolerance(in); err != nil {
@@ -68,9 +81,6 @@ func ValidateUsageReport(in ReportInput) (repo.ValidationOutcome, *exchange.Erro
 		return out, err
 	}
 	if out, err := validateTimestamp(in); err != nil {
-		return out, err
-	}
-	if out, err := validateExchange(in); err != nil {
 		return out, err
 	}
 	return repo.ValidationOutcomeValidated, nil
@@ -84,21 +94,6 @@ func validateRequiredFields(in ReportInput) (repo.ValidationOutcome, *exchange.E
 				"required field %q missing or empty", field,
 			).WithField(field)
 		}
-	}
-	return repo.ValidationOutcomeValidated, nil
-}
-
-func validateWindow(in ReportInput) (repo.ValidationOutcome, *exchange.Error) {
-	if in.Obligation.Deadline.IsZero() {
-		// No deadline persisted (legacy row) — skip rather than reject so we do
-		// not break replay against archived obligations.
-		return repo.ValidationOutcomeValidated, nil
-	}
-	if in.Now.After(in.Obligation.Deadline) {
-		return repo.ValidationOutcomeRejectedWindow, exchange.Newf(
-			exchange.KindFailedPrecondition,
-			"reporting window expired",
-		).WithField("window")
 	}
 	return repo.ValidationOutcomeValidated, nil
 }
@@ -131,7 +126,7 @@ func validateTolerance(in ReportInput) (repo.ValidationOutcome, *exchange.Error)
 		diff = -diff
 	}
 	tol := in.Obligation.QuantityTolerance
-	// A stamped 0 is an explicit exact-match policy, not "unset": buildPersistIntent
+	// A stamped 0 is an explicit exact-match policy, not "unset": planObligation
 	// resolves a nil policy to defaultQuantityTolerance before persisting, so a 0
 	// reaching the validator can only be a deliberate zero-tolerance. Only the
 	// impossible negative falls back to the default.
@@ -194,22 +189,6 @@ func validateTimestamp(in ReportInput) (repo.ValidationOutcome, *exchange.Error)
 			"report timestamp %s is more than %s in the future",
 			reported.UTC().Format(time.RFC3339Nano), timestampSkewFuture,
 		).WithField("timestamp")
-	}
-	return repo.ValidationOutcomeValidated, nil
-}
-
-func validateExchange(in ReportInput) (repo.ValidationOutcome, *exchange.Error) {
-	got := in.Report.GetExchange()
-	if got == "" {
-		// Exchange is optional — caller didn't claim one.
-		return repo.ValidationOutcomeValidated, nil
-	}
-	if in.Exchange != "" && got != in.Exchange {
-		return repo.ValidationOutcomeRejectedExchange, exchange.Newf(
-			exchange.KindInvalidRequest,
-			"report exchange %q does not match exchange %q",
-			got, in.Exchange,
-		).WithField("exchange")
 	}
 	return repo.ValidationOutcomeValidated, nil
 }

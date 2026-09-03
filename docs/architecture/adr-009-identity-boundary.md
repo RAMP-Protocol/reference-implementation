@@ -1,6 +1,6 @@
 # ADR-009 — Identity Boundary: Exchange vs Billing
 
-**Status:** Accepted (2026-06-02)
+**Status:** Accepted (2026-06-02); **amended 2026-08-13** — D2's "no protocol-driven onboarding flow mints a balance" is narrowed: the Register flow MAY grant a tenant-configured one-time default credit (`tenants.default_agent_credit`, 0 = disabled) to a newly registered agent, drawn from the operator's `platform:liquidity` account under an idempotent `"service-welcome:" + billing_ref` ledger slot. Everything else in D2 stands. See the [Amendment (2026-08-13)](#amendment-2026-08-13--tenant-configured-default-credit-at-register) section.
 
 ---
 
@@ -14,11 +14,11 @@ The Exchange and the Billing adapter both reason about "who is acting," but the 
 
 ### D1 — The Exchange's `agents` table is the cryptographic source of truth
 
-The `ramp.agents` table (migration `000001_init`) is the deployment's authoritative store of which keys this Exchange accepts signatures from and what role each key plays (AGENT / BROKER / HUMAN_TOOL / SERVICE / DELEGATED / RESEARCH). It is not an account ledger: no balance, no quota, no reservation state. The Exchange's authorization layer (`src/exchange/internal/service/authz.go` — `resolveCaller`, `authorizeForAgent`) reads it on every request. An unknown keyID is `Unauthenticated`; a known one maps to a `Caller` whose role decides whether the transaction is self-acting (CallerAgent) or broker-on-behalf (CallerBroker, gated by `tenants.allow_broker_relay` per ADR-006). Separating cryptographic identity from financial state means the Exchange refuses forged signatures without consulting the Billing adapter — the cryptographic boundary lives entirely inside the Exchange, hydrated from `/.well-known/ramp.json` per ADR-003's pull-only discovery.
+The `ramp.agents` table (migration `000001_init`) is the deployment's authoritative store of which keys this Exchange accepts signatures from and what role each key plays (AGENT / BROKER / HUMAN_TOOL / SERVICE / DELEGATED / RESEARCH). It is not an account ledger: no balance, no quota, no reservation state. The Exchange's authorization layer (`src/exchange/internal/service/authz.go` — `resolveCaller`, `authorizeForAgent`) reads it on every request. An unknown keyID is `Unauthenticated`; a known one maps to a `Caller` whose role decides whether the transaction is self-acting (CallerAgent) or broker-on-behalf (CallerBroker, gated by `tenants.allow_broker_relay` per ADR-006). Separating cryptographic identity from financial state means the Exchange refuses forged signatures without consulting the Billing adapter — the cryptographic boundary is owned entirely by the Exchange, hydrated from the signer's Web Bot Auth key directory at `/.well-known/http-message-signatures-directory` per ADR-003's pull-only discovery. Keys were carried in `/.well-known/ramp.json` before the WBA split; they are not any longer, and the commercial overlay at that path publishes no key material.
 
 ### D2 — Registration is lazy; Billing creates accounts on first Authorize, when it needs an account at all
 
-There is no mandatory pre-registration ceremony. A new agent presenting a valid signature against a key in its `/.well-known/ramp.json` MAY consume immediately. The first inbound request whose keyID is absent from `ramp.agents` triggers the Exchange's registration path — pull the key, persist the row, proceed with authorization.
+There is no mandatory pre-registration ceremony. A new agent presenting a valid signature against a key in its Web Bot Auth directory MAY consume immediately. The first inbound request whose keyID is absent from `ramp.agents` triggers the Exchange's registration path — fetch that directory from the host the identity anchors to, pin the currently-valid key it publishes, persist the row, proceed with authorization.
 
 The Exchange recognizes exactly three call-paths; everything else is refused at authz:
 
@@ -87,6 +87,72 @@ The previous per-transaction audit fingerprint `sha256(agent_id || "|" || tx_req
 
 ---
 
+## Amendment (2026-08-13) — tenant-configured default credit at Register
+
+**Status of this amendment:** Accepted (2026-08-13). Implemented in the Exchange's
+Register flow and billing adapters.
+
+The original D2 text above is preserved as the record. Where it conflicts with this
+amendment, **this amendment governs**.
+
+**What changes.** D2's closing sentence — "No protocol-driven onboarding flow mints a
+balance" — made self-service onboarding impossible on a strictly prepaid deployment: a
+freshly registered agent held a zero balance, so its first paid transaction was always
+denied with `INSUFFICIENT_BALANCE` until an operator funded the account by hand. That
+sentence is narrowed. One protocol flow now mints a balance, under operator control:
+
+- **Tenant configuration.** `ramp.tenants.default_agent_credit` (`NUMERIC(20,8)`,
+  non-negative, denominated in the deployment ledger currency) is the one-time credit a
+  newly registered agent receives. The default is 0, which disables the grant entirely —
+  an unconfigured deployment keeps the exact pre-amendment behavior. The environment
+  variable `EXCHANGE_DEFAULT_AGENT_CREDIT` is the sole configuration channel: every
+  boot replaces the column with the variable's value (unset means 0, so removing the
+  variable disables the grant at the next restart), there is no admin RPC, and operator
+  SQL is not a supported channel. The column is per-tenant in the schema, but the
+  Register flow reads it only from the deployment's configured default tenant — the
+  same shape as `activate_new_agents_by_default`, because the RegisterRequest carries
+  no tenant field. Resolving an agent to a specific tenant, and with it genuinely
+  per-tenant grants, is future work.
+- **When it runs.** Only in the first-register branch of the Register flow, after the
+  ledger account is created and before the `billing_ref` is stored on the agent row. The
+  already-registered fast path never credits. A grant failure fails the Register RPC, so
+  a retry re-enters the branch; idempotent writes make the retry safe.
+- **How it stays single-shot.** The grant is a single posted ledger transfer from the
+  operator's `platform:liquidity` account, with a transfer id derived from
+  `"service-welcome:" + billing_ref` (one Go owner: `billing.WelcomeCreditKey`, with a
+  pinned-vector test the funding script's shell copy is checked against). The ledger's
+  duplicate-id rejection makes the grant idempotent across Register retries AND across
+  operator prefunds: a funding script that already credited the account under the
+  reserved `service-welcome` label occupies the same slot, so the service grant becomes
+  a no-op. The first credit wins; the grant never tops up. `service-welcome` is a fresh
+  reserved label — every other funding label keeps the amount-bearing derivation and
+  stacks deliberately.
+- **Liquidity accounting.** `platform:liquidity` carries no debit cap and may go
+  arbitrarily negative — its balance is the running total of credit the operator has
+  extended, which is the operator's liability to settle out of band. The grant is
+  bounded per agent (one welcome credit per `billing_ref`, never topped up), but the
+  aggregate liability is unbounded: self-signup identities are free and unlimited, so
+  every fresh registration draws another grant. That is accepted for the demo phase —
+  deliberately no `DebitsMustNotExceedCredits` cap on `platform:liquidity` and no
+  treasury account. The mitigations in place are the activation-policy gate
+  (`activate_new_agents_by_default = false` holds new agents for review, and an
+  inactive account is granted nothing), the request-correlated "granted default agent
+  credit" log line, and the per-IP rate limit on the agent-registration endpoint. When
+  the platform
+  outgrows the demo, the follow-up design is a capped budget: a dedicated treasury
+  account funded with a seed prefund, `DebitsMustNotExceedCredits` set on it, and
+  Register skipping the grant when the budget is exhausted (registration still
+  succeeds; the agent starts unfunded). Operator-mediated settlement (invoice via
+  Stripe or equivalent, manual top-ups for amounts beyond the welcome credit) remains
+  the model for everything else; this amendment adds exactly one automated,
+  per-agent-bounded, operator-configured exception.
+
+**What does not change.** Free and biscuit paths still bypass billing entirely; lazy
+registration still requires no ceremony; the billing adapter still creates accounts
+lazily; per-agent top-up and balance-read RPCs remain out of protocol.
+
+---
+
 ## Out of scope
 
 - **`audit_root` canonicalization scope.** ADR-010 D2 leaves `audit_root` canonicalization to the implementation MR. If it includes `agent_identity_hash`, anchor it to the post-D5 Thumbprint from day one. Flagged for the ADR-010 implementer.
@@ -103,5 +169,5 @@ The previous per-transaction audit fingerprint `sha256(agent_id || "|" || tx_req
 - Onboarding has no protocol-level ceremony — a new agent can consume on its first authenticated request.
 - Audit and reconciliation are single-key joins; ADR-011's reconciler joins on `agent_identity_hash` (equal on both sides by D5).
 - Key rotation is operator-controlled at one URL; the 5-minute TTL bounds global effect; no Billing-side coordination.
-- Lazy registration depends on a well-formed discovery anchor — a malformed/unreachable `/.well-known/ramp.json` gets refused. Domainless agents use the registry-host pattern (proto §1664-1670).
+- Lazy registration depends on a well-formed discovery anchor — a malformed or unreachable `/.well-known/http-message-signatures-directory` gets refused. Domainless agents use the registry-host pattern: a registry hosts the agent's well-known documents on a subdomain it mints, and the agent's identity anchors to that host.
 - Federated identity is decentralised with bounded staleness; cross-Exchange consistency is bounded by the cache window, not a coordinator.

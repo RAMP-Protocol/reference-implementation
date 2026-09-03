@@ -2,217 +2,197 @@ package mcp
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
-	"time"
+	"strings"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
-	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
-	"google.golang.org/protobuf/types/known/structpb"
 
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/account"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/exchacct"
 )
 
-// toolset holds what the tool handlers need. It exists so the handlers are
-// methods with one dependency set rather than closures capturing loose values.
-type toolset struct {
-	ramp       rampCaller
-	developers developerReader
-	// content fetches the licensed bytes for a delivered item. It signs as the
-	// caller, using the same custodied key the offer acceptance was signed with —
-	// which is the key the Exchange bound the delivery URL to.
-	content contentFetcher
-	// callTimeout bounds one ramp_execute's whole content leg, and
-	// maxCallContentBytes what it may accumulate. Both are CALL-scoped, so they
-	// live here rather than in the fetcher, which bounds one request and has no
-	// notion of a batch.
-	//
-	// maxItemContentBytes mirrors the fetcher's own per-item cap. It is held here
-	// only so the budget check can ask whether the NEXT body could still fit,
-	// instead of admitting one and discovering the overrun afterwards.
-	callTimeout         time.Duration
-	maxCallContentBytes int64
-	maxItemContentBytes int64
-	// log is the construction-time logger, used only when a call arrives with no
-	// request-scoped one. Handlers log through toolset.logger(ctx, caller).
-	log *slog.Logger
-	// directory builds a caller's directory origin. It is the OUTBOUND SIGNER's own
-	// function (agentsign), not a copy of its logic: the Broker/Exchange authorize a
-	// request by comparing the signed Signature-Agent origin to requester.id, so
-	// the two values must be produced by the same code, not merely configured from
-	// the same setting.
-	directory func(subdomain string) string
-}
-
-// agentDirectory is the caller's directory origin — its RAMP identity, matching
-// the Signature-Agent the outbound signature carries. requester.id must be this,
-// not the bare subdomain, or the Broker/Exchange reject the call as one agent
-// trying to act on behalf of another.
-func (t *toolset) agentDirectory(subdomain string) string {
-	return t.directory(subdomain)
-}
-
-// register mounts every tool on srv. Adding a tool here is the ONLY way it
-// becomes reachable, so this list is the endpoint's surface.
-func (t *toolset) register(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "ramp_register",
-		Description: "Create this agent's account on the RAMP Exchange, or return the existing one. " +
-			"Takes no arguments: the account belongs to the signed-in developer, and the licensing " +
-			"details submitted at sign-up are forwarded automatically. Safe to call more than once — " +
-			"a repeat call returns the same account handle.",
-	}, t.handleRegister)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "ramp_status",
-		Description: "Report this agent's RAMP account state: its account handle and whether the " +
-			"account is currently active. Takes no arguments. An inactive or absent account is why " +
-			"a purchase would be refused.",
-	}, t.handleStatus)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "ramp_discover",
-		Description: "Find licensable offers for one or more URLs, or for a free-form query. " +
-			"Returns one group per requested URL, each carrying that URL's offers. A URL with " +
-			"nothing licensable comes back as an empty group with a reason, never silently dropped. " +
-			"Pass an offer back unchanged to license it.",
-	}, t.handleDiscover)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "ramp_execute",
-		Description: "License one or more discovered offers and get a signed delivery URL for each. " +
-			"Pass the offers ramp_discover returned, unchanged. A single offer is fine — it is just a " +
-			"batch of one. Each result is licensed independently: a delivered item carries a delivery " +
-			"URL and its transaction id, a refused one carries the reason. The content itself comes " +
-			"back with the result, so there is nothing further to fetch.",
-	}, t.handleExecute)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "ramp_report",
-		Description: "Report usage of licensed content to the Exchange that issued the offer. " +
-			"Reporting is a licensing obligation: an offer's terms may require it, and overdue " +
-			"reports can get later purchases denied.",
-	}, t.handleReport)
-}
-
-// noInput is the argument shape of a tool that takes none. The caller's identity
-// comes from its bearer token, so a tool acting on "this agent" has nothing left
-// to accept — and deliberately offers no field that could name a different agent.
-type noInput struct{}
-
-// accountOutput mirrors the account fields RegisterResponse and
-// GetAccountStatusResponse share.
-type accountOutput struct {
-	// BillingRef is the Exchange-minted account handle. Opaque, stable across
-	// calls, and never accepted back as input — the Exchange resolves the account
-	// from the request signature.
-	BillingRef string `json:"billing_ref"`
-	// Active reports whether the account may transact right now. An account can
-	// exist and be inactive; the operator activates it out of band.
-	Active bool `json:"active"`
-	// RequestID is the correlation id this call ran under, quotable in a bug
-	// report. Every tool returns it, so an agent never has to know which of the
-	// five happens to carry one.
-	RequestID string `json:"request_id,omitempty"`
-}
-
-// handleRegister creates the caller's Exchange account.
+// What ramp_register and ramp_status share: one rendering of an exchacct failure
+// for both.
 //
-// The Exchange derives WHO is registering from the verified request signature
-// (ADR-017 D6), never from the payload, so this handler sends only the business
-// details: the legal entity, address, and jurisdiction the developer supplied at
-// sign-up. Those are read back from our own store rather than accepted as tool
-// arguments — a caller must not be able to register under someone else's legal
-// identity.
-func (t *toolset) handleRegister(
-	ctx context.Context, req *mcpsdk.CallToolRequest, _ noInput,
-) (*mcpsdk.CallToolResult, accountOutput, error) {
-	who, err := callerFrom(ctx, req)
-	if err != nil {
-		return nil, accountOutput{}, err
+// The two tools are different calls with the same failure vocabulary — the same
+// kinds, the same remedies, the same rule about which failures an operator hears.
+// One renderer is what stops the two drifting into telling an agent different
+// things about the same refusal. It sits in its own file rather than in either
+// tool's, because a shared renderer living in one caller's file reads as that
+// caller's own until the day someone changes it for that caller alone.
+
+// accountFailure turns an exchacct failure into what the agent is told, and
+// decides which failures the operator also hears about. It serves BOTH account
+// tools — opening an account and asking after one fail the same ways.
+//
+// The split is by who refused. A local refusal — the payload is outside the
+// protocol's bounds, carries a value the wire cannot hold, or does not match the
+// schema the Exchange publishes — is the caller's own input coming back, and it
+// is answered without a log line: nothing left this process, and one of those
+// messages quotes the data itself. Everything that involved a third party or
+// this service's own store reaches the operator through accountCallFailed.
+func (t *toolset) accountFailure(ctx context.Context, who caller, tool string, err error) error {
+	kind, ok := exchacct.KindOf(err)
+	if !ok {
+		return t.accountCallFailed(ctx, who, tool, err)
 	}
-	data, err := t.registrationFor(ctx, who.subdomain)
-	if err != nil {
-		return nil, accountOutput{}, err
+	switch kind {
+	// The two refusals the service makes about the ARGUMENT, before it reads or
+	// sends anything. Rendered as the verdicts they are rather than through the
+	// transport-failure path, and worded by the same helpers this layer's own
+	// checks use, so an agent cannot tell which layer refused.
+	//
+	// Not reachable from a tool call: checkExchangeArg applies both rules first.
+	// The arms exist because the service is reachable without this layer — its
+	// package doc names "whatever asks next" — and a kind with no arm here falls
+	// through to a transport-failure rendering that names the wrong problem.
+	case exchacct.KindExchangeShape:
+		return notBareDomainError(tool, exchacct.ExchangeOf(err))
+	case exchacct.KindNotPermitted:
+		return notPermittedError(tool, exchacct.ExchangeOf(err))
+	case exchacct.KindFieldsOutOfBounds:
+		return fmt.Errorf(
+			"%s: fields are outside what a registration may carry (%w); the protocol bounds "+
+				"the payload's size, its member count and how deeply it nests",
+			tool, exchacct.CauseOf(err))
+	case exchacct.KindFieldsMalformed:
+		return fmt.Errorf(
+			"%s: fields carry a value a registration cannot hold: %w", tool, exchacct.CauseOf(err))
+	case exchacct.KindFieldsRefused:
+		return registrationFieldFailure(tool, exchacct.ExchangeOf(err), exchacct.FieldsOf(err))
+	case exchacct.KindOutbound:
+		return t.exchangeRefused(ctx, who, tool, err)
+	case exchacct.KindNotes:
+		return t.notesUnavailable(ctx, who, tool, err)
+	// KindRequirements has no arm of its own: the Exchange did not answer, which
+	// is the same thing the default says. Naming it would read as a decision and
+	// make no difference, and accountCallFailed is written so that a kind added
+	// later carries its own answer rather than needing one here.
+	default:
+		return t.accountCallFailed(ctx, who, tool, err)
 	}
-	resp, err := t.ramp.Register(who.outbound(ctx), &rampv1.RegisterRequest{
-		Ver:              rampproto.Ver,
-		RegistrationData: data,
-	})
-	if err != nil {
-		return nil, accountOutput{}, rampError("ramp_register", err)
-	}
-	t.logger(ctx, who).InfoContext(ctx, "identity.mcp.register",
-		"subdomain", who.subdomain, "active", resp.GetActive())
-	return nil, accountOutput{
-		BillingRef: resp.GetBillingRef(),
-		Active:     resp.GetActive(),
-		RequestID:  who.requestID,
-	}, nil
 }
 
-// registrationFor reads the caller's own licensing details and packs them for the
-// Exchange. It sits between the handler and the store so the handler stays a
-// transport concern: read who is calling, delegate, shape the answer.
-func (t *toolset) registrationFor(ctx context.Context, subdomain string) (*structpb.Struct, error) {
-	developer, err := t.developers.BySubdomain(ctx, subdomain)
-	if err != nil {
-		return nil, developerLookupError(subdomain, err)
+// accountCallFailed is the account tools' operator line: failed(), with the one
+// rule this surface adds.
+//
+// Whether the operator hears the message at all is ASKED of the error
+// rather than decided by which arm above happens to call this. exchacct marks a
+// failure whose text can quote the caller's registration data; a marked one is
+// answered to the agent and never written to a log line. Reading the mark here
+// means a kind added later carries its own answer instead of falling through to
+// a log line because this switch does not name it yet.
+//
+// That is the only rule this surface adds. The bound on a peer's own text is not
+// one of them: it applies wherever a peer's words reach an operator line, so it
+// sits on failed() beside logFailure rather than here.
+func (t *toolset) accountCallFailed(ctx context.Context, who caller, tool string, err error) error {
+	if exchacct.Sensitive(err) {
+		return fmt.Errorf("%s: %w", tool, exchacct.CauseOf(err))
 	}
-	return registrationData(developer)
+	return t.failed(ctx, who, tool, err)
 }
 
-// handleStatus reports the caller's account state.
-func (t *toolset) handleStatus(
-	ctx context.Context, req *mcpsdk.CallToolRequest, _ noInput,
-) (*mcpsdk.CallToolResult, accountOutput, error) {
-	who, err := callerFrom(ctx, req)
-	if err != nil {
-		return nil, accountOutput{}, err
-	}
-	resp, err := t.ramp.AccountStatus(who.outbound(ctx),
-		&rampv1.GetAccountStatusRequest{Ver: rampproto.Ver})
-	if err != nil {
-		return nil, accountOutput{}, rampError("ramp_status", err)
-	}
-	t.logger(ctx, who).InfoContext(ctx, "identity.mcp.status",
-		"subdomain", who.subdomain, "active", resp.GetActive())
-	return nil, accountOutput{
-		BillingRef: resp.GetBillingRef(),
-		Active:     resp.GetActive(),
-		RequestID:  who.requestID,
-	}, nil
+// notesUnavailable is what an agent is told when this service's own note store
+// could not answer, and what the operator is told about it.
+//
+// The operator's half is the same identity.mcp.call_failed line every other
+// failure on this surface produces, at the same level and carrying the same op
+// field, so one query covers the whole surface. The cause is written in full:
+// the store is ours, and nothing a third party wrote is in it.
+//
+// The agent's half is this sentence rather than the rendered cause. It names
+// what it can do instead — ask about one Exchange by name, which does not read
+// the note store at all — where the cause would name a database it cannot act
+// on.
+func (t *toolset) notesUnavailable(ctx context.Context, who caller, tool string, err error) error {
+	t.logFailure(ctx, who, tool, err, err.Error())
+	return fmt.Errorf(
+		"%s: could not read where this agent has registered; ask about one Exchange "+
+			"by name to get its own answer instead", tool)
 }
 
-// registrationData packs the developer's licensing details into the
-// operator-defined payload the Exchange stores without inspecting. The field
-// names match what the sign-up form collected, so the Exchange's system of record
-// sees the same vocabulary the developer filled in.
-func registrationData(d account.Developer) (*structpb.Struct, error) {
-	data, err := structpb.NewStruct(map[string]any{
-		"legal_entity":         d.LegalEntity,
-		"address":              d.Address,
-		"jurisdiction_country": d.JurisdictionCountry,
-		"email":                d.Email,
-		"subdomain":            d.Subdomain,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("ramp_register: build registration payload: %w", err)
+// exchangeRefused turns a peer's refusal into what the agent is told. It serves
+// both account tools: the Exchange refuses a registration and an account-status
+// call the same way, through the same transport.
+//
+// It runs the ordinary path first, so the operator gets a call_failed line and
+// the agent gets the typed reason it branches on. Then, if the peer attached a
+// registration failure naming FIELDS, it says which — because an Exchange that
+// refuses on its schema and an adapter that refuses on the same schema are the
+// same problem with the same remedy, and an agent told "invalid registration
+// data" by one and "/vat_id: does not match pattern" by the other would
+// reasonably think they were different.
+//
+// The reason token is kept alongside rather than replaced. It is the part an
+// agent branches on; the field list is the part a human or a retry acts on, and
+// dropping either would make this worse than what it replaces.
+//
+// A test drives this by staging a peer whose refusal carries the detail an
+// enforcing Exchange attaches, rather than by standing up an Exchange: the
+// adapter's own pre-check refuses a non-conforming payload before the call is
+// signed, so in a healthy deployment the remote refusal is the rarer path — it
+// is reached when the agent's cached copy of the schema is older than the one
+// the Exchange now publishes.
+func (t *toolset) exchangeRefused(ctx context.Context, who caller, tool string, err error) error {
+	refusal := t.accountCallFailed(ctx, who, tool, err)
+	fields := detailOf(err).GetRegistrationFailure().GetFieldErrors()
+	if len(fields) == 0 {
+		return refusal
 	}
-	return data, nil
+	return fmt.Errorf("%w — %s", refusal, fieldRefusal(exchacct.ExchangeOf(err), fields))
 }
 
-// developerLookupError maps a store failure to a caller-facing one. A missing
-// account is the interesting case: it means the bearer names a developer we have
-// no record of, which is a real inconsistency rather than a routine "not found",
-// so it is reported as such instead of being passed off as a RAMP-side refusal.
-// Every error a tool returns is prefixed with that tool's name, so an agent
-// reading a failure knows which call produced it without inferring from wording.
-func developerLookupError(subdomain string, err error) error {
-	if errors.Is(err, account.ErrNotFound) {
-		return fmt.Errorf("ramp_register: no developer account for %q — sign up before registering", subdomain)
+// registrationFieldFailure renders the local pre-check's schema refusal.
+func registrationFieldFailure(tool, exchange string, failures []*rampv1.RegistrationFieldError) error {
+	return fmt.Errorf("%s: %s will not accept these fields — %s",
+		tool, exchange, fieldRefusal(exchange, failures))
+}
+
+// fieldRefusal renders what a schema refusal tells the agent: which members are
+// at fault, then where the requirements are published.
+//
+// ONE renderer for two sources, and the remedy sentence is the half that has to
+// be shared. The same refusal arrives from this adapter's pre-check and from the
+// Exchange's own answer, and the agent's remedy is identical either way — read
+// the schema, fix the members, retry. An agent that got the pointer from one
+// source and a bare field list from the other would reasonably read them as two
+// different problems, which is the outcome one renderer exists to prevent.
+//
+// The pointer is dropped when no domain is known rather than rendered as a URL
+// with a hole in it. That case is a caller passing an error this package did not
+// build; a sentence naming https:///.well-known/ramp.json would send the agent
+// somewhere that cannot exist.
+//
+// The scheme is https because that is what an Exchange's manifest is served over
+// in any deployment an agent reaches from outside, and it matches the URL the
+// ramp_register tool description gives.
+func fieldRefusal(exchange string, failures []*rampv1.RegistrationFieldError) string {
+	list := fieldFailureList(failures)
+	if exchange == "" {
+		return list
 	}
-	return fmt.Errorf("ramp_register: read developer account: %w", err)
+	return fmt.Sprintf(
+		"%s. The shape it requires is published at "+
+			"https://%s/.well-known/ramp.json under account_registration.data_schema",
+		list, exchange)
+}
+
+// fieldFailureList renders the members of a refusal, one per entry.
+//
+// Shared by the local pre-check and the Exchange's own refusal through
+// fieldRefusal, which is the whole point: the two are the same problem and must
+// not read as two.
+func fieldFailureList(failures []*rampv1.RegistrationFieldError) string {
+	parts := make([]string, 0, len(failures))
+	for _, f := range failures {
+		if path := f.GetPath(); path != "" {
+			parts = append(parts, path+": "+f.GetError())
+			continue
+		}
+		// An empty path addresses the whole object, which is how a missing
+		// required member is reported. Rendering a bare ": ..." there would read
+		// as a member with no name.
+		parts = append(parts, f.GetError())
+	}
+	return strings.Join(parts, "; ")
 }

@@ -43,13 +43,29 @@ func entryFromProto(tenantID string, e *rampv1.ResourceEntry) (repo.CatalogEntry
 		TermsJSON:      terms,
 		DeliveryMethod: "INSTRUCTIONS",
 		MetadataJSON:   metadata,
+		// Stored in its own column, not in MetadataJSON: marshalResourceMetadata
+		// projects only the extension-metadata fields and excludes the title by
+		// design. An empty pushed title is normalized to nil so the column stays
+		// NULL and Offer.title stays unset, rather than becoming a
+		// present-but-empty field.
+		Title: titleOrNil(e.GetTitle()),
 	}, nil
 }
 
-// namespaceResourceID scopes a resource_id to its owning tenant so the public
-// resource_id (== offer_id) can never collide across tenants: a
-// contributor for one tenant cannot address — and so cannot overwrite — another
-// tenant's row. tenant_id is a t_<uuid> (no ':') so the delimiter is unambiguous.
+// titleOrNil maps a pushed ResourceEntry.title onto the nullable stored title.
+// The proto field is optional, so an absent title already arrives as "", and an
+// explicitly-empty one is treated the same way: neither is a title.
+func titleOrNil(title string) *string {
+	if title == "" {
+		return nil
+	}
+	return &title
+}
+
+// namespaceResourceID scopes a resource_id to its owning tenant so a
+// resource_id can never collide across tenants: a contributor for one tenant
+// cannot address — and so cannot overwrite — another tenant's row. tenant_id is
+// a t_<uuid> (no ':') so the delimiter is unambiguous.
 //
 // The scoping KEY is the caller-supplied content_id when present. When absent,
 // the key falls back to the entry's URI rather than a fresh server UUID: the URI

@@ -10,9 +10,10 @@ import (
 	"net/http"
 	"regexp"
 
-	"github.com/RAMP-Protocol/protocol/sdk/go/connectserver"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/google/uuid"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/httpsig/transportconnect"
 )
 
 // HeaderRequestID is the correlation header every service reads on the way in
@@ -117,14 +118,17 @@ func RequestIDMinted(ctx context.Context) (minted, ok bool) {
 // outermost, so r.Context() already carries the scoped logger; FromContext falls
 // back to slog.Default() if a request ever bypasses the middleware. service
 // names the audit message key ("<service>.httpsig.reject"); the audit outcome
-// token comes from the SDK's own connectserver.ClassifyReject — the gate owns
-// the reject classification, the app derives no copy of it. Broker and Exchange
+// token comes from transportconnect.RejectAuditOutcome, which defers to the
+// SDK's own connectserver.ClassifyReject for the four authentication outcomes —
+// the gate owns that judgement and the app derives no copy of it — and names
+// the one outcome the SDK's enum cannot express, a body past the read cap,
+// rather than letting it default to a signature failure. Broker and Exchange
 // register the same body under their own service token.
 func NewRejectLogger(service string) func(*http.Request, error) {
 	msg := service + ".httpsig.reject"
 	return func(r *http.Request, err error) {
 		FromContext(r.Context()).WarnContext(r.Context(), msg,
-			"path", r.URL.Path, "outcome", connectserver.ClassifyReject(err).String(), "err", err.Error())
+			"path", r.URL.Path, "outcome", transportconnect.RejectAuditOutcome(err), "err", err.Error())
 	}
 }
 

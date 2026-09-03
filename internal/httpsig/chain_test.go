@@ -394,8 +394,8 @@ func TestChain_TooManyHops(t *testing.T) {
 
 // TestChain_HopBudgetRejectedThroughMiddleware exercises the full hop-bound
 // wiring: InterceptorOptions.MaxSignatures → verifyOpts → VerifyMultisigRequest,
-// and the default reject responder (ErrTooManyHops → HTTP 429). The Connect-code
-// and REJECTED_HOP_BUDGET audit-token mapping lives in — and is tested by —
+// and the default reject responder (ErrTooManyHops → HTTP 429). The mapping from
+// that sentinel to a Connect code is tested by
 // internal/httpsig/transportconnect. MaxSignatures:2 mirrors the Exchange wiring
 // (max_intermediary_hops + 1); a 3-signature chain must be rejected BEFORE crypto
 // (so the test-server URL mismatch is irrelevant — the bound fires first).

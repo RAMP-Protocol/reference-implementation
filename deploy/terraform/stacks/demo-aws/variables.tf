@@ -27,22 +27,13 @@ variable "instance_type" {
   nullable    = false
 }
 
-variable "ssh_public_key" {
-  description = "OpenSSH public key installed on the VM for the ubuntu user."
-  type        = string
-  nullable    = false
-}
-
-variable "ssh_ingress_cidr" {
-  description = "CIDR allowed to SSH to the VM — your own address as a /32."
-  type        = string
-  nullable    = false
-}
-
-variable "ssh_private_key_path" {
-  description = "Local path to the private key matching ssh_public_key, e.g. \"~/.ssh/ramp-demo\". Only used to build the ssh_command output (adds -i <path>); the key itself never leaves your machine. Leave null when the key is one your ssh client tries by default (~/.ssh/id_ed25519, ~/.ssh/id_rsa, or ssh-agent)."
-  type        = string
-  default     = null
+variable "ssh_operators" {
+  description = "Operators allowed to SSH in, keyed by name. Each key is installed with an OpenSSH from= restriction limiting it to that operator's own addresses; the security group opens the union. WARNING: editing this map replaces the VM and destroys its data."
+  type = map(object({
+    public_key   = string
+    source_cidrs = set(string)
+  }))
+  nullable = false
 }
 
 # ── DNS (Route 53) ───────────────────────────────────────────────────────────
@@ -168,6 +159,13 @@ variable "billing_adapter" {
   description = "Exchange billing adapter. Demo default is tigerbeetle — per-article accounting on a real ledger."
   type        = string
   default     = "tigerbeetle"
+  nullable    = false
+}
+
+variable "default_agent_credit" {
+  description = "One-time welcome credit granted to each newly registered agent, in WHOLE units of the ledger currency — \"100\" on the default EUR ledger grants EUR 100.00 per agent, not 100 cents. The default \"0\" disables the grant; a freshly deployed stack then starts with an empty ledger and agents are funded by the operator scripts instead. Format and full semantics: the compose-stack module's variable of the same name."
+  type        = string
+  default     = "0"
   nullable    = false
 }
 

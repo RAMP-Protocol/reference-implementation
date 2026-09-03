@@ -136,7 +136,9 @@ func TestExecuteTransaction_PaidPathUnchanged(t *testing.T) {
 // pins that execution actually reached persist — the guard's entry path — rather
 // than an earlier failure that would also leave Release uncalled.
 func TestExecuteTransaction_FreePathReleaseGuard(t *testing.T) {
-	h, rec := newRecordingHarnessWith(t, harnessOptions{txRunner: failTxRunner{}})
+	runner := &failTxRunner{}
+	h, rec := newRecordingHarnessWith(t, harnessOptions{txRunnerWrap: runner.wrap})
+	runner.arm()
 	offer := pushDiscoverTermOffer(t, h, "/articles/free", seedFreeTerm())
 
 	_, err := executeOfferRaw(t, h, offer)

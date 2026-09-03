@@ -31,8 +31,8 @@ import (
 	protobuf "google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	rampproto "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/proto"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampcost"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/transactionkey"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
@@ -44,116 +44,133 @@ import (
 // then execute each item collect-and-continue. Per-item business denials stay
 // in-body; an envelope/internal failure aborts the whole batch.
 //
-// Request-level idempotency replay: a resent idempotency_key returns the ORIGINAL
-// TransactionResponse rather than re-executing (ramp.proto conformance —
-// "a replay returns the original result rather than re-executing"). The check is
-// done DURABLY off the persisted transaction_log rows (replayBatchResponse), so it
-// returns the same original result whether the replay hits this process or another
-// after a restart/failover — no in-memory cache is consulted. The
-// transaction_log.idempotency_key UNIQUE constraint (keyed on the DERIVED per-item
-// key) remains underneath as the last-resort double-charge backstop for a genuine
-// race that slips past the pre-check.
+// Request-level idempotency replay: a resent idempotency_key returns the
+// ORIGINAL TransactionResponse rather than re-executing (ramp.proto
+// conformance), served durably off the request claim's finalized response or
+// the persisted transaction_log rows — see admitBatchRequest for the full
+// outcome table. The transaction_log.idempotency_key UNIQUE constraint (keyed
+// on the DERIVED per-item key) remains underneath as the last-resort
+// double-charge backstop for a race that slips past the admission gate.
 func (s *ExchangeService) executeBatch(
 	ctx context.Context, req *rampv1.TransactionRequest,
 ) (*rampv1.TransactionResponse, error) {
 	if err := s.validateBatchRequest(req); err != nil {
 		return nil, err
 	}
-	agentID, billingRef, err := s.resolveAgentID(ctx, req)
+	// One agent row read, one key snapshot: every signature below — the complete
+	// request proof, the broker-relay per-item checks, and each item's execution-
+	// time authorization — verifies against this one value (see agentKey).
+	agent, err := s.resolveAgent(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	// Idempotent-replay: a resent idempotency_key returns the ORIGINAL response
-	// rather than re-executing (ramp.proto conformance). The lookup is durable —
-	// done directly off the persisted transaction_log rows — so a replay
-	// reconstructs the original result identically regardless of which instance
-	// serves it or whether the original process is still running. There is no
-	// in-memory idempotency cache; the persisted rows are the sole source of truth.
-	//
-	// The stored result carries a signed retrieval URL bound to the ORIGINAL
-	// agent's identity; the derived probe key (idempotency_key:offer_id) is a
-	// client-chosen token, not a bearer secret. replayBatchResponse therefore
-	// serves the stored result ONLY to a caller that proves possession of that
-	// agent key (body offer-acceptance) — a foreign principal presenting the pair
-	// is refused with PermissionDenied, never handed the URL.
-	if resp, replay, err := s.replayBatchResponse(ctx, req, agentID); err != nil {
+	// Request-level admission: prove possession of the requester identity,
+	// apply the broker-relay policy, then claim (agent, idempotency_key) for
+	// THIS item set — all before any side effect — and answer replays. An
+	// exact retry is served the finalized stored response (denials included);
+	// the loser of a concurrent duplicate waits for the winner's response; a
+	// reuse of the key with a different item set is refused; a fresh request
+	// falls through to execution. See admitBatchRequest for the outcome table.
+	adm, err := s.admitBatchRequest(ctx, req, agent)
+	if err != nil {
 		return nil, err
-	} else if replay {
+	}
+	if adm.done {
+		return adm.resp, nil
+	}
+	outcome, err := s.runBatchItems(ctx, req, agent, adm.binding)
+	if err != nil {
+		return nil, err
+	}
+	if outcome.recovered != nil {
+		return outcome.recovered, nil
+	}
+	// The VALIDATED outcome line is emitted once per successful batch
+	// (at least one item persisted) through the request-scoped logger. Replay
+	// state is durable only — the claim's finalized response plus the
+	// transaction_log rows, no in-memory cache — so the same original result
+	// is returned whether the replay hits this process or another (post
+	// restart/failover).
+	if outcome.lastTxID != "" {
+		s.logOutcome(ctx, "execute_transaction", "VALIDATED",
+			Caller{KeyID: agent.id, Kind: CallerAgent, AgentID: agent.id}, nil, agent.id, outcome.lastTxID, nil)
+	}
+	resp, err := buildBatchTxResponse(outcome.results, outcome.sharedThumbprint)
+	if err != nil {
+		return nil, err
+	}
+	// Persist the finalized response (denials included) onto the claim BEFORE
+	// returning — the durable original an exact retry or concurrent-duplicate
+	// loser is served verbatim. Only when this request holds the claim: a
+	// possession-unproven request deliberately stores nothing (its all-denied
+	// result must not become a durable response under someone else's identity).
+	if !adm.claimed {
 		return resp, nil
 	}
+	return s.finalizeBatchResponse(ctx, req, agent.id, resp)
+}
+
+// batchOutcome carries the item loop's results back to executeBatch: the
+// in-order result items, the shared agent thumbprint, the last persisted
+// transaction id (for the outcome log line), and — exclusively — a recovered
+// original response when this request turned out to be the loser of a
+// concurrent duplicate (recovered non-nil means: return it, nothing here ran).
+type batchOutcome struct {
+	results          []*rampv1.TransactionResultItem
+	sharedThumbprint string
+	lastTxID         string
+	recovered        *rampv1.TransactionResponse
+}
+
+// runBatchItems executes each item collect-and-continue: a classified denial
+// becomes that item's in-body result, a per-item UNIQUE loss to a concurrent
+// identical request resolves to the winner's original response (the only
+// source of KindIdempotent past admission), and any other failure aborts the
+// whole batch.
+func (s *ExchangeService) runBatchItems(
+	ctx context.Context, req *rampv1.TransactionRequest, agent resolvedAgent, binding agentBinding,
+) (batchOutcome, error) {
 	// The correlation id + provenance are request-scoped, so they are resolved
 	// ONCE here at the service boundary and carried to persistence as data. No
 	// layer below reaches into the context for a value it writes.
 	correlation := resolveRequestCorrelation(ctx)
-	results := make([]*rampv1.TransactionResultItem, 0, len(req.GetItems()))
-	var sharedThumbprint string
-	var lastTxID string
+	out := batchOutcome{results: make([]*rampv1.TransactionResultItem, 0, len(req.GetItems()))}
 	for _, item := range req.GetItems() {
-		res, thumb, execErr := s.executeBatchItem(ctx, req, item, agentID, billingRef, correlation)
-		if execErr != nil {
-			// A non-denial (envelope-invalid / internal) failure aborts the whole
-			// batch; a classified denial is folded into the in-body result.
-			denied, ok := batchDenialResult(item, execErr)
-			if !ok {
-				return nil, execErr
+		res, thumb, execErr := s.executeBatchItem(ctx, req, item, agent, correlation)
+		if execErr == nil {
+			if out.sharedThumbprint == "" {
+				out.sharedThumbprint = thumb
 			}
-			results = append(results, denied)
+			out.lastTxID = res.GetTransactionId()
+			out.results = append(out.results, res)
 			continue
 		}
-		if sharedThumbprint == "" {
-			sharedThumbprint = thumb
+		if denied, ok := batchDenialResult(item, execErr); ok {
+			out.results = append(out.results, denied)
+			continue
 		}
-		lastTxID = res.GetTransactionId()
-		results = append(results, res)
-	}
-	// The VALIDATED outcome line is emitted once per successful batch
-	// (at least one item persisted) through the request-scoped logger. The durable
-	// transaction_log rows (loaded by replayBatchResponse on a resent key) are the
-	// sole record of a replay — no in-memory LRU is consulted, so the same original
-	// result is returned whether the replay hits this process or another (post
-	// restart/failover).
-	if lastTxID != "" {
-		s.logOutcome(ctx, "execute_transaction", "VALIDATED",
-			Caller{KeyID: agentID, Kind: CallerAgent, AgentID: agentID}, nil, agentID, lastTxID, nil)
-	}
-	return buildBatchTxResponse(results, sharedThumbprint)
-}
-
-// validateBatchRequest checks the batch envelope invariants: the shared
-// idempotency_key + requester, and each item's offer signature + agent
-// acceptance signature. A missing envelope field is KindInvalidRequest and
-// aborts the whole batch (it is malformed, not a per-item business denial).
-func (s *ExchangeService) validateBatchRequest(req *rampv1.TransactionRequest) error {
-	if req.GetIdempotencyKey() == "" {
-		return exchange.Newf(exchange.KindInvalidRequest, "idempotency_key required").WithField("idempotency_key")
-	}
-	if len(req.GetIdempotencyKey()) > maxIdempotencyKeyLen {
-		return exchange.Newf(exchange.KindInvalidRequest,
-			"idempotency_key exceeds %d bytes", maxIdempotencyKeyLen).WithField("idempotency_key")
-	}
-	if req.GetRequester().GetId() == "" {
-		return exchange.Newf(exchange.KindInvalidRequest, "requester.id required")
-	}
-	if len(req.GetRequester().GetDomain()) > maxRequesterDomainLen {
-		return exchange.Newf(exchange.KindInvalidRequest,
-			"requester.domain exceeds %d bytes", maxRequesterDomainLen).WithField("requester.domain")
-	}
-	// At least one item is required: an empty items[] is a malformed envelope, not
-	// an empty-but-valid batch (mirrors the broker C3 guard). Rejecting here
-	// prevents returning an empty TransactionResponse for a body that carried no
-	// work.
-	if len(req.GetItems()) == 0 {
-		return exchange.Newf(exchange.KindInvalidRequest, "at least one item required")
-	}
-	for i, item := range req.GetItems() {
-		if item.GetOffer().GetSignature() == "" {
-			return exchange.Newf(exchange.KindInvalidRequest, "item %d: offer signature required", i)
+		if isIdempotentReplay(execErr) {
+			// The residual concurrent-duplicate race: this request slipped past
+			// the claim gate (the winner had not finalized within the wait
+			// bound), executed, and lost the per-item UNIQUE insert. Its hold was
+			// already settled by releaseDuplicateLossHold. The winner's original
+			// is recoverable from the same three sources a claim loser reads, so
+			// serveLostClaim answers it — and the persisted rows are the likeliest
+			// of the three here, because losing the UNIQUE insert PROVES the
+			// winner committed at least one. served=false with no error leaves
+			// execErr to surface as the safe idempotency refusal, which touches
+			// neither the winner's rows nor its hold.
+			resp, served, rerr := s.serveLostClaim(ctx, req, agent.id, binding)
+			if rerr != nil {
+				return batchOutcome{}, rerr
+			}
+			if served {
+				return batchOutcome{recovered: resp}, nil
+			}
 		}
-		if item.GetAgentAcceptance().GetSignature() == "" {
-			return exchange.Newf(exchange.KindInvalidRequest, "item %d: agent_acceptance signature required", i)
-		}
+		return batchOutcome{}, execErr
 	}
-	return nil
+	return out, nil
 }
 
 // executeBatchItem runs one batch item through the SAME single-offer pipeline
@@ -166,21 +183,30 @@ func (s *ExchangeService) validateBatchRequest(req *rampv1.TransactionRequest) e
 // returns the result item (which itself carries the per-item cost) and the agent
 // thumbprint; on failure the classifying error (denial vs abort decided by the
 // caller).
-func (s *ExchangeService) executeBatchItem(
-	ctx context.Context, req *rampv1.TransactionRequest, item *rampv1.TransactionItem,
-	agentID, billingRef string, correlation requestCorrelation,
-) (*rampv1.TransactionResultItem, string, error) {
-	// Re-project the item onto a per-item synthetic 1-item TransactionRequest that
-	// carries the SHARED envelope (idempotency_key + requester) + THIS item — so
-	// the shared pipeline (resolveOfferForTx / verifyAgentAcceptance read items[0])
-	// runs verbatim and VerifyOfferAcceptance binds the request-level key the agent
-	// signed. Billing + persistence use the DERIVED per-item key.
-	itemReq := &rampv1.TransactionRequest{
+// itemRequest re-projects one batch item onto a synthetic 1-item
+// TransactionRequest carrying the SHARED envelope (idempotency_key +
+// requester), the shape every items[0]-reading pipeline function consumes.
+// Ver is echoed, never stamped: the agent authored and signed this request, so
+// the version on it is the agent's own contract, not ours.
+func itemRequest(req *rampv1.TransactionRequest, item *rampv1.TransactionItem) *rampv1.TransactionRequest {
+	return &rampv1.TransactionRequest{
 		Ver:            req.GetVer(),
 		IdempotencyKey: req.GetIdempotencyKey(),
 		Requester:      req.GetRequester(),
 		Items:          []*rampv1.TransactionItem{item},
 	}
+}
+
+func (s *ExchangeService) executeBatchItem(
+	ctx context.Context, req *rampv1.TransactionRequest, item *rampv1.TransactionItem,
+	agent resolvedAgent, correlation requestCorrelation,
+) (*rampv1.TransactionResultItem, string, error) {
+	// Re-project the item onto a per-item synthetic 1-item TransactionRequest
+	// (itemRequest) so the shared pipeline (resolveOfferForTx /
+	// verifyAgentAcceptance read items[0]) runs verbatim and
+	// VerifyOfferAcceptance binds the request-level key the agent signed.
+	// Billing + persistence use the DERIVED per-item key.
+	itemReq := itemRequest(req, item)
 	resolved, err := s.resolveOfferForTx(itemReq)
 	if err != nil {
 		return nil, "", err
@@ -189,15 +215,15 @@ func (s *ExchangeService) executeBatchItem(
 	if err != nil {
 		return nil, "", exchange.Wrap(exchange.KindInternal, err, "load tenant")
 	}
-	caller, binding, err := s.authorizeExecute(ctx, itemReq, agentID, tenant)
+	caller, binding, err := s.authorizeExecute(ctx, itemReq, agent, tenant)
 	if err != nil {
 		return nil, "", err
 	}
-	// Deny an agent holding an overdue reporting obligation before any funds are
+	// Deny an agent far enough behind on usage reports before any funds are
 	// reserved (v1.1 reporting-overdue gate): after authorization, before billing.
 	// Checked per item because a multi-exchange batch's items can resolve to
 	// different tenants, and the overdue rule is per (tenant, agent).
-	if oerr := s.denyIfReportingOverdue(ctx, caller, &tenant, agentID); oerr != nil {
+	if oerr := s.denyIfReportingOverdue(ctx, caller, &tenant, agent.id); oerr != nil {
 		return nil, "", oerr
 	}
 	// Resolve the effective commission at Authorize, where the tenant (hence its
@@ -218,10 +244,10 @@ func (s *ExchangeService) executeBatchItem(
 	feeRateBps := ResolveFeeRateBps(tenant.FeeRateBps, override)
 	// Derived per-item dedup key: distinct offer_ids ⇒ distinct keys, so neither
 	// the idempotency_key UNIQUE backstop nor the billing dedup collapses the items.
-	derivedKey := req.GetIdempotencyKey() + ":" + item.GetOffer().GetOfferId()
+	derivedKey := transactionkey.DerivedItemKey(req.GetIdempotencyKey(), item.GetOffer().GetOfferId())
 	result, err := s.runBatchItemBilling(ctx, batchItemBilling{
 		tenant: tenant, resolved: resolved, itemReq: itemReq, item: item,
-		agentID: agentID, billingRef: billingRef, binding: binding, derivedKey: derivedKey,
+		agentID: agent.id, billingRef: agent.billingRef, binding: binding, derivedKey: derivedKey,
 		resourceOwnerID: resolved.entry.ResourceOwnerID, feeRateBps: feeRateBps,
 		correlation: correlation,
 	})
@@ -269,7 +295,7 @@ func (s *ExchangeService) runBatchItemBilling(
 	// Free-resource path (ADR-009 D2): a zero unit_cost bypasses the billing
 	// adapter entirely — no Authorize, no Record, no Release. PricingDoc.IsFree is
 	// the single unit_cost==0 predicate; it drives the Authorize gate here, the
-	// Record gate below, AND the obligation's required_fields (buildPersistIntent
+	// Record gate below, AND the obligation's required_fields (requiredFieldsFor
 	// drops the unsatisfiable billing_id requirement), so the free/paid decision can
 	// never disagree across those sites. auth stays zero-valued on the free path, so
 	// billing_id persists NULL (ADR-009 D5) and the wire field is omitted
@@ -298,14 +324,21 @@ func (s *ExchangeService) runBatchItemBilling(
 	// Mint the transaction_id and build the result item BEFORE the INSERT so the
 	// serialized item lands on the same row in the same transaction.
 	txID := uuid.NewString()
-	result := buildBatchResultItem(in.item, in.resolved.entry, txID, auth.BillingID, signed, in.resolved.pricing)
+	// Derived once, before the result is built, because the result is serialized
+	// into transaction_log.result_payload on the same INSERT that writes the
+	// obligation row — both have to be decided before either is written.
+	plan := s.planObligation(in.tenant, in.resolved.pricing)
+	result := buildBatchResultItem(batchResultItem{
+		item: in.item, transactionID: txID, billingID: auth.BillingID,
+		signed: signed, pricing: in.resolved.pricing, plan: plan,
+	})
 	payload, err := protobuf.Marshal(result)
 	if err != nil {
 		s.releaseHold(ctx, auth.BillingID, in.derivedKey, "marshal result failed")
 		return nil, exchange.Wrap(exchange.KindInternal, err, "marshal transaction result")
 	}
 	rec, err := s.persistTransaction(ctx, persistInput{
-		tenant: in.tenant, entry: in.resolved.entry, pricing: in.resolved.pricing,
+		tenant: in.tenant, entry: in.resolved.entry, pricing: in.resolved.pricing, plan: plan,
 		req: in.itemReq, item: in.item, agentID: in.agentID, auth: auth, signed: signed,
 		agentHash: in.binding.digest, agentPublicKey: in.binding.pub,
 		agentDiscoveryURL: in.binding.discoveryURL, idempotencyKey: in.derivedKey,
@@ -315,7 +348,15 @@ func (s *ExchangeService) runBatchItemBilling(
 		transactionID:            txID, resultPayload: payload,
 	})
 	if err != nil {
-		s.releaseHold(ctx, auth.BillingID, in.derivedKey, "persist failed")
+		// A duplicate-key loss means a concurrent identical request already
+		// committed this item; the hold is then shared or ours alone depending
+		// on whether the winner had settled when we authorized — see
+		// releaseDuplicateLossHold. Every other persist failure still releases.
+		if isIdempotentReplay(err) {
+			s.releaseDuplicateLossHold(ctx, auth.BillingID, in.derivedKey)
+		} else {
+			s.releaseHold(ctx, auth.BillingID, in.derivedKey, "persist failed")
+		}
 		return nil, err
 	}
 	// Record settles the hold best-effort, AFTER the WAL commit and outside any shared
@@ -335,17 +376,14 @@ func (s *ExchangeService) runBatchItemBilling(
 	return result, nil
 }
 
-// buildBatchResultItem assembles one successful TransactionResultItem mirroring
-// buildTxResponse: it carries the item's offer_id, transaction/billing ids, the
-// per-item cost, the signed retrieval endpoint + its expiry, and the per-item
-// reporting obligation. Built BEFORE persist over the pre-minted transaction_id
-// and billing_id so the item can be serialized onto its own transaction_log row.
+// buildBatchResultItem assembles one successful TransactionResultItem: the
+// item's offer_id, transaction/billing ids, the per-item cost, the signed
+// retrieval endpoint + its expiry, and the reporting obligation the agent owes
+// for it. Built BEFORE persist over the pre-minted transaction_id and billing_id
+// so the item can be serialized onto its own transaction_log row.
 // Money is rendered in EXACT decimal then the canonical wire string, never float.
-func buildBatchResultItem(
-	item *rampv1.TransactionItem, entry repo.CatalogEntry, transactionID, billingID string,
-	signed helpers.SignedURL, pricing PricingDoc,
-) *rampv1.TransactionResultItem {
-	title := entry.ResourceID
+func buildBatchResultItem(in batchResultItem) *rampv1.TransactionResultItem {
+	item, pricing, signed := in.item, in.pricing, in.signed
 	endpoint := signed.URL
 	qty := decimal.NewFromInt32(maxInt32(pricing.EstQty, 1))
 	amountStr, aErr := helpers.FormatMoney(pricing.UnitCost.Mul(qty))
@@ -355,19 +393,41 @@ func buildBatchResultItem(
 		cost = &rampv1.Cost{Amount: amountStr, Currency: pricing.Currency, UnitCost: &ucStr}
 	}
 	return &rampv1.TransactionResultItem{
-		OfferId:           item.GetOffer().GetOfferId(),
-		TransactionId:     transactionID,
-		BillingId:         billingID,
-		ResourceTitle:     &title,
+		OfferId:       item.GetOffer().GetOfferId(),
+		TransactionId: in.transactionID,
+		BillingId:     in.billingID,
+		// Echoed from the offer the agent accepted, which the protocol defines as
+		// the source for this field, and never re-read from the catalog: a title
+		// edited between discovery and execution must not change what the agent
+		// was told it was buying. Trusting it is sound because resolveOfferForTx
+		// calls verifyPresentedOffer BEFORE any field is used, and title is inside
+		// the signed payload (CanonicalOfferBytes clears only the two signature
+		// fields). This is the same rule the pricing above already follows. A nil
+		// title stays nil — an offer without one yields a result without one,
+		// with no resource id or URI standing in.
+		ResourceTitle:     item.GetOffer().Title,
 		Cost:              cost,
 		ExpiresAt:         timestamppb.New(signed.Expiry),
 		RetrievalEndpoint: &endpoint,
 		DeliveryMethod:    rampv1.DeliveryMethod_DELIVERY_METHOD_INSTRUCTIONS,
-		ReportingObligation: &rampv1.ReportingObligation{
-			Required: true,
-			Endpoint: strPtr("/ramp.v1.ExchangeService/ReportUsage"),
-		},
+		// Projected from the SAME plan persistTransaction writes the obligation
+		// row from, so the window and field list the agent is handed are the ones
+		// its report will actually be held to.
+		ReportingObligation: in.plan.buildReportingObligation(),
 	}
+}
+
+// batchResultItem names what buildBatchResultItem consumes so the call stays
+// under the per-function argument cap, mirroring batchItemBilling above.
+type batchResultItem struct {
+	item *rampv1.TransactionItem
+	// transactionID and billingID are pre-minted: the result is built BEFORE the
+	// INSERT so it can be serialized onto the same row.
+	transactionID string
+	billingID     string
+	signed        helpers.SignedURL
+	pricing       PricingDoc
+	plan          obligationPlan
 }
 
 // buildBatchTxResponse assembles the wire TransactionResponse for a batch:
@@ -386,7 +446,7 @@ func buildBatchTxResponse(
 		return nil, exchange.Wrap(exchange.KindInternal, err, "aggregate batch total_cost")
 	}
 	return &rampv1.TransactionResponse{
-		Ver:               rampproto.Ver,
+		Ver:               helpers.ProtocolVersion,
 		Items:             items,
 		AgentIdentityHash: agentThumbprint,
 		TotalCost:         total,

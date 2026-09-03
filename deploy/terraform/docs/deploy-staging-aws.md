@@ -35,18 +35,60 @@ environment variables, if you prefer.
     file and in Terraform state, so keep its blast radius small.
     Goes into: `cloudflare_api_token` in `secrets.auto.tfvars` —
     never in `terraform.tfvars`.
-- **SSH and your address**
-  - A keypair (`ssh-keygen -t ed25519` if you have none). The public key 
-    (whole key, including the `ssh-ed25519 ...` part)
-    goes into: `ssh_public_key`. Terraform installs it on the VM for the
-    `ubuntu` user; the matching private key stays on your machine and is
-    what lets you in. If that private key is NOT one your ssh client tries
-    by default (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, or a key loaded in
-    ssh-agent), also set `ssh_private_key_path` — the `ssh_command` output
-    then includes `-i <path>` so the command works as printed. Without it
-    you would see `Permission denied (publickey)`.
-  - Your public IP (`curl ifconfig.me`). Goes into: `ssh_ingress_cidr`
-    as `<ip>/32` — SSH is open to that address only.
+- **SSH: one entry per operator**
+  - A keypair per operator (`ssh-keygen -t ed25519` if you have none), and
+    each operator's own public addresses (`curl ifconfig.me`). Both go into
+    `ssh_operators`, keyed by operator name:
+
+    ```hcl
+    ssh_operators = {
+      alice = {
+        public_key   = "ssh-ed25519 AAAA... alice@laptop"
+        source_cidrs = ["203.0.113.7/32"]
+      }
+      bob = {
+        public_key   = "ssh-ed25519 AAAA... bob@laptop"
+        source_cidrs = ["198.51.100.24/32", "198.51.100.25/32"]
+      }
+    }
+    ```
+
+  - **Two SSH settings, and they take opposite kinds of value.** Read this
+    once and the rest follows:
+    - `public_key` is the one-line CONTENTS of the operator's `.pub` file,
+      not a path to it. Read it with `cat ~/.ssh/id_ed25519.pub` and paste
+      the whole line, including the `ssh-ed25519 ` prefix and the trailing
+      comment. Terraform variable-definition files cannot call functions, so
+      `file("~/.ssh/id_ed25519.pub")` does not work in `terraform.tfvars`.
+    - `RAMP_SSH_IDENTITY_FILE` is a PATH, to the matching PRIVATE key, and it
+      is an environment variable rather than a Terraform input. It MUST resolve
+      to an absolute path. `~` is NOT expanded inside a quoted assignment, so
+      write `$HOME` or the full path instead:
+
+      ```bash
+      export RAMP_SSH_IDENTITY_FILE="$HOME/.ssh/id_ed25519"   # NOT "~/.ssh/id_ed25519"
+      ```
+
+      Set it when the private key is not one your ssh client would try by
+      default. The operator scripts then add `-o IdentitiesOnly=yes -i <path>`
+      themselves. Terraform never sees it, which is what lets several people
+      share one state.
+  - Addresses are single hosts written as `/32`. Each key is installed with
+    an OpenSSH `from=` option carrying only that operator's own addresses, so
+    one operator's key cannot be used from another operator's address. The
+    security group opens the union; `from=` restricts each key inside it.
+    Both mechanisms are required, and neither substitutes for the other.
+  - **Editing `ssh_operators` replaces the VM and destroys its data.** The map
+    is part of the instance's user data, so adding, removing, or re-keying an
+    operator recreates the instance. The Elastic IP survives, so DNS does not
+    have to follow; everything on the root volume does not.
+  - **Everyone logs in as `ubuntu`. Per-operator keys are not per-operator
+    accounts.** Each key can be revoked on its own and each authentication is
+    attributable to a key, but once the session is open every operator is the
+    same Unix user, and shell history cannot be attributed to a person. If
+    per-person shell accountability is needed, the answer is a Unix account
+    per operator or Systems Manager session logging — this does not provide
+    it.
 - **Container registry**
   - A registry the VM can pull from — GitLab Container Registry by
     default. Goes into: `image_prefix` (your `<group>/<project>` path)
@@ -219,7 +261,11 @@ over SSH; the `docker compose` commands run inside that SSH session, on the VM:
 # After a VM recreate, drop the old host key first — the new VM has a new
 # identity, so ssh refuses with "REMOTE HOST IDENTIFICATION HAS CHANGED":
 ssh-keygen -R "$(terraform output -raw vm_public_ip)"
-$(terraform output -raw ssh_command)     # ssh [-i <key>] ubuntu@<vm ip>
+$(terraform output -raw ssh_command)     # ssh ubuntu@<vm ip>
+
+# The output selects no key. If yours is not one ssh tries by default, add it:
+ssh -o IdentitiesOnly=yes -i "${RAMP_SSH_IDENTITY_FILE}" \
+    "ubuntu@$(terraform output -raw vm_public_ip)"
 
 # now on the VM:
 sudo docker compose -f /opt/ramp/docker-compose.yml ps
@@ -227,10 +273,19 @@ sudo docker compose -f /opt/ramp/docker-compose.yml logs -f exchange
 ```
 
 `Permission denied (publickey)` here means your ssh client did not offer the
-private key matching `ssh_public_key` — set `ssh_private_key_path` in
-`terraform.tfvars` (see the prerequisites) and re-run
-`terraform output -raw ssh_command`; the printed command then carries the
-right `-i` flag.
+private key matching your entry in `ssh_operators` — export
+`RAMP_SSH_IDENTITY_FILE` as an absolute path to that private key (see the
+prerequisites), or pass `-i` yourself.
+
+`Too many authentication failures` means your ssh agent offered several keys
+and the server refused each one before reaching yours. Add
+`-o IdentitiesOnly=yes` alongside `-i`; the operator scripts already do this
+when `RAMP_SSH_IDENTITY_FILE` is set.
+
+Connecting from an address that is not in your own `source_cidrs` fails the
+same way, even when another operator's address is open — that is the `from=`
+restriction doing its job. Add the address to your entry and re-apply, keeping
+in mind that this replaces the VM.
 
 ## Step 5 — bootstrap identity
 
@@ -261,11 +316,15 @@ The login policy this step provisions allows self-registration: the sign-in
 page has a "register" option, so a new developer can create an account
 without an operator creating it first. Finishing that registration depends
 on email, though — Zitadel sends a confirmation code to the new address and
-does not treat the account as usable until the code is entered. **The stack
+does not treat the account as usable until the code is entered. **This stack
 does not configure any SMTP server**, so out of the box that code is never
 delivered and a self-registered user gets stuck waiting for it.
 
-Three ways to handle this:
+The demo stack does configure one, through Amazon SES. That work is
+deliberately demo-only: it depends on Terraform publishing DKIM records into
+the same Route 53 zone the stack already manages, and this environment's DNS
+is hosted elsewhere. Giving this stack its own sending identity is separate
+work. Until then, three ways to handle it:
 
 - **Use Google sign-in instead** (next section). A user created through
   Google arrives with the email already marked verified — Google vouches

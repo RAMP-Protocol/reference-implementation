@@ -3,6 +3,7 @@
 package transport_test
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"testing"
 	"time"
@@ -25,8 +26,9 @@ import (
 //
 //   - enforces the offer's signed expires_at against the service clock
 //     (DENIAL_REASON_OFFER_EXPIRED);
-//   - binds delivery/pricing to the SIGNED offer.offer_id, rejecting a genuine
-//     offer for resource A presented against resource B (HIGH offer_id binding);
+//   - binds delivery/pricing to the catalog row the SIGNED Identity.canonical_url
+//     names (offer_id is an opaque per-offer UUID and carries no resource
+//     semantics — see execute_canonical_binding_integration_test.go);
 //   - charges the SIGNED offer.pricing, not a recompute from the live catalog
 //     (MEDIUM1 — agent pays what it signed; catalog drift is the publisher's
 //     problem).
@@ -48,68 +50,22 @@ import (
 func seedResourceWithRate(t *testing.T, h *testHarness, path, rate string) string {
 	t.Helper()
 	unit := "accesses"
-	if _, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.tenantDomain,
-			Path:   path,
-			Terms: []*rampv1.LicenseTerm{{
-				Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
-				Pricing: &rampv1.Pricing{
-					Model:    rampv1.PricingModel_PRICING_MODEL_PER_UNIT,
-					Rate:     rate,
-					Currency: "USD",
-					Unit:     &unit,
-				},
-			}},
+	if _, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{{
+		Domain: h.tenantDomain,
+		Path:   path,
+		Terms: []*rampv1.LicenseTerm{{
+			Semantics: rampv1.TermSemantics_TERM_SEMANTICS_ENUMERATED,
+			Pricing: &rampv1.Pricing{
+				Model:    rampv1.PricingModel_PRICING_MODEL_PER_UNIT,
+				Rate:     rate,
+				Currency: "USD",
+				Unit:     &unit,
+			},
 		}},
-	})); err != nil {
+	}}))); err != nil {
 		t.Fatalf("push %s @ %s: %v", path, rate, err)
 	}
 	return "https://" + h.tenantDomain + path
-}
-
-// discoverOfferForURI runs DiscoverResources for a single URI and returns the
-// first signed offer. Distinct from discoverFirst, which is hard-wired to the
-// /articles/hello fixture URI.
-func discoverOfferForURI(t *testing.T, h *testHarness, uri string) *rampv1.Offer {
-	t.Helper()
-	resp, err := h.exchangeClient.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver:  "1.0",
-		Uris: []string{uri},
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
-	if err != nil {
-		t.Fatalf("discover %s: %v", uri, err)
-	}
-	offers := resp.Msg.GetOffers()
-	if len(offers) == 0 {
-		t.Fatalf("no offers for %s", uri)
-	}
-	return offers[0]
-}
-
-// executePresented runs ExecuteTransaction with the presented offer carried as a
-// single items[] entry (the items-only contract after the collapse). It
-// returns the raw response/error so a negative leg can assert on the
-// rejection (connect-error aborts) or the in-body per-item denial. txID is the
-// shared request idempotency key; the per-item persistence/billing key is the
-// DERIVED key idempotency_key:offer_id (read via derivedTxKey).
-//
-// topLevelOfferID is retained for call-site signal of the binding cases but the
-// items[] shape has no top-level offer_id; the signed offer_id inside the
-// presented offer is the sole authority. A presented offer whose signed
-// offer_id differs from topLevelOfferID is the A↔B binding case and is exercised
-// by presenting a clone whose signed offer_id is A directly.
-func executePresented(
-	t *testing.T, h *testHarness, txID, topLevelOfferID string, presented *rampv1.Offer,
-) (*connect.Response[rampv1.TransactionResponse], error) {
-	t.Helper()
-	_ = topLevelOfferID
-	return executeSingleItem(t, h, txID, presented)
 }
 
 // executeSingleItem drives ExecuteTransaction with a single items[] entry: the
@@ -133,17 +89,17 @@ func executeSingleItemWithRequestID(
 	t *testing.T, h *testHarness, txID string, presented *rampv1.Offer, requestID string,
 ) (*connect.Response[rampv1.TransactionResponse], error) {
 	t.Helper()
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
-	req := connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+	requester := newRequester("agent-test", "agent.example")
+	txReq := &rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: txID,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{
 			{Offer: presented, AgentAcceptance: signAcceptanceFor(t, h.callerPriv, presented, requester, txID)},
 		},
-	})
+	}
+	txReq.AgentRequestAcceptance = signRequestAcceptanceFor(t, h.callerPriv, txReq)
+	req := connect.NewRequest(txReq)
 	if requestID != "" {
 		req.Header().Set(helpers.RequestIDHeader, requestID)
 	}
@@ -158,12 +114,25 @@ func executeItems(
 	t *testing.T, h *testHarness, reqKey string, items ...*rampv1.TransactionItem,
 ) (*connect.Response[rampv1.TransactionResponse], error) {
 	t.Helper()
-	return h.exchangeClient.ExecuteTransaction(h.ctx, connect.NewRequest(&rampv1.TransactionRequest{
-		Ver:            "1.0",
+	req := &rampv1.TransactionRequest{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: reqKey,
 		Requester:      agentRequester("agent-test"),
 		Items:          items,
-	}))
+	}
+	req.AgentRequestAcceptance = signRequestAcceptanceFor(t, h.callerPriv, req)
+	return h.exchangeClient.ExecuteTransaction(h.ctx, connect.NewRequest(req))
+}
+
+func signRequestAcceptanceFor(
+	t *testing.T, priv ed25519.PrivateKey, req *rampv1.TransactionRequest,
+) *rampv1.AgentRequestAcceptance {
+	t.Helper()
+	acceptance, err := helpers.SignRequestAcceptance(priv, req)
+	if err != nil {
+		t.Fatalf("SignRequestAcceptance: %v", err)
+	}
+	return acceptance
 }
 
 // derivedTxKey is the per-item persistence/billing key the batch path writes
@@ -253,10 +222,10 @@ func assertBalanceUnchanged(t *testing.T, h *testHarness) {
 func TestExecuteTransaction_PresentedOfferAccepted(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/accept", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const txID = "tx-presented-accept"
-	resp, err := executePresented(t, h, txID, offer.GetOfferId(), offer)
+	resp, err := executeSingleItem(t, h, txID, offer)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -278,15 +247,13 @@ func TestExecuteTransaction_PresentedOfferAccepted(t *testing.T) {
 // TestExecuteTransaction_TamperedOfferPriceRejected pins the presented-bytes
 // invariant: a genuinely discovered offer whose signed Pricing.Rate is mutated
 // AFTER discovery (a different price than the Exchange signed) must be rejected
-// — the signature no longer covers the presented bytes. Today the service
-// reconstructs the offer from the catalog and verifies the presented signature
-// against THAT, so a tampered offer.Pricing.Rate is never inspected and the
-// transaction WRONGLY succeeds; this test fails RED until verification moves to
-// the presented bytes (helpers.VerifyPresentedOffer).
+// — the signature no longer covers the presented bytes. Verification runs over
+// the PRESENTED offer bytes (helpers.VerifyPresentedOffer), so the mutated rate
+// breaks the signature and the item is denied.
 func TestExecuteTransaction_TamperedOfferPriceRejected(t *testing.T) {
 	h := newTestHarness(t)
 	uri := seedResourceWithRate(t, h, "/articles/tamper", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	tampered, ok := proto.Clone(offer).(*rampv1.Offer)
 	if !ok {
@@ -297,7 +264,7 @@ func TestExecuteTransaction_TamperedOfferPriceRejected(t *testing.T) {
 	tampered.GetPricing().Rate = "0.01"
 
 	const txID = "tx-tampered-price"
-	resp, err := executePresented(t, h, txID, tampered.GetOfferId(), tampered)
+	resp, err := executeSingleItem(t, h, txID, tampered)
 	// After the C4 items-only collapse, a SIGNATURE_INVALID denial (a denial-map
 	// kind) surfaces in-body as the item's denial_reason on an HTTP-200 batch, not
 	// as a connect error (Flag #1 resolution). Strength is preserved: rejection +
@@ -319,70 +286,19 @@ func TestExecuteTransaction_ExpiredOfferRejected(t *testing.T) {
 	det := clock.NewDeterministic(time.Now().UTC())
 	h := newTestHarnessWithClock(t, det)
 	uri := seedResourceWithRate(t, h, "/articles/expire", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	// Default OfferTTL is 5m (ExchangeConfig.withDefaults); jump well past it so
 	// the signed expires_at is strictly in the past relative to the service clock.
 	det.Advance(10 * time.Minute)
 
 	const txID = "tx-expired-offer"
-	resp, err := executePresented(t, h, txID, offer.GetOfferId(), offer)
+	resp, err := executeSingleItem(t, h, txID, offer)
 	// OFFER_EXPIRED is a denial-map kind → in-body per-item denial after the C4
 	// collapse (Flag #1). LOW1: the reason stays distinct from SIGNATURE_INVALID.
 	assertItemDenied(t, resp, err, rampv1.DenialReason_DENIAL_REASON_OFFER_EXPIRED)
 	assertNoTransaction(t, h, derivedTxKey(txID, offer))
 	assertBalanceUnchanged(t, h)
-}
-
-// TestExecuteTransaction_SignedOfferIdKeysCatalog pins the HIGH offer_id-binding
-// invariant as it survives the C4 items-only collapse: the catalog binding +
-// pricing key on the SIGNED offer.offer_id, so a genuine offer for resource A
-// can ONLY ever redeem against A — never against another resource. The
-// items[] contract carries NO top-level offer_id (TransactionItem has only
-// offer + agent_acceptance), so the original "claim B at the top level"
-// cross-resource attack is no longer EXPRESSIBLE on the wire; the equality
-// guard in resolveOfferForTx becomes inert because the top-level offer_id is
-// structurally absent. The substance the guard protected — the signed offer_id
-// is the sole authority — is now enforced purely by keying the catalog lookup on
-// it, which this test pins directly: presenting A's genuine offer transacts
-// against A (charged at A's signed price) and leaves B untouched.
-//
-// A and B share the SAME signed price/terms shape (differing only in
-// URI/resource_id) so the assertion proves binding-by-offer_id, not a price
-// divergence accident.
-func TestExecuteTransaction_SignedOfferIdKeysCatalog(t *testing.T) {
-	h := newTestHarness(t)
-	uriA := seedResourceWithRate(t, h, "/articles/cheap-a", "0.05")
-	_ = seedResourceWithRate(t, h, "/articles/expensive-b", "0.05")
-
-	offerA := discoverOfferForURI(t, h, uriA)
-	offerB := discoverOfferForURI(t, h, "https://"+h.tenantDomain+"/articles/expensive-b")
-	if offerA.GetOfferId() == offerB.GetOfferId() {
-		t.Fatal("A and B must resolve to distinct offer_ids for the binding test")
-	}
-
-	// Present A's genuine signed offer unchanged (signed offer_id == A).
-	presented, ok := proto.Clone(offerA).(*rampv1.Offer)
-	if !ok {
-		t.Fatal("clone offer A")
-	}
-	const txID = "tx-binding-signed-a"
-	resp, err := executeSingleItem(t, h, txID, presented)
-	if err != nil {
-		t.Fatalf("genuine offer for A must redeem against A: %v", err)
-	}
-	// The transaction bound to A: its persisted row lives under A's derived key,
-	// and the returned item's offer_id is A.
-	if got := singleResultItem(t, resp).GetOfferId(); got != offerA.GetOfferId() {
-		t.Errorf("result offer_id = %q, want A %q (signed offer_id keys the binding)", got, offerA.GetOfferId())
-	}
-	if _, err := repo.NewTransactionRepo(h.queries).ByIdempotencyKey(h.ctx, derivedTxKey(txID, offerA)); err != nil {
-		t.Fatalf("ByIdempotencyKey(derived A) after redeeming A's offer: %v", err)
-	}
-	// Nothing was ever persisted under B's derived key — A's offer cannot reach B.
-	if _, err := repo.NewTransactionRepo(h.queries).ByIdempotencyKey(h.ctx, derivedTxKey(txID, offerB)); !errors.Is(err, repo.ErrTransactionNotFound) {
-		t.Fatalf("a transaction was persisted touching resource B after redeeming A's offer: %v", err)
-	}
 }
 
 // TestExecuteTransaction_SignedPriceHonoredOnCatalogDrift pins the user pricing
@@ -402,7 +318,7 @@ func TestExecuteTransaction_SignedPriceHonoredOnCatalogDrift(t *testing.T) {
 	h := newTestHarness(t)
 	const path = "/articles/drift"
 	uri := seedResourceWithRate(t, h, path, "0.05") // price X
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 	if got := offer.GetPricing().GetRate(); got != "0.05" {
 		t.Fatalf("discovered offer rate = %q, want signed X 0.05", got)
 	}
@@ -412,7 +328,7 @@ func TestExecuteTransaction_SignedPriceHonoredOnCatalogDrift(t *testing.T) {
 	_ = seedResourceWithRate(t, h, path, "0.50") // re-push same resource at price Y
 
 	const txID = "tx-signed-price"
-	resp, err := executePresented(t, h, txID, offer.GetOfferId(), offer)
+	resp, err := executeSingleItem(t, h, txID, offer)
 	if err != nil {
 		t.Fatalf("execute signed offer after catalog drift: %v", err)
 	}

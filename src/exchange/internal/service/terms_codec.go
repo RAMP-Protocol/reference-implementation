@@ -9,8 +9,10 @@ import (
 )
 
 // marshalTerms serializes the repeated LicenseTerm into the JSONB array stored
-// in catalog.terms. Terms are normalized (licenseterm.Normalize) and validated
-// by the handler before this runs, so the persisted document is canonical. Each
+// in catalog.terms. Terms are canonicalized in place (the SDK's
+// helpers.NormalizeResourceEntry) and have passed the SDK's ingest-tier checks
+// (helpers.ValidateLicenseTerm) in the service before this runs, so the
+// persisted document is canonical. Each
 // element is rendered with protojson snake_case so it round-trips back into a
 // rampv1.LicenseTerm via unmarshalTerms without surprise.
 func marshalTerms(terms []*rampv1.LicenseTerm) ([]byte, error) {

@@ -20,7 +20,7 @@ import (
 
 // SoR active-flag gate on the paid path: a registered account the
 // operator switched off in the system of record is denied in-body with
-// DENIAL_REASON_BILLING_REF_INACTIVE before any money is reserved; free content
+// DENIAL_REASON_ACCOUNT_INACTIVE before any money is reserved; free content
 // never consults the flag; the flag is read through the production 30-second
 // cache, so an operator's change converges within one lifetime and the SoR is
 // asked at most once per lifetime per account. SoR read errors on the hot path
@@ -83,7 +83,7 @@ func (c *sorControl) setActive(t *testing.T, billingRef string, active bool) {
 
 // assertPaidItemDeniedNoSideEffects drives one paid item and asserts the full
 // deny-before-Authorize post-condition shared by every billing-ref denial case:
-// the item is denied in-body with DENIAL_REASON_BILLING_REF_INACTIVE and
+// the item is denied in-body with DENIAL_REASON_ACCOUNT_INACTIVE and
 // NOTHING happened on the side — no transaction_log row (same tier-2 repo read
 // the sibling negative tests use — no public transaction-read RPC yet), no
 // balance movement, and no billing hold.
@@ -93,7 +93,7 @@ func assertPaidItemDeniedNoSideEffects(
 ) {
 	t.Helper()
 	resp, err := executeSingleItem(t, h, idem, offer)
-	assertItemDenied(t, resp, err, rampv1.DenialReason_DENIAL_REASON_BILLING_REF_INACTIVE)
+	assertItemDenied(t, resp, err, rampv1.DenialReason_DENIAL_REASON_ACCOUNT_INACTIVE)
 	assertNoTransaction(t, h, derivedTxKey(idem, offer))
 	assertBalanceUnchanged(t, h)
 	assertNoBillingHold(t, rec, caseLabel)
@@ -112,7 +112,7 @@ func assertItemSucceeded(t *testing.T, resp *connect.Response[rampv1.Transaction
 
 // TestExecuteTransaction_DeactivatedAccountPaidDenied drives a PAID transaction
 // from a registered account the operator switched off. The item is denied
-// in-body with DENIAL_REASON_BILLING_REF_INACTIVE, no transaction row is
+// in-body with DENIAL_REASON_ACCOUNT_INACTIVE, no transaction row is
 // persisted, the balance is untouched, and Authorize is never reached — the
 // gate runs before any money is reserved. The harness wires the SoR without
 // the cache, so the operator's change is visible immediately.
@@ -198,7 +198,7 @@ func TestExecuteTransaction_ActiveFlagCacheLifecycle(t *testing.T) {
 	det.Advance(sor.DefaultCacheTTL + time.Second)
 	const deniedKey = "tx-deactivated-cached"
 	resp, err := executeSingleItem(t, h, deniedKey, offer)
-	assertItemDenied(t, resp, err, rampv1.DenialReason_DENIAL_REASON_BILLING_REF_INACTIVE)
+	assertItemDenied(t, resp, err, rampv1.DenialReason_DENIAL_REASON_ACCOUNT_INACTIVE)
 	assertNoTransaction(t, h, derivedTxKey(deniedKey, offer))
 
 	// The operator switches it back on: one more lifetime later, paid

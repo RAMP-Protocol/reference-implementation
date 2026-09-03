@@ -5,10 +5,10 @@ import (
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/licenseterm"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 )
@@ -71,17 +71,17 @@ func (s *ExchangeService) groupFor(
 }
 
 // buildOffer constructs and signs the Offer for a catalog entry. When requester
-// is non-nil the persisted terms are first filtered through licenseterm.Select
+// is non-nil the persisted terms are first filtered through selectTerms
 // so the offer carries only the terms this requester is entitled to — the
 // requester-eligibility FILTERING layered on top of the resource→offer terms
-// projection (Select is the single source of term-eligibility; this is its only
-// caller on the discovery path). The signature is computed AFTER filtering so it
-// covers exactly the projected subset.
+// projection (selectTerms is the single source of term-eligibility; this is its
+// only caller on the discovery path). The signature is computed AFTER filtering
+// so it covers exactly the projected subset.
 //
-// A nil requester skips Select and projects all stored terms unchanged. The
-// execute path no longer reconstructs offers for verification (it verifies the
-// PRESENTED signed offer via helpers.VerifyPresentedOffer); buildOffer is the
-// discovery-time producer only.
+// A nil requester skips selectTerms and projects all stored terms unchanged
+// (defensive only — DiscoverResources validates the requester upstream). The
+// execute path verifies the PRESENTED signed offer via
+// helpers.VerifyPresentedOffer; buildOffer is the discovery-time producer only.
 //
 // Returns (nil, nil) — no error — when the requester is entitled to no priced
 // term: the entry's terms all filtered out (or it carries none), so there is no
@@ -117,7 +117,13 @@ func (s *ExchangeService) buildOffer(
 	}
 	expires := s.clk.Now().Add(s.cfg.OfferTTL)
 	offer := &rampv1.Offer{
-		OfferId: entry.ResourceID,
+		// A fresh random UUID v4 per issued offer: offer_id is an opaque unique
+		// identifier, decoupled from resource identity. The execute path binds
+		// the offer to its catalog entry via the signed Identity.canonical_url,
+		// so nothing derives the resource from this value; what it DOES key is
+		// per-item batch correlation, the derived replay key
+		// (idempotency_key + offer_id), and the audit rows' offer identity.
+		OfferId: uuid.NewString(),
 		// Canonical domain of the Exchange that issued this offer. Set BEFORE
 		// SignOffer so it falls inside the signed offer payload
 		// (helpers.canonicalOfferPayload marshals the whole Offer minus
@@ -126,6 +132,13 @@ func (s *ExchangeService) buildOffer(
 		// derivable from the signed offer itself, retiring the
 		// X-RAMP-Exchange-Endpoint transport header.
 		Exchange: s.cfg.Exchange,
+		// Set here, inside the struct literal that SignOffer is called over a few
+		// lines below, so the title is signature-covered like every other offer
+		// field. It is NOT routed through applyMetadata: that function projects
+		// the extension metadata only, which is the same split the catalog
+		// storage follows. nil stays nil, so a resource pushed without a title
+		// yields an offer without one.
+		Title: entry.Title,
 		Pricing: &rampv1.Pricing{
 			Model:    rampv1.PricingModel(rampv1.PricingModel_value[pricing.Model]),
 			Rate:     rateStr,
@@ -150,21 +163,28 @@ func (s *ExchangeService) buildOffer(
 	if pricing.EstQty > 0 {
 		offer.Pricing.EstimatedQuantity = &pricing.EstQty
 	}
+	// The metering basis has to reach Offer.pricing, not just Offer.terms: the
+	// execute path reads the price back from the VERIFIED offer, so a term that
+	// meters nothing would otherwise still mint a reporting obligation. Set only
+	// when the term declared one — Offer.pricing is signature-covered, so writing
+	// an explicit default onto every offer would change the canonical bytes of
+	// offers whose term says nothing about metering.
+	if pricing.Metering != nil {
+		offer.Pricing.Metering = pricing.Metering.Enum()
+	}
 	// Project the resource extension metadata onto the offer BEFORE signing so it
 	// is covered by the signature. Read from the same rebuild-time snapshot decode
-	// cache (no per-call decode). buildOffer is also the tx-reconstruction path
-	// (verifyOffer), and every field applied here derives only from stored
-	// snapshot state — never s.clk.Now() — so the reconstructed offer reproduces
-	// identical signed bytes (signature parity).
+	// cache (no per-call decode). buildOffer runs only at discovery: the execute
+	// path verifies the PRESENTED offer bytes, never a reconstruction, so nothing
+	// requires two buildOffer calls to reproduce identical signed bytes.
 	md := snap.DecodedMetadata(entry.ResourceID)
 	if md != nil {
 		applyMetadata(offer, md)
 	}
 	// Merge the CoMP projection (precomputed once at snapshot rebuild)
-	// AFTER metadata and BEFORE signing, so the comp ext is signature-covered and
-	// reproduced at tx-reconstruction. Looked up by the selected headline term's
-	// ORIGINAL stored index, so the blob is deterministic from stored state and
-	// discovery/reconstruction merge identical bytes.
+	// AFTER metadata and BEFORE signing, so the comp ext is signature-covered.
+	// Looked up by the selected headline term's ORIGINAL stored index, so the
+	// blob is deterministic from stored state.
 	cached := snap.RenderedProfile(entry.ResourceID, headlineIdx, profileCoMPV1)
 	applyCompProfile(offer, cached, profiles)
 	sig, err := s.offerSigner.SignOffer(offer)
@@ -177,18 +197,20 @@ func (s *ExchangeService) buildOffer(
 }
 
 // selectedPricing is the single derivation of an offer's price and projected
-// terms from a catalog entry's terms, shared by the discovery path (buildOffer)
-// and the billing path (resolveOfferForTx) so the price an agent is SHOWN and the
-// price it is CHARGED can never diverge.
+// terms from a catalog entry's terms, run at discovery (buildOffer, its only
+// caller). The billing path charges the SIGNED offer's pricing —
+// resolveOfferForTx reads it off the verified presented offer — so the price an
+// agent is SHOWN and the price it is CHARGED can never diverge: the signature
+// carries the price derived here to execute.
 //
 // The persisted terms are decoded ONCE at snapshot-rebuild time and passed in
 // here as `stored` (the caller reads them from the snapshot via DecodedTerms);
 // this method NEVER decodes JSONB per call. It filters `stored` through
-// licenseterm.Select for the requester (the single source of term eligibility)
+// selectTerms for the requester (the single source of term eligibility)
 // and returns:
 //   - the PricingDoc derived from the FIRST projected term (the
 //     publisher controls the headline price by term order),
-//   - the full Select-projected term slice (for Offer.terms / the signature),
+//   - the full selectTerms-projected term slice (for Offer.terms / the signature),
 //   - the ORIGINAL stored index of that headline term (the CoMP
 //     package_id carries the publisher index, so the discovery path can look up
 //     the precomputed CoMP projection for the selected term),
@@ -197,14 +219,15 @@ func (s *ExchangeService) buildOffer(
 //   - a non-nil error when the headline term's stored Pricing fails to project
 //     into a PricingDoc (e.g. an unparseable money string).
 //
-// A nil requester projects all stored terms unchanged (the offer-reconstruction
-// path); an empty stored-terms set still yields ok=false.
+// A nil requester projects all stored terms unchanged; the branch is defensive,
+// since DiscoverResources refuses a request that names no requester before
+// groupFor runs. An empty stored-terms set still yields ok=false.
 func (s *ExchangeService) selectedPricing(
 	stored []*rampv1.LicenseTerm, requester *rampv1.Requester,
 ) (PricingDoc, []*rampv1.LicenseTerm, int, bool, error) {
 	terms := stored
 	if requester != nil {
-		terms = licenseterm.Select(terms, requester)
+		terms = selectTerms(terms, requester)
 	}
 	if len(terms) == 0 {
 		return PricingDoc{}, nil, 0, false, nil
@@ -217,7 +240,7 @@ func (s *ExchangeService) selectedPricing(
 }
 
 // headlineIndex returns the ORIGINAL stored position of the selected headline
-// term. licenseterm.Select is order-preserving and returns the same pointers it
+// term. selectTerms is order-preserving and returns the same pointers it
 // was given, so identity match recovers the publisher index that the CoMP
 // package_id carries (Q8). Falls back to 0 if not found (defensive).
 func headlineIndex(stored []*rampv1.LicenseTerm, headline *rampv1.LicenseTerm) int {

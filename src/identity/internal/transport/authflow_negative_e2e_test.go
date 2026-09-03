@@ -59,9 +59,7 @@ func TestAuthFlow_CallbackRejectsUpstreamFailure(t *testing.T) {
 	if cb.location != "" {
 		t.Fatalf("a failed callback must not redirect; got Location %q", cb.location)
 	}
-	if _, err := f.devs.BySubdomain(t.Context(), f.subdomain); err == nil {
-		t.Fatalf("developer was provisioned despite the upstream failure")
-	}
+	f.noDeveloperProvisioned(t)
 }
 
 func TestAuthFlow_CallbackRejectsStateMismatch(t *testing.T) {
@@ -91,16 +89,14 @@ func TestAuthFlow_CallbackRejectsStateMismatch(t *testing.T) {
 	if r.location != "" {
 		t.Fatalf("a state-mismatch callback must not redirect; got Location %q", r.location)
 	}
-	if _, err := f.devs.BySubdomain(t.Context(), f.subdomain); err == nil {
-		t.Fatalf("developer was provisioned despite the state mismatch")
-	}
+	f.noDeveloperProvisioned(t)
 }
 
 func TestAuthFlow_TokenCodeIsSingleUse(t *testing.T) {
 	f := newAuthFixture(t)
-	clientID, verifier := f.driveToForm(t)
+	clientID, verifier := f.driveToConsent(t)
 
-	code := codeFromRedirect(t, f.grantCode(t, validLicensingForm()))
+	code := f.grantCode(t)
 
 	// First redemption succeeds (peek -> validate -> consume -> mint); the replay
 	// must be rejected because the code is now spent. Exercises the grant service's
@@ -116,8 +112,8 @@ func TestAuthFlow_TokenCodeIsSingleUse(t *testing.T) {
 
 func TestAuthFlow_TokenRejectsWrongPKCEVerifier(t *testing.T) {
 	f := newAuthFixture(t)
-	clientID, verifier := f.driveToForm(t)
-	code := codeFromRedirect(t, f.grantCode(t, validLicensingForm()))
+	clientID, verifier := f.driveToConsent(t)
+	code := f.grantCode(t)
 
 	// Redeem with a verifier that does not match the challenge sent at /authorize:
 	// PKCE — the OAuth server's code-interception defense — must reject with
@@ -140,9 +136,9 @@ func TestAuthFlow_TokenRejectsWrongPKCEVerifier(t *testing.T) {
 func TestAuthFlow_TokenRejectsExpiredCode(t *testing.T) {
 	const codeTTL = 2 * time.Minute
 	f, clk := newExpiredCodeFixture(t, codeTTL)
-	clientID, verifier := f.driveToForm(t)
+	clientID, verifier := f.driveToConsent(t)
 
-	code := codeFromRedirect(t, f.grantCode(t, validLicensingForm()))
+	code := f.grantCode(t)
 
 	// Advance the auth server's clock past the code's TTL, then redeem it: the
 	// expiry branch (distinct from replay) must reject with 400 invalid_grant and
@@ -197,22 +193,16 @@ func TestAuthFlow_CallbackRejectsUpstreamDenial(t *testing.T) {
 	if got := loc.Query().Get("error"); got != "access_denied" {
 		t.Fatalf("denial error param = %q, want access_denied", got)
 	}
-	if _, err := f.devs.BySubdomain(t.Context(), f.subdomain); err == nil {
-		t.Fatalf("developer was provisioned despite consent denial")
-	}
+	f.noDeveloperProvisioned(t)
 }
 
 func TestAuthFlow_ConsentDenialYieldsAccessDenied(t *testing.T) {
 	f := newAuthFixture(t)
-	f.driveToForm(t)
+	f.driveToConsent(t)
 
-	// Complete the licensing form (which hands off to the consent screen), then DENY:
-	// the developer refuses the requesting client, so the server must return
+	// DENY: the developer refuses the requesting client, so the server must return
 	// access_denied to the client and issue no authorization code.
-	if r := f.submitForm(t, validLicensingForm()); r.status != http.StatusFound || r.location != oauthserver.ConsentPath {
-		t.Fatalf("form submit = %d -> %q, want 302 -> /consent", r.status, r.location)
-	}
-	r := f.decideConsent(t, "deny")
+	r := f.decideConsent(t, consentDeny)
 	if r.status != http.StatusFound {
 		t.Fatalf("consent deny = %d, want 302", r.status)
 	}
@@ -233,75 +223,119 @@ func TestAuthFlow_ConsentDenialYieldsAccessDenied(t *testing.T) {
 
 func TestAuthFlow_ConsentRejectsMissingCSRF(t *testing.T) {
 	f := newAuthFixture(t)
-	f.driveToForm(t)
-	if r := f.submitForm(t, validLicensingForm()); r.status != http.StatusFound || r.location != oauthserver.ConsentPath {
-		t.Fatalf("form submit = %d -> %q, want 302 -> /consent", r.status, r.location)
-	}
+	f.driveToConsent(t)
 
 	// POST an approval WITHOUT the CSRF token — the cross-site approval a phisher
 	// could auto-submit. It must be rejected outright, with no code issued.
-	req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		f.srv.URL+oauthserver.ConsentPath, strings.NewReader(url.Values{"decision": {"approve"}}.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r := f.do(t, req)
+	r := f.postConsent(t, url.Values{consentField: {consentApprove}}.Encode())
 	if r.status != http.StatusBadRequest {
 		t.Fatalf("consent approve without CSRF = %d, want 400", r.status)
 	}
 	if r.location != "" {
 		t.Fatalf("a rejected consent must not redirect; got Location %q", r.location)
 	}
+	// Rejecting the forged POST must not also destroy the developer's in-flight
+	// sign-in. handleConsentPost spends the pending session only after
+	// readPendingPOST returns, so a clearCookie added to the CSRF branch would be
+	// invisible to the status and Location checks above: the developer would be
+	// sent back to the start by a request they never made. Their own approval
+	// still has to work.
+	f.grantCode(t)
 }
 
-func TestAuthFlow_FormRejectsMissingCSRF(t *testing.T) {
+// TestAuthFlow_ConsentWithoutSessionRejected drives the branch where the sealed
+// pending cookie is absent altogether, which readPendingPOST's CSRF check never
+// reaches: it fails at readSealed, one step earlier. The GET render runs no CSRF
+// check at all, so this is the only assertion covering it.
+//
+// A real developer is driven to the consent screen first, and the two refusal
+// probes then come from a client with no cookies. That ordering is what makes the
+// leak assertions worth making: the server holds a pending sign-up for a known
+// subdomain, so a response that named it would be naming a real one. Against an
+// empty server there is no subdomain in play at all and the same assertions pass
+// whatever the handler does.
+//
+// The final check is deliberately the other way round. It comes back from the
+// developer's own cookie-carrying client, because only the client holding the
+// session can show the session survived the stranger's rejected approval.
+//
+// Both legs assert the refusal message, not only the status. /consent answers a
+// missing session from two places — handleConsentGet for the render and
+// readPendingPOST for the submission — and one route must not answer the same
+// failure two different ways.
+func TestAuthFlow_ConsentWithoutSessionRejected(t *testing.T) {
 	f := newAuthFixture(t)
-	f.driveToForm(t) // seals the pending cookie; the browser is now at /form
+	f.driveToConsent(t)
 
-	// POST valid licensing fields WITHOUT the CSRF token — the cross-site submit a
-	// SameSite-unaware phisher could auto-submit. It must be rejected, and the
-	// registration must not complete.
-	req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		f.srv.URL+oauthserver.FormPath, strings.NewReader(validLicensingForm().Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r := f.do(t, req)
+	greq, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, f.srv.URL+oauthserver.ConsentPath, nil)
+	g := f.doAsStranger(t, greq)
+	if g.status != http.StatusBadRequest {
+		t.Fatalf("GET /consent with no session = %d, want 400", g.status)
+	}
+	if !strings.Contains(string(g.body), noSessionRefusal) {
+		t.Errorf("GET /consent with no session answered %q, want %q", g.body, noSessionRefusal)
+	}
+	if strings.Contains(string(g.body), f.subdomain) {
+		t.Errorf("the no-session render named subdomain %q; a caller with no session "+
+			"must learn nothing about who signed up", f.subdomain)
+	}
+
+	pr := f.doAsStranger(t, f.newConsentPOST(t, url.Values{consentField: {consentApprove}}.Encode()))
+	if pr.status != http.StatusBadRequest {
+		t.Fatalf("POST /consent with no session = %d, want 400", pr.status)
+	}
+	if !strings.Contains(string(pr.body), noSessionRefusal) {
+		t.Errorf("POST /consent with no session answered %q, want %q — the render and the "+
+			"submission must refuse a missing session in the same words", pr.body, noSessionRefusal)
+	}
+	if strings.Contains(string(pr.body), f.subdomain) {
+		t.Errorf("the no-session refusal named subdomain %q; a caller with no session "+
+			"must learn nothing about who signed up", f.subdomain)
+	}
+	if pr.location != "" {
+		t.Fatalf("a sessionless approval must not redirect; got Location %q — a redirect "+
+			"here is an authorization code leaving with no session behind it", pr.location)
+	}
+	// The stranger's rejected approval must not have spent the developer's own
+	// session. grantCode drives both halves of that claim: it re-renders the
+	// consent screen to scrape the CSRF token, then approves and requires the code
+	// in the redirect. Re-rendering alone is a weaker check — it passes with code
+	// issuance broken, and the session this asserts survives exists to issue one.
+	f.grantCode(t)
+}
+
+// TestAuthFlow_ConsentRejectsMalformedBody drives the parse failure, which sits
+// BEFORE the CSRF check in readPendingPOST and so is unreachable from the
+// missing-token test. The body is malformed rather than merely wrong on purpose:
+// a wrong-but-parseable body would be refused one step later, by the CSRF check.
+//
+// The message is asserted, not just the status, and that is the whole difficulty
+// here. Both branches answer 400 with no Location, because a body that will not
+// parse also yields an empty CSRF field — so a status-only assertion passes with
+// the parse check deleted, and proves nothing about the branch it names. Deleting
+// the check makes this test fail; a status-only version stayed green.
+func TestAuthFlow_ConsentRejectsMalformedBody(t *testing.T) {
+	f := newAuthFixture(t)
+	f.driveToConsent(t)
+
+	r := f.postConsent(t, "%zz")
 	if r.status != http.StatusBadRequest {
-		t.Fatalf("form POST without CSRF = %d, want 400", r.status)
+		t.Fatalf("malformed consent body = %d, want 400", r.status)
+	}
+	if !strings.Contains(string(r.body), "malformed submission") {
+		t.Fatalf("malformed consent body answered %q, want the parse refusal — a body that "+
+			"cannot be parsed must be refused at parse time, not fall through to the CSRF "+
+			"check and be refused for the wrong reason", r.body)
 	}
 	if r.location != "" {
-		t.Fatalf("a rejected form must not redirect; got Location %q", r.location)
+		t.Fatalf("a rejected consent must not redirect; got Location %q", r.location)
 	}
-	if dev, _ := f.devs.BySubdomain(t.Context(), f.subdomain); dev.RegistrationComplete {
-		t.Fatal("registration completed despite a missing CSRF token")
-	}
-}
 
-func TestAuthFlow_FormWithoutSessionRejected(t *testing.T) {
-	f := newAuthFixture(t)
-	// No sign-in has happened, so there is no sealed pending cookie. Both the GET
-	// render and the POST must 400 (a reachable user-facing state), not 500 or render.
-	greq, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, f.srv.URL+oauthserver.FormPath, nil)
-	if r := f.do(t, greq); r.status != http.StatusBadRequest {
-		t.Fatalf("GET /form with no session = %d, want 400", r.status)
-	}
-	preq, _ := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		f.srv.URL+oauthserver.FormPath, strings.NewReader(validLicensingForm().Encode()))
-	preq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if r := f.do(t, preq); r.status != http.StatusBadRequest {
-		t.Fatalf("POST /form with no session = %d, want 400", r.status)
-	}
-}
-
-func TestAuthFlow_FormRejectsMalformedBody(t *testing.T) {
-	f := newAuthFixture(t)
-	f.driveToForm(t)
-
-	// A body that is not valid application/x-www-form-urlencoded (a stray percent
-	// escape) must be rejected at parse time with a 400, before any field is read.
-	req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		f.srv.URL+oauthserver.FormPath, strings.NewReader("%zz"))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if r := f.do(t, req); r.status != http.StatusBadRequest {
-		t.Fatalf("malformed form body = %d, want 400", r.status)
-	}
+	// The rejection must not have spent the session: a well-formed approval still
+	// works. Without this the test would also pass if readPendingPOST cleared the
+	// pending cookie before validating the body, which would turn a typo into a
+	// sign-in the developer has to start over.
+	f.grantCode(t)
 }
 
 func TestAuthFlow_RegisterRejectsBadRedirectURIs(t *testing.T) {
@@ -406,8 +440,8 @@ func TestAuthFlow_AuthorizeRejectsUnknownClient(t *testing.T) {
 
 func TestAuthFlow_TokenRejectsBindingMismatch(t *testing.T) {
 	f := newAuthFixture(t)
-	clientID, verifier := f.driveToForm(t)
-	code := codeFromRedirect(t, f.grantCode(t, validLicensingForm()))
+	clientID, verifier := f.driveToConsent(t)
+	code := f.grantCode(t)
 
 	base := func() url.Values {
 		return url.Values{

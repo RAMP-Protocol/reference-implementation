@@ -28,6 +28,15 @@ func (FreeAdapter) EnsureAgentAccount(_ context.Context, billingRef string) erro
 	return nil
 }
 
+// Credit is a no-op success: the free tier keeps no ledger, so there is no
+// balance to grant into. The shared argument gate still applies so the
+// interface contract is uniform across tiers, and it checks the amount against
+// DemoCurrency — the currency GetBalance reports below, so this tier has a
+// currency and takes no exemption from the rule.
+func (FreeAdapter) Credit(_ context.Context, billingRef string, amount Amount, idempotencyKey string) error {
+	return validateCreditArgs(billingRef, amount, idempotencyKey, DemoCurrency)
+}
+
 // Authorize always approves and returns a fresh ULID BillingID.
 func (FreeAdapter) Authorize(_ context.Context, _ AuthorizeRequest) (AuthorizeResult, error) {
 	return AuthorizeResult{
@@ -51,9 +60,9 @@ func (FreeAdapter) Refund(_ context.Context, _ string, _ Amount, _ string, _ str
 	return ErrRefundUnsupported
 }
 
-// GetBalance reports an effectively unbounded balance in USD.
+// GetBalance reports an effectively unbounded balance in the demo currency.
 func (FreeAdapter) GetBalance(_ context.Context, _ string) (Amount, error) {
-	return Amount{Value: big.NewRat(math.MaxInt64, 1), Currency: "USD"}, nil
+	return Amount{Value: big.NewRat(math.MaxInt64, 1), Currency: DemoCurrency}, nil
 }
 
 // GetQuota reports an effectively unbounded quota.

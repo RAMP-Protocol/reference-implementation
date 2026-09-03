@@ -5,6 +5,7 @@ import (
 	"time"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
@@ -36,13 +37,13 @@ func baseInput() ReportInput {
 		BillingID:     "bill-abc",
 		CreatedAt:     epoch,
 		Report: &rampv1.UsageReport{
+			Ver:            helpers.ProtocolVersion,
 			IdempotencyKey: "r-1",
 			TransactionId:  "tx-1",
 			BillingId:      "bill-abc",
 			Usage:          &rampv1.Usage{ConsumedQuantity: 100},
 		},
-		Now:      defaultNow,
-		Exchange: exchangeDomain,
+		Now: defaultNow,
 	}
 }
 
@@ -100,28 +101,23 @@ func TestReportValidator_TableDriven(t *testing.T) {
 			wantOutcome: repo.ValidationOutcomeRejectedFields,
 			wantInMsg:   "consumed_quantity",
 		},
-		// ---- Window ----------------------------------------------------------
+		// ---- Window: no longer a check ---------------------------------------
+		// A report is accepted whatever the time. Rejecting a late one left the
+		// obligation PENDING, and a PENDING obligation past its deadline is what
+		// the execute gate refuses on, so a missed window locked the agent out
+		// with no way back. These two rows are the regression guard: if a window
+		// check is ever reintroduced here, both fail.
 		{
-			name: "Window_Expired",
+			name: "Window_LongPastDeadline_Accepted",
 			mutate: func(in *ReportInput) {
-				in.Now = in.Obligation.Deadline.Add(time.Second)
-			},
-			wantOutcome: repo.ValidationOutcomeRejectedWindow,
-			wantKind:    exchange.KindFailedPrecondition,
-			wantInMsg:   "window",
-		},
-		{
-			name: "Window_AtBoundary",
-			mutate: func(in *ReportInput) {
-				in.Now = in.Obligation.Deadline
+				in.Now = in.Obligation.Deadline.Add(30 * 24 * time.Hour)
 			},
 			wantOutcome: repo.ValidationOutcomeValidated,
 		},
 		{
-			name: "Window_NoDeadlinePersisted",
+			name: "Window_OneSecondPastDeadline_Accepted",
 			mutate: func(in *ReportInput) {
-				in.Obligation.Deadline = time.Time{}
-				in.Now = epoch.Add(48 * time.Hour) // would fail if deadline was set
+				in.Now = in.Obligation.Deadline.Add(time.Second)
 			},
 			wantOutcome: repo.ValidationOutcomeValidated,
 		},
@@ -176,7 +172,7 @@ func TestReportValidator_TableDriven(t *testing.T) {
 		},
 		{
 			// A stamped tolerance of 0 is an explicit exact-match policy, not
-			// "unset" — buildPersistIntent resolves a nil policy to the default
+			// "unset" — planObligation resolves a nil policy to the default
 			// before persisting, so 0 on the obligation is always deliberate. An
 			// exact report passes. (The ±20% default band is covered by the
 			// Tolerance_Boundary* cases, whose obligation carries the default.)
@@ -264,32 +260,10 @@ func TestReportValidator_TableDriven(t *testing.T) {
 			wantOutcome: repo.ValidationOutcomeRejectedTimestamp,
 			wantInMsg:   "precedes",
 		},
-		// ---- Exchange (L6 remainder) -------------------------------------
-		{
-			name: "Exchange_Unset_Pass",
-			mutate: func(in *ReportInput) {
-				in.Report.Exchange = nil
-			},
-			wantOutcome: repo.ValidationOutcomeValidated,
-		},
-		{
-			name: "Exchange_Match_Pass",
-			mutate: func(in *ReportInput) {
-				m := exchangeDomain
-				in.Report.Exchange = &m
-			},
-			wantOutcome: repo.ValidationOutcomeValidated,
-		},
-		{
-			name: "Exchange_Mismatch_Rejected",
-			mutate: func(in *ReportInput) {
-				m := "evil.example"
-				in.Report.Exchange = &m
-			},
-			wantOutcome: repo.ValidationOutcomeRejectedExchange,
-			wantKind:    exchange.KindInvalidRequest,
-			wantInMsg:   "exchange",
-		},
+		// The recipient the report names is NOT checked here. It is decided by
+		// the interceptor on the Connect surface, before this validator's
+		// obligation is loaded, and is covered through the ReportUsage RPC in
+		// the transport package's recipient tests.
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -333,12 +307,12 @@ func TestReportValidator_TableDriven(t *testing.T) {
 // and ValidateRequiredFieldNames must agree with the same set. Adding a name to
 // one without the other breaks this test.
 func TestReportHasFieldCoversKnownFields(t *testing.T) {
-	ex := exchangeDomain
 	full := &rampv1.UsageReport{
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: "r-1",
 		TransactionId:  "tx-1",
 		BillingId:      "bill-1",
-		Exchange:       &ex,
+		Exchange:       exchangeDomain,
 		Timestamp:      timestamppb.New(epoch),
 		Usage:          &rampv1.Usage{ConsumedQuantity: 1, Function: []string{"summarize"}},
 	}

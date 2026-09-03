@@ -70,7 +70,7 @@ this is the only place this document names one, and every command below reuses
 it:
 
 ```bash
-VERSION=1.0.0-rc.2
+VERSION=1.0.0-rc.3
 docker pull ghcr.io/ramp-protocol/exchange:$VERSION
 ```
 
@@ -198,7 +198,12 @@ these, and they apply to both:
 - **The role owns what it creates.** Migrations run as the connecting role, and
   later migrations alter and drop what earlier ones made. A role with only
   `INSERT`/`SELECT` grants will fail on the first start.
-- **`sslmode=require`** (or stricter) on any DSN that leaves the host.
+- **TLS on the DSN, decided by the network path.** A connection that stays on the
+  database host may use `sslmode=disable`. On a private network you control end to
+  end, `sslmode=require` or stricter is strongly recommended. Once any part of the
+  path is not exclusively yours — a managed database service, a shared cloud
+  network — it is required
+  ([`deploy/storage/postgres/CONFIGURATION.md`](../../deploy/storage/postgres/CONFIGURATION.md) §2.3).
 - **Reachability from every Exchange instance**, with enough connections
   available for each — the Exchange holds a pool per process.
 
@@ -281,6 +286,10 @@ services:
       RAMP_BILLING_ADAPTER: "tigerbeetle"
       EXCHANGE_BILLING_LEDGER: "978"
       EXCHANGE_BILLING_TB_ADDRESS: "10.0.6.20:3000"
+      # Welcome credit for newly registered agents, in WHOLE units of the
+      # ledger currency: "100" on the EUR ledger above grants EUR 100.00 per
+      # agent, not 100 cents — [`CONFIGURATION.md`](CONFIGURATION.md) §2.1.
+      # EXCHANGE_DEFAULT_AGENT_CREDIT: "100"
     volumes:
       - ./keys:/keys:ro                 # readable by uid 65532
 ```
@@ -290,7 +299,7 @@ Start it, then confirm it came up cleanly:
 ```bash
 docker compose logs exchange | head -20
 # Expect these lines, in this order:
-#   {"level":"INFO","msg":"migrations applied","version":25,"dirty":false,"table":"schema_migrations_ramp"}
+#   {"level":"INFO","msg":"migrations applied","version":26,"dirty":false,"table":"schema_migrations_ramp"}
 #   {"level":"INFO","msg":"ed25519 signing key loaded"}
 #   {"level":"INFO","msg":"rsa signing key loaded"}
 #   {"level":"INFO","msg":"billing adapter: tigerbeetle","ledger":978,"currency":"EUR", ...}

@@ -25,7 +25,7 @@ A publisher feeds the Exchange a JSONL file (one resource per line). The
 pipeline is:
 
 ```
-ParseJSONL (parser.go) → MapRecords (mapper.go) → PushEntries
+ParseJSONL (parser.go) → MapRecords (mapper.go) → PushEntries (push.go, through the SDK catalog client)
   → CatalogService.PushResources RPC → ramp.catalog
   → DiscoverResources RPC → buildOffer (discover.go) → signed Offer
 ```
@@ -74,7 +74,7 @@ On the **Offer** side:
 
 ### Enum value names (verified against the pinned proto)
 
-Proto pin: `github.com/RAMP-Protocol/protocol@v0.1.1-0.20260721162850-bccfa6c89676` (adds the typed `ResourceEntry.resource_mutability`, field 14).
+Verified against the protocol module at the revision `go.mod` pins — read the pin there rather than from a version written into this page, which goes stale at the next re-pin. `resource_mutability` is a typed field on `ResourceEntry`, number 14, not an `ext` key.
 
 - `ResourceMutability`: `RESOURCE_MUTABILITY_UNSPECIFIED | _STATIC | _DYNAMIC | _LIVE`
 - `IngestionSource`: `INGESTION_SOURCE_UNSPECIFIED | _RAMP_SITEMAP | _RSL |
@@ -82,7 +82,8 @@ Proto pin: `github.com/RAMP-Protocol/protocol@v0.1.1-0.20260721162850-bccfa6c896
 
 ### The pricing/selection invariant (the whole point)
 
-`licenseterm.Select` (`licenseterm.go`) filters terms by **scopes ONLY**.
+`selectTerms` (`src/exchange/internal/service/termselect.go`) filters terms by
+**scopes ONLY**.
 Metadata is **never** an input to term/price selection. The corpus proves this
 two ways (see the entanglement cases below).
 
@@ -138,10 +139,11 @@ metadata-free baseline shape.
 `transact_parity.jsonl` → `transact_parity_full_meta` carries
 `"transact_parity": true`. The push→discover→**ExecuteTransaction** e2e
 must, for this line: discover the signed offer, call `ExecuteTransaction` with it,
-and assert the signature re-verifies. The Exchange's `verifyOffer` rebuilds the
-offer via `buildOffer`; if metadata is emitted on discovery but dropped or
-reordered on reconstruction, the canonical signed bytes diverge and verification
-fails. This case is the guard against that divergence.
+and assert the signature re-verifies. The Exchange verifies the PRESENTED
+offer's exact signed bytes (metadata included) at execute; if the discovery
+path emits metadata that is dropped or reordered anywhere between signing and
+presentation, the canonical signed bytes diverge and verification fails. This
+case is the guard against that divergence.
 
 ## Consuming `expected_outcomes.json` from a Go integration test
 

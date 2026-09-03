@@ -30,7 +30,9 @@ from typing import Any, cast
 import httpx
 
 from ramp_sdk.core import sign_offer_acceptance_jcs
+from ramp_sdk import ProtocolVersion
 from ..discovery import DISCOVER_PATH, discover_body
+from ..exchanges import recipient_of
 from ..httpsig_signer import load_keypair
 from ..signing import AGENT_E2E_KEY_PATH, sign_post
 
@@ -59,6 +61,7 @@ def discover_first_offer(
         body=discover_body(
             uris=[uri],
             agent_id=agent_id,
+            exchange=recipient_of(exchange_url),
             domain=domain,
             user_type=user_type,
             geography=geography,
@@ -145,7 +148,7 @@ def execute_offer(
     resp = sign_post(
         f"{exchange_url}{_EXECUTE_PATH}",
         body={
-            "ver": "1.0",
+            "ver": ProtocolVersion,
             "idempotency_key": tx_request_id,
             "requester": {
                 "id": agent_id,

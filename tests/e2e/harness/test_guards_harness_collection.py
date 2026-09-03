@@ -45,6 +45,31 @@ HARNESS_DIR = Path(__file__).resolve().parent
 _COLLECT_TIMEOUT = 180
 
 
+def _collection_aborted(combined: str) -> list[str]:
+    """Return the lines of pytest output that report a COLLECTION abort.
+
+    Matched against pytest's own markers, not the substring "error" anywhere in
+    the output. That output lists every collected node id, so a bare substring
+    match forbids the word "error" in any test name in the package -- which is a
+    normal word for a test about an error detail, and cost one an afternoon.
+
+    A collection failure prints "ERROR <module>" in the short summary and
+    "Interrupted: N error(s) during collection"; neither can collide with a
+    lowercase node id. Both spellings are matched because either can appear
+    alone: -q trims the short summary on some runs, and the Interrupted line is
+    absent when a plugin swallows the exception.
+
+    Pure so it can be driven directly. The caller runs a real pytest subprocess
+    and can only produce the passing path, so until this was a function of its
+    own the detector had never been observed firing.
+    """
+    return [
+        line
+        for line in combined.splitlines()
+        if line.startswith("ERROR ") or "during collection" in line
+    ]
+
+
 @pytest.mark.stack_isolation("isolated")
 def test_the_package_collects_without_the_scripts_directory(tmp_path: Path) -> None:
     """Collection succeeds when REPO_ROOT holds no ``scripts/``.
@@ -83,10 +108,52 @@ def test_the_package_collects_without_the_scripts_directory(tmp_path: Path) -> N
     # none of them: a collection error and a plain usage mistake in the command
     # above both exit non-zero, and a run that imported nothing at all would exit
     # 0. The wording assertions are what distinguish the three.
-    assert "error" not in combined.lower(), (
+    #
+    # Matched against pytest's OWN markers, not the substring "error" anywhere in
+    # the output. That output lists every collected node id, so a bare substring
+    # match forbids the word "error" in any test name in the package — which is a
+    # normal word for a test about an error detail, and cost one an afternoon.
+    # A collection failure prints "ERROR <module>" in the short summary and
+    # "Interrupted: N error(s) during collection"; neither can collide with a
+    # lowercase node id.
+    aborted = _collection_aborted(combined)
+    assert not aborted, (
         "importing the harness raised with scripts/ absent, so pytest aborted "
         "collection and NO test in the package would run. Something now reads the "
         f"shared definition at module scope; move it into a test body.\n\n{combined}"
     )
     assert proc.returncode == 0, combined
+    # Only meaningful once `aborted` is empty: pytest prints "N tests collected,
+    # 1 error" on the failing path too, so this line alone separates nothing.
     assert "tests collected" in combined, combined
+
+
+@pytest.mark.stack_isolation("shared-without-cleanup")
+def test_the_abort_detector_reads_pytests_markers_not_the_word_error() -> None:
+    """The detector fires on a real abort and stays quiet on a clean run.
+
+    Three cases, and the first is the one that matters. A clean collection lists
+    every node id it found, and a package that tests error handling has the word
+    "error" all through those ids -- so a detector matching the bare substring
+    reports an abort on a run where nothing went wrong. The other two are the two
+    spellings pytest actually uses to say collection stopped.
+
+    Drives the pure function rather than the subprocess: the subprocess can only
+    produce the passing case, which is exactly why the failing ones were never
+    seen.
+    """
+    clean = (
+        "harness/test_error_detail.py::test_error_reason_is_decoded PASSED\n"
+        "harness/test_guards_denial_reason_key.py::test_no_camelcase_error_key PASSED\n"
+        "2 tests collected in 0.42s"
+    )
+    assert _collection_aborted(clean) == [], (
+        "reported an abort on a clean run whose node ids merely contain the word "
+        "'error' -- the detector is matching text, not pytest's markers"
+    )
+
+    short_summary = "ERROR harness/test_seed.py\n1 error in 0.11s"
+    assert _collection_aborted(short_summary) == ["ERROR harness/test_seed.py"]
+
+    interrupted = "!!!! Interrupted: 2 errors during collection !!!!"
+    assert _collection_aborted(interrupted) == [interrupted]

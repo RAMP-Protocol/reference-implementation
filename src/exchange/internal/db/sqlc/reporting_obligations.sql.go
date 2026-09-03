@@ -11,6 +11,69 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countObligationsByStateAndDueness = `-- name: CountObligationsByStateAndDueness :many
+SELECT ro.state,
+       (ro.deadline < $1)::boolean AS past_deadline,
+       COUNT(*)                                 AS n
+  FROM ramp.reporting_obligations AS ro
+  JOIN ramp.transaction_log AS tl ON tl.transaction_id = ro.transaction_id
+ WHERE tl.tenant_id = $2
+   AND tl.agent_id  = $3
+ GROUP BY ro.state, past_deadline
+`
+
+type CountObligationsByStateAndDuenessParams struct {
+	AsOf     pgtype.Timestamptz `json:"as_of"`
+	TenantID string             `json:"tenant_id"`
+	AgentID  string             `json:"agent_id"`
+}
+
+type CountObligationsByStateAndDuenessRow struct {
+	State        RampObligationState `json:"state"`
+	PastDeadline bool                `json:"past_deadline"`
+	N            int64               `json:"n"`
+}
+
+// The reporting-compliance fact table for one (tenant_id, agent_id): how many
+// obligations sit in each state, split by whether their deadline had already
+// passed at as_of. It returns at most four rows (two states x two dueness
+// values) whatever the agent's history, but that bounds the result, not the
+// work: the join is served by reporting_obligations_transaction_idx, so the
+// rows READ are the agent's own obligations rather than the whole table. Drop
+// that index and this becomes a sequential scan of every tenant's obligations,
+// once per executed item, in front of fund reservation.
+//
+// It counts and classifies nothing. Which bucket means "overdue", which ones
+// form the denominator, and where the thresholds sit are the Exchange's
+// reporting policy, and that policy is applied in the service so a future
+// per-tenant rule reads these same numbers differently without a new query.
+//
+// Joins to transaction_log because reporting_obligations carries no tenant_id /
+// agent_id column of its own. as_of is the service clock's instant: the deadline
+// it is compared against was written from that same clock.
+//
+// The ::boolean cast pins the generated Go field to bool. deadline is NOT NULL,
+// so the comparison is never null.
+func (q *Queries) CountObligationsByStateAndDueness(ctx context.Context, arg CountObligationsByStateAndDuenessParams) ([]CountObligationsByStateAndDuenessRow, error) {
+	rows, err := q.db.Query(ctx, countObligationsByStateAndDueness, arg.AsOf, arg.TenantID, arg.AgentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CountObligationsByStateAndDuenessRow{}
+	for rows.Next() {
+		var i CountObligationsByStateAndDuenessRow
+		if err := rows.Scan(&i.State, &i.PastDeadline, &i.N); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const createObligation = `-- name: CreateObligation :one
 INSERT INTO ramp.reporting_obligations (
     obligation_id, transaction_id, state, window_seconds, deadline,
@@ -62,24 +125,35 @@ func (q *Queries) CreateObligation(ctx context.Context, arg CreateObligationPara
 	return i, err
 }
 
-const findObligationBySourceReportID = `-- name: FindObligationBySourceReportID :one
+const findAcceptedObligationBySourceReportID = `-- name: FindAcceptedObligationBySourceReportID :one
 SELECT obligation_id, transaction_id, state, window_seconds, deadline, consumed_quantity, received_at, created_at, required_fields, estimated_quantity, quantity_tolerance, validation_outcome, validated_at, source_report_id, issued_report_id FROM ramp.reporting_obligations
  WHERE transaction_id = $1
    AND source_report_id = $2
+   AND issued_report_id IS NOT NULL
  LIMIT 1
 `
 
-type FindObligationBySourceReportIDParams struct {
+type FindAcceptedObligationBySourceReportIDParams struct {
 	TransactionID  string      `json:"transaction_id"`
 	SourceReportID pgtype.Text `json:"source_report_id"`
 }
 
 // Idempotent-retry probe for ReportUsage: returns the obligation row whose
-// (transaction_id, source_report_id) pair was already recorded. A non-empty
-// hit means the caller is replaying a prior UsageReport and the service must
-// return the original issued_report_id without re-running validation.
-func (q *Queries) FindObligationBySourceReportID(ctx context.Context, arg FindObligationBySourceReportIDParams) (RampReportingObligation, error) {
-	row := q.db.QueryRow(ctx, findObligationBySourceReportID, arg.TransactionID, arg.SourceReportID)
+// (transaction_id, source_report_id) pair was already recorded AND ACCEPTED.
+// "Accepted" is in the name because it is in the predicate: a caller wanting the
+// row for a key that was only ever rejected will not find it here. A
+// hit means the caller is replaying a report this Exchange already validated,
+// so the service returns the original issued_report_id without re-running
+// validation.
+//
+// issued_report_id IS NOT NULL is what makes "accepted" the condition rather
+// than "seen". A rejected report also persists source_report_id, so without
+// this predicate a retry carrying the same key would match, return 200 with an
+// empty report_id, and never re-validate -- the obligation would stay PENDING
+// while the agent believed it had reported. issued_report_id is written only on
+// acceptance, so it already means exactly "there is a result to replay".
+func (q *Queries) FindAcceptedObligationBySourceReportID(ctx context.Context, arg FindAcceptedObligationBySourceReportIDParams) (RampReportingObligation, error) {
+	row := q.db.QueryRow(ctx, findAcceptedObligationBySourceReportID, arg.TransactionID, arg.SourceReportID)
 	var i RampReportingObligation
 	err := row.Scan(
 		&i.ObligationID,
@@ -281,89 +355,51 @@ func (q *Queries) GetObligationWithTransactionForUpdate(ctx context.Context, tra
 	return i, err
 }
 
-const listOutstandingObligations = `-- name: ListOutstandingObligations :many
-SELECT ro.obligation_id, ro.transaction_id, ro.state, ro.window_seconds,
-       ro.deadline, ro.consumed_quantity, ro.received_at, ro.created_at,
-       ro.required_fields, ro.estimated_quantity, ro.quantity_tolerance,
-       ro.validation_outcome, ro.validated_at,
-       ro.source_report_id, ro.issued_report_id
-  FROM ramp.reporting_obligations AS ro
-  JOIN ramp.transaction_log AS tl ON tl.transaction_id = ro.transaction_id
- WHERE tl.tenant_id = $1
-   AND tl.agent_id = $2
-   AND ro.state = 'PENDING'
-   AND ro.deadline < NOW()
- ORDER BY ro.deadline ASC
-`
-
-type ListOutstandingObligationsParams struct {
-	TenantID string `json:"tenant_id"`
-	AgentID  string `json:"agent_id"`
-}
-
-// Returns reporting obligations whose deadline has passed but which still
-// sit in PENDING for a specific (tenant_id, agent_id). Joins to
-// transaction_log because reporting_obligations does not carry tenant_id /
-// agent_id columns directly. The result drives the ExecuteTransaction
-// reporting-overdue refusal: a non-empty list refuses the agent's next
-// transaction with FailedPrecondition until it files the missing report.
-func (q *Queries) ListOutstandingObligations(ctx context.Context, arg ListOutstandingObligationsParams) ([]RampReportingObligation, error) {
-	rows, err := q.db.Query(ctx, listOutstandingObligations, arg.TenantID, arg.AgentID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []RampReportingObligation{}
-	for rows.Next() {
-		var i RampReportingObligation
-		if err := rows.Scan(
-			&i.ObligationID,
-			&i.TransactionID,
-			&i.State,
-			&i.WindowSeconds,
-			&i.Deadline,
-			&i.ConsumedQuantity,
-			&i.ReceivedAt,
-			&i.CreatedAt,
-			&i.RequiredFields,
-			&i.EstimatedQuantity,
-			&i.QuantityTolerance,
-			&i.ValidationOutcome,
-			&i.ValidatedAt,
-			&i.SourceReportID,
-			&i.IssuedReportID,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const markValidationRejected = `-- name: MarkValidationRejected :one
 UPDATE ramp.reporting_obligations
-   SET validation_outcome = $2,
-       validated_at       = NOW(),
+   SET validation_outcome = $1,
+       validated_at       = $2,
        source_report_id   = COALESCE($3, source_report_id)
- WHERE obligation_id = $1
+ WHERE obligation_id = $4
+   AND state         = 'PENDING'
 RETURNING obligation_id, transaction_id, state, window_seconds, deadline, consumed_quantity, received_at, created_at, required_fields, estimated_quantity, quantity_tolerance, validation_outcome, validated_at, source_report_id, issued_report_id
 `
 
 type MarkValidationRejectedParams struct {
-	ObligationID      string                    `json:"obligation_id"`
 	ValidationOutcome NullRampValidationOutcome `json:"validation_outcome"`
+	Now               pgtype.Timestamptz        `json:"now"`
 	SourceReportID    pgtype.Text               `json:"source_report_id"`
+	ObligationID      string                    `json:"obligation_id"`
 }
 
-// Records the rejection outcome without changing obligation state. The audit
-// row is written for every rejection so disputes have a trail, but the
-// obligation stays PENDING and the caller may retry with a corrected report
-// until the deadline expires.
+// Records the rejection outcome for an obligation that is still PENDING. An
+// audit row is written for every rejection against a PENDING obligation, so
+// disputes have a trail; a report against an obligation that has already
+// settled matches zero rows and writes nothing, and the service logs the
+// refusal instead. The state is left alone so the caller may retry with a
+// corrected report. The
+// retry may reuse the same source_report_id: the replay probe above fires only
+// on an accepted result, so a corrected retry under the original key is
+// validated afresh rather than short-circuited.
+//
+// The state predicate matches the accept statement above, and for a stronger
+// reason than symmetry. Without it a second, invalid report against an
+// obligation already in RECEIVED would commit over the settled row: the outcome
+// would walk back from VALIDATED to a rejection, and source_report_id would move
+// off the accepted key, so a later replay of that key would miss the probe and
+// be refused as already-reported. Zero rows updated means the obligation was not
+// PENDING, and the caller surfaces FailedPrecondition.
+//
+// validated_at comes from the caller for the same reason as the accept
+// statement above: the obligation's three report timestamps all come from the
+// service clock, so they can be compared against the deadline written from it.
 func (q *Queries) MarkValidationRejected(ctx context.Context, arg MarkValidationRejectedParams) (RampReportingObligation, error) {
-	row := q.db.QueryRow(ctx, markValidationRejected, arg.ObligationID, arg.ValidationOutcome, arg.SourceReportID)
+	row := q.db.QueryRow(ctx, markValidationRejected,
+		arg.ValidationOutcome,
+		arg.Now,
+		arg.SourceReportID,
+		arg.ObligationID,
+	)
 	var i RampReportingObligation
 	err := row.Scan(
 		&i.ObligationID,
@@ -388,22 +424,23 @@ func (q *Queries) MarkValidationRejected(ctx context.Context, arg MarkValidation
 const markValidationValidated = `-- name: MarkValidationValidated :one
 UPDATE ramp.reporting_obligations
    SET state              = 'RECEIVED',
-       consumed_quantity  = $2,
-       received_at        = NOW(),
+       consumed_quantity  = $1,
+       received_at        = $2,
        validation_outcome = 'VALIDATED',
-       validated_at       = NOW(),
+       validated_at       = $2,
        source_report_id   = $3,
        issued_report_id   = $4
- WHERE obligation_id = $1
+ WHERE obligation_id = $5
    AND state         = 'PENDING'
 RETURNING obligation_id, transaction_id, state, window_seconds, deadline, consumed_quantity, received_at, created_at, required_fields, estimated_quantity, quantity_tolerance, validation_outcome, validated_at, source_report_id, issued_report_id
 `
 
 type MarkValidationValidatedParams struct {
-	ObligationID     string         `json:"obligation_id"`
-	ConsumedQuantity pgtype.Numeric `json:"consumed_quantity"`
-	SourceReportID   pgtype.Text    `json:"source_report_id"`
-	IssuedReportID   pgtype.Text    `json:"issued_report_id"`
+	ConsumedQuantity pgtype.Numeric     `json:"consumed_quantity"`
+	Now              pgtype.Timestamptz `json:"now"`
+	SourceReportID   pgtype.Text        `json:"source_report_id"`
+	IssuedReportID   pgtype.Text        `json:"issued_report_id"`
+	ObligationID     string             `json:"obligation_id"`
 }
 
 // Sets validation_outcome=VALIDATED, transitions state PENDING→RECEIVED, and
@@ -412,12 +449,19 @@ type MarkValidationValidatedParams struct {
 // in RECEIVED matches zero rows and the caller surfaces FailedPrecondition.
 // The partial unique index on (transaction_id, source_report_id) prevents
 // two concurrent "same-id" writes from both succeeding.
+//
+// received_at and validated_at come from the caller, not NOW(). The deadline
+// they are compared against was written from the service clock, so reading the
+// database clock here would compare two different clocks: received_at > deadline
+// would not be a sound lateness check, and a test could not drive the comparison
+// deterministically.
 func (q *Queries) MarkValidationValidated(ctx context.Context, arg MarkValidationValidatedParams) (RampReportingObligation, error) {
 	row := q.db.QueryRow(ctx, markValidationValidated,
-		arg.ObligationID,
 		arg.ConsumedQuantity,
+		arg.Now,
 		arg.SourceReportID,
 		arg.IssuedReportID,
+		arg.ObligationID,
 	)
 	var i RampReportingObligation
 	err := row.Scan(

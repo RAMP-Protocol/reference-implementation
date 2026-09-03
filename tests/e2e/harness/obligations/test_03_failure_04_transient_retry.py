@@ -25,6 +25,8 @@ import httpx
 import psycopg
 import pytest
 
+from ..exchanges import recipient_of
+from ..discovery import discover_body
 from ..conftest import COMPOSE_FILE, StackURLs
 from ..seed import (
     DEMO_PHILOSOPHY_DOMAIN,
@@ -39,7 +41,6 @@ pytestmark = pytest.mark.stack_isolation("shared-clean-fixtures")
 
 _LIST_OFFERS_PATH = "/ramp.v1.ExchangeService/DiscoverResources"
 _RESOURCE_URI = f"http://{DEMO_PHILOSOPHY_DOMAIN}/articles/philosophers/epicurus.txt"
-_EXPECTED_OFFER_ID = f"tenant-demo-philosophy:{_RESOURCE_URI}"
 
 # A deliberately unused loopback port → ECONNREFUSED.
 _UNREACHABLE_URL = "http://127.0.0.1:19999"
@@ -72,17 +73,14 @@ def test_unreachable_browse_raises_transient_then_retry_succeeds(
     dsn = _resolve_pg_dsn(str(COMPOSE_FILE))
     rows_before = _count_transaction_rows(dsn)
 
-    body = {
-        "id": f"q-{uuid.uuid4().hex}",
-        "requester": {
-            "id": USD_AGENT_ID,
-            "domain": DEMO_PHILOSOPHY_DOMAIN,
-            "type": "REQUESTER_TYPE_AGENT",
-            "user_type": "individual",
-            "geography": "US",
-        },
-        "uris": [_RESOURCE_URI],
-    }
+    body = discover_body(
+        agent_id=USD_AGENT_ID,
+        uris=[_RESOURCE_URI],
+        exchange=recipient_of(compose_stack.exchange),
+        domain=DEMO_PHILOSOPHY_DOMAIN,
+        user_type="individual",
+        geography="US",
+    )
 
     # (1)+(2) Unreachable attempt → transport-level ConnectError.
     with pytest.raises(httpx.ConnectError) as excinfo:
@@ -107,10 +105,20 @@ def test_unreachable_browse_raises_transient_then_retry_succeeds(
         f"retry body must be JSON object: {retry_resp.text[:256]}"
     )
     offers = retry_payload.get("offers") or []
-    offer_ids = {o.get("offer_id") for o in offers if isinstance(o, dict)}
-    assert _EXPECTED_OFFER_ID in offer_ids, (
-        f"retry must surface the seeded offer {_EXPECTED_OFFER_ID!r}; got {sorted(o for o in offer_ids if o)}"
+    # The seeded offer is identified by its signed identity.canonical_url:
+    # offer_id is a random per-offer UUID minted at discovery and carries no
+    # resource identity, so it cannot name the seeded resource.
+    seeded_offers = [
+        o
+        for o in offers
+        if isinstance(o, dict) and (o.get("identity") or {}).get("canonical_url") == _RESOURCE_URI
+    ]
+    assert seeded_offers, (
+        f"retry must surface the seeded offer for {_RESOURCE_URI!r}; got "
+        f"{[(o.get('identity') or {}).get('canonical_url') for o in offers if isinstance(o, dict)]}"
     )
+    offer_id = seeded_offers[0].get("offer_id") or ""
+    assert uuid.UUID(offer_id), f"offer_id must be a per-offer UUID, got {offer_id!r}"
 
     # (4) Still read-only after a successful browse retry.
     rows_after_retry = _count_transaction_rows(dsn)

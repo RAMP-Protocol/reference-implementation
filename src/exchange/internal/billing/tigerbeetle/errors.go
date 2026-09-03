@@ -31,12 +31,6 @@ var (
 	// ErrBadID is returned by DecodeID when a string is not a 16-byte hex id.
 	ErrBadID = errors.New("tigerbeetle: malformed id")
 
-	// ErrAmountNotRepresentable is returned by MinorUnits when a value has finer
-	// precision than the ledger's asset scale can represent exactly — converting
-	// it would require rounding, so the converter refuses it rather than silently
-	// truncate a money amount.
-	ErrAmountNotRepresentable = errors.New("tigerbeetle: amount not representable at asset scale")
-
 	// ErrUnavailable is returned when the cluster does not answer within the
 	// per-call deadline — from Health, or from any bounded hot-path call whose
 	// deadline elapses. The tigerbeetle-go client is not context-cancelable and

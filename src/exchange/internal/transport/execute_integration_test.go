@@ -26,7 +26,22 @@ func TestExecuteTransaction_SignatureInvalid(t *testing.T) {
 	bogus := offers[0].GetSignature() + "00"
 	offerID := offers[0].GetOfferId()
 
-	bogusOffer := &rampv1.Offer{OfferId: offerID, Signature: bogus}
+	// The offer names this Exchange and carries a canonical URL, as a real one
+	// would. Both are checked before the signature guard under test — the
+	// recipient check is a whole-request admission gate and the canonical URL is
+	// an envelope presence check — so an offer missing either would be refused
+	// earlier and this case would never reach the behaviour it names. The URL is
+	// the seeded resource's own, so the denial can only come from the signature.
+	canonicalURL := offers[0].GetIdentity().GetCanonicalUrl()
+	bogusOffer := &rampv1.Offer{
+		OfferId:   offerID,
+		Exchange:  harnessExchangeDomain,
+		Signature: bogus,
+		Identity: &rampv1.ResourceIdentity{
+			CanonicalUrl:       &canonicalURL,
+			ResourceMutability: rampv1.ResourceMutability_RESOURCE_MUTABILITY_STATIC,
+		},
+	}
 	resp, err := executeSingleItem(t, h, "tx-bad", bogusOffer)
 	// The offer-signature guard fires in resolveOfferForTx (KindSignatureInvalid),
 	// before the body acceptance is verified; the kind is in the denial map.
@@ -141,18 +156,14 @@ func TestExecuteTransaction_BindsAgentIdentity(t *testing.T) {
 
 func seedCatalog(t *testing.T, h *testHarness) {
 	t.Helper()
-	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: h.tenantID,
-		CallerId: "agent-test",
-		Entries: []*rampv1.ResourceEntry{{
-			Domain: h.tenantDomain,
-			Path:   "/articles/hello",
-			// Pricing is derived from the selected term: an entry needs
-			// at least one eligible priced term to yield an offer. This unrestricted
-			// PER_UNIT term projects for any requester.
-			Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
-		}},
-	}))
+	_, err := h.catalogClient.PushResources(h.ctx, connect.NewRequest(newPushRequest(h.tenantID, "agent-test", []*rampv1.ResourceEntry{{
+		Domain: h.tenantDomain,
+		Path:   "/articles/hello",
+		// Pricing is derived from the selected term: an entry needs
+		// at least one eligible priced term to yield an offer. This unrestricted
+		// PER_UNIT term projects for any requester.
+		Terms: []*rampv1.LicenseTerm{seedPricedTerm()},
+	}})))
 	if err != nil {
 		t.Fatalf("seed push: %v", err)
 	}
@@ -217,33 +228,4 @@ func seedZeroRatePerUnitTerm() *rampv1.LicenseTerm {
 			Unit:     &unit,
 		},
 	}
-}
-
-// discoverPath discovers the offers for a single URI under the harness tenant.
-// Generalized from discoverFirst so the free-resource-path suite can discover a
-// seeded path other than the default /articles/hello.
-func discoverPath(t *testing.T, h *testHarness, path string) []*rampv1.Offer {
-	t.Helper()
-	uri := "https://" + h.tenantDomain + path
-	resp, err := h.exchangeClient.DiscoverResources(h.ctx, connect.NewRequest(&rampv1.ResourceQuery{
-		Ver: "1.0",
-		// v1.1's generalized uri (discoverFirst delegates here with a path), but
-		// WITHOUT v1.1's Id: ResourceQuery.Id was removed in the WBA-split proto.
-		Uris: []string{uri},
-		Requester: &rampv1.Requester{
-			Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-		},
-	}))
-	if err != nil {
-		t.Fatalf("discover %s: %v", uri, err)
-	}
-	if len(resp.Msg.GetOffers()) == 0 {
-		t.Fatalf("no offers returned for %s", uri)
-	}
-	return resp.Msg.GetOffers()
-}
-
-func discoverFirst(t *testing.T, h *testHarness) []*rampv1.Offer {
-	t.Helper()
-	return discoverPath(t, h, "/articles/hello")
 }

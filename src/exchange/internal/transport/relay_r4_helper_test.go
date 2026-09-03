@@ -52,7 +52,7 @@ func signAcceptance(
 ) *rampv1.AgentAcceptance {
 	t.Helper()
 	return signAcceptanceFor(t, priv, offer,
-		&rampv1.Requester{Id: requesterID, Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT},
+		newRequester(requesterID, "agent.example"),
 		txID)
 }
 
@@ -83,12 +83,14 @@ func newMultisigSigningTransport(
 		c := counter.Add(1)
 		return c, c + 3600
 	})
-	brokerRT := core.NewSigningTransport(mustSigner(brokerPriv), base,
+	brokerRT := core.NewSigningTransport(
+		mustSigner(brokerPriv), base,
 		core.WithSignPredicate(rampauth.IsRAMPProcedure),
 		core.WithAppendSigner(),
 		core.WithWindow(win),
 	)
-	return core.NewSigningTransport(mustSigner(agentPriv), brokerRT,
+	return core.NewSigningTransport(
+		mustSigner(agentPriv), brokerRT,
 		core.WithSignPredicate(rampauth.IsRAMPProcedure),
 		core.WithSignatureAgent(agentKeyID),
 		core.WithWindow(win),

@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -26,7 +27,6 @@ type Tenant struct {
 	ID                  string
 	Domain              string
 	Ed25519KeyRef       string
-	HMACSecretRef       string // retained for compatibility; never used for URL signing
 	SigningScheme       string
 	RSAKeyRef           string
 	CloudFrontKeyPairID string
@@ -54,6 +54,12 @@ type Tenant struct {
 	// registered agent starts active in the billing system-of-record. TRUE by
 	// default; set out of band like the other tenant configuration columns.
 	ActivateNewAgentsByDefault bool
+	// DefaultAgentCredit is the one-time credit the Register flow grants a
+	// freshly registered agent, denominated in the deployment ledger currency.
+	// Zero (the column default) disables the grant. Never nil for a row read
+	// through this repo; representable exactly at ledger asset scale 8 (the
+	// write guard enforces it). Server-side commercial term, never on the wire.
+	DefaultAgentCredit *big.Rat
 }
 
 // TenantReadRepo is the read-only tenant contract the agent hot path depends on:
@@ -77,6 +83,21 @@ type TenantWriteRepo interface {
 	SetFeeRate(ctx context.Context, tx pgx.Tx, tenantID string, bps int, notes *string) (int64, error)
 	// SetReportingPolicy replaces the reporting_policy JSONB for a tenant.
 	SetReportingPolicy(ctx context.Context, tx pgx.Tx, tenantID string, policyJSON []byte) (int64, error)
+	// SetDefaultAgentCredit replaces the per-tenant default credit granted to a
+	// newly registered agent (deployment ledger currency; 0 disables the
+	// grant). Reached only through AdminService.SetDefaultAgentCredit — the
+	// boot-time env seeding (EXCHANGE_DEFAULT_AGENT_CREDIT) routes through the
+	// service so the write commits with its audit row; there is no admin RPC.
+	// Returns ErrDefaultCreditInvalid for a nil or negative amount, an amount
+	// finer than ledger asset scale 8, or one too large for the column — whether
+	// the Go-side guard catches it or the column's CHECK backstop rejects it.
+	SetDefaultAgentCredit(ctx context.Context, tx pgx.Tx, tenantID string, credit *big.Rat) (int64, error)
+	// SetActivateNewAgentsByDefault flips whether a newly registered agent
+	// starts active in the billing system-of-record. The column defaults to
+	// TRUE on insert, so this is only needed to opt a tenant out. No admin RPC
+	// writes it yet, so this port is currently the highest surface that reaches
+	// the column.
+	SetActivateNewAgentsByDefault(ctx context.Context, tx pgx.Tx, tenantID string, active bool) (int64, error)
 }
 
 // NewTenantReadRepo composes the read-only tenant ports over the fat sqlc.Querier.
@@ -100,7 +121,7 @@ func (r *tenantRepo) ByID(ctx context.Context, tenantID string) (Tenant, error) 
 		}
 		return Tenant{}, fmt.Errorf("get tenant by id: %w", err)
 	}
-	return tenantFromRow(row), nil
+	return tenantFromRow(row)
 }
 
 func (r *tenantRepo) ByDomain(ctx context.Context, domain string) (Tenant, error) {
@@ -111,7 +132,7 @@ func (r *tenantRepo) ByDomain(ctx context.Context, domain string) (Tenant, error
 		}
 		return Tenant{}, fmt.Errorf("get tenant by domain: %w", err)
 	}
-	return tenantFromRow(row), nil
+	return tenantFromRow(row)
 }
 
 func (r *tenantRepo) SetFeeRate(
@@ -126,7 +147,21 @@ func (r *tenantRepo) SetFeeRate(
 		FeeRateBps:   v,
 		FeeRateNotes: pgTextPtr(notes),
 	})
-	return n, mapFeeWriteErr(err, "set tenant fee rate")
+	return n, mapCheckWriteErr(err, "set tenant fee rate", ErrFeeRateOutOfRange)
+}
+
+func (r *tenantRepo) SetDefaultAgentCredit(
+	ctx context.Context, tx pgx.Tx, tenantID string, credit *big.Rat,
+) (int64, error) {
+	v, err := guardDefaultAgentCredit(credit)
+	if err != nil {
+		return 0, err
+	}
+	n, err := sqlc.New(tx).SetTenantDefaultAgentCredit(ctx, sqlc.SetTenantDefaultAgentCreditParams{
+		TenantID:           tenantID,
+		DefaultAgentCredit: v,
+	})
+	return n, mapCheckWriteErr(err, "set tenant default agent credit", ErrDefaultCreditInvalid)
 }
 
 func (r *tenantRepo) SetReportingPolicy(
@@ -142,12 +177,34 @@ func (r *tenantRepo) SetReportingPolicy(
 	return n, nil
 }
 
-func tenantFromRow(row sqlc.RampTenant) Tenant {
+func (r *tenantRepo) SetActivateNewAgentsByDefault(
+	ctx context.Context, tx pgx.Tx, tenantID string, active bool,
+) (int64, error) {
+	n, err := sqlc.New(tx).SetTenantActivateNewAgentsByDefault(ctx,
+		sqlc.SetTenantActivateNewAgentsByDefaultParams{
+			TenantID:                   tenantID,
+			ActivateNewAgentsByDefault: active,
+		})
+	if err != nil {
+		return 0, fmt.Errorf("set tenant activate_new_agents_by_default: %w", err)
+	}
+	return n, nil
+}
+
+func tenantFromRow(row sqlc.RampTenant) (Tenant, error) {
+	// Propagate the NUMERIC decode error rather than swallowing it: a money
+	// field must never be silently zeroed by a decode failure. The column's
+	// CHECK excludes negative and NaN values, but a decode failure here means
+	// the store and the reader disagree, and that must surface, not degrade
+	// to "grant disabled".
+	credit, err := ratFromNumeric(row.DefaultAgentCredit)
+	if err != nil {
+		return Tenant{}, fmt.Errorf("decode default_agent_credit for tenant %q: %w", row.TenantID, err)
+	}
 	return Tenant{
 		ID:                         row.TenantID,
 		Domain:                     row.Domain,
 		Ed25519KeyRef:              row.Ed25519KeyRef,
-		HMACSecretRef:              row.HmacSecretRef,
 		SigningScheme:              string(row.SigningScheme),
 		RSAKeyRef:                  textOrEmpty(row.RsaKeyRef),
 		CloudFrontKeyPairID:        textOrEmpty(row.CloudfrontKeyPairID),
@@ -156,7 +213,8 @@ func tenantFromRow(row sqlc.RampTenant) Tenant {
 		FeeRateBps:                 int(row.FeeRateBps),
 		FeeRateNotes:               textFromPG(row.FeeRateNotes),
 		ActivateNewAgentsByDefault: row.ActivateNewAgentsByDefault,
-	}
+		DefaultAgentCredit:         credit,
+	}, nil
 }
 
 func textOrEmpty(t pgtype.Text) string {

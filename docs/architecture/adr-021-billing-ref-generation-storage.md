@@ -1,6 +1,12 @@
 # ADR-021 — How `billing_ref` (the account id) is generated and stored
 
 **Status:** Proposed (2026-07-09) · D5 amended and open question 1 resolved (2026-07-13) · D6 added (2026-07-13) · D6 partly superseded (2026-07-14)
+**Amendment (2026-08-18):** The one denial reason this ADR wrote for both refusals became two.
+`DENIAL_REASON_BILLING_REF_INACTIVE` no longer exists: an agent with no `billing_ref` is denied
+`DENIAL_REASON_ACCOUNT_NOT_REGISTERED`, whose remedy is to call `Register`, and an account the SoR
+reports as switched off is denied `DENIAL_REASON_ACCOUNT_INACTIVE`, where the agent can only wait.
+The two cases had one wire value and therefore one remedy, which was wrong for whichever agent read
+it. Both decisions below name the value that now applies.
 **Realisation (2026-07-29):** Shipped. `billing_ref` generation and storage live in the Exchange service — `src/exchange/internal/service/register.go` (mint plus the already-assigned fast path), `agent_resolution.go` and `exchange_helpers.go` (resolving the paying account on the charge path). The status above is deliberately unchanged: the decisions below have not been re-reviewed since the last amendment, so read them as the design the shipped code follows, not as a ratified contract.
 **Builds on:** ADR-009 (identity boundary), ADR-017 (Agent Identity & Registration — D3, D6, D10).
 **Refines:** ADR-017 D6 and D10 — it fills in details those decisions left open.
@@ -143,7 +149,7 @@ What changes, and what does not:
   service finds `billing_ref` on the agent's `ramp.agents` row — the row it already reads for the
   signature check (D3), so this costs no extra query. An agent whose row has no `billing_ref` has not
   registered and cannot buy paid content: the paid item is refused before any money is reserved, with
-  the wire reason `DENIAL_REASON_BILLING_REF_INACTIVE` and a plain message telling the agent to call
+  the wire reason `DENIAL_REASON_ACCOUNT_NOT_REGISTERED` and a plain message telling the agent to call
   `Register` first (decided 2026-07-13). Free content is not affected — the free path never talks to
   billing.
 - **The id of a pending hold now includes the account.** The ledger builds a hold's id from
@@ -244,7 +250,7 @@ there is no longer a field to echo.
 - **Checking the account's active flag on each paid transaction** — split out into its
   own ticket on 2026-07-13, now implemented. Each paid item reads the SoR-owned active flag before
   any money is reserved (through the 30-second read-through cache built for exactly this) and a
-  switched-off account is denied in-body with `DENIAL_REASON_BILLING_REF_INACTIVE`. Error policy on
+  switched-off account is denied in-body with `DENIAL_REASON_ACCOUNT_INACTIVE`. Error policy on
   the hot path: **definitive answers fail closed** — a known-inactive account and an account the SoR
   does not know are both denied; **transient SoR read errors fail open** — the transaction proceeds
   with a warning log. Reasons: the ledger balance check still bounds what any account can spend, a

@@ -21,6 +21,7 @@ import (
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/server"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/wellknown"
 )
 
@@ -47,24 +48,37 @@ func closeResponse(t *testing.T, resp *http.Response) {
 
 var keyNotBefore = time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
 
-func newTestServer(t *testing.T) (*httptest.Server, ed25519.PrivateKey) {
-	t.Helper()
-	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("ed25519 keygen: %v", err)
-	}
+// exchangeTestDomain is the placeholder host every test in this package
+// publishes under. RFC 6761 reserves .example, so it can never resolve to a
+// real party.
+const exchangeTestDomain = "exchange.example"
+
+// exchangeConfig is the production-shaped Config every test in this package
+// starts from, on a deterministic clock. A test that pins one field adjusts the
+// returned value rather than restating the whole thing, so the shared shape
+// moves in one place.
+func exchangeConfig(offerKey ed25519.PublicKey) wellknown.Config {
 	hops := int32(4)
-	h, err := wellknown.New(wellknown.Config{
-		Domain:              "exchange.ramp-demo.com",
-		Endpoint:            "https://exchange.ramp-demo.com",
-		CatalogEndpoint:     "https://exchange.ramp-demo.com",
+	return wellknown.Config{
+		Domain:              exchangeTestDomain,
+		Endpoint:            "https://" + exchangeTestDomain,
+		CatalogEndpoint:     "https://" + exchangeTestDomain,
 		BaseCurrency:        "USD",
 		SupportedProfiles:   []string{"ramp-news-v1"},
 		MaxIntermediaryHops: &hops,
-		OfferKey:            edPub,
+		OfferKey:            offerKey,
 		Clock:               clock.NewDeterministic(keyNotBefore),
 		KeyLifetime:         274 * 24 * time.Hour,
-	})
+	}
+}
+
+// serveConfig mounts cfg's discovery surface on a real http.ServeMux behind an
+// httptest server, so every assertion runs over an actual HTTP round trip. The
+// handler pair is returned alongside for the one test that drives its
+// refresher directly.
+func serveConfig(t *testing.T, cfg wellknown.Config) (*httptest.Server, server.Handlers) {
+	t.Helper()
+	h, err := wellknown.New(cfg)
 	if err != nil {
 		t.Fatalf("wellknown.New: %v", err)
 	}
@@ -72,6 +86,23 @@ func newTestServer(t *testing.T) (*httptest.Server, ed25519.PrivateKey) {
 	h.RegisterRoutes(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
+	return srv, h
+}
+
+// newKeyPair returns a fresh Ed25519 offer-signing pair.
+func newKeyPair(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519 keygen: %v", err)
+	}
+	return pub, priv
+}
+
+func newTestServer(t *testing.T) (*httptest.Server, ed25519.PrivateKey) {
+	t.Helper()
+	edPub, edPriv := newKeyPair(t)
+	srv, _ := serveConfig(t, exchangeConfig(edPub))
 	return srv, edPriv
 }
 
@@ -98,21 +129,17 @@ func fetchWBAKey(t *testing.T, srv *httptest.Server) (ed25519.PublicKey, bool) {
 
 func TestRampManifest_ShapeAndRole(t *testing.T) {
 	srv, _ := newTestServer(t)
+	// The content type is the one property the shared fetch helper does not
+	// carry, so it is asserted on its own response before the document itself
+	// is read back through that helper.
 	resp := httpGet(t, srv.URL+rampwellknown.Path)
-	defer closeResponse(t, resp)
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
 	if got := resp.Header.Get("Content-Type"); got != "application/json" {
-		t.Fatalf("Content-Type = %q, want application/json", got)
+		t.Errorf("Content-Type = %q, want application/json", got)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	m, err := rampwellknown.ParseManifest(body, rampwellknown.RoleExchange)
-	if err != nil {
-		t.Fatalf("served manifest invalid: %v", err)
-	}
-	if m.GetDomain() != "exchange.ramp-demo.com" {
+	closeResponse(t, resp)
+
+	m, _ := fetchManifest(t, srv.URL)
+	if m.GetDomain() != exchangeTestDomain {
 		t.Errorf("domain = %q", m.GetDomain())
 	}
 	if m.GetBaseCurrency() != "USD" {
@@ -193,30 +220,11 @@ func servedOfferWindow(t *testing.T, baseURL string) (time.Time, time.Time) {
 func TestRampWBA_RefresherKeepsWindowFresh(t *testing.T) {
 	buildTime := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	clk := clock.NewDeterministic(buildTime)
-	edPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("ed25519 keygen: %v", err)
-	}
+	edPub, _ := newKeyPair(t)
 	const lifetime = 10 * 365 * 24 * time.Hour
-	hops := int32(4)
-	h, err := wellknown.New(wellknown.Config{
-		Domain:              "exchange.ramp-demo.com",
-		Endpoint:            "https://exchange.ramp-demo.com",
-		CatalogEndpoint:     "https://exchange.ramp-demo.com",
-		BaseCurrency:        "USD",
-		SupportedProfiles:   []string{"ramp-news-v1"},
-		MaxIntermediaryHops: &hops,
-		OfferKey:            edPub,
-		Clock:               clk,
-		KeyLifetime:         lifetime,
-	})
-	if err != nil {
-		t.Fatalf("wellknown.New: %v", err)
-	}
-	mux := http.NewServeMux()
-	h.RegisterRoutes(mux)
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
+	cfg := exchangeConfig(edPub)
+	cfg.Clock, cfg.KeyLifetime = clk, lifetime
+	srv, h := serveConfig(t, cfg)
 
 	if nb, _ := servedOfferWindow(t, srv.URL); !nb.Equal(buildTime.Add(-time.Hour)) {
 		t.Fatalf("initial not_before = %s, want %s (build time minus the clock-skew allowance)", nb, buildTime.Add(-time.Hour))

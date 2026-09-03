@@ -52,6 +52,7 @@ from typing import Any
 
 import httpx
 import pytest
+from ramp_sdk import ProtocolVersion
 
 from ..conftest import StackURLs
 
@@ -139,7 +140,7 @@ def test_unsigned_canonical_rpc_is_refused_with_signature_specific_reason(
        token, so a buyer operator can tell this apart from a missing-
        scope refusal or a missing-resource refusal.
     """
-    body = {"requester": {}, "uris": ["http://edge:8787/premium/any.html"]}
+    body = {"ver": ProtocolVersion, "requester": {}, "uris": ["http://edge:8787/premium/any.html"]}
     url = f"{compose_stack.exchange}{_DISCOVER_PATH}"
     # No Signature-Input, no Signature, no Content-Digest, no
     # Authorization. This is the "unsigned request" input.

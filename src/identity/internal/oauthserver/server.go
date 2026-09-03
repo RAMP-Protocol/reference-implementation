@@ -1,11 +1,11 @@
 // Package oauthserver is the Identity Service's OAuth 2.1 authorization server — the
 // surface an MCP client drives to sign a developer in. It fronts Dynamic Client
 // Registration and the authorize/token endpoints downstream, federates
-// authentication to Zitadel upstream (via the oidcup port), and slots the mandatory
-// registration form in between: /callback provisions the identity, and the form gates
-// completion before the authorization code is released back to the client. Nothing
-// here mints agent keys itself — it composes the signup service, the oauth store, the
-// session codec, the upstream authenticator, and the token issuer.
+// authentication to Zitadel upstream (via the oidcup port), and asks the developer to
+// approve the requesting client in between: /callback provisions the identity, and
+// /consent releases the authorization code back to the client. Nothing here mints
+// agent keys itself — it composes the signup service, the oauth store, the session
+// codec, the upstream authenticator, and the token issuer.
 package oauthserver
 
 import (
@@ -35,7 +35,6 @@ const (
 	RegisterPath  = "/register"
 	AuthorizePath = "/authorize"
 	CallbackPath  = "/callback"
-	FormPath      = "/form"
 	ConsentPath   = "/consent"
 	TokenPath     = "/token"
 )
@@ -44,7 +43,7 @@ const (
 	defaultTokenTTL = time.Hour
 	defaultCodeTTL  = 5 * time.Minute
 
-	// maxFormBytes bounds the /form and /token request bodies — both are small
+	// maxFormBytes bounds the /consent and /token request bodies — both are small
 	// url-encoded submissions, never payloads.
 	maxFormBytes = 16 << 10
 )
@@ -137,8 +136,6 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+RegisterPath, s.handleRegister)
 	mux.HandleFunc("GET "+AuthorizePath, s.handleAuthorize)
 	mux.HandleFunc("GET "+CallbackPath, s.handleCallback)
-	mux.HandleFunc("GET "+FormPath, s.handleFormGet)
-	mux.HandleFunc("POST "+FormPath, s.handleFormPost)
 	mux.HandleFunc("GET "+ConsentPath, s.handleConsentGet)
 	mux.HandleFunc("POST "+ConsentPath, s.handleConsentPost)
 	mux.HandleFunc("POST "+TokenPath, s.handleToken)

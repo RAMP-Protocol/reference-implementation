@@ -18,8 +18,8 @@ import (
 // Frozen fixture: a 2-signature forwarding chain produced by the earlier
 // hand-rolled signer, whose @signature-params used the param order
 // keyid;alg;created;expires. The swap to yaronf/httpsign emits
-// created;expires;alg;keyid. These constants are the exact bytes the old code
-// put on the wire (captured from internal/httpsig@origin/v1.1 with fixed seeds).
+// created;expires;alg;keyid. These constants are the exact bytes that signer
+// put on the wire, captured from it with fixed seeds before the swap.
 const (
 	oldFixCreated   = 1700000000
 	oldFixExpires   = 1700000030

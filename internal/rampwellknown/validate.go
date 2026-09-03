@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"fmt"
 
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -82,6 +83,17 @@ func decodeValidated[T proto.Message](raw []byte, msg T, validate func([]byte) e
 	}
 	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(raw, msg); err != nil {
 		return fmt.Errorf("%w: protojson: %w", ErrSchemaInvalid, err)
+	}
+	// The embedded schema checks the WIRE SHAPE — which members exist, what JSON
+	// type each carries, which enum names are spelled. The protocol's own field
+	// and cross-field rules live in the proto as protovalidate constraints, and
+	// running them here is what keeps this package from restating them in a
+	// second language. A rule written twice drifts, and these two drift
+	// invisibly: a producer that only ever emits the valid combination would
+	// pass every behavioral test in this repo while the copy disagreed with the
+	// protocol about the rest.
+	if err := helpers.Validate(msg); err != nil {
+		return fmt.Errorf("%w: %w", ErrSchemaInvalid, err)
 	}
 	return nil
 }

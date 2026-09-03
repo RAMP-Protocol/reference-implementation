@@ -17,6 +17,8 @@ import (
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/buyerkeys"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 )
 
 type jwk struct {
@@ -33,15 +35,13 @@ func encodePub(p ed25519.PublicKey) string {
 	return base64.RawURLEncoding.EncodeToString(p)
 }
 
-// relaxEnv drops both SDK guards via the env flags, so a loopback httptest server
-// (http://127.0.0.1) is reachable: SKIP_SSRF disables the dial-time address guard
-// and ALLOW_INSECURE permits the plaintext http scheme. This is the sanctioned
-// escape hatch now that the SDK owns scheme/address policy — the app carries no
-// config-driven insecure toggle of its own.
+// relaxEnv opens the SDK's two deployment opt-outs so a loopback httptest server
+// is reachable. It delegates: the pair, the reason for opening it, and the note
+// that these are production switches rather than a test-only bypass are stated
+// once, in the shared helper.
 func relaxEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv("SKIP_SSRF", "true")
-	t.Setenv("ALLOW_INSECURE", "true")
+	testutil.AllowLoopbackFetch(t)
 }
 
 // newFetcher constructs a Fetcher for the test. Production New no longer

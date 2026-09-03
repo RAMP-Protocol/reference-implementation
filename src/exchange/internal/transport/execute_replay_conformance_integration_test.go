@@ -7,6 +7,7 @@ import (
 
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 )
 
 // TestExecuteTransaction_ReplayReturnsOriginalResult pins the proto idempotency
@@ -33,14 +34,12 @@ func TestExecuteTransaction_ReplayReturnsOriginalResult(t *testing.T) {
 	h := newTestHarness(t)
 	ctx := h.ctx
 	uri := seedResourceWithRate(t, h, "/articles/replay-conformance", "0.05")
-	offer := discoverOfferForURI(t, h, uri)
+	offer := discoverOffer(t, h, uri)
 
 	const idem = "tx-replay-original"
-	requester := &rampv1.Requester{
-		Id: "agent-test", Domain: "agent.example", Type: rampv1.RequesterType_REQUESTER_TYPE_AGENT,
-	}
+	requester := newRequester("agent-test", "agent.example")
 	req := &rampv1.TransactionRequest{
-		Ver:            "1.0",
+		Ver:            helpers.ProtocolVersion,
 		IdempotencyKey: idem,
 		Requester:      requester,
 		Items: []*rampv1.TransactionItem{

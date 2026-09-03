@@ -36,7 +36,6 @@ import (
 const (
 	e2eTBLedger   uint32 = 840 // ISO 4217 USD — matches the harness's USD-priced offers
 	e2eTBCurrency        = "USD"
-	e2eAssetScale        = 8
 	// e2eOwnerID is the resource_owner_id the harness manifest attests (see
 	// newAllowAllManifestCache). The agent leg is keyed on the harness's
 	// billing_ref, read via h.billingRef, not a fixed agent id.
@@ -54,7 +53,6 @@ func newTBAdapter(salt string) *billing.TigerBeetleAdapter {
 		Client:      tbClient,
 		Ledger:      e2eTBLedger,
 		Currency:    e2eTBCurrency,
-		AssetScale:  e2eAssetScale,
 		HoldTimeout: time.Minute,
 		IDNamespace: salt,
 	})
@@ -85,7 +83,7 @@ func newTBHarness(t *testing.T, salt string, feeBps int, opts harnessOptions) (*
 // the E2E ledger + asset scale. Funding and balance reads route through it (the
 // shape lives in tbtest, shared with the billing suite).
 func tbLedger() tbtest.Ledger {
-	return tbtest.Ledger{Client: tbClient, ID: e2eTBLedger, Scale: e2eAssetScale}
+	return tbtest.Ledger{Client: tbClient, ID: e2eTBLedger}
 }
 
 // fundTBAgent seeds a real prepaid balance for the salted agent — the operator's
@@ -150,10 +148,7 @@ func TestTigerBeetleE2E_SettlementSplit(t *testing.T) {
 	}
 
 	// ReportUsage completes the round-trip but must be ledger-neutral.
-	if _, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(&rampv1.UsageReport{
-		Ver: "1.0", IdempotencyKey: "r-1", TransactionId: txID, BillingId: billingID,
-		Usage: &rampv1.Usage{ConsumedQuantity: 20},
-	})); err != nil {
+	if _, err := h.exchangeClient.ReportUsage(h.ctx, connect.NewRequest(newUsageReport("r-1", txID, billingID, &rampv1.Usage{ConsumedQuantity: 20}))); err != nil {
 		t.Fatalf("report usage: %v", err)
 	}
 	assertObligationState(t, h, txID, "RECEIVED", "VALIDATED")
@@ -165,7 +160,9 @@ func TestTigerBeetleE2E_SettlementSplit(t *testing.T) {
 // postings.
 func TestTigerBeetleE2E_HoldRelease(t *testing.T) {
 	salt := sharedTB.Salt(t)
-	h, _ := newTBHarness(t, salt, e2eFeeBps, harnessOptions{txRunner: failTxRunner{}})
+	runner := &failTxRunner{}
+	h, _ := newTBHarness(t, salt, e2eFeeBps, harnessOptions{txRunnerWrap: runner.wrap})
+	runner.arm()
 	fundTBAgent(t, salt, h.billingRef, "10.00")
 
 	offer := pushDiscoverOffer(t, h, 20)
@@ -221,7 +218,7 @@ func TestTigerBeetleE2E_RateFrozenAtAuthorize(t *testing.T) {
 	fundTBAgent(t, salt, h.billingRef, "10.00")
 	// Jam the override to 50% between Authorize and Record; the frozen 10% must win.
 	rec.mu.Lock()
-	rec.beforeRecord = func() {
+	rec.beforeRecord = func(context.Context) {
 		if err := repo.NewFeeOverrideRepo(h.queries).Set(h.ctx, h.tenantID, e2eOwnerID, 5000); err != nil {
 			t.Errorf("mutate override in beforeRecord: %v", err)
 		}

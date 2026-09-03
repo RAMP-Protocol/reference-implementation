@@ -1,5 +1,6 @@
-// Package transport is the Identity Service's HTTP adapter. It serves each agent's
-// Web Bot Auth directory and Signature Agent Card on its per-user subdomain: the
+// Package transport is the Identity Service's HTTP adapter. It serves four documents
+// on each agent's per-user subdomain: the Web Bot Auth directory, the Signature Agent
+// Card, the key-revocation list, and the RAMP commercial overlay. The
 // request Host selects the agent, and the publisher service builds and caches the
 // documents. One server fronts the whole wildcard zone (*.<base>), so a new agent
 // needs no route, handler, or restart. An unknown host returns 404 and never
@@ -27,9 +28,10 @@ type DocumentService interface {
 	Directory(ctx context.Context, subdomain string) ([]byte, error)
 	Card(ctx context.Context, subdomain string) ([]byte, error)
 	Revocation(ctx context.Context, subdomain string) ([]byte, error)
+	Manifest(ctx context.Context, subdomain string) ([]byte, error)
 }
 
-// Handler dispatches the two well-known documents by request Host across the
+// Handler dispatches the well-known documents by request Host across the
 // wildcard zone. It holds no per-agent state; everything is resolved per request
 // through the publisher service.
 type Handler struct {
@@ -50,12 +52,13 @@ func NewHandler(base string, svc DocumentService, maxAge time.Duration) *Handler
 	}
 }
 
-// RegisterRoutes mounts the two well-known routes on mux at their fixed paths. The
+// RegisterRoutes mounts the well-known routes on mux at their fixed paths. The
 // patterns are path-only; the Host is matched inside the handlers, not by the mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+rampwellknown.WBAPath, h.serveWBA)
 	mux.HandleFunc("GET "+directory.CardPath, h.serveCard)
 	mux.HandleFunc("GET "+rampwellknown.RevocationPath, h.serveRevocation)
+	mux.HandleFunc("GET "+rampwellknown.Path, h.serveManifest)
 }
 
 // RouteRegistrar mounts additional routes on the identity mux. The OAuth sign-up
@@ -87,7 +90,7 @@ func WithRoutes(reg RouteRegistrar) ServerOption {
 	}
 }
 
-// NewServer assembles the identity service's full HTTP handler: the two well-known
+// NewServer assembles the identity service's full HTTP handler: the well-known
 // routes, a /healthz probe, any additional registrars (the sign-up auth server), and
 // the request-id middleware, exactly as production runs it — so a test that drives
 // this exercises the real chain (X-Request-ID, health, host dispatch), not a
@@ -135,6 +138,13 @@ func (h *Handler) serveCard(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) serveRevocation(w http.ResponseWriter, r *http.Request) {
 	h.serve(w, r, directory.RevocationMediaType, h.svc.Revocation)
+}
+
+// serveManifest answers the RAMP commercial overlay. The media type is the plain
+// application/json every RAMP participant serves this document as; the shared
+// rampwellknown/server handler that Exchanges and Brokers mount uses the same value.
+func (h *Handler) serveManifest(w http.ResponseWriter, r *http.Request) {
+	h.serve(w, r, "application/json", h.svc.Manifest)
 }
 
 // serve resolves the subdomain from the Host, fetches the selected document, and

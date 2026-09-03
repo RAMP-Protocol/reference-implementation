@@ -107,12 +107,15 @@ table below gives both.
 |---|---|---|
 | `exchange.exit` | ERROR | Refused to start, or stopped. `err` names the cause. |
 | `exchange.httpsig.broker_wellknown_unavailable` | WARN | The Broker's withdrawn-key document could not be read. **The request is rejected, not let through.** |
-| `exchange.httpsig.reject` | WARN | A signed request was rejected. `outcome` is `signature`, `replay`, `broken_chain` or `hop_budget`. |
+| `exchange.httpsig.reject` | WARN | A request was rejected before it reached a handler. `outcome` is `signature`, `replay`, `broken_chain`, `hop_budget` or `body_too_large`. The first four are authentication outcomes and point at the caller's key, clock or relay chain, so a request carrying them was signed. `body_too_large` is not one of them and need not be signed at all — the request never reached verification, because its body passed the read cap, and the caller fixes it by sending less. See [`CONFIGURATION.md`](CONFIGURATION.md) §2.7. The line appears for a catalog push as well as for the other RPCs; the two mounts refuse an over-cap body by different means and write the same line. |
 | `exchange.admin.ip_reject` | WARN | An admin call came from an address not in `ADMIN_ALLOWED_CIDRS`. Field `client_ip`. |
-| `exchange.execute_transaction` | INFO on success, WARN on rejection | One line per purchase attempt. `outcome` is `VALIDATED`, `REJECTED_AUTHZ` or `REJECTED_REPORTING_OVERDUE`; `kind` and `err` carry the detail. |
+| `exchange.execute_transaction` | INFO on success, WARN on rejection | One line per purchase attempt. `outcome` is `VALIDATED`, `REJECTED_AUTHZ` or `REJECTED_REPORTING_OVERDUE`; `kind` and `err` carry the detail. A `REJECTED_REPORTING_OVERDUE` line does NOT mean the caller saw an HTTP error: the refusal travels in the response body as the item's `denial_reason`, under a 200. §3.1. |
 | `exchange.execute_transaction` with `event=billing_record_failed_best_effort` | **ERROR** | The transaction committed and the agent has its URL, but the charge was never posted to the ledger — a silent under-charge. See §2.3. |
 | `exchange.execute_transaction` with `event=release_hold_failed` | ERROR | A failed purchase's reservation could not be released. It expires on its own; money is not lost, but the agent's available balance is understated until it does. |
-| `exchange.report_usage` | INFO on success, WARN on rejection | One line per usage report. `outcome` is `VALIDATED`, `REPLAY`, `REJECTED_AUTHZ`, `REJECTED_FIELDS`, `REJECTED_WINDOW`, `REJECTED_TOLERANCE`, `REJECTED_BILLING_ID`, `REJECTED_TIMESTAMP` or `REJECTED_EXCHANGE`. |
+| `exchange.report_usage` | INFO on success, WARN on rejection | One line per usage report. `outcome` is `VALIDATED`, `REPLAY`, `REJECTED_AUTHZ`, `REJECTED_FIELDS`, `REJECTED_TOLERANCE`, `REJECTED_BILLING_ID`, `REJECTED_TIMESTAMP` or `REJECTED_ALREADY_REPORTED`. `REJECTED_ALREADY_REPORTED` means a second, different report arrived for an obligation that had already been accepted: nothing was written to the obligation row, and this line is the only record of the attempt. Repeated lines from one agent are worth looking at — a settled report cannot be revised, so the agent is either retrying past a success it did not notice or trying to change a record it is the subject of. `REJECTED_WINDOW` is no longer produced — a report is accepted whatever the time — but it survives on rows written before that changed. A report addressed to another Exchange never reaches this line — it is refused before the obligation is read, and appears as `rampaudience.refused` below. |
+| `exchange.catalog_push.reject` | WARN | One line per catalog entry a push was refused for, whatever refused it. Carries `uri` and the machine-readable `reason` — the same token the publisher sees in the refusal message — plus `detail` when the refusing check has one. A push is all-or-nothing per submission, so any of these lines means the whole submission was refused and nothing from it was stored. This is what to grep when a publisher reports a refusal and you need to place it; §3.1 lists every reason with its fix. |
+| `license term refused at ingest` | WARN | The second line a term refusal writes, one gate deeper than the row above. Carries `uri`, the SDK `rule` id, the entry-relative `path` (`terms[i].…`) and the offending `token`, so you can name the bad value without asking for the publisher's feed. Only the ingest-tier term check produces it; every other reason has the row above and nothing more. |
+| `rampaudience.refused` | WARN, **ERROR** for the two below | A request named a recipient other than this Exchange and was refused before the handler ran, so it changed nothing. Carries `path` (the RPC), `verdict`, `self` (the identity this service answers to) and `reason`. `verdict` is `mismatch` (a well-formed domain naming somebody else), `empty` (no recipient at all) or `malformed` (not a bare domain). A steady stream of `mismatch` from one caller usually means their configured Exchange domain disagrees with `EXCHANGE_DOMAIN` here. At **ERROR** level it is not the caller's fault: `no_verdict` means this service's own identity is unusable and **every** caller is being refused, and any other verdict means a value this build does not understand. |
 | `migrations applied` | INFO | Boot. Carries `version`, `dirty` and `table`. **Appears twice** — once per database. Read `table` to tell them apart: `schema_migrations_ramp` is the catalog database, `schema_migrations_sor` the account registry. |
 | `ed25519 signing key loaded` | INFO | Boot. Must always appear. |
 | `rsa signing key loaded` | INFO | Boot. Appears only when an RSA key is configured. Without one, `no RSA signing key configured; AWS_CLOUDFRONT_RSA tenants will be refused` appears instead — fine for an all-Ed25519 deployment, a problem the moment a publisher uses CloudFront. |
@@ -121,6 +124,9 @@ table below gives both.
 | `sor adapter: postgres` | INFO | Boot. The account registry is connected and migrated. Carries `cache_ttl`. **Not optional** — its absence means the Exchange is not running. |
 | `default tenant not found yet — Register will fail until it is seeded` | WARN | Boot. No tenant row matches `EXCHANGE_DEFAULT_TENANT` (or `EXCHANGE_DOMAIN`). **No agent can register, so no agent can buy.** Boot continues anyway. Carries `default_tenant_domain`. |
 | `could not verify default tenant at boot` | WARN | Boot. The check could not run, usually a brief database problem. Carries `default_tenant_domain` and `err`. Re-check by hand once the service is up. |
+| `applied default agent credit to the default tenant` | INFO | Boot. `EXCHANGE_DEFAULT_AGENT_CREDIT` (unset means `0`) was written to the default tenant's column. Appears on every boot with a seeded default tenant; carries `default_tenant_domain` and `default_agent_credit`. A malformed value never reaches this line — it stops the boot instead. |
+| `default tenant not seeded yet — default agent credit NOT applied` | WARN | Boot. `EXCHANGE_DEFAULT_AGENT_CREDIT` is set but no default tenant row exists, so the value was not written. Seed the tenant, then restart to apply it. Carries `default_tenant_domain` and `default_agent_credit`. |
+| `granted default agent credit` | INFO | One line per welcome-credit grant at Register — the operator's visibility into credit drawn from the ledger's liquidity account, because the grant has no aggregate cap. Carries `billing_ref` and `amount`. |
 | `exchange.execute_transaction` with `event=sor_active_check_failed` | WARN | The account registry could not be read during a purchase. The purchase is **allowed through** — the ledger balance still bounds spending — but an account you switched off may buy until the registry answers again. |
 | `exchange.httpsig.replay_store_ready` | INFO | Boot. Redis-backed replay protection is live. Carries `addr`. |
 | `exchange.httpsig.replay_store_disabled` | INFO | Boot. `REDIS_URL` is unset, so replay protection is per-process — safe at one instance, not above (§3.3). |
@@ -162,13 +168,20 @@ design, and the internet will try it.
 | **Every signed request rejected, `outcome=signature`** | A proxy in front terminates HTTPS and forwards HTTP, so the URL the caller signed is not the URL the Exchange checks | Set `RAMP_TRUST_PROXY_HEADERS=true` — [`CONFIGURATION.md`](CONFIGURATION.md) §4. Only behind a proxy you control, never on a directly-exposed Exchange. |
 | A CloudFront publisher's purchases refused: `no RSA signing key` | An absent RSA key never stops the boot. The Exchange runs, serves every Ed25519 publisher, and refuses only a CloudFront-scheme tenant's requests — per request, with the `failed_precondition` code | Generate the key and supply it: [`DEPLOYMENT.md`](DEPLOYMENT.md) §5. No restart loop to worry about; add the key and restart once. |
 | Refuses to start: `EXCHANGE_BROKER_WELLKNOWN_URL is required` | Refusing is deliberate — with nothing to check the withdrawn-key list against, a withdrawn key would keep working | Point it at the Broker's `/.well-known/ramp.json`. |
+| **A catalog push refused `resource_exhausted` (HTTP 413), same submission every time** | The ingester splits a feed by entry COUNT (256, the protocol's bound on one request), and the Exchange also bounds the request SIZE at 1 MiB. A feed of unusually large entries builds a submission under the count bound and over the size one, and re-running rebuilds it identically | Split the feed file so the offending range goes as smaller submissions — the report names the entry range that was refused. This refusal is the Exchange's own verdict, so it prints `REFUSED` and nothing from that range is stored; the ranges stored before it stay stored, so re-running the split feed is safe. |
 | **Every catalog push rejected, `missing_resource_owner_id`** | The publisher's `ramp.json` names no payee (the one who gets paid) for this Exchange — it does not "attest" one. The payee is never guessed, and there is no fallback to the tenant id | The manifest needs `exchanges[].ext.resource_owner_id` on the entry whose `domain` equals your `EXCHANGE_DOMAIN`. §4.2. |
 | Every push rejected, `caller_not_in_catalog_contributors` | The publisher's `ramp.json` does not list the pushing key's identifier, or could not be fetched at all | Add it to `catalog_contributors[].domain`, or make it equal the manifest's own `domain`. §4.2. |
 | Every push rejected, `unknown_publisher_domain` | No tenant row exists for the entry's domain | Create the tenant first. §4.2. |
+| Every push rejected, `tenant_mismatch` | The push named a `tenant_id` that disagrees with the tenant the entry's `domain` resolves to. The server derives the owner from the domain and does not honour a disagreeing client value | Send no `tenant_id`, or send the one the domain resolves to. The derived tenant is authoritative either way, so omitting it is always correct. |
+| A push rejected, `invalid_license_terms` | One of the entry's terms failed an ingest-tier check — a `pricing.unit` or `quota.metric` token that is not in the registry, or a restriction naming the same token as both permitted and prohibited once aliases and letter case are folded (`scrape` and `crawl` are one token, so are `CRAWL` and `crawl`). The wire-tier term rules are refused earlier and never reach this reason | The second line the refusal writes, `license term refused at ingest`, carries the `rule` id, the entry-relative `path` and the offending `token`. For an unregistered token, register it or prefix it `vendor:` to declare it custom. For a collision the `token` is the folded form both spellings resolve to; drop it from one of the two lists. `ramp-ingest --check feed.jsonl` reports both readings of it before a push. |
+| A push rejected, `invalid_entry` | The entry would not convert for storage: a missing `domain` or `path`, or terms and metadata that would not marshal. It is a backstop — the wire rules refuse an empty `domain` or `path` earlier, so seeing this reason means the entry got past them | Rare, and worth reporting rather than working around: it means the wire rules and the storage conversion disagree about the same entry. The `uri` names the line. |
+| A push rejected, `uri_owned_by_other_resource` | The URI the entry materialises already belongs to a DIFFERENT catalog row, or two lines in the same push claim it under different keys. A URI belongs to exactly one row | Re-pushing the same resource is not a conflict — it updates in place. A real collision means two lines carry the same `domain` + `path` under different `content_id` values; correct the `content_id`. |
 | Purchases denied with `currency mismatch` | The catalog's terms are priced in one currency and the ledger is configured for another. A deployment is single-currency | Compare `EXCHANGE_BILLING_LEDGER` (`978`=EUR, `840`=USD) against the currency in the catalog's `pricing`. §3.2. |
 | **A committed transaction has no ledger posting** | The posting is best-effort: it happens after the transaction commits and its failure cannot fail the request. A crash, or a brief ledger failure, in that window leaves a charge unposted | Find it in the logs and put it right by hand — §3.2. Nothing does this automatically. |
 | Admin API unreachable | The allowlist refuses everything by default **and** has no effect behind a proxy, so "too strict" and "not applied at all" look identical | [`DEPLOYMENT.md`](DEPLOYMENT.md) §7. Bind the port directly; read `exchange.admin.ip_reject` for the address actually seen. |
+| **One agent's purchases all denied, `outcome=REJECTED_REPORTING_OVERDUE`** | The agent owes usage reports. It is refused while more than 10 obligations are overdue, or more than one in five of its due obligations is unreported — and with no history, the first missed report is one out of one, so it blocks | The agent files the missing reports through `ReportUsage`. They are accepted however late they are, and each accepted report clears one. Nothing needs doing on this side, and the deadline must never be edited in the database. The denial arrives as the item's `denial_reason` under a 200, not as an HTTP error, so an agent that only checks the status code will look like it is silently getting nothing. |
 | **Offer prices are out of date** | The copy the Exchange keeps in memory is rebuilt at boot and after each catalog push — nothing else refreshes it, so a row edited directly in the database is invisible | Run the ingest tool again (§4.2), or restart. Prefer the ingest tool: it re-validates. |
+| **Discovery fails for one listed URL instead of returning its offer, and takes the rest of the response with it** | The stored term names the same token as both permitted and prohibited once aliases and letter case are folded — the shape a push is refused for today, in a row written before that refusal existed. Stored terms ride out on offers and the Exchange validates its own responses, so it refuses to answer with that resource. A discovery call naming several URLs fails whole, so healthy resources in the same request stop answering too | The publisher re-pushes the resource with the token dropped from one of the two lists. A push upserts on the row's `resource_id`, which the entry's `content_id` decides, so the corrected push must carry the same `content_id` the stored row was written under; then the corrected term replaces it in place — no row is deleted and nothing is edited in the database. `ramp-ingest --check feed.jsonl` names the offending token before a push, without a key or a running Exchange. |
 | Discovery returns nothing for a URL you know is listed | The URL's domain has no tenant, or its stored form differs from the one asked for | Check the catalog rows for that prefix — §3.2. |
 | **One agent is denied every paid purchase: `agent is not registered for paid content: call Register first`** | The agent has no account. It authenticates fine and can still fetch free content, but it has nothing to charge. Adding a row to `ramp.agents` by hand does **not** fix this — that row's `billing_ref` stays empty | The agent must call the `Register` RPC itself. **Do not fund it** — there is no account to fund yet. §4.2. |
 | One agent denied with `account is switched off: contact the operator to turn it back on` | The agent registered, but its account row in the registry has `active = false` | Switch it back on — §4.2. |
@@ -345,10 +358,10 @@ SELECT tenant_id, domain, signing_scheme, fee_rate_bps, fee_rate_notes,
 **1. Create the tenant.** There is no RPC for this; it is a database row.
 
 ```sql
-INSERT INTO ramp.tenants (tenant_id, domain, hmac_secret_ref, ed25519_key_ref,
+INSERT INTO ramp.tenants (tenant_id, domain, ed25519_key_ref,
                           signing_scheme, fee_rate_bps,
                           activate_new_agents_by_default)
-VALUES ('publisher', 'www.publisher.example', 'unused', 'exchange-primary',
+VALUES ('publisher', 'www.publisher.example', 'exchange-primary',
         'ED25519', 1500, TRUE);
 -- Expect: INSERT 0 1
 ```
@@ -498,19 +511,45 @@ go build ./src/exchange/cmd/ramp-ingest
   --tenant publisher \
   --key /secrets/catalog-contributor.json \
   feed.jsonl
-# Expect: push: accepted=1284 rejected=0 warnings=3
+# Expect: push: accepted=1284 warnings=3
+#         followed, for a feed larger than one submission, by one line per
+#         submission naming the entry range it carried and whether it was stored
 ```
 
 The feed path is an optional positional argument; omit it and the feed is read
 from standard input, so piping `feed.jsonl` in works identically.
 
-**Read the result as pass or fail: `rejected=0` is the only passing result.** A
-non-zero rejected count exits non-zero and nothing is saved — the push is
-all-or-nothing, so a partial catalog never passes silently. Warnings are notes
-about small problems and do not block. Each rejection names its URL and reason;
-the common ones are in §3.1. **Scheduled runs are not implemented yet**: there is
-no cron entry, timer or watcher, so the pipeline is run by hand and the catalog
-reflects the last time someone ran it.
+**Read the result as pass or fail: exit status 0 is the only passing result.**
+The Exchange stores or refuses a submission whole — never part of one — and the
+binary exits non-zero on the first failure, so a partial catalog never passes
+silently. A feed larger than the wire bound on one submission (256 entries at
+the pinned protocol revision) is sent as several submissions in feed order; on a
+failure the report says which entry ranges were stored, which submission the run
+stopped at and why, and which entries were not sent, and re-running the same
+feed is safe — the catalog push is an upsert, so entries already stored are
+stored again unchanged.
+
+**A submission the run stopped at is printed one of two ways, and they mean
+different things.** `REFUSED` is the Exchange's own verdict: the request reached
+it, it refused the submission whole, and **nothing from that range is stored**.
+`NOT CONFIRMED` means no verdict came back — the call timed out, the connection
+dropped, or the Exchange answered success over a count that disagreed with what
+was sent — so **that range may or may not be stored**, and only a re-run
+settles it. Do not read `NOT CONFIRMED` as "absent"; re-running is safe either
+way, because the push upserts. A rerun clears a refusal a later run would not repeat: a
+transient failure, or an entry you have corrected. It does not clear one the
+same feed reproduces — see the `resource_exhausted` row in §3.1. Warnings are
+notes about small problems and do not block. Each refusal names its URL and
+reason; the common ones are in §3.1.
+
+Before pushing, `./ramp-ingest --check feed.jsonl` runs the same parse and
+mapping plus the SDK's entry validation locally — no key, no Exchange, no
+tenant — and exits 1 listing every violation with its record, rule id and field
+path, so a feed is fixed in one round rather than one refusal at a time.
+
+**Scheduled runs are not implemented yet**: there is no cron entry, timer or
+watcher, so the pipeline is run by hand and the catalog reflects the last time
+someone ran it.
 
 #### Rotate the tenant signing key
 
@@ -602,10 +641,12 @@ against it depends on what the release's migrations did:
 | **Added** a table, a column or an enum value | **Safe** — the older code never mentions the new object |
 | **Renamed or dropped** a column | **Not safe** — the older code still queries the old name |
 
-Two migrations in this schema are of the second kind: `000016` renamed
-`tx_request_id` to `idempotency_key`, and `000021` renamed `manifest_url` to
-`discovery_url`. Rolled back across either, the older image fails on the first
-query that touches the column — loudly, at boot or on that query, not silently.
+Three migrations in this schema are of the second kind: `000016` renamed
+`tx_request_id` to `idempotency_key`, `000021` renamed `manifest_url` to
+`discovery_url`, and `000031` dropped `tenants.hmac_secret_ref`. Rolled back
+across any of them, the older image fails on the first query that touches the
+column — loudly, at boot or on that query, not silently. Across `000031` that
+is every tenant read, so no offer, catalog lookup or signed URL is served.
 If you cannot tell which kind a release contained, treat it as the second.
 
 **Do not reverse a migration by hand.** Down-migration files exist in the source

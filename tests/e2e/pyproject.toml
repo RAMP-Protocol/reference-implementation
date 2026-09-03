@@ -56,11 +56,11 @@ dependencies = [
 # must match the Go module pin in the root go.mod, so the harness signs with the
 # same canonical wire form the services verify. No sibling checkout required.
 # Switch to a published release pin once one exists.
-ramp-protocol-sdk = { git = "https://github.com/RAMP-Protocol/protocol.git", subdirectory = "sdk/python", rev = "104d867aa9a15a316723af6c3dd61d73ed490363" }
+ramp-protocol-sdk = { git = "https://github.com/RAMP-Protocol/protocol.git", subdirectory = "sdk/python", rev = "5a2674e6617202a792a8e57362fce32cb5d2db7e" }
 # Generated wire types, pinned off the SAME revision as the SDK above — a split
 # between the two would mean the harness signs one payload shape and the services
 # verify another.
-ramp-protocol = { git = "https://github.com/RAMP-Protocol/protocol.git", subdirectory = "gen/python", rev = "104d867aa9a15a316723af6c3dd61d73ed490363" }
+ramp-protocol = { git = "https://github.com/RAMP-Protocol/protocol.git", subdirectory = "gen/python", rev = "5a2674e6617202a792a8e57362fce32cb5d2db7e" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

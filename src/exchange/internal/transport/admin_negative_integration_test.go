@@ -11,6 +11,9 @@ import (
 
 	connect "connectrpc.com/connect"
 	rampadminv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/admin/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
+
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 )
 
 // TestAdmin_SetTenantFeeRate_UnknownTenant_NotFound drives a setter for a tenant
@@ -23,7 +26,7 @@ func TestAdmin_SetTenantFeeRate_UnknownTenant_NotFound(t *testing.T) {
 
 	const missing = "t_does_not_exist"
 	_, err := admin.SetTenantFeeRate(h.ctx, connect.NewRequest(&rampadminv1.SetTenantFeeRateRequest{
-		Ver:  "1.0",
+		Ver:  helpers.ProtocolVersion,
 		Rate: &rampadminv1.TenantFeeRate{TenantId: missing, FeeRateBps: 100},
 	}))
 	assertConnectError(t, err, connect.CodeNotFound, "")
@@ -52,7 +55,7 @@ func TestAdmin_SetReportingPolicy_UnknownTenant_NotFound(t *testing.T) {
 	const missing = "t_does_not_exist"
 	tol := 0.1
 	_, err := admin.SetReportingPolicy(h.ctx, connect.NewRequest(&rampadminv1.SetReportingPolicyRequest{
-		Ver:    "1.0",
+		Ver:    helpers.ProtocolVersion,
 		Policy: &rampadminv1.ReportingPolicy{TenantId: missing, QuantityTolerance: &tol},
 	}))
 	assertConnectError(t, err, connect.CodeNotFound, "")
@@ -76,7 +79,7 @@ func TestAdmin_SetReportingPolicy_UnknownToken_InvalidArgument(t *testing.T) {
 	admin, _ := startAdminServer(t, h, "127.0.0.0/8")
 
 	_, err := admin.SetReportingPolicy(h.ctx, connect.NewRequest(&rampadminv1.SetReportingPolicyRequest{
-		Ver:    "1.0",
+		Ver:    helpers.ProtocolVersion,
 		Policy: &rampadminv1.ReportingPolicy{TenantId: h.tenantID, RequiredFields: []string{"bogus_field"}},
 	}))
 	assertConnectError(t, err, connect.CodeInvalidArgument, "bogus_field")
@@ -103,31 +106,31 @@ func TestAdmin_ValidateInterceptor_RejectsOutOfRange(t *testing.T) {
 	}{
 		{"fee_rate_bps_too_high", "fee_rate_bps", func() error {
 			_, err := admin.SetTenantFeeRate(h.ctx, connect.NewRequest(&rampadminv1.SetTenantFeeRateRequest{
-				Ver: "1.0", Rate: &rampadminv1.TenantFeeRate{TenantId: h.tenantID, FeeRateBps: 10000},
+				Ver: helpers.ProtocolVersion, Rate: &rampadminv1.TenantFeeRate{TenantId: h.tenantID, FeeRateBps: 10000},
 			}))
 			return err
 		}},
 		{"notes_too_long", "notes", func() error {
 			_, err := admin.SetTenantFeeRate(h.ctx, connect.NewRequest(&rampadminv1.SetTenantFeeRateRequest{
-				Ver: "1.0", Rate: &rampadminv1.TenantFeeRate{TenantId: h.tenantID, FeeRateBps: 100, Notes: &longNote},
+				Ver: helpers.ProtocolVersion, Rate: &rampadminv1.TenantFeeRate{TenantId: h.tenantID, FeeRateBps: 100, Notes: &longNote},
 			}))
 			return err
 		}},
 		{"tolerance_above_one", "quantity_tolerance", func() error {
 			_, err := admin.SetReportingPolicy(h.ctx, connect.NewRequest(&rampadminv1.SetReportingPolicyRequest{
-				Ver: "1.0", Policy: &rampadminv1.ReportingPolicy{TenantId: h.tenantID, QuantityTolerance: &tol},
+				Ver: helpers.ProtocolVersion, Policy: &rampadminv1.ReportingPolicy{TenantId: h.tenantID, QuantityTolerance: &tol},
 			}))
 			return err
 		}},
 		{"window_seconds_zero", "window_seconds", func() error {
 			_, err := admin.SetReportingPolicy(h.ctx, connect.NewRequest(&rampadminv1.SetReportingPolicyRequest{
-				Ver: "1.0", Policy: &rampadminv1.ReportingPolicy{TenantId: h.tenantID, WindowSeconds: &winZero},
+				Ver: helpers.ProtocolVersion, Policy: &rampadminv1.ReportingPolicy{TenantId: h.tenantID, WindowSeconds: &winZero},
 			}))
 			return err
 		}},
 		{"duplicate_required_fields", "required_fields", func() error {
 			_, err := admin.SetReportingPolicy(h.ctx, connect.NewRequest(&rampadminv1.SetReportingPolicyRequest{
-				Ver:    "1.0",
+				Ver:    helpers.ProtocolVersion,
 				Policy: &rampadminv1.ReportingPolicy{TenantId: h.tenantID, RequiredFields: []string{"billing_id", "billing_id"}},
 			}))
 			return err
@@ -215,15 +218,27 @@ func TestAdmin_JSONEcho_EmitsZeroFeeAndSnakeCase(t *testing.T) {
 	if got, ok := rate["fee_rate_bps"]; !ok || string(got) != "0" {
 		t.Errorf("fee_rate_bps = %s (present=%v), want 0 present (emit-unpopulated)", got, ok)
 	}
-	if _, ok := rate["feeRateBps"]; ok {
-		t.Error("response used camelCase feeRateBps, want snake_case")
-	}
 	if _, ok := rate["tenant_id"]; !ok {
 		t.Error("tenant_id missing from echoed rate")
 	}
 	if _, ok := rate["notes"]; ok {
 		t.Error("omitted notes should be absent from the echo")
 	}
+	// The three checks above each name one field, and each pins something the
+	// descriptor walk below does NOT read: fee_rate_bps present at 0 is the
+	// emit-unpopulated contract, tenant_id present is the echo itself, notes
+	// absent is the omitted-field contract. The walk reads the whole body against
+	// the descriptor, so a field added to the admin contract later has its
+	// SPELLING covered without anyone remembering to add a line here. That is
+	// also why no camelCase feeRateBps check sits here any more: the walk reports
+	// exactly that, generalised over every field.
+	//
+	// Read for its descriptor, not its contents — but ver is stamped anyway,
+	// because every construction of a ver-bearing message in this repo is, and
+	// one that is not costs the next reader a detour to find out why.
+	testutil.AssertCanonicalWireNames(t, raw, &rampadminv1.SetTenantFeeRateResponse{
+		Ver: helpers.ProtocolVersion,
+	})
 }
 
 // adminPostJSON issues a Connect unary JSON POST to the admin procedure. Uses a

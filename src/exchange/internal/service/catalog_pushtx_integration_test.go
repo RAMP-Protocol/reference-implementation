@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -85,7 +86,6 @@ func TestPushResources_AtomicRollbackOnMidBatchFailure(t *testing.T) {
 	if _, err := sqlc.New(pool).InsertTenant(ctx, sqlc.InsertTenantParams{
 		TenantID:        "t1",
 		Domain:          "pub.example",
-		HmacSecretRef:   "h",
 		Ed25519KeyRef:   "k",
 		ReportingPolicy: []byte(`{}`),
 		SigningScheme:   sqlc.RampSigningSchemeED25519,
@@ -99,6 +99,8 @@ func TestPushResources_AtomicRollbackOnMidBatchFailure(t *testing.T) {
 		sharedb.PoolRunner{Pool: pool}, pushTestExchangeDomain)
 
 	_, err := svc.PushResources(ctx, &rampv1.PushResourcesRequest{
+		Exchange: pushTestExchangeDomain,
+		Ver:      helpers.ProtocolVersion,
 		TenantId: "t1",
 		CallerId: "pub.example",
 		Entries: []*rampv1.ResourceEntry{

@@ -26,16 +26,19 @@ from pathlib import Path
 
 import pytest
 
-_E2E_ROOT = Path(__file__).resolve().parent.parent  # tests/e2e/
-_SELF = Path(__file__).resolve()
+from .ast_scan import scan_tree
 
 # The camelCase key that is always None on the snake_case parsed item dict.
 _FORBIDDEN_GET_KEY = "denialReason"
 
 
-def _forbidden_get_linenos(tree: ast.AST) -> list[int]:
-    """Lines of every ``<x>.get("denialReason")`` call in ``tree``."""
-    hits: list[int] = []
+def _forbidden_get_offences(tree: ast.AST) -> list[tuple[int, str]]:
+    """Every ``<x>.get("denialReason")`` call in ``tree``, as (line, "").
+
+    The reason is empty: there is one forbidden key, and the assertion below
+    already names it.
+    """
+    hits: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
@@ -45,28 +48,14 @@ def _forbidden_get_linenos(tree: ast.AST) -> list[int]:
             and isinstance(node.args[0], ast.Constant)
             and node.args[0].value == _FORBIDDEN_GET_KEY
         ):
-            hits.append(node.lineno)
-    return hits
-
-
-def _scan_e2e_tree() -> list[str]:
-    """Return ``tests/e2e/<rel>:<line>`` for every forbidden ``.get()`` call."""
-    hits: list[str] = []
-    for path in sorted(_E2E_ROOT.rglob("*.py")):
-        if path.resolve() == _SELF:
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        hits.extend(
-            f"tests/e2e/{path.relative_to(_E2E_ROOT)}:{lineno}"
-            for lineno in _forbidden_get_linenos(tree)
-        )
+            hits.append((node.lineno, ""))
     return hits
 
 
 @pytest.mark.stack_isolation("shared-without-cleanup")
 def test_no_camelcase_denial_reason_get_in_e2e() -> None:
     """No e2e .py reads the always-None ``.get("denialReason")`` on a snake item."""
-    hits = _scan_e2e_tree()
+    hits = scan_tree(_forbidden_get_offences, exclude=Path(__file__))
     assert not hits, (
         f'Found {len(hits)} `.get("denialReason")` read(s) in tests/e2e/ — the parsed '
         f'item is snake_case, so this always returns None. Use `.get("denial_reason")`:\n  '
@@ -78,11 +67,11 @@ def test_no_camelcase_denial_reason_get_in_e2e() -> None:
 def test_guard_flags_camelcase_get() -> None:
     """POSITIVE meta-test: the detector flags a ``.get("denialReason")`` call."""
     tree = ast.parse('x = item.get("denialReason")')
-    assert len(_forbidden_get_linenos(tree)) == 1
+    assert len(_forbidden_get_offences(tree)) == 1
 
 
 @pytest.mark.stack_isolation("shared-without-cleanup")
 def test_guard_ignores_snake_get() -> None:
     """NEGATIVE meta-test: the correct ``.get("denial_reason")`` is NOT flagged."""
     tree = ast.parse('x = item.get("denial_reason")')
-    assert _forbidden_get_linenos(tree) == []
+    assert _forbidden_get_offences(tree) == []

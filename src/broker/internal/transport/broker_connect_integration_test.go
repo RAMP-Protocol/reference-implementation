@@ -26,12 +26,8 @@ package transport_test
 // here.
 
 import (
-	"bytes"
-	"compress/gzip"
 	"crypto/ed25519"
 	"crypto/rand"
-	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -40,11 +36,11 @@ import (
 	connect "connectrpc.com/connect"
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
-	sdkconnect "github.com/RAMP-Protocol/protocol/sdk/go/connect"
 	"github.com/RAMP-Protocol/protocol/sdk/go/connectserver"
 	"github.com/RAMP-Protocol/protocol/sdk/go/core"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
+	audiencetest "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampaudience/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampauth"
 	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/replay"
@@ -52,6 +48,12 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport"
 )
+
+// harnessBrokerDomain is the identity this harness's Broker publishes, and what
+// the recipient check compares an addressed request against. It is the Broker's
+// twin of the Exchange harness's own domain constant, and a reserved .test name
+// so it can never resolve to a real party.
+const harnessBrokerDomain = "broker.ramp.test"
 
 // brokerConnectFixture bundles the in-process server, the underlying base
 // transport that signing clients chain onto, the SDK static resolver (so
@@ -81,29 +83,17 @@ func startBrokerConnectServer(t *testing.T, fx *fixture, callerID string, caller
 	// the WBA split — not by the caller's directory identity (callerID).
 	resolver := helpers.NewStaticKeyResolver(map[string]ed25519.PublicKey{rwtestutil.MustThumbprint(t, callerPub): callerPub})
 	replayStore := replay.NewCoreAdapter(replay.NewMemoryStore(time.Now))
-	// Production parity (cmd/server/main.go buildBrokerMux): the exact ServerOption
-	// set the production BrokerService handler wires — no more, no less — so the
-	// harness exercises the SAME middleware AND wire codec, not a look-alike.
-	// WithValidation(Strict) ALONE installs the SDK's bidirectional protovalidate
-	// interceptor (requests + responses + error details, via
-	// sdkconnect.NewValidateInterceptor); a separate WithInterceptors(validate...)
-	// would only re-add the same engine, so production does not wire one and neither
-	// does this harness. WithEmitUnpopulated keeps zero-valued response fields on the
-	// JSON wire (the platform JSON contract); dropping it silently forks the wire
-	// shape — the divergence TestResolve_RefusalKeepsZeroValuedFieldsOnJSONWire pins.
-	svrOpts := []connectserver.ServerOption{
-		connectserver.WithKeyResolver(resolver),
-		connectserver.WithReplayStore(replayStore),
-		connectserver.WithValidation(sdkconnect.ValidationStrict),
-		connectserver.WithEmitUnpopulated(),
-		// Production parity (cmd/server/main.go): an unsigned /ramp. request
-		// reaches the handler, which returns the typed Unauthenticated fault.
-		connectserver.WithVerifyGate(func(r *http.Request) bool {
-			return r.Header.Get("Signature-Input") != ""
-		}),
-		// Audit-log every gate rejection with its SDK-classified outcome, exactly
-		// as production wires it.
-		connectserver.WithOnReject(transport.LogHTTPSigReject),
+	// Built by the function production builds it with, not by a list assembled
+	// here. Hand-assembling it is how the two came apart: this list omitted the
+	// recipient check production mounts, while the comment above it said the set
+	// was production's "no more, no less". Nothing failed, because no
+	// agent-facing BrokerService request names a recipient — so the gap was
+	// invisible right up to the day an RPC gains one.
+	svrOpts, err := transport.BrokerMountOptions(
+		resolver, replayStore, audiencetest.MustInterceptor(t, harnessBrokerDomain),
+	)
+	if err != nil {
+		t.Fatalf("broker mount options: %v", err)
 	}
 	// connectserver.NewBrokerServiceHandler wraps request-id (outermost) → RFC 9421
 	// verify middleware → connect interceptors (protovalidate).
@@ -117,7 +107,11 @@ func startBrokerConnectServer(t *testing.T, fx *fixture, callerID string, caller
 	// again mirrors production run(), which routes every route through
 	// WrapPublicSurface (request-id + URL normalization). Default options: the
 	// proxy-trust opt-in is off, matching a directly-exposed broker.
-	server := httptest.NewServer(transport.WrapPublicSurface(testutil.DiscardLogger(), mux, runhttp.PublicSurfaceOptions{}))
+	// The FIXTURE's logger, not a second discard instance: RequestIDMiddleware
+	// (inside WrapPublicSurface) is what attaches the request-scoped logger the
+	// handler writes through, so this is the only place a test can observe the
+	// records the service emits while serving a request.
+	server := httptest.NewServer(transport.WrapPublicSurface(fx.logger, mux, runhttp.PublicSurfaceOptions{}))
 	t.Cleanup(server.Close)
 
 	base := server.Client().Transport
@@ -125,41 +119,6 @@ func startBrokerConnectServer(t *testing.T, fx *fixture, callerID string, caller
 		base = http.DefaultTransport
 	}
 	return &brokerConnectFixture{server: server, base: base, resolver: resolver, exchange: fx.exchange}
-}
-
-// captureBody tees the JSON response body so a test can assert the EXACT wire
-// bytes the server emitted (i.e. whether the EmitUnpopulated codec is active)
-// while the Connect client still decodes the typed message normally. It wraps
-// the signing transport, so the request is signed BEFORE the response is teed.
-type captureBody struct {
-	base http.RoundTripper
-	body []byte
-}
-
-func (c *captureBody) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := c.base.RoundTrip(req)
-	if err != nil || resp.Body == nil {
-		return resp, err
-	}
-	raw, rerr := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if rerr != nil {
-		return nil, rerr
-	}
-	// Connect advertises gzip, so the server may compress the JSON response. Store
-	// the DECODED bytes for wire-shape inspection, but re-serve the original raw
-	// bytes to the client so its own decoder is unaffected.
-	c.body = raw
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		if zr, zerr := gzip.NewReader(bytes.NewReader(raw)); zerr == nil {
-			if dec, derr := io.ReadAll(zr); derr == nil {
-				c.body = dec
-			}
-			_ = zr.Close()
-		}
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(raw))
-	return resp, nil
 }
 
 // signingBrokerJSONClient is signingBrokerClient's Connect-JSON twin: it drives
@@ -171,8 +130,8 @@ func (c *captureBody) RoundTrip(req *http.Request) (*http.Response, error) {
 // JSON to observe it — the gRPC client used elsewhere cannot.
 func signingBrokerJSONClient(
 	base http.RoundTripper, baseURL, keyID string, priv ed25519.PrivateKey,
-) (rampconnect.BrokerServiceClient, *captureBody) {
-	cap := &captureBody{base: brokerSigningTransport(base, keyID, priv)}
+) (rampconnect.BrokerServiceClient, *testutil.CaptureBody) {
+	cap := &testutil.CaptureBody{Base: brokerSigningTransport(base, keyID, priv)}
 	client := &http.Client{Transport: cap}
 	return rampconnect.NewBrokerServiceClient(client, baseURL, connect.WithProtoJSON()), cap
 }
@@ -192,7 +151,8 @@ func brokerSigningTransport(base http.RoundTripper, keyID string, priv ed25519.P
 	if err != nil {
 		panic(err)
 	}
-	return core.NewSigningTransport(signer, base,
+	return core.NewSigningTransport(
+		signer, base,
 		core.WithSignPredicate(rampauth.IsRAMPProcedure),
 		core.WithSignatureAgent(keyID),
 		core.WithWindow(core.ClockWindow(time.Now, 3600*time.Second)),
@@ -250,32 +210,23 @@ func assertBrokerErrorDetail(t *testing.T, err error, wantDomain string) {
 	}
 }
 
-// brokerErrorDetail locates the single typed *rampv1.ErrorDetail carried on a
-// broker Connect fault, asserting err is a *connect.Error that carries one. The
-// connect.Error/Details() walk lives here once so the three assert* helpers
-// (Domain-only, metadata-field, metadata-absent) layer their specific checks on
-// top without duplicating the boundary read (Testing Doctrine pt9 — the detail is
-// read through the public Connect error envelope, never past the transport).
+// brokerErrorDetail returns the typed *rampv1.ErrorDetail carried on a broker
+// Connect fault, so the three assert* helpers below (Domain-only,
+// metadata-field, metadata-absent) each layer their own check on one named
+// read.
+//
+// The walk itself is testutil.SingleErrorDetail, shared with the exchange
+// assertions, so both services hold their envelopes to the same contract:
+// EXACTLY one detail. Every RAMP fault builds its envelope in one place, so a
+// second detail means two builders ran over the same error. This wrapper adds
+// only the nil-error message. The detail is read through the public Connect
+// error envelope (Testing Doctrine pt9 — never past the transport).
 func brokerErrorDetail(t *testing.T, err error) *rampv1.ErrorDetail {
 	t.Helper()
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	var ce *connect.Error
-	if !errors.As(err, &ce) {
-		t.Fatalf("not connect.Error: %v", err)
-	}
-	for _, d := range ce.Details() {
-		msg, verr := d.Value()
-		if verr != nil {
-			continue
-		}
-		if ed, ok := msg.(*rampv1.ErrorDetail); ok {
-			return ed
-		}
-	}
-	t.Fatalf("no *rampv1.ErrorDetail on connect error: %v", err)
-	return nil
+	return testutil.SingleErrorDetail(t, err)
 }
 
 // assertBrokerErrorField fails unless err is a *connect.Error carrying a typed
@@ -284,8 +235,8 @@ func brokerErrorDetail(t *testing.T, err error) *rampv1.ErrorDetail {
 // Connect sink: a broker input-validation reject carries its offending field
 // (or other machine-readable axis) as TYPED ErrorDetail.metadata, NEVER baked
 // into the non-authoritative Message string. It is the broker mirror of the
-// exchange's assertReportRejectionField
-// (src/exchange/internal/transport/integration_assert_test.go:126) and a
+// exchange's assertReportRejectionField in
+// src/exchange/internal/transport/integration_assert_test.go, and a
 // metadata-aware sibling of assertBrokerErrorDetail above (Domain-only). The
 // detail is read through the public Connect error envelope (Testing Doctrine
 // pt9 — never past the transport boundary).

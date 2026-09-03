@@ -1,7 +1,7 @@
-"""Phase-2a demo-catalog proof driver (items 2-5).
+"""Local-stack catalog proof driver (items 2-5).
 
 Re-runnable proof that the live e2e stack ingests and serves the multi-publisher
-demo catalog through the REAL JSONL ingestion path. NOT a pytest module — a
+catalog through the REAL JSONL ingestion path. NOT a pytest module — a
 standalone script run against an already-up stack (`make e2e-up`):
 
     uv run --project tests/e2e python tests/e2e/demo_proof.py
@@ -15,8 +15,9 @@ What it does, end to end:
 2. Registers the catalog-contributor pubkey (Gate 1) and the broker exchange row
    (so the Broker can route a demo resolve to exchange:8081).
 3. Runs the production ingest binary `cmd/ramp-ingest` ONCE PER FEED
-   (philosophy/music/sfx), each a single signed PushResources RPC. A non-zero
-   rejected count fails the proof.
+   (philosophy/music/sfx), each as signed PushResources RPCs — one per
+   submission of at most the wire bound; every demo feed fits in one. A
+   non-zero exit (the binary exits non-zero on any refusal) fails the proof.
 4. DiscoverResources (via the Broker resolve surface) for a demo resource
    (socrates) and prints its offer/terms — proving ingest+discovery on the real
    catalog.
@@ -50,6 +51,8 @@ from harness.resolve_carriers import (  # noqa: E402
     licensed_of,
     retrieval_endpoint_of,
 )
+from harness.exchanges import EXCHANGE_A_DOMAIN, EXCHANGE_A_INTERNAL_URL  # noqa: E402
+from harness.ingest_runner import ingest_succeeded, run_ingest  # noqa: E402
 from harness.seed import (  # noqa: E402
     _broker_relay_pubkey_bytes,
     _BROKER_RELAY_KID,
@@ -62,13 +65,26 @@ CONTRIBUTOR_KEY = (
 )
 CONTRIBUTOR_ID = "catalog-contributor-e2e"
 
+# Feed paths are REPO_ROOT-relative because ingest runs with cwd=REPO_ROOT.
+CATALOG_DIR_REL = "tests/e2e/harness/fixtures/catalog"
+
+# The catalog feeds this script ingests are the HARNESS-OWNED ones under
+# harness/fixtures/catalog/, the same feeds seed.py uses — NOT the demo
+# deployment's feeds under deploy/fixtures/demo/.
+#
+# Both this script and the pytest harness seed the SAME local stack, under the
+# same publisher domains and the same URIs, and ramp.catalog has UNIQUE(uri):
+# whichever ingests last wins. Pointing this script at a different feed set would
+# silently replace the catalog the tests expect, and the damage would surface as
+# unrelated tests failing on terms they never asked for.
+#
 # (tenant_id, domain, signing_scheme, feed file, edge service, edge container port).
-DEMO_PUBLISHERS = [
+E2E_PUBLISHERS = [
     (
         "tenant-demo-philosophy",
         "demo.ramp-protocol.org",
         "ED25519",
-        "deploy/fixtures/demo/philosophy.jsonl",
+        f"{CATALOG_DIR_REL}/philosophy.jsonl",
         "edge",
         8787,
     ),
@@ -76,7 +92,7 @@ DEMO_PUBLISHERS = [
         "tenant-demo-music",
         "music.demo.ramp-protocol.org",
         "ED25519",
-        "deploy/fixtures/demo/music.jsonl",
+        f"{CATALOG_DIR_REL}/music.jsonl",
         "fastly-edge",
         7676,
     ),
@@ -84,7 +100,7 @@ DEMO_PUBLISHERS = [
         "tenant-demo-sfx",
         "sfx.demo.ramp-protocol.org",
         "AWS_CLOUDFRONT_RSA",
-        "deploy/fixtures/demo/sfx.jsonl",
+        f"{CATALOG_DIR_REL}/sfx.jsonl",
         "aws-edge",
         8788,
     ),
@@ -93,10 +109,18 @@ DEMO_PUBLISHERS = [
 ED25519_KEY_REF = "exchange-primary"
 RSA_KEY_REF = "cf-rsa-primary"
 
-# EUR-funded demo buyer (seeded in EXCHANGE_BILLING_SEED). The demo catalog is
-# mostly EUR/GBP and the in-memory billing adapter authorizes every term on a
-# currency match, so the demo buyer must hold EUR. Its kid == agent_id so the
-# Broker self-act gate (verified keyID == req.agent_id) admits it.
+# The buyer this proof runs as. It is NOT funded, and cannot be: the in-memory
+# billing adapter denominates every balance in one currency, billing.DemoCurrency
+# ("USD"), and its seed loader drops any EXCHANGE_BILLING_SEED entry in another
+# currency. Registration then gives this agent a zero USD account.
+#
+# That is enough for what this script proves. The resources it walks — socrates
+# for discovery, thales for the canary fetch — are reached on terms whose charge
+# is zero, and a zero charge skips the currency and balance gates. Point it at a
+# PRICED term and Authorize refuses with "currency mismatch".
+#
+# Its kid == agent_id so the Broker self-act gate (verified keyID == req.agent_id)
+# admits it.
 DEMO_AGENT_ID = "agent-demo-eur"
 DEMO_AGENT_KEY_PATH = (
     REPO_ROOT / "tests" / "e2e" / "harness" / "fixtures" / "agent_demo_eur_key.json"
@@ -129,9 +153,9 @@ def _register_tenant(dsn: str, tenant_id: str, domain: str, scheme: str) -> None
             cur.execute(
                 """
                 INSERT INTO ramp.tenants (
-                    tenant_id, domain, hmac_secret_ref, ed25519_key_ref,
+                    tenant_id, domain, ed25519_key_ref,
                     reporting_policy, signing_scheme, rsa_key_ref, cloudfront_key_pair_id
-                ) VALUES (%s, %s, 'none', %s, '{}', 'AWS_CLOUDFRONT_RSA', %s, %s)
+                ) VALUES (%s, %s, %s, '{}', 'AWS_CLOUDFRONT_RSA', %s, %s)
                 """,
                 (tenant_id, domain, ED25519_KEY_REF, RSA_KEY_REF, RSA_KEY_REF),
             )
@@ -139,9 +163,9 @@ def _register_tenant(dsn: str, tenant_id: str, domain: str, scheme: str) -> None
             cur.execute(
                 """
                 INSERT INTO ramp.tenants (
-                    tenant_id, domain, hmac_secret_ref, ed25519_key_ref,
+                    tenant_id, domain, ed25519_key_ref,
                     reporting_policy, signing_scheme
-                ) VALUES (%s, %s, 'none', %s, '{}', 'ED25519')
+                ) VALUES (%s, %s, %s, '{}', 'ED25519')
                 """,
                 (tenant_id, domain, ED25519_KEY_REF),
             )
@@ -188,16 +212,21 @@ def _register_contributor_and_exchange(dsn: str) -> None:
             """,
             (_BROKER_RELAY_KID, _broker_relay_pubkey_bytes()),
         )
-        cur.execute("SELECT 1 FROM broker.exchanges WHERE domain = %s", ("exchange:8081",))
+        # The registry row and the recipient every push names must be the same
+        # exchange, or the demo routes to one and addresses the other. Both come
+        # from the constant, so they cannot be kept equal by hand and then not
+        # be.
+        cur.execute("SELECT 1 FROM broker.exchanges WHERE domain = %s", (EXCHANGE_A_DOMAIN,))
         if cur.fetchone() is None:
             cur.execute(
                 """
                 INSERT INTO broker.exchanges (
                     exchange_id, domain, endpoint, trust_level,
                     supported_profiles, priority, healthy
-                ) VALUES ('ex-demo', 'exchange:8081', 'http://exchange:8081',
+                ) VALUES ('ex-demo', %s, %s,
                           'VERIFIED', '["ramp-news-v1"]'::jsonb, 10, TRUE)
                 """,
+                (EXCHANGE_A_DOMAIN, EXCHANGE_A_INTERNAL_URL),
             )
         conn.commit()
 
@@ -213,28 +242,21 @@ def _enable_broker_relay(dsn: str, domain: str) -> None:
 
 
 def _ingest(exchange_url: str, tenant_id: str, feed: str) -> None:
-    proc = subprocess.run(
-        [
-            "go",
-            "run",
-            "./src/exchange/cmd/ramp-ingest",
-            "--exchange-url",
-            exchange_url,
-            "--tenant",
-            tenant_id,
-            "--key",
-            str(CONTRIBUTOR_KEY),
-            feed,
-        ],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=300,
+    """Push one feed. ``exchange_url`` is a host-mapped 127.0.0.1 port, which
+    names no exchange, so ``--exchange`` overrides the recipient the binary
+    would otherwise derive from it."""
+    proc = run_ingest(
+        argv_prefix=["go", "run", "./src/exchange/cmd/ramp-ingest"],
+        exchange_url=exchange_url,
+        exchange=EXCHANGE_A_DOMAIN,
+        tenant_id=tenant_id,
+        key_path=CONTRIBUTOR_KEY,
+        feed=Path(feed),
+        cwd=REPO_ROOT,
     )
     tail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else ""
     print(f"  ingest {feed} -> rc={proc.returncode} | {tail}")
-    if proc.returncode != 0 or "rejected=0" not in proc.stderr:
+    if not ingest_succeeded(proc):
         print(proc.stderr)
         msg = f"ingest failed for {feed}"
         raise SystemExit(msg)
@@ -264,14 +286,14 @@ def main() -> None:
     )
 
     print("== item 2: register demo tenants + contributor + exchange ==")
-    for tenant_id, domain, scheme, _feed, _svc, _p in DEMO_PUBLISHERS:
+    for tenant_id, domain, scheme, _feed, _svc, _p in E2E_PUBLISHERS:
         _register_tenant(dsn, tenant_id, domain, scheme)
         _enable_broker_relay(dsn, domain)
         print(f"  tenant {tenant_id} ({domain}, {scheme})")
     _register_contributor_and_exchange(dsn)
 
     print("== item 2: ingest all three demo feeds via cmd/ramp-ingest ==")
-    for tenant_id, _domain, _scheme, feed, _svc, _p in DEMO_PUBLISHERS:
+    for tenant_id, _domain, _scheme, feed, _svc, _p in E2E_PUBLISHERS:
         _ingest(exchange_url, tenant_id, feed)
 
     print("== item 3: DiscoverResources for socrates ==")

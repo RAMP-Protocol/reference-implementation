@@ -12,6 +12,7 @@ import (
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/account"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/directory"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/keystore"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/publisher"
@@ -132,6 +133,12 @@ func newSvc(t *testing.T, cfg publisher.Config) *publisher.Service {
 	}
 	if cfg.Revocations == nil {
 		cfg.Revocations = &stubRevocations{}
+	}
+	// Default to an UNREGISTERED subdomain so a test that says nothing about the
+	// account row gets no overlay, and every existing presence expectation is
+	// unchanged by the overlay's arrival.
+	if cfg.Registrations == nil {
+		cfg.Registrations = &stubRegistrations{err: account.ErrNotFound}
 	}
 	svc, err := publisher.New(cfg)
 	if err != nil {
@@ -386,14 +393,27 @@ func TestNegativeCacheAvoidsRepeatBackendHits(t *testing.T) {
 
 func TestNewRejectsMissingDependencies(t *testing.T) {
 	t.Parallel()
-	if _, err := publisher.New(publisher.Config{Cards: &stubCards{}, Revocations: &stubRevocations{}}); err == nil {
-		t.Error("New without Keys = nil error, want a validation error")
+	full := func() publisher.Config {
+		return publisher.Config{
+			Keys: &stubKeys{}, Cards: &stubCards{},
+			Revocations: &stubRevocations{}, Registrations: registered(),
+		}
 	}
-	if _, err := publisher.New(publisher.Config{Keys: &stubKeys{}, Revocations: &stubRevocations{}}); err == nil {
-		t.Error("New without Cards = nil error, want a validation error")
+	cases := map[string]func(*publisher.Config){
+		"Keys":          func(c *publisher.Config) { c.Keys = nil },
+		"Cards":         func(c *publisher.Config) { c.Cards = nil },
+		"Revocations":   func(c *publisher.Config) { c.Revocations = nil },
+		"Registrations": func(c *publisher.Config) { c.Registrations = nil },
 	}
-	if _, err := publisher.New(publisher.Config{Keys: &stubKeys{}, Cards: &stubCards{}}); err == nil {
-		t.Error("New without Revocations = nil error, want a validation error")
+	for name, drop := range cases {
+		cfg := full()
+		drop(&cfg)
+		if _, err := publisher.New(cfg); err == nil {
+			t.Errorf("New without %s = nil error, want a validation error", name)
+		}
+	}
+	if _, err := publisher.New(full()); err != nil {
+		t.Errorf("New with every dependency = %v, want nil", err)
 	}
 }
 

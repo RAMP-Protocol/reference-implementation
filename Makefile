@@ -2,10 +2,11 @@
 .PHONY: go-fmt go-fmt-check go-lint go-typecheck go-test test-integration test-zitadel test-e2e-collect
 .PHONY: db-up db-down db-logs dev-keys adr-001-check adr-008-d3-check sdk-pin-check
 .PHONY: stale-proto-names-check published-refs-check published-secrets-check test-terraform
+.PHONY: delivery-event-check
 .PHONY: image-version-check
-.PHONY: zitadel-up zitadel-creds zitadel-logs zitadel-down
+.PHONY: zitadel-up zitadel-creds zitadel-logs zitadel-down buildx-check
 .PHONY: edge-%
-.PHONY: test-e2e e2e-keys e2e-up e2e-down e2e-logs e2e-demo
+.PHONY: test-e2e e2e-keys e2e-up e2e-down e2e-logs e2e-demo ledger
 
 # Go is a single module covering src/exchange, src/broker, src/identity, and
 # internal/. Edge (TS) has its own Makefile under src/; the Python e2e harness
@@ -30,11 +31,12 @@ help:
 	@echo "  make test-integration - run //go:build integration tests (spins testcontainers)"
 	@echo "  make test-terraform - terraform module test suites + config drift checks (needs terraform)"
 	@echo "  make published-secrets-check - scan the published file set for secrets (needs gitleaks)"
+	@echo "  make ledger TX=<id> - render the evidence chain for one transaction"
 	@echo "  make install-tools  - install sqlc, gitleaks, golangci-lint, gofumpt, biome, jscpd, wrangler"
 	@echo ""
 	@echo "Per-subproject: make edge-<target> (e.g. edge-lint, edge-test)"
 
-quality: fmt lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3-check sdk-pin-check stale-proto-names-check published-refs-check published-secrets-check image-version-check
+quality: fmt lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3-check sdk-pin-check stale-proto-names-check delivery-event-check published-refs-check published-secrets-check image-version-check
 	@echo "All quality gates passed!"
 
 # CI variant of `quality`: formatting is CHECKED, never written. CI must not
@@ -42,7 +44,7 @@ quality: fmt lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3
 # silently auto-fixing them. (Go + edge formatting is also enforced by their
 # linters; tests/e2e Python formatting is enforced ONLY here.) Local
 # `make quality` keeps auto-formatting via `fmt`.
-quality-ci: fmt-check lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3-check sdk-pin-check stale-proto-names-check published-refs-check published-secrets-check image-version-check
+quality-ci: fmt-check lint typecheck test-fast jscpd file-length adr-001-check adr-008-d3-check sdk-pin-check stale-proto-names-check delivery-event-check published-refs-check published-secrets-check image-version-check
 	@echo "All quality gates passed (CI, check-only fmt)!"
 
 file-length:
@@ -69,6 +71,13 @@ sdk-pin-check:
 # compiler cannot see them.
 stale-proto-names-check:
 	@scripts/check-stale-proto-names.sh
+
+# Keeps the edge worker's delivery-record name and the ledger's search for it in
+# agreement. They are written in two languages, and drift renders every evidence
+# chain's delivery row as "not recorded" while both sides still pass their own
+# tests.
+delivery-event-check:
+	@scripts/check-delivery-event-name.sh
 
 # Terraform module test suites (offline: plan mode + mocked providers) plus
 # config drift checks (compatibility_date vs wrangler.toml). Not part of
@@ -139,6 +148,18 @@ go-lint:
 go-typecheck:
 	@echo "==> go build"
 	go build ./...
+# Build-tagged test files are outside every other Go gate: `go build` does not
+# compile test files at all, and both `go lint` and `go test` run untagged, so a
+# file behind `integration` or `integration && zitadel` can stop compiling and
+# every gate stays green. `go vet` does typecheck test files, so one vet per tag
+# combination puts those tiers back under the build. The two combinations cover
+# all three tag expressions in the tree: `integration` also selects
+# `integration && !zitadel`, and `integration zitadel` also selects
+# `integration && zitadel`.
+	@echo "==> go vet -tags integration"
+	go vet -tags "integration" ./...
+	@echo "==> go vet -tags 'integration zitadel'"
+	go vet -tags "integration zitadel" ./...
 
 go-test:
 	@echo "==> go test"
@@ -297,8 +318,16 @@ e2e-keys:
 # --wait blocks until every service is healthy; --wait-timeout caps the
 # wait at 120s (Wave 0 acceptance bound). e2e-keys runs first so a clean
 # checkout (no committed keys) comes up with zero manual steps.
-e2e-up: e2e-keys
+#
+# buildx-check runs before either: without the plugin compose builds these 19
+# images on the legacy builder and says so only in a warning nobody reads, which
+# turns a ~75s stack-up into ~39 minutes. Failing here costs a second and names
+# the cause.
+e2e-up: buildx-check e2e-keys
 	$(COMPOSE_E2E) up -d --build --wait --wait-timeout 120
+
+buildx-check:
+	@scripts/check-buildx.sh
 
 # Phase-2a demo-catalog proof (items 2-5): register the three demo tenants,
 # ingest all three demo feeds via the production cmd/ramp-ingest binary,
@@ -306,6 +335,22 @@ e2e-up: e2e-keys
 # edge. Re-runnable against an already-up stack (`make e2e-up` first).
 e2e-demo:
 	uv run --project tests/e2e python tests/e2e/demo_proof.py
+
+# Render the cryptographic evidence chain for one executed transaction. Reads
+# the Exchange admin plane, the Broker's selection audit, and the edge delivery
+# logs, then re-verifies both Ed25519 signatures offline.
+#
+# The Exchange admin plane and the Broker database are reachable from inside a
+# deployment only, so both are normally addressed through a tunnel. Every
+# endpoint and credential comes from the environment; nothing is defaulted to a
+# live host here. Run `go run ./src/broker/cmd/ramp-ledger -h` for the full set.
+#
+#   RAMP_ADMIN_URL   Exchange admin base URL (required)
+#   BROKER_DB_URL    Broker Postgres DSN; unset skips the routing leg
+#   RAMP_EDGE_LOG_GROUP  edge CloudWatch log group; unset skips the delivery leg
+ledger:
+	@test -n "$(TX)" || { echo "usage: make ledger TX=<transaction-id>" >&2; exit 2; }
+	@go run ./src/broker/cmd/ramp-ledger -tx "$(TX)"
 
 e2e-down:
 	$(COMPOSE_E2E) down -v
@@ -323,7 +368,7 @@ e2e-logs:
 test-e2e-collect:
 	@cd tests/e2e && uv run pytest --collect-only $(E2E_PYTEST_ARGS)
 
-# ───── AWS demo deploy helpers — see RUNBOOK-aws-demo.md ────────────────────
+# ───── AWS demo deploy helpers (retired ECS demo; kept for the tooling sweep) ─
 aws-rotate-keys:
 	@scripts/rotate-keys.sh generate
 

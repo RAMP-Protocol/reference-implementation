@@ -13,7 +13,9 @@
 #                  "x": <base64url raw 32-byte pubkey>,
 #                  "not_before": <RFC3339>, "not_after": <RFC3339>}]}
 # The CatalogSignatureMiddleware self-signup path fetches the WBA directory to
-# learn the writer key (matched by caller_id == manifest domain).
+# learn the writer key. Identity is anchored by WHERE the directory is fetched
+# from, not by anything inside it: the directory carries no role and no domain,
+# and no manifest field is compared on either side.
 #
 # not_before/not_after are wide-open (now-1h .. now+10y) so the
 # fixture is never the reason a self-signup fails in the e2e stack.

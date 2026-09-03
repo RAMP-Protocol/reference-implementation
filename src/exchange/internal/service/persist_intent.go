@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"slices"
 	"time"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
@@ -21,9 +20,15 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 )
 
-// buildPersistIntent assembles what the repos consume. All derived values (IDs,
-// agent-identity hash, reporting-policy defaults, obligation window/deadline) are
-// computed here so persistTransaction reduces to "build, run tx, call the repos".
+// buildPersistIntent assembles what the repos consume: the ids, the
+// agent-identity hash, the evidence, and the obligation's deadline derived from
+// the window the caller already planned — so persistTransaction reduces to
+// "build, run tx, call the repos".
+//
+// The obligation's shape (window, required fields, tolerance, and whether one is
+// owed at all) arrives on persistInput.plan rather than being derived here. The
+// agent was handed those same values in its result item before this ran, and a
+// second derivation is a second chance to disagree with them.
 //
 // The evidence record is returned ALONGSIDE the intent rather than embedded in
 // it: the intent is the transaction_log + obligation shape, and threading a whole
@@ -32,47 +37,22 @@ import (
 // persistInput, including the request correlation the caller resolved at the
 // service boundary.
 func (s *ExchangeService) buildPersistIntent(in persistInput) (repo.PersistTxIntent, repo.EvidenceRecord, error) {
-	policy := decodeReportingPolicy(in.tenant.ReportingPolicy)
-	tolerance := defaultQuantityTolerance
-	if policy.QuantityTolerance != nil {
-		tolerance = *policy.QuantityTolerance
-	}
-	windowSeconds := windowSecondsForObligation(policy, s.cfg.ReportWindow)
-	// Normalize required_fields to a non-nil slice so the NOT NULL TEXT[]
-	// column receives an empty array rather than NULL when the tenant
-	// policy did not pin any fields. sqlc passes the Go slice straight
-	// through, so a nil here would violate the column constraint.
-	requiredFields := policy.RequiredFields
-	if in.pricing.IsFree() {
-		// A price-zero transaction stores no billing_id (ADR-009 D5), so a
-		// conformant report carries an empty billing_id — which validateRequiredFields
-		// would reject as "missing" (reportHasField keys billing_id on non-empty).
-		// billing_id conformance on the free path is enforced separately by
-		// validateBillingID (empty==empty passes; a forged non-empty is rejected,
-		// threat model T25), so requiring it here is unsatisfiable, not redundant.
-		// Drop it for this obligation; the paid / FreeAdapter path (non-zero
-		// unit_cost, non-empty stored billing_id) keeps the requirement. The
-		// "billing_id" token matches reportHasField.
-		requiredFields = slices.DeleteFunc(requiredFields, func(f string) bool {
-			return f == "billing_id"
-		})
-	}
-	if requiredFields == nil {
-		requiredFields = []string{}
-	}
 	evidence, err := s.offerEvidence(in)
 	if err != nil {
 		return repo.PersistTxIntent{}, repo.EvidenceRecord{}, err
 	}
 	return repo.PersistTxIntent{
-		TransactionID:     in.transactionID,
-		IdempotencyKey:    in.idempotencyKey,
-		ResultPayload:     in.resultPayload,
-		ObligationID:      uuid.NewString(),
-		TenantID:          in.tenant.ID,
-		AgentID:           in.agentID,
+		TransactionID:  in.transactionID,
+		IdempotencyKey: in.idempotencyKey,
+		ResultPayload:  in.resultPayload,
+		ObligationID:   uuid.NewString(),
+		TenantID:       in.tenant.ID,
+		AgentID:        in.agentID,
+		// Two distinct identities, recorded unconflated: resource_id is the
+		// resolved catalog entry the delivery binds to; offer_id is the
+		// presented signed offer's own id (a random per-offer UUID).
 		ResourceID:        in.entry.ResourceID,
-		OfferID:           in.entry.ResourceID,
+		OfferID:           in.item.GetOffer().GetOfferId(),
 		AgentIdentityHash: in.agentHash,
 		SignedURLHash:     in.signed.Hash,
 		Expiry:            in.signed.Expiry,
@@ -80,11 +60,11 @@ func (s *ExchangeService) buildPersistIntent(in persistInput) (repo.PersistTxInt
 		UnitCostDecimal:   in.pricing.UnitCost.String(),
 		Currency:          in.pricing.Currency,
 		State:             repo.ObligationStatePending,
-		WindowSeconds:     windowSeconds,
-		Deadline:          s.clk.Now().Add(time.Duration(windowSeconds) * time.Second),
-		RequiredFields:    requiredFields,
+		WindowSeconds:     in.plan.WindowSeconds,
+		Deadline:          s.clk.Now().Add(time.Duration(in.plan.WindowSeconds) * time.Second),
+		RequiredFields:    in.plan.RequiredFields,
 		EstimatedQuantity: int64(in.pricing.EstQty),
-		QuantityTolerance: tolerance,
+		QuantityTolerance: in.plan.QuantityTolerance,
 	}, evidence, nil
 }
 
@@ -203,7 +183,12 @@ type persistInput struct {
 	tenant  repo.Tenant
 	entry   repo.CatalogEntry
 	pricing PricingDoc
-	req     *rampv1.TransactionRequest
+	// plan is the obligation shape the caller already derived and already told
+	// the agent about in the result item. Passed in rather than recomputed here,
+	// so the row written below and the ReportingObligation the agent holds state
+	// the same window and the same field list by construction.
+	plan obligationPlan
+	req  *rampv1.TransactionRequest
 	// item is THE item this persist is for. req is the per-item synthetic
 	// request executeBatchItem projects, so req.items[0] happens to be the same
 	// message today — but carrying the item explicitly keeps the evidence row
@@ -274,8 +259,13 @@ func (s *ExchangeService) persistTransaction(ctx context.Context, in persistInpu
 			return err
 		}
 		rec = created
-		if _, err := s.obligations.CreateForOffer(ctx, tx, intent); err != nil {
-			return err
+		// A price whose metering is NONE owes no usage report, so no obligation
+		// row is written and the execute gate has nothing to hold against the
+		// agent later. The result item already told the agent the same thing.
+		if in.plan.Required {
+			if _, err := s.obligations.CreateForOffer(ctx, tx, intent); err != nil {
+				return err
+			}
 		}
 		// Evidence commits in the SAME transaction as the transaction_log +
 		// obligation rows, after the transaction_log row exists (the evidence

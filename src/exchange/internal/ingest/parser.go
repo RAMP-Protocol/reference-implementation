@@ -1,15 +1,21 @@
 // Package ingest is the RAMP JSON-L ingestion core: it reads a
 // JSON-Lines feed (one resource per line) into typed records, maps
-// each record to a proto-exact ramp.v1.ResourceEntry (terms[] that pass
-// licenseterm.Validate), then signs and pushes them to the Exchange via the
-// CatalogService.PushResources RPC. The cmd/ramp-ingest binary is a thin
-// flag-parsing wrapper over Run.
+// each record to a proto-exact ramp.v1.ResourceEntry with its restriction
+// tokens canonicalised, then signs and pushes them to the Exchange through
+// the protocol SDK's catalog client over the CatalogService.PushResources
+// RPC — in several submissions when the feed is larger than the wire bound on
+// one. Check runs the SDK's entry validation over a feed without pushing it.
+// The cmd/ramp-ingest binary is a thin flag-parsing wrapper over Run and
+// Check.
 //
 // This file is the parse layer: a faithful, typed transport DTO for the JSON-L
 // line schema THIS repository fixes — a feed does not get to extend it, since
 // unknown fields are rejected rather than ignored (see Record below). It performs
-// no proto mapping and no licence-term validation — those are owned by the
-// mapper slice and the licenseterm package respectively.
+// no proto mapping and no licence-term validation: mapping is the mapper
+// slice's, and the term rules are the protocol's — the wire tier is
+// protovalidate over the entry, the ingest tier is the SDK's per-term checks
+// over canonical tokens, both from module github.com/RAMP-Protocol/protocol —
+// run by the Exchange at push and by Check before it.
 package ingest
 
 import (
@@ -66,8 +72,9 @@ type Attestation struct {
 }
 
 // License is the governing licence document for a record's terms.
-// A REFERENCE_ONLY term requires a non-empty Uri (enforced downstream by
-// licenseterm.Validate).
+// A REFERENCE_ONLY term requires a non-empty Uri: a wire rule
+// (license_term.reference_only.requires_uri in the pinned protocol module),
+// so the Exchange refuses the submission and Check reports it.
 type License struct {
 	ID        string `json:"id,omitempty"`
 	URI       string `json:"uri,omitempty"`
@@ -100,6 +107,17 @@ type Pricing struct {
 	Unit     string `json:"unit,omitempty"`
 	Rate     string `json:"rate"`
 	Currency string `json:"currency,omitempty"`
+	// Metering is how usage is tracked for billing reconciliation: "online",
+	// "offline_self_reported" or "none". Omitted reads as online, which is what
+	// the protocol says an absent value means.
+	//
+	// It is settable here because the Exchange reads it to decide whether a
+	// transaction owes a usage report at all — "none" is a one-time perpetual
+	// sale, which mints no reporting obligation. Without this field a publisher
+	// selling perpetual licences through a feed would still have an obligation
+	// minted on every execute, and its agents would accumulate overdue rows for
+	// content that owes no report.
+	Metering string `json:"metering,omitempty"`
 }
 
 // Quota is a usage cap. Window is one of "hourly" | "daily" |

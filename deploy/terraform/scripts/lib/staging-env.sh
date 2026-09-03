@@ -48,6 +48,35 @@
 #                     line, not every script. Named VM_* to avoid colliding
 #                     with docker compose's own COMPOSE_FILE variable.
 #
+#   SSH_CMD           The ssh command every script uses to reach the VM, built
+#   load_ssh_cmd      by load_ssh_cmd as an ARRAY. The destination comes from
+#                     the stack's vm_public_ip output; the identity does NOT
+#                     come from Terraform at all. Set RAMP_SSH_IDENTITY_FILE
+#                     to select a private key and the helper adds
+#                     "-o IdentitiesOnly=yes -i <path>"; leave it unset and
+#                     your ssh client picks the key the way it normally does.
+#                     RAMP_SSH_IDENTITY_FILE MUST RESOLVE TO AN ABSOLUTE PATH.
+#                     "~" is NOT expanded inside a quoted assignment, so write
+#                     "$HOME/.ssh/<key>" or the full path instead.
+#
+#                     IdentitiesOnly=yes is not optional here. Without it ssh
+#                     offers every key in the agent before the one named by
+#                     -i. Each operator key is installed with an OpenSSH from=
+#                     restriction, so the server refuses the ones that are not
+#                     yours, and after enough refusals ssh reports "Too many
+#                     authentication failures" — which reads like a broken key
+#                     rather than the wrong key being offered first.
+#
+#                     The identity is deliberately not a Terraform output.
+#                     State is local and gets copied between machines, and
+#                     terraform output replays a value the last apply stored,
+#                     so a private-key path taken from it points at whoever
+#                     applied last. This helper makes the scripts identity-
+#                     neutral. It does NOT make them state-free: it still
+#                     reads vm_public_ip, and the scripts read many other
+#                     outputs, so someone without the state still cannot run
+#                     them.
+#
 #   VM_COMPOSE_PROJECT  The bundle's `name:` — the prefix Docker puts on the
 #                     network and volumes it creates (<project>_default,
 #                     <project>_<volume>). A script that runs a one-off
@@ -68,6 +97,25 @@ BROKER_RELAY_KID="${BROKER_RELAY_KID:-broker.staging.v1}"
 STACK_DIR="${STACK_DIR:-${REPO_ROOT}/deploy/terraform/stacks/staging-aws}"
 KEYS_DIR="${STACK_DIR}/keys"
 tf_out() { terraform -chdir="${STACK_DIR}" output -raw "$1"; }
+
+# Builds SSH_CMD as an array. Building the array directly, rather than word-
+# splitting a Terraform output, also keeps an identity path containing a space
+# in one element.
+load_ssh_cmd() {
+    local host
+    host="$(tf_out vm_public_ip)"
+
+    SSH_CMD=(ssh)
+
+    if [ -n "${RAMP_SSH_IDENTITY_FILE:-}" ]; then
+        SSH_CMD+=(
+            -o IdentitiesOnly=yes
+            -i "${RAMP_SSH_IDENTITY_FILE}"
+        )
+    fi
+
+    SSH_CMD+=("ubuntu@${host}")
+}
 
 # staging_id <key-file> <tf-output> <label>: the identity id for one smoke
 # keypair. Three sources, in trust order:

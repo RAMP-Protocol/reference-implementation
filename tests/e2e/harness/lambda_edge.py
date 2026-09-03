@@ -43,6 +43,23 @@ INVOKE_PATH = "/2015-03-31/functions/function/invocations"
 # presence turns an otherwise-ordinary 200 into a failed invocation.
 _FUNCTION_ERROR_HEADER = "X-Amz-Function-Error"
 
+# Emulators this process gave up waiting on, base URL -> what happened.
+#
+# The emulator serves ONE invocation at a time and holds it reserved until the
+# function returns. A client-side timeout abandons that reservation without
+# ending it, so the next POST is a second concurrent invocation — and the
+# emulator answers that by aborting the in-flight request unanswered and
+# exiting its own process. The container dies, and every later test fails on a
+# name that no longer resolves instead of on the timeout that actually
+# happened.
+#
+# So a timeout retires that emulator for the rest of the session. Module state
+# rather than a fixture because the reservation is a property of the emulator
+# process, not of any one test; keyed by base URL because the stack runs two
+# emulator containers and only the one that timed out is in doubt. Nothing
+# clears it: once the slot state is unknown it stays unknown.
+_ABANDONED: dict[str, str] = {}
+
 
 def viewer_request_event(
     url: str,
@@ -94,8 +111,26 @@ def invoke(base_url: str, event: Mapping[str, Any], *, timeout: float = 30.0) ->
     the outcome under test, and the error message carries the function's own
     message so the failure names its cause instead of a shape mismatch three
     assertions later.
+
+    Also refuses to POST at all once an earlier call to this emulator timed out
+    client-side, and records a timeout so later calls can refuse. See
+    ``_ABANDONED`` for why posting into that state destroys the container.
     """
-    resp = httpx.post(f"{base_url}{INVOKE_PATH}", json=dict(event), timeout=timeout)
+    abandoned = _ABANDONED.get(base_url)
+    if abandoned is not None:
+        msg = (
+            f"not invoking {base_url}: an earlier invocation was abandoned "
+            f"client-side ({abandoned}) and the emulator may still hold it "
+            "reserved. Posting again makes the emulator exit and takes the "
+            "container down, which turns one timeout into every later test "
+            "failing on an unresolvable name."
+        )
+        raise AssertionError(msg)
+    try:
+        resp = httpx.post(f"{base_url}{INVOKE_PATH}", json=dict(event), timeout=timeout)
+    except httpx.TimeoutException as exc:
+        _ABANDONED[base_url] = f"{type(exc).__name__} after {timeout}s"
+        raise
     assert resp.status_code == httpx.codes.OK, (
         f"lambda runtime emulator answered {resp.status_code}: {resp.text[:256]}"
     )
@@ -127,19 +162,40 @@ def response_header(result: Mapping[str, Any], name: str) -> str | None:
 def wait_ready(base_url: str, timeout_seconds: float = 90.0) -> None:
     """Poll the invoke endpoint until the function answers its /healthz route.
 
-    The compose healthcheck already gates the runner on this, so in a normal run
-    the first invocation succeeds. It matters for a host-side run against a
-    stack that is still coming up.
+    This is the ONLY readiness invocation, and it is why the container probe
+    must not invoke: two invocations at once destroy the emulator. The compose
+    healthcheck proves the emulator is accepting connections and nothing more,
+    so a stack that is still bringing the function up is caught here.
+
+    Never more than one invocation in flight. The client deadline is whatever
+    is left of the budget rather than a fixed slice, so a timeout means the
+    budget is spent — it can never mean "retry now" while the emulator still
+    holds the previous invocation reserved.
     """
     event = viewer_request_event("http://lambda-edge.invalid/healthz")
     deadline = time.monotonic() + timeout_seconds
     last_err: str | None = None
-    while time.monotonic() < deadline:
+    while True:
+        remaining = deadline - time.monotonic()
+        # Under a second is not a real attempt, and a sub-second client
+        # deadline would report a connect timeout as the reason the function
+        # never answered.
+        if remaining < 1.0:
+            break
         try:
-            result = invoke(base_url, event, timeout=5.0)
+            result = invoke(base_url, event, timeout=remaining)
             if result.get("status") == "200":
                 return
             last_err = str(result)[:128]
+        except httpx.TimeoutException:
+            # The emulator may still hold this invocation. `invoke` has already
+            # retired it for the session; spend the budget rather than retry.
+            last_err = "timed out with the invocation still in flight"
+            break
+        # A refused connection reserved nothing, and a completed invocation
+        # that answered badly has already released the slot. Both are safe to
+        # retry. TimeoutException is a subclass of HTTPError, which is why it
+        # is caught above this line rather than swept in here.
         except (httpx.HTTPError, OSError, AssertionError) as exc:
             last_err = str(exc)[:128]
         time.sleep(1.0)

@@ -33,15 +33,6 @@ func (f *fakeStore) BySubject(_ context.Context, iss, sub string) (account.Devel
 	return account.Developer{}, account.ErrNotFound
 }
 
-func (f *fakeStore) BySubdomain(_ context.Context, subdomain string) (account.Developer, error) {
-	for _, d := range f.subjects {
-		if d.Subdomain == subdomain {
-			return d, nil
-		}
-	}
-	return account.Developer{}, account.ErrNotFound
-}
-
 func (f *fakeStore) Reserve(_ context.Context, d account.Developer) (account.Developer, error) {
 	if _, ok := f.subjects[skey(d.Issuer, d.Subject)]; ok {
 		return account.Developer{}, account.ErrAlreadyExists
@@ -51,20 +42,6 @@ func (f *fakeStore) Reserve(_ context.Context, d account.Developer) (account.Dev
 	}
 	f.subdomains[d.Subdomain] = true
 	f.subjects[skey(d.Issuer, d.Subject)] = d
-	return d, nil
-}
-
-func (f *fakeStore) CompleteRegistration(
-	_ context.Context, iss, sub string, ld account.LicensingDetails,
-) (account.Developer, error) {
-	k := skey(iss, sub)
-	d, ok := f.subjects[k]
-	if !ok {
-		return account.Developer{}, account.ErrNotFound
-	}
-	d.LegalEntity, d.Address, d.JurisdictionCountry = ld.LegalEntity, ld.Address, ld.JurisdictionCountry
-	d.RegistrationComplete = true
-	f.subjects[k] = d
 	return d, nil
 }
 
@@ -153,15 +130,12 @@ var claims = oidcup.Claims{
 
 func TestSignIn_NewDeveloperProvisions(t *testing.T) {
 	h := newHarness(t, "agent-aaaa1111")
-	sub, needsForm, err := h.svc.SignIn(context.Background(), claims)
+	sub, err := h.svc.SignIn(context.Background(), claims)
 	if err != nil {
 		t.Fatalf("SignIn: %v", err)
 	}
 	if sub != "agent-aaaa1111.rampmcp.org" {
 		t.Errorf("subdomain = %q, want the minted FQDN", sub)
-	}
-	if !needsForm {
-		t.Error("a brand-new developer must still need the form")
 	}
 	if h.keys.created[sub] != 1 {
 		t.Errorf("key create count = %d, want exactly 1", h.keys.created[sub])
@@ -177,13 +151,13 @@ func TestSignIn_NewDeveloperProvisions(t *testing.T) {
 
 func TestSignIn_ReturningDeveloperIsStable(t *testing.T) {
 	h := newHarness(t, "agent-aaaa1111")
-	first, _, err := h.svc.SignIn(context.Background(), claims)
+	first, err := h.svc.SignIn(context.Background(), claims)
 	if err != nil {
 		t.Fatalf("first SignIn: %v", err)
 	}
 	// Second sign-in of the same identity must reuse the subdomain and not mint a
 	// second first-key.
-	second, _, err := h.svc.SignIn(context.Background(), claims)
+	second, err := h.svc.SignIn(context.Background(), claims)
 	if err != nil {
 		t.Fatalf("second SignIn: %v", err)
 	}
@@ -199,46 +173,11 @@ func TestSignIn_RetriesOnSlugCollision(t *testing.T) {
 	h := newHarness(t, "agent-taken000", "agent-free0001")
 	h.store.subdomains["agent-taken000.rampmcp.org"] = true // first slug is already claimed
 
-	sub, _, err := h.svc.SignIn(context.Background(), claims)
+	sub, err := h.svc.SignIn(context.Background(), claims)
 	if err != nil {
 		t.Fatalf("SignIn: %v", err)
 	}
 	if sub != "agent-free0001.rampmcp.org" {
 		t.Errorf("subdomain = %q, want the second (free) slug", sub)
-	}
-}
-
-func TestCompleteRegistration_ValidStoresFields(t *testing.T) {
-	h := newHarness(t, "agent-aaaa1111")
-	if _, _, err := h.svc.SignIn(context.Background(), claims); err != nil {
-		t.Fatalf("SignIn: %v", err)
-	}
-	dev, verr, err := h.svc.CompleteRegistration(context.Background(), claims.Issuer, claims.Subject,
-		signup.FormInput{LegalEntity: "Acme GmbH", Address: "1 Main St", JurisdictionCountry: "de"})
-	if err != nil || verr != nil {
-		t.Fatalf("CompleteRegistration: err=%v verr=%v", err, verr)
-	}
-	if !dev.RegistrationComplete || dev.JurisdictionCountry != "DE" || dev.LegalEntity != "Acme GmbH" {
-		t.Errorf("stored developer = %+v, want complete with normalized fields", dev)
-	}
-}
-
-func TestCompleteRegistration_InvalidChangesNothing(t *testing.T) {
-	h := newHarness(t, "agent-aaaa1111")
-	if _, _, err := h.svc.SignIn(context.Background(), claims); err != nil {
-		t.Fatalf("SignIn: %v", err)
-	}
-	_, verr, err := h.svc.CompleteRegistration(context.Background(), claims.Issuer, claims.Subject,
-		signup.FormInput{LegalEntity: "", Address: "1 Main St", JurisdictionCountry: "ZZ"})
-	if err != nil {
-		t.Fatalf("unexpected store error: %v", err)
-	}
-	if verr == nil {
-		t.Fatal("expected a ValidationError for blank legal entity + bad country")
-	}
-	// No state may change on a rejected form.
-	got, _ := h.store.BySubject(context.Background(), claims.Issuer, claims.Subject)
-	if got.RegistrationComplete {
-		t.Error("registration_complete flipped despite an invalid form")
 	}
 }

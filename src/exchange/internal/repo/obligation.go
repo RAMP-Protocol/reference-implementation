@@ -64,31 +64,67 @@ type ObligationRepo interface {
 	// obligation row. Used inside ReportUsage's pgx.BeginFunc so load,
 	// validate, and write run atomically against a held row.
 	LoadForReportTx(ctx context.Context, tx pgx.Tx, transactionID string) (ReportValidationContext, error)
-	// FindBySourceReportID returns the obligation row whose
-	// (transaction_id, source_report_id) pair was already recorded. A
-	// non-empty hit means the caller is replaying a prior UsageReport.id
-	// and the service should return the original IssuedReportID without
-	// re-running validation.
-	FindBySourceReportID(ctx context.Context, transactionID, sourceReportID string) (Obligation, error)
+	// FindAcceptedBySourceReportID returns the obligation whose
+	// (transaction_id, source_report_id) pair was already recorded AND
+	// ACCEPTED. A hit means the caller is replaying a report this Exchange
+	// already validated, so the service returns the original IssuedReportID
+	// without re-running validation. A key that was only ever REJECTED does
+	// not match: there is no accepted result to replay, and the retry must be
+	// validated afresh.
+	FindAcceptedBySourceReportID(ctx context.Context, transactionID, sourceReportID string) (Obligation, error)
 	// MarkValidationValidated transitions the obligation PENDING→RECEIVED and
 	// writes consumed_quantity + the source/issued report-id idempotency
 	// anchors. The query carries an AND state = 'PENDING' predicate; zero
 	// rows updated → ErrObligationAlreadyReported.
-	MarkValidationValidated(
-		ctx context.Context, tx pgx.Tx,
-		id, sourceReportID, issuedReportID string,
-		consumed pgtype.Numeric,
-	) (Obligation, error)
+	MarkValidationValidated(ctx context.Context, tx pgx.Tx, in AcceptReport) (Obligation, error)
 	// MarkValidationRejected records the rejection outcome without changing
-	// obligation state. Audit row written on every rejection.
-	MarkValidationRejected(
-		ctx context.Context, tx pgx.Tx,
-		id string, outcome ValidationOutcome, sourceReportID string,
-	) (Obligation, error)
-	// ListOutstanding returns PENDING obligations whose deadline has
-	// already elapsed for the given (tenant_id, agent_id). Drives the
-	// ExecuteTransaction reporting-overdue refusal.
-	ListOutstanding(ctx context.Context, tenantID, agentID string) ([]Obligation, error)
+	// obligation state, so the obligation stays PENDING and the caller may
+	// retry with a corrected report — including under the same source report
+	// id, which FindAcceptedBySourceReportID deliberately does not treat as a
+	// replay.
+	// The query carries an AND state = 'PENDING' predicate; zero rows updated
+	// → ErrObligationAlreadyReported. So an audit row is written for every
+	// rejection against a PENDING obligation, and none against a settled one.
+	MarkValidationRejected(ctx context.Context, tx pgx.Tx, in RejectReport) (Obligation, error)
+	// CountByStateAndDueness returns the reporting-compliance fact table for a
+	// (tenant_id, agent_id): how many obligations sit in each state, split by
+	// whether their deadline had passed at asOf. It classifies nothing —
+	// naming a bucket "overdue" is the service's policy decision.
+	CountByStateAndDueness(
+		ctx context.Context, tenantID, agentID string, asOf time.Time,
+	) (ObligationCounts, error)
+}
+
+// AcceptReport carries everything MarkValidationValidated writes. A struct
+// rather than a longer parameter list: the fields are one decision — this report
+// was accepted — so they travel together, and naming them at the call site is
+// what keeps the two report ids from being passed in the wrong order.
+type AcceptReport struct {
+	ObligationID   string
+	SourceReportID string
+	IssuedReportID string
+	Consumed       pgtype.Numeric
+	// Now is the service clock's instant, written to received_at and
+	// validated_at. The database clock is deliberately not consulted: the
+	// deadline these are compared against was written from the service clock,
+	// and comparing two clocks would make received_at > deadline unsound as a
+	// lateness check. created_at is the one column on this row that still takes
+	// the database default.
+	Now time.Time
+}
+
+// RejectReport carries everything MarkValidationRejected writes. Mirrors
+// AcceptReport so the two audit writes read the same way at their call sites.
+type RejectReport struct {
+	ObligationID   string
+	Outcome        ValidationOutcome
+	SourceReportID string
+	// Now is the service clock's instant, written to validated_at. The
+	// obligation's deadline, received_at and validated_at all come from this
+	// clock, which is what makes received_at > deadline a sound lateness check.
+	// It is not a claim about every timestamp on the row: created_at still takes
+	// the column's database default.
+	Now time.Time
 }
 
 // NewObligationRepo composes an ObligationRepo over a sqlc.Querier.
@@ -100,9 +136,10 @@ type obligationRepo struct{ q sqlc.Querier }
 var (
 	// ErrObligationNotFound signals a lookup miss on the requested transaction.
 	ErrObligationNotFound = errors.New("repo: obligation not found")
-	// ErrObligationAlreadyReported signals that MarkValidationValidated's
-	// state guard matched zero rows — the obligation has already transitioned
-	// out of PENDING and the caller is filing a second, distinct report.
+	// ErrObligationAlreadyReported signals that the AND state = 'PENDING' guard
+	// matched zero rows on either MarkValidationValidated or
+	// MarkValidationRejected — the obligation has already transitioned out of
+	// PENDING and the caller is filing a second, distinct report.
 	ErrObligationAlreadyReported = errors.New("repo: obligation already reported")
 )
 
@@ -182,10 +219,10 @@ func (r *obligationRepo) LoadForReportTx(
 	return reportContextFromJoinRow(joinRowFromGetObligationForUpdate(row))
 }
 
-func (r *obligationRepo) FindBySourceReportID(
+func (r *obligationRepo) FindAcceptedBySourceReportID(
 	ctx context.Context, transactionID, sourceReportID string,
 ) (Obligation, error) {
-	row, err := r.q.FindObligationBySourceReportID(ctx, sqlc.FindObligationBySourceReportIDParams{
+	row, err := r.q.FindAcceptedObligationBySourceReportID(ctx, sqlc.FindAcceptedObligationBySourceReportIDParams{
 		TransactionID:  transactionID,
 		SourceReportID: pgtype.Text{String: sourceReportID, Valid: sourceReportID != ""},
 	})
@@ -199,16 +236,15 @@ func (r *obligationRepo) FindBySourceReportID(
 }
 
 func (r *obligationRepo) MarkValidationValidated(
-	ctx context.Context, tx pgx.Tx,
-	id, sourceReportID, issuedReportID string,
-	consumed pgtype.Numeric,
+	ctx context.Context, tx pgx.Tx, in AcceptReport,
 ) (Obligation, error) {
 	qtx := sqlc.New(tx)
 	row, err := qtx.MarkValidationValidated(ctx, sqlc.MarkValidationValidatedParams{
-		ObligationID:     id,
-		ConsumedQuantity: consumed,
-		SourceReportID:   pgtype.Text{String: sourceReportID, Valid: sourceReportID != ""},
-		IssuedReportID:   pgtype.Text{String: issuedReportID, Valid: issuedReportID != ""},
+		ObligationID:     in.ObligationID,
+		ConsumedQuantity: in.Consumed,
+		SourceReportID:   pgtype.Text{String: in.SourceReportID, Valid: in.SourceReportID != ""},
+		IssuedReportID:   pgtype.Text{String: in.IssuedReportID, Valid: in.IssuedReportID != ""},
+		Now:              pgtype.Timestamptz{Time: in.Now, Valid: true},
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -222,43 +258,50 @@ func (r *obligationRepo) MarkValidationValidated(
 }
 
 func (r *obligationRepo) MarkValidationRejected(
-	ctx context.Context, tx pgx.Tx,
-	id string, outcome ValidationOutcome, sourceReportID string,
+	ctx context.Context, tx pgx.Tx, in RejectReport,
 ) (Obligation, error) {
 	qtx := sqlc.New(tx)
 	row, err := qtx.MarkValidationRejected(ctx, sqlc.MarkValidationRejectedParams{
-		ObligationID: id,
+		ObligationID: in.ObligationID,
 		ValidationOutcome: sqlc.NullRampValidationOutcome{
-			RampValidationOutcome: sqlcValidationOutcome(outcome),
+			RampValidationOutcome: sqlcValidationOutcome(in.Outcome),
 			Valid:                 true,
 		},
-		SourceReportID: pgtype.Text{String: sourceReportID, Valid: sourceReportID != ""},
+		SourceReportID: pgtype.Text{String: in.SourceReportID, Valid: in.SourceReportID != ""},
+		Now:            pgtype.Timestamptz{Time: in.Now, Valid: true},
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The statement's state predicate did not match, so the obligation
+			// was not PENDING. Same mapping as the accept path: a report against
+			// a settled obligation is refused rather than written over it.
+			return Obligation{}, ErrObligationAlreadyReported
+		}
 		return Obligation{}, fmt.Errorf("mark validation rejected: %w", err)
 	}
 	return obligationFromRow(row)
 }
 
-func (r *obligationRepo) ListOutstanding(
-	ctx context.Context, tenantID, agentID string,
-) ([]Obligation, error) {
-	rows, err := r.q.ListOutstandingObligations(ctx, sqlc.ListOutstandingObligationsParams{
+func (r *obligationRepo) CountByStateAndDueness(
+	ctx context.Context, tenantID, agentID string, asOf time.Time,
+) (ObligationCounts, error) {
+	rows, err := r.q.CountObligationsByStateAndDueness(ctx, sqlc.CountObligationsByStateAndDuenessParams{
 		TenantID: tenantID,
 		AgentID:  agentID,
+		AsOf:     pgtype.Timestamptz{Time: asOf, Valid: true},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list outstanding obligations: %w", err)
+		return ObligationCounts{}, fmt.Errorf("count obligations by state and dueness: %w", err)
 	}
-	out := make([]Obligation, 0, len(rows))
+	// At most four rows: two states times two dueness values.
+	buckets := make(map[obligationBucket]int64, len(rows))
 	for _, row := range rows {
-		o, err := obligationFromRow(row)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, o)
+		buckets[obligationBucket{
+			state:        domainObligationState(row.State),
+			pastDeadline: row.PastDeadline,
+		}] = row.N
 	}
-	return out, nil
+	return ObligationCounts{buckets: buckets}, nil
 }
 
 // obligationFromRow is the single owner of RampReportingObligation → Obligation

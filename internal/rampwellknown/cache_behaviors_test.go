@@ -37,21 +37,21 @@ func TestCache_NegativeCacheStickyThenExpires(t *testing.T) {
 	c := newPublisherCache(clk)
 	ctx := context.Background()
 
-	if _, err := c.Get(ctx, origin.URL); !errors.Is(err, rampwellknown.ErrNoManifest) {
-		t.Fatalf("first Get = %v, want ErrNoManifest", err)
+	if _, err := c.Get(ctx, origin.URL); !errors.Is(err, rampwellknown.ErrNoDocument) {
+		t.Fatalf("first Get = %v, want ErrNoDocument", err)
 	}
 	// Within the negative TTL (default 5m) the absence is cached: no re-probe.
 	clk.Advance(4 * time.Minute)
-	if _, err := c.Get(ctx, origin.URL); !errors.Is(err, rampwellknown.ErrNoManifest) {
-		t.Fatalf("cached negative = %v, want ErrNoManifest", err)
+	if _, err := c.Get(ctx, origin.URL); !errors.Is(err, rampwellknown.ErrNoDocument) {
+		t.Fatalf("cached negative = %v, want ErrNoDocument", err)
 	}
 	if got := origin.Hits(); got != 1 {
 		t.Fatalf("origin hits = %d, want 1 (negative cached)", got)
 	}
 	// Past the negative TTL the entry expires and the origin is re-probed.
 	clk.Advance(2 * time.Minute) // 6m total
-	if _, err := c.Get(ctx, origin.URL); !errors.Is(err, rampwellknown.ErrNoManifest) {
-		t.Fatalf("post-expiry Get = %v, want ErrNoManifest", err)
+	if _, err := c.Get(ctx, origin.URL); !errors.Is(err, rampwellknown.ErrNoDocument) {
+		t.Fatalf("post-expiry Get = %v, want ErrNoDocument", err)
 	}
 	if got := origin.Hits(); got != 2 {
 		t.Fatalf("origin hits = %d, want 2 after negative expiry", got)
@@ -87,8 +87,8 @@ func TestCache_Non2xxNotCached(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := c.Get(ctx, origin.URL)
-	if !errors.Is(err, rampwellknown.ErrFetch) || errors.Is(err, rampwellknown.ErrNoManifest) {
-		t.Fatalf("500 Get = %v, want ErrFetch (not ErrNoManifest)", err)
+	if !errors.Is(err, rampwellknown.ErrFetch) || errors.Is(err, rampwellknown.ErrNoDocument) {
+		t.Fatalf("500 Get = %v, want ErrFetch (not ErrNoDocument)", err)
 	}
 	if _, err := c.Get(ctx, origin.URL); !errors.Is(err, rampwellknown.ErrFetch) {
 		t.Fatalf("second 500 Get = %v, want ErrFetch", err)

@@ -67,6 +67,10 @@ echo "cloudflare-edge bindings mirror the worker env contract ($(printf '%s\n' "
 # terraform on PATH + fabricated key files — see the test script).
 "$(dirname "${BASH_SOURCE[0]}")/tests/staging-env-guard-test.sh"
 
+# load_ssh_cmd keeps the operator's identity out of Terraform state; prove it
+# builds the command line correctly (same stubbed-terraform harness).
+"$(dirname "${BASH_SOURCE[0]}")/tests/load-ssh-cmd-test.sh"
+
 failed=0
 for module in "${MODULES_DIR}"/*/; do
     [ -d "${module}tests" ] || continue

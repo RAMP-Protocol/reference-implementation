@@ -9,7 +9,9 @@ RFC 7638 thumbprint — which is also the RFC 9421 `keyid`. `/.well-known/ramp.j
 commercial overlay only; a manifest that arrives carrying keys has them dropped as unknown
 fields. The domain-verification messages D3 builds on exist in the protocol but have no call
 site here. The delivery-log record contract (D1, D4, D5 onward) is unaffected and is what the
-Edge implements. Corrections are inline below; the reasoning is kept as a design record.
+Edge implements. Corrections are inline below; the reasoning is kept as a design record. · **The signed-URL claims in D1, D3 and
+D4 describe an HMAC scheme that was never implemented** — see the amendment at the end of
+`## Decision`.
 
 ---
 
@@ -130,6 +132,52 @@ The Edge retains records for at least 90 days rolling, matching the Exchange's `
 ### D9 — Implementation-level contract, not protocol-level
 
 This ADR does not add a `DeliveryLog` message to `ramp.proto`. The protocol's reconciliation model names three witnesses without standardising the form of the first; multiple delivery topologies are protocol-compatible, and standardising one would exclude the `CDN_ACCESS_LOG` fallback. The Edge ↔ Exchange interface is internal to the Exchange operator's deployment. A future protocol-level `EdgeManifest` carrying delivery-log format declarations, so third-party Exchanges can read each other's reconciliation feeds, is a worthwhile RFC for a later version but is out of scope for v1.
+
+#### Amendment (2026-09-02) — the delivery URL carries an Ed25519 signature, not an HMAC
+
+Four lines above describe delivery-URL signing as an HMAC over a secret shared between the
+Exchange and the CDN. No implementation ever produced such a secret. URL signing has always
+been asymmetric and selected per tenant by `tenants.signing_scheme`: Ed25519 verified by the
+edge worker, or RSA verified natively by CloudFront. The delivery endpoint holds public keys
+only. The `hmac_secret_ref` column this ADR's era created was dropped without a reader.
+
+The amendment cuts across three decisions, so it is recorded once here rather than three
+times in place. Superseded, line by line:
+
+- **D1, the `DELIVERY_OUTCOME_DENIED_VERIFICATION` row** — "URL HMAC or Ed25519 sig failed"
+  is now Ed25519 signature failure alone. The reason token that distinguishes the cases comes
+  from the SDK verifier (`missing_sig`, `bad_sig_encoding`, `signature_mismatch`,
+  `missing_exp`, `bad_exp_encoding`, `bad_agent_encoding`, `expired`), plus
+  `verify_unavailable`, which the edge adds itself when key resolution throws and it fails
+  closed with 503 rather than falling through to the origin.
+- **D3, step 4** — `cdn_type` is a wire field, `DomainVerificationConfirmation.cdn_type`
+  in the module `github.com/RAMP-Protocol/protocol`, and at the version this repository pins
+  its documented values are still `"cloudfront"`, `"akamai"`, `"fastly"` and `"hmac"`. The
+  `"edge-ed25519"` this ADR recommends was never adopted by the protocol. The recommendation
+  stands, and its shape is now a narrowing to `"edge-ed25519"` | `"cloudfront"`: `"hmac"`
+  names a scheme that does not exist, and `"akamai"` and `"fastly"` name vendors rather than
+  schemes, which makes `"fastly"` actively wrong — a Fastly Compute deployment runs the
+  Ed25519 verifier. That narrowing is a protocol change (the proto comment, a regenerated
+  `gen/`, a changelog entry) and has not shipped. Nothing in this repository reads or writes
+  the field, so until it does, the pinned module's value list is the one an implementer
+  must send.
+- **D4** — what this ADR calls "covered by the URL HMAC" is covered by the URL signature.
+  The signed message is `"GET\n"` followed by the canonical URL, so scheme, host, path and
+  every query parameter are covered by construction. The `ch` and `chm` parameters D4
+  introduces are unimplemented in the same way `txn_id` is: the Exchange's signer adds
+  `exp`, `kid`, `agent_id` and `sig` and nothing else, so no minted URL carries a content
+  hash today, and a reconciler cannot compare an announced hash against an observed one.
+  If they are ever added they are covered like any other parameter. The substance of D4 is
+  unaffected; only the primitive named in it is, and its content-hash binding remains a
+  design that has not been built.
+
+**Open, not decided here:** D1's `transaction_id` row says the value comes from the signed
+URL's `txn_id` parameter. There is no such parameter and there never was. The edge record as
+implemented carries `url_hash` — SHA-256 of the request URL verbatim — which is what the
+reconciler joins on, and the Exchange records the same value as `transaction_log.
+signed_url_hash`. Whether the delivery record should also carry a transaction id, and where
+it would come from, is a design question about the record shape rather than a wording
+correction, so this amendment names it and leaves it open.
 
 ---
 

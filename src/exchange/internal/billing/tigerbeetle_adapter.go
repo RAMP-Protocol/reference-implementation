@@ -11,14 +11,10 @@ import (
 	"time"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing/tigerbeetle"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/money"
 )
 
 const (
-	// defaultAssetScale is the ledger's power-of-ten asset scale. The Exchange
-	// carries prices at 8 decimal places, so scale 8 represents every amount the
-	// system can produce as an exact integer (no rounding). TigerBeetle asset
-	// scales are immutable per ledger, so this is chosen high up front.
-	defaultAssetScale = 8
 	// defaultHoldTimeout backstops the pending expiry when none is wired: the
 	// signed-URL TTL (5m) plus a 1m grace so a settle/void can still land at the
 	// edge of URL validity. Boot wiring overrides it with the real URLTTL + grace.
@@ -42,7 +38,6 @@ type TigerBeetleAdapter struct {
 	tb          *tigerbeetle.Client
 	ledger      uint32
 	currency    string
-	assetScale  uint8
 	holdTimeout time.Duration
 	// idNS namespaces every derived account/transfer id. It is empty in production
 	// (hashing stays unsalted); tests set a unique value per instance so cases on
@@ -50,13 +45,13 @@ type TigerBeetleAdapter struct {
 	idNS string
 }
 
-// TigerBeetleOptions configures a TigerBeetleAdapter. AssetScale and HoldTimeout
-// fall back to package defaults when zero.
+// TigerBeetleOptions configures a TigerBeetleAdapter. HoldTimeout falls back
+// to the package default when zero. The asset scale is not an option: it is
+// deliberately fixed at money.AssetScale for every deployment.
 type TigerBeetleOptions struct {
 	Client      *tigerbeetle.Client
 	Ledger      uint32
 	Currency    string
-	AssetScale  uint8
 	HoldTimeout time.Duration
 	IDNamespace string
 }
@@ -67,12 +62,8 @@ func NewTigerBeetleAdapter(opts TigerBeetleOptions) *TigerBeetleAdapter {
 		tb:          opts.Client,
 		ledger:      opts.Ledger,
 		currency:    opts.Currency,
-		assetScale:  opts.AssetScale,
 		holdTimeout: opts.HoldTimeout,
 		idNS:        opts.IDNamespace,
-	}
-	if a.assetScale == 0 {
-		a.assetScale = defaultAssetScale
 	}
 	if a.holdTimeout <= 0 {
 		a.holdTimeout = defaultHoldTimeout
@@ -393,7 +384,9 @@ func (a *TigerBeetleAdapter) pendingID(billingRef, authKey string, gen int) (tig
 	if strings.Contains(billingRef, ":") {
 		return tigerbeetle.ID{}, fmt.Errorf("billing: billing_ref %q must not contain ':'", billingRef)
 	}
-	id, err := tigerbeetle.TransferID(a.idNS + "pending:" + billingRef + ":" + authKey + ":" + strconv.Itoa(gen))
+	businessID := a.idNS + tigerbeetle.TransferPendingPrefix +
+		billingRef + ":" + authKey + ":" + strconv.Itoa(gen)
+	id, err := tigerbeetle.TransferID(businessID)
 	if err != nil {
 		return id, fmt.Errorf("billing: derive pending id: %w", err)
 	}
@@ -405,10 +398,10 @@ func (a *TigerBeetleAdapter) pendingID(billingRef, authKey string, gen int) (tig
 // Record/Release key, and a replay re-derives the same id.
 func (a *TigerBeetleAdapter) resolveIDs(pendingID tigerbeetle.ID) (postID, voidID tigerbeetle.ID, err error) {
 	hexID := tigerbeetle.EncodeID(pendingID)
-	if postID, err = tigerbeetle.TransferID(a.idNS + "post:" + hexID); err != nil {
+	if postID, err = tigerbeetle.TransferID(a.idNS + tigerbeetle.TransferPostPrefix + hexID); err != nil {
 		return postID, voidID, fmt.Errorf("billing: derive post id: %w", err)
 	}
-	if voidID, err = tigerbeetle.TransferID(a.idNS + "void:" + hexID); err != nil {
+	if voidID, err = tigerbeetle.TransferID(a.idNS + tigerbeetle.TransferVoidPrefix + hexID); err != nil {
 		return postID, voidID, fmt.Errorf("billing: derive void id: %w", err)
 	}
 	return postID, voidID, nil
@@ -455,12 +448,12 @@ func (a *TigerBeetleAdapter) timeoutSeconds() uint32 {
 // toMinor converts a currency amount to an integer number of minor units at the
 // ledger's asset scale. At scale 8 every amount the Exchange produces (8-decimal
 // prices) is exact; a value with finer precision is rejected rather than silently
-// rounded. The conversion itself lives in tigerbeetle.MinorUnits so the adapter
-// and the test fixtures share one money-math source of truth.
+// rounded. The conversion itself is money.MinorUnits so the adapter, the repo
+// layer, and the test fixtures share one money-math source of truth.
 func (a *TigerBeetleAdapter) toMinor(amt Amount) (*big.Int, error) {
-	minor, err := tigerbeetle.MinorUnits(amt.Value, a.assetScale)
-	if errors.Is(err, tigerbeetle.ErrAmountNotRepresentable) {
-		// Translate the ledger-layer sentinel into the billing sentinel so a
+	minor, err := money.MinorUnits(amt.Value)
+	if errors.Is(err, money.ErrAmountNotRepresentable) {
+		// Translate the conversion-layer sentinel into the billing sentinel so a
 		// finer-than-scale price surfaces as KindInvalidRequest (4xx), not a 500.
 		return nil, fmt.Errorf("%w: %w", ErrAmountNotRepresentable, err)
 	}
@@ -469,7 +462,7 @@ func (a *TigerBeetleAdapter) toMinor(amt Amount) (*big.Int, error) {
 
 func (a *TigerBeetleAdapter) fromMinor(minor *big.Int) Amount {
 	return Amount{
-		Value:    new(big.Rat).SetFrac(minor, tigerbeetle.ScaleFactor(a.assetScale)),
+		Value:    new(big.Rat).SetFrac(minor, money.ScaleFactor()),
 		Currency: a.currency,
 	}
 }

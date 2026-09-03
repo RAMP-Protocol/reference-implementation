@@ -21,6 +21,7 @@ import (
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/server"
 	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
+	sharedtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/signing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/broker/internal/transport/transporttest"
@@ -76,9 +77,13 @@ func keyWindow(t *testing.T, f *rampv1.WBAFile, tp string) (time.Time, time.Time
 	return nb, na
 }
 
+// getBody GETs url and returns the body. The manifest fetches in this file go
+// through sharedtestutil.FetchManifest instead, which is where every package
+// reading a served manifest goes; this one covers the WBA directory, which has
+// no shared equivalent yet.
 func getBody(t *testing.T, url string) []byte {
 	t.Helper()
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
@@ -86,8 +91,18 @@ func getBody(t *testing.T, url string) []byte {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			t.Errorf("close body: %v", cerr)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200", url, resp.StatusCode)
+	}
 	return body
 }
 
@@ -105,10 +120,7 @@ func TestWellKnownHandler_ServesBrokerDiscovery(t *testing.T) {
 
 	srv, identityPub, _ := brokerDiscovery(t, nil, reg, "")
 
-	m, err := rampwellknown.ParseManifest(getBody(t, srv.URL+rampwellknown.Path), rampwellknown.RoleBroker)
-	if err != nil {
-		t.Fatalf("served broker manifest invalid: %v", err)
-	}
+	m, _ := sharedtestutil.FetchManifest(t, srv.URL, rampwellknown.RoleBroker)
 	if m.GetDomain() != "broker.example" {
 		t.Errorf("domain = %q, want broker.example", m.GetDomain())
 	}

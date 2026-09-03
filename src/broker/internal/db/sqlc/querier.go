@@ -9,9 +9,38 @@ import (
 )
 
 type Querier interface {
-	ListActiveExchanges(ctx context.Context) ([]BrokerExchange, error)
+	// ListUnblockedExchanges returns every exchange the operator has not BLOCKED,
+	// INCLUDING the ones currently marked unhealthy, and carries the healthy flag
+	// on each row so a caller decides for itself what to do with a down exchange.
+	// That is the whole registry read surface on purpose: a query that pre-filtered
+	// healthy rows could not tell "the operator never registered this" apart from
+	// "it is registered and down", and those two need different answers. The health
+	// refresher must see down rows or it could never probe one back to life; the
+	// relay allowlist must see them to refuse a down exchange with a retryable
+	// error instead of claiming it was never registered.
+	// BLOCKED rows stay excluded for every caller. The operator withdrew trust from
+	// them, so the broker sends them no traffic at all, a health probe included.
+	// exchange_id closes the ordering. Priority and trust_level do not break every
+	// tie, so two rows equal on both came back in whichever order the planner chose,
+	// and a caller reading position-dependent answers off this list got a different
+	// one on each call.
+	ListUnblockedExchanges(ctx context.Context) ([]BrokerExchange, error)
 	RecordSelection(ctx context.Context, arg RecordSelectionParams) (BrokerSelectionLog, error)
 	SelectionsByRequestID(ctx context.Context, requestID string) ([]BrokerSelectionLog, error)
+	// Selections that offered one particular offer to one agent, most recent
+	// first. The caller wants the newest row in a bounded window, so the window
+	// bounds are parameters and the LIMIT is the caller's, not this query's.
+	//
+	// The offer test is JSONB containment against a one-element array, which is
+	// how a `[{"offer_id": ...}, ...]` array is asked "does it hold this member".
+	// Equality against the whole column would require reproducing every candidate
+	// the broker returned, which the caller does not know.
+	//
+	// selection_log_agent_idx (agent_id, created_at DESC) serves the agent and
+	// range predicates; the containment test filters the rows that survive them.
+	// Offered-in-window is a handful of rows per agent, so no JSONB index is
+	// needed to keep this cheap.
+	SelectionsOfferingOffer(ctx context.Context, arg SelectionsOfferingOfferParams) ([]BrokerSelectionLog, error)
 	UpsertExchange(ctx context.Context, arg UpsertExchangeParams) (BrokerExchange, error)
 }
 

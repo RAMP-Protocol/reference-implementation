@@ -5,11 +5,8 @@ package transport_test
 import (
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
-
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/identity/internal/oauthserver"
 )
 
 // The sign-up flow driven through the REAL oidcup.Zitadel against a real Zitadel
@@ -18,24 +15,18 @@ import (
 // Zitadel instead of the mock" — everything reachable through a successful login
 // lives here; only the upstream-exchange failure a real Zitadel cannot stage
 // stays on the fake (authflow_negative_e2e_test.go).
+//
+// The flow these drive is callback -> consent -> token, with no gap: the happy
+// path below covers the whole of it against a real upstream.
 
 func TestAuthFlow_RealZitadel_HappyPath(t *testing.T) {
 	f := newZitadelFixture(t)
-	verifier, challenge := pkcePair(t)
-	clientID := f.register(t, flowClientURI)
 
-	// Authenticate through Zitadel; a brand-new developer is sent to the form.
-	cb := f.authorizeThenCallback(t, clientID, flowClientURI, challenge)
-	if cb.status != http.StatusFound || cb.location != oauthserver.FormPath {
-		t.Fatalf("callback = %d -> %q, want 302 -> /form", cb.status, cb.location)
-	}
+	// Authenticate through Zitadel; the developer lands on the consent screen.
+	clientID, verifier := f.driveToConsent(t)
 
-	// Submit valid licensing fields; the code is released back to the client.
-	code := codeFromRedirect(t, f.grantCode(t, url.Values{
-		"legal_entity":         {"Acme GmbH"},
-		"address":              {"1 Main St, Berlin"},
-		"jurisdiction_country": {"de"},
-	}))
+	// Approve the requesting client; the code is released back to it.
+	code := f.grantCode(t)
 
 	// Exchange the code for a token bound to the minted subdomain.
 	tok := f.exchangeToken(t, code, verifier, clientID)
@@ -57,81 +48,11 @@ func TestAuthFlow_RealZitadel_HappyPath(t *testing.T) {
 	f.assertProvisioned(t)
 }
 
-func TestAuthFlow_RealZitadel_FormBlocksOnMissingField(t *testing.T) {
-	// The ticket requires the form reject a submission "with any of the three
-	// missing", so each field is driven through the public /form surface — not just
-	// legal_entity — with the other two valid.
-	cases := []struct {
-		name    string
-		values  url.Values
-		wantErr string
-	}{
-		{
-			"legal entity",
-			url.Values{"legal_entity": {""}, "address": {"1 Main St"}, "jurisdiction_country": {"DE"}},
-			"Legal entity is required",
-		},
-		{
-			"address",
-			url.Values{"legal_entity": {"Acme GmbH"}, "address": {""}, "jurisdiction_country": {"DE"}},
-			"Address is required",
-		},
-		{
-			"jurisdiction",
-			url.Values{"legal_entity": {"Acme GmbH"}, "address": {"1 Main St"}, "jurisdiction_country": {""}},
-			"Jurisdiction is required",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newZitadelFixture(t)
-			f.driveToForm(t)
-
-			r := f.submitForm(t, tc.values)
-			if r.status != http.StatusOK {
-				t.Fatalf("submit with blank %s = %d, want 200 re-render", tc.name, r.status)
-			}
-			if r.location != "" {
-				t.Fatalf("a rejected form must not redirect; got Location %q", r.location)
-			}
-			if !strings.Contains(string(r.body), tc.wantErr) {
-				t.Errorf("re-rendered form missing %q; body:\n%s", tc.wantErr, r.body)
-			}
-			if dev, err := f.devs.BySubdomain(t.Context(), f.subdomain); err != nil || dev.RegistrationComplete {
-				t.Errorf("developer complete=%v (err %v) after a rejected form, want incomplete",
-					dev.RegistrationComplete, err)
-			}
-		})
-	}
-}
-
-func TestAuthFlow_RealZitadel_FormRejectsInvalidCountry(t *testing.T) {
-	f := newZitadelFixture(t)
-	f.driveToForm(t)
-
-	r := f.submitForm(t, url.Values{
-		"legal_entity":         {"Acme GmbH"},
-		"address":              {"1 Main St"},
-		"jurisdiction_country": {"ZZ"},
-	})
-	if r.status != http.StatusOK || r.location != "" {
-		t.Fatalf("invalid-country submit = %d loc=%q, want 200 re-render", r.status, r.location)
-	}
-	if !strings.Contains(string(r.body), "ISO 3166-1") {
-		t.Errorf("re-rendered form missing the country error; body:\n%s", r.body)
-	}
-	if dev, _ := f.devs.BySubdomain(t.Context(), f.subdomain); dev.RegistrationComplete {
-		t.Error("registration completed despite an invalid country code")
-	}
-}
-
 func TestAuthFlow_RealZitadel_TokenRejectsWrongPKCEVerifier(t *testing.T) {
 	f := newZitadelFixture(t)
-	clientID, _ := f.driveToForm(t)
+	clientID, _ := f.driveToConsent(t)
 
-	code := codeFromRedirect(t, f.grantCode(t, url.Values{
-		"legal_entity": {"Acme GmbH"}, "address": {"1 Main St"}, "jurisdiction_country": {"DE"},
-	}))
+	code := f.grantCode(t)
 
 	// A verifier that does not match the challenge sent at /authorize must fail.
 	wrongVerifier, _ := pkcePair(t)
@@ -146,11 +67,9 @@ func TestAuthFlow_RealZitadel_TokenRejectsWrongPKCEVerifier(t *testing.T) {
 
 func TestAuthFlow_RealZitadel_CodeIsSingleUse(t *testing.T) {
 	f := newZitadelFixture(t)
-	clientID, verifier := f.driveToForm(t)
+	clientID, verifier := f.driveToConsent(t)
 
-	code := codeFromRedirect(t, f.grantCode(t, url.Values{
-		"legal_entity": {"Acme GmbH"}, "address": {"1 Main St"}, "jurisdiction_country": {"DE"},
-	}))
+	code := f.grantCode(t)
 
 	if first := f.exchangeToken(t, code, verifier, clientID); first.status != http.StatusOK {
 		t.Fatalf("first token exchange = %d, want 200", first.status)

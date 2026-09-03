@@ -29,9 +29,8 @@ type consentView struct {
 // authorization step: a self-registered client (open Dynamic Client Registration)
 // cannot obtain a code for the developer's identity without this explicit approval.
 func (s *Server) handleConsentGet(w http.ResponseWriter, r *http.Request) {
-	var p pending
-	if err := s.readSealed(r, pendingCookie, &p); err != nil {
-		userError(w, http.StatusBadRequest, "no active sign-in session; start again")
+	p, ok := s.openPending(w, r)
+	if !ok {
 		return
 	}
 	s.renderConsent(w, r, consentView{

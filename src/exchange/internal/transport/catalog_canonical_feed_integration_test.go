@@ -86,11 +86,7 @@ func pushCanonicalContributor(t *testing.T, h *pushHarness) (client rampconnect.
 // carry their own (domain, path) from the feed.
 func pushCanonicalEntry(t *testing.T, h *pushHarness, client rampconnect.CatalogServiceClient, kid, tenantID string, entry *rampv1.ResourceEntry) {
 	t.Helper()
-	resp, err := client.PushResources(h.ctx, connect.NewRequest(&rampv1.PushResourcesRequest{
-		TenantId: tenantID,
-		CallerId: kid,
-		Entries:  []*rampv1.ResourceEntry{entry},
-	}))
+	resp, err := client.PushResources(h.ctx, connect.NewRequest(newPushRequest(tenantID, kid, []*rampv1.ResourceEntry{entry})))
 	if err != nil {
 		t.Fatalf("push %s%s: %v", entry.GetDomain(), entry.GetPath(), err)
 	}

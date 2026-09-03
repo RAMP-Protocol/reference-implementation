@@ -67,7 +67,8 @@ func (e RampDeliveryMethod) Valid() bool {
 type RampDenialReason string
 
 const (
-	RampDenialReasonBILLINGREFINACTIVE      RampDenialReason = "BILLING_REF_INACTIVE"
+	RampDenialReasonACCOUNTINACTIVE         RampDenialReason = "ACCOUNT_INACTIVE"
+	RampDenialReasonACCOUNTNOTREGISTERED    RampDenialReason = "ACCOUNT_NOT_REGISTERED"
 	RampDenialReasonINSUFFICIENTBALANCE     RampDenialReason = "INSUFFICIENT_BALANCE"
 	RampDenialReasonRATELIMITED             RampDenialReason = "RATE_LIMITED"
 	RampDenialReasonCONTENTUNAVAILABLE      RampDenialReason = "CONTENT_UNAVAILABLE"
@@ -123,7 +124,8 @@ func (ns NullRampDenialReason) Value() (driver.Value, error) {
 
 func (e RampDenialReason) Valid() bool {
 	switch e {
-	case RampDenialReasonBILLINGREFINACTIVE,
+	case RampDenialReasonACCOUNTINACTIVE,
+		RampDenialReasonACCOUNTNOTREGISTERED,
 		RampDenialReasonINSUFFICIENTBALANCE,
 		RampDenialReasonRATELIMITED,
 		RampDenialReasonCONTENTUNAVAILABLE,
@@ -374,12 +376,13 @@ func (e RampValidationOutcome) Valid() bool {
 }
 
 type RampAgent struct {
-	AgentID       string             `json:"agent_id"`
-	PublicKey     []byte             `json:"public_key"`
-	DiscoveryUrl  pgtype.Text        `json:"discovery_url"`
-	RequesterType RampRequesterType  `json:"requester_type"`
-	RegisteredAt  pgtype.Timestamptz `json:"registered_at"`
-	BillingRef    pgtype.Text        `json:"billing_ref"`
+	AgentID             string             `json:"agent_id"`
+	PublicKey           []byte             `json:"public_key"`
+	DiscoveryUrl        pgtype.Text        `json:"discovery_url"`
+	RequesterType       RampRequesterType  `json:"requester_type"`
+	RegisteredAt        pgtype.Timestamptz `json:"registered_at"`
+	BillingRef          pgtype.Text        `json:"billing_ref"`
+	AcceptedTermsDigest pgtype.Text        `json:"accepted_terms_digest"`
 }
 
 type RampAuditLog struct {
@@ -405,6 +408,7 @@ type RampCatalog struct {
 	Terms           []byte             `json:"terms"`
 	Metadata        []byte             `json:"metadata"`
 	ResourceOwnerID string             `json:"resource_owner_id"`
+	Title           pgtype.Text        `json:"title"`
 }
 
 type RampReportingObligation struct {
@@ -428,7 +432,6 @@ type RampReportingObligation struct {
 type RampTenant struct {
 	TenantID                   string             `json:"tenant_id"`
 	Domain                     string             `json:"domain"`
-	HmacSecretRef              string             `json:"hmac_secret_ref"`
 	Ed25519KeyRef              string             `json:"ed25519_key_ref"`
 	ReportingPolicy            []byte             `json:"reporting_policy"`
 	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
@@ -439,6 +442,7 @@ type RampTenant struct {
 	FeeRateBps                 int32              `json:"fee_rate_bps"`
 	FeeRateNotes               pgtype.Text        `json:"fee_rate_notes"`
 	ActivateNewAgentsByDefault bool               `json:"activate_new_agents_by_default"`
+	DefaultAgentCredit         pgtype.Numeric     `json:"default_agent_credit"`
 }
 
 type RampTenantResourceOwnerFee struct {
@@ -489,4 +493,12 @@ type RampTransactionLog struct {
 	DenialReason      NullRampDenialReason `json:"denial_reason"`
 	CreatedAt         pgtype.Timestamptz   `json:"created_at"`
 	ResultPayload     []byte               `json:"result_payload"`
+}
+
+type RampTransactionRequestClaim struct {
+	AgentID         string             `json:"agent_id"`
+	IdempotencyKey  string             `json:"idempotency_key"`
+	ItemsDigest     []byte             `json:"items_digest"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	ResponsePayload []byte             `json:"response_payload"`
 }

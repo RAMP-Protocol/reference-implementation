@@ -1,0 +1,27 @@
+-- Restores ramp.tenants.hmac_secret_ref as 000001 declared it: TEXT, NOT NULL,
+-- no default. It does not restore the column's contents or its position.
+--
+-- CONTENTS. Existing rows need a value to satisfy NOT NULL, so the column is
+-- added with a temporary default and the default is then dropped. Every
+-- restored row therefore holds ''. That is a placeholder, not a recovery:
+-- nothing ever read this column, and the values it held were placeholders too.
+--
+-- POSITIONS. ADD COLUMN appends, and Postgres cannot reorder, so the column
+-- comes back after default_agent_credit rather than third, where 000001 put it.
+-- That is cosmetic. Every generated query names its columns explicitly in its
+-- SELECT list and its RETURNING clause, so no scan depends on where a column
+-- physically sits.
+--
+-- ORDER. Applying the up migration needs the previous tag stopped first. The
+-- Exchange applies migrations at boot, and the previous tag's generated queries
+-- name hmac_secret_ref in their SELECT lists, so an instance of that tag still
+-- running when 000031 applies fails every tenant read from that moment.
+--
+-- Going backwards is the case to know about. Start the previous tag after
+-- 000031 has applied and every tenant read asks for a column the planner no
+-- longer returns, so no offer, no catalog lookup and no signed URL can be
+-- served. This file is what would repair that, but nothing runs it: down files
+-- ship inside the image and stay there. Reversing 000031 is an escalation, not
+-- a step an operator runs by hand.
+ALTER TABLE ramp.tenants ADD COLUMN hmac_secret_ref TEXT NOT NULL DEFAULT '';
+ALTER TABLE ramp.tenants ALTER COLUMN hmac_secret_ref DROP DEFAULT;

@@ -2,6 +2,7 @@ package billing_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -79,6 +80,43 @@ func TestInMemoryAdapter_CurrencyMismatch(t *testing.T) {
 	})
 	if res.Approved {
 		t.Fatal("expected denial on currency mismatch")
+	}
+}
+
+// TestInMemoryAdapter_CreditIntoForeignCurrencyBalance pins the second of the
+// two currency rules on Credit. The credit here is in the deployment currency,
+// so it passes the shared argument gate; only the comparison against the
+// stored balance can stop it. Without that comparison the 0.10 USD is added
+// into a EUR balance and the account reports 1.10 EUR — a total whose currency
+// label is a lie, and one a EUR-priced catalog term could spend.
+//
+// The balance must be left EXACTLY as seeded, not merely "not obviously wrong":
+// a partial mutation is the failure this guards against.
+func TestInMemoryAdapter_CreditIntoForeignCurrencyBalance(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	a := billing.NewInMemoryAdapter(billing.InMemoryOptions{
+		Balances: map[string]billing.Amount{"ag": mustAmount(t, "1.00", "EUR")},
+	})
+	err := a.Credit(ctx, "ag", mustAmount(t, "0.10", billing.DemoCurrency), "welcome-key")
+	if err == nil {
+		t.Fatal("Credit into a EUR balance = nil, want an error")
+	}
+	// Not ErrInvalidAmount: the credit is valid and the stored balance is not,
+	// so this must reach the caller as an internal fault, never as a 4xx that
+	// blames the caller for state it did not create.
+	if errors.Is(err, billing.ErrInvalidAmount) {
+		t.Errorf("Credit into a EUR balance = %v, want a plain error, not ErrInvalidAmount", err)
+	}
+	bal, err := a.GetBalance(ctx, "ag")
+	if err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if bal.Currency != "EUR" {
+		t.Errorf("balance currency = %q, want EUR (unchanged)", bal.Currency)
+	}
+	if want := mustAmount(t, "1.00", "EUR"); bal.Value.Cmp(want.Value) != 0 {
+		t.Errorf("balance = %s, want 1.00 (unchanged)", bal.Value.FloatString(8))
 	}
 }
 

@@ -155,7 +155,13 @@ Apple's AI crawler, which is still blocked and must pay.
 ```
 bot\b        crawler        spider        GPTBot        ClaudeBot        anthropic-ai
 OAI-SearchBot        CCBot        PerplexityBot        Bytespider        Google-Extended
+Meta-ExternalAgent        Claude-User        ChatGPT-User        Perplexity-User        Meta-ExternalFetcher
 ```
+
+`Claude-User`, `ChatGPT-User`, `Perplexity-User` and `Meta-ExternalFetcher` are
+the user agents assistants send for user-initiated fetches (a human asked for
+the page, as opposed to autonomous crawling). They are gated like the crawlers:
+AI access to paid content is licensed regardless of who initiated the fetch.
 
 A caller sending **no** identity string at all counts as a bot — normal browsers
 always send one. Anything matching neither list is a human.

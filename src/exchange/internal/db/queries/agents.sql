@@ -11,13 +11,21 @@ ON CONFLICT (agent_id) DO UPDATE
 RETURNING *;
 
 -- name: SetAgentBillingRef :one
--- Stores the billing account id for an agent, first write wins. The
--- billing_ref IS NULL guard makes a repeat call a no-op (zero rows →
--- pgx.ErrNoRows), so a stored ref is never overwritten (ADR-021 D4). The
--- column is deliberately absent from UpsertAgent's update list: a key
--- rotation re-upsert must leave billing_ref intact (ADR-021 D3).
+-- Stores the billing account id for an agent, plus the digest of the licensing
+-- terms the registration accepted, first write wins. The billing_ref IS NULL
+-- guard makes a repeat call a no-op (zero rows → pgx.ErrNoRows), so a stored ref
+-- is never overwritten (ADR-021 D4).
+--
+-- Both columns are written by this ONE guarded statement, so first-write-wins
+-- covers them together and the account can never end up carrying a billing_ref
+-- from one registration and an accepted digest from another. The digest is NULL
+-- when the Exchange published none at the time.
+--
+-- Neither column appears in UpsertAgent's update list: a key rotation re-upsert
+-- must leave both intact (ADR-021 D3).
 UPDATE ramp.agents
-   SET billing_ref = $2
+   SET billing_ref = $2,
+       accepted_terms_digest = $3
  WHERE agent_id = $1
    AND billing_ref IS NULL
 RETURNING *;

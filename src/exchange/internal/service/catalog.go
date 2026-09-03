@@ -6,18 +6,20 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 
 	rampv1 "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1"
+	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 	"github.com/jackc/pgx/v5"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/agentid"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown"
+	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/reqctx"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/exchange"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/licenseterm"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 )
 
@@ -79,7 +81,7 @@ func (s *CatalogSnapshot) Lookup(uri string) (repo.CatalogEntry, LookupVerdict) 
 
 // ManifestCache is the narrow port the CatalogService needs from the shared
 // publisher-manifest cache: fetch a host's manifest (a 404 surfaces as
-// rampwellknown.ErrNoManifest). Composed from rampwellknown.Cache at wiring
+// rampwellknown.ErrNoDocument). Composed from rampwellknown.Cache at wiring
 // time so the service depends only on the read it makes: ports stay narrow.
 type ManifestCache interface {
 	Get(ctx context.Context, host string) (*rampwellknown.Manifest, error)
@@ -98,11 +100,7 @@ type CatalogService struct {
 	// resource_owner_id payee is read at push. Required: an empty value matches no
 	// entry, so every push would be rejected for a missing payee attestation.
 	exchangeDomain string
-	// vocab backs licenseterm.Validate's (deferred) unknown-token warnings.
-	// Defaulted to an in-memory provider in NewCatalogService; the hard-reject
-	// path this slice wires does not consult it.
-	vocab    licenseterm.VocabProvider
-	snapshot atomic.Pointer[CatalogSnapshot]
+	snapshot       atomic.Pointer[CatalogSnapshot]
 	// clk drives any time-dependent CatalogService state. Defaults to
 	// clock.System{} per ADR-008 D1; integration tests inject a DeterministicClock
 	// via SetClock. Retained for future per-entry clock hooks (e.g. valid_until).
@@ -133,7 +131,6 @@ func NewCatalogService(
 		manifests:      manifests,
 		tx:             tx,
 		exchangeDomain: exchangeDomain,
-		vocab:          licenseterm.NewInMemoryVocab(),
 		clk:            clock.System{},
 	}
 }
@@ -196,11 +193,16 @@ func (s *CatalogService) PushResources(
 		return nil, err
 	}
 	// All-or-nothing: a submission is accepted only if EVERY entry is
-	// valid. Any business/coherence rejection => persist NOTHING and reject the
+	// valid. Any per-entry rejection => persist NOTHING and reject the
 	// whole submission with per-item reasons, so the publisher fixes and
-	// resubmits the whole set. No partial acceptance. (Term SHAPE — pricing,
-	// REFERENCE_ONLY⇒uri, uri⇒uri_digest, formats — is already enforced by
-	// protovalidate at the RPC boundary before this handler runs.)
+	// resubmits the whole set. No partial acceptance. Term rules run in two
+	// tiers before this point: the wire tier (the protovalidate interceptor —
+	// term shape and cross-field rules, refused before this method runs) and
+	// the ingest tier (the SDK helpers, in classifyEntry, over canonicalized
+	// terms). The gates the Exchange owns — tenant derivation, contributor
+	// authorization, resource-owner attestation, URI ownership — run in the
+	// same per-entry chain, and this refusal of the whole set is the
+	// Exchange's.
 	if len(rejections) > 0 {
 		return nil, exchange.Newf(exchange.KindInvalidRequest,
 			"push rejected, nothing persisted; fix and resubmit: %s", formatRejections(rejections))
@@ -209,24 +211,42 @@ func (s *CatalogService) PushResources(
 	// whole batch back rather than leaving the catalog half-written (Arch rule 7).
 	// The snapshot rebuild reads committed state, so it runs after the commit.
 	if len(accepted) > 0 {
-		if err := s.tx.WithTx(ctx, func(tx pgx.Tx) error {
-			for _, entry := range accepted {
-				if _, err := s.repo.UpsertTx(ctx, tx, entry); err != nil {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
-			return nil, exchange.Wrap(exchange.KindInternal, err, "upsert catalog entries")
+		if err := s.persistAccepted(ctx, accepted); err != nil {
+			return nil, err
 		}
 		if err := s.rebuild(ctx); err != nil {
 			return nil, exchange.Wrap(exchange.KindInternal, err, "rebuild catalog snapshot")
 		}
 	}
 	return &rampv1.PushResourcesResponse{
+		Ver:      helpers.ProtocolVersion,
 		Accepted: int32(len(accepted)), //nolint:gosec // per-request batch size fits in int32
 		Warnings: warnings,
 	}, nil
+}
+
+// persistAccepted upserts the accepted entries in one transaction (Arch rule
+// 7: a mid-batch failure rolls the whole batch back). The guarded upsert
+// refuses a URI move for an existing resource_id — the race-safe backstop
+// behind the rejectURIConflicts precheck — and a push that loses that race is
+// a caller-fixable conflict, not an infrastructure failure.
+func (s *CatalogService) persistAccepted(ctx context.Context, accepted []repo.CatalogEntry) error {
+	err := s.tx.WithTx(ctx, func(tx pgx.Tx) error {
+		for _, entry := range accepted {
+			if _, err := s.repo.UpsertTx(ctx, tx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, repo.ErrCatalogURIImmutable) {
+		return exchange.Wrap(exchange.KindInvalidRequest, err,
+			"push rejected, nothing persisted: catalog uri is immutable for an existing resource")
+	}
+	return exchange.Wrap(exchange.KindInternal, err, "upsert catalog entries")
 }
 
 // partitionByContributor walks req.Entries, classifying each through the full
@@ -263,6 +283,7 @@ func (s *CatalogService) partitionByContributor(
 		return nil, nil, nil, err
 	}
 	rejections = append(rejections, uriRejections...)
+	logRejections(ctx, rejections)
 	return accepted, rejections, warnings, nil
 }
 
@@ -270,28 +291,26 @@ func (s *CatalogService) partitionByContributor(
 // an accepted entry (rej == nil) or a rejection (zero entry, rej != nil). A
 // non-nil error is an infrastructure failure that aborts the whole batch.
 //
-// Chain order: token canonicalization; server-side tenant derivation
-// (tenant_id comes from the publisher domain, never the wire); proto→repo
-// conversion with a tenant-scoped resource_id; contributor
-// authorization (Gate 2) and resource-owner attestation, both read off the owner
-// manifest; license-term validation.
+// Chain order: token canonicalization (the SDK's NormalizeResourceEntry, in
+// place); server-side tenant derivation (tenant_id comes from the publisher
+// domain, never the wire); proto→repo conversion with a tenant-scoped
+// resource_id; contributor authorization (Gate 2) and resource-owner
+// attestation, both read off the owner manifest; the SDK's ingest-tier term
+// checks (validateEntryTerms).
 func (s *CatalogService) classifyEntry(
 	ctx context.Context,
 	req *rampv1.PushResourcesRequest,
 	e *rampv1.ResourceEntry,
 ) (repo.CatalogEntry, *CatalogPushRejection, []string, error) {
-	// Cap terms[] cardinality before any further work: an over-cap entry
-	// is rejected per-entry so the stored JSONB the discovery read path decodes
-	// can never grow without bound. Length-only — per-term validity is checked by
-	// validateEntryTerms below.
-	if rej := rejectIfTooManyTerms(e); rej != nil {
-		return repo.CatalogEntry{}, rej, nil, nil
-	}
-	// Canonicalize tokens before marshalling/validation so the persisted row and
-	// the DiscoverResources→Offer.terms projection carry canonical tokens.
-	for _, term := range e.GetTerms() {
-		licenseterm.Normalize(term)
-	}
+	// The terms[] length is not checked here. ResourceEntry.terms carries its
+	// cap on the wire, so the validate interceptor refuses an over-cap entry —
+	// and with it the whole submission — at the RPC boundary, before this chain
+	// runs; a per-entry check here would be unreachable.
+	//
+	// Canonicalize tokens in place before conversion and validation, so the
+	// persisted row and the DiscoverResources→Offer.terms projection carry
+	// canonical tokens and the ingest-tier checks compare canonical values.
+	helpers.NormalizeResourceEntry(e)
 	tenantID, rej, err := s.deriveTenantID(ctx, req, e)
 	if err != nil || rej != nil {
 		return repo.CatalogEntry{}, rej, nil, err
@@ -310,11 +329,12 @@ func (s *CatalogService) classifyEntry(
 		return repo.CatalogEntry{}, rej, nil, err
 	}
 	entry.ResourceOwnerID = ownerID
-	// One invalid license term drops the whole entry; lint warnings on
-	// accepted terms surface in PushResourcesResponse.warnings[].
-	entryWarnings, err := s.validateEntryTerms(e)
-	if err != nil {
-		return repo.CatalogEntry{}, reject(entry.URI, RejectionReasonInvalidTerms), nil, nil //nolint:nilerr // err->rejection
+	// One term failing the SDK's ingest-tier checks drops the whole entry, with
+	// the SDK's message as the rejection detail; lint warnings on accepted
+	// terms surface in PushResourcesResponse.warnings[].
+	entryWarnings, rej := validateEntryTerms(ctx, entry.URI, e)
+	if rej != nil {
+		return repo.CatalogEntry{}, rej, nil, nil
 	}
 	return entry, nil, entryWarnings, nil
 }
@@ -357,7 +377,7 @@ func (s *CatalogService) resolveManifestGates(
 ) (string, *CatalogPushRejection, error) {
 	manifest, err := s.manifests.Get(ctx, e.GetDomain())
 	if err != nil {
-		if errors.Is(err, rampwellknown.ErrNoManifest) {
+		if errors.Is(err, rampwellknown.ErrNoDocument) {
 			return "", reject(uri, RejectionReasonNotInContributors), nil //nolint:nilerr // err->rejection
 		}
 		return "", nil, exchange.Wrap(exchange.KindInternal, err, "fetch publisher manifest")
@@ -372,23 +392,71 @@ func (s *CatalogService) resolveManifestGates(
 	return ownerID, nil, nil
 }
 
-// validateEntryTerms runs licenseterm.Validate over every term on the entry,
-// returning the first hard violation (which drops the whole entry) and the
-// accumulated lint warnings across the entry's accepted terms. Terms are already
-// canonicalized by licenseterm.Normalize earlier in partitionByContributor, so
-// Validate sees canonical tokens. Term logic lives entirely in the licenseterm
-// package (over rampv1.LicenseTerm); the handler only routes the verdict to
-// acceptance or rejection and surfaces the warnings.
-func (s *CatalogService) validateEntryTerms(e *rampv1.ResourceEntry) ([]string, error) {
+// validateEntryTerms runs the SDK's ingest-tier checks
+// (helpers.ValidateLicenseTerm) over every term on the entry. It returns either
+// the accumulated lint warnings — each RuleWarning.Message verbatim, in term
+// order and, within a term, in the SDK's order, the strings that become
+// PushResourcesResponse.warnings[] — or, on the first hard violation, the
+// RejectionReasonInvalidTerms rejection that drops the whole entry, carrying
+// the SDK's message as its Detail. The terms were canonicalized in place by
+// helpers.NormalizeResourceEntry at the top of classifyEntry, so the checks see
+// canonical tokens.
+//
+// The per-term face is deliberate: the Exchange never calls
+// helpers.ValidateResourceEntry, for three reasons. That face re-runs
+// protovalidate over the whole entry, which the validate interceptor already
+// did once per request. It normalizes a proto.Clone and returns a verdict,
+// while the Exchange must persist canonical tokens and so needs the in-place
+// face. And it reports every violation, for a publisher fixing a feed, whereas
+// the Exchange stops at the first hard violation per entry (all-or-nothing),
+// which is ValidateLicenseTerm's contract.
+//
+// A refusal is logged at Warn with the entry URI and the violation's rule,
+// path and token, so an operator can name the offending value without the
+// publisher's feed. The path is made entry-relative ("terms[i].<path>"), the
+// form the SDK's entry verdict reports.
+//
+// This is the SECOND line a term refusal produces, and it is deliberate. Every
+// refused entry, whatever refused it, gets one line from logRejections carrying
+// the URI and the machine-readable reason. That vocabulary has no place for a
+// rule id, a field path or a token, and those three are what an operator names
+// the bad value from — so the gate that holds them writes them here, one level
+// deeper, rather than widening the shape every refusal shares.
+func validateEntryTerms(
+	ctx context.Context, uri string, e *rampv1.ResourceEntry,
+) ([]string, *CatalogPushRejection) {
 	var warnings []string
-	for _, term := range e.GetTerms() {
-		w, err := licenseterm.Validate(term, s.vocab)
+	for i, term := range e.GetTerms() {
+		termWarnings, err := helpers.ValidateLicenseTerm(term)
 		if err != nil {
-			return nil, err
+			violation := asRuleViolation(err)
+			reqctx.FromContext(ctx).WarnContext(
+				ctx, "license term refused at ingest",
+				"uri", uri,
+				"rule", violation.Rule,
+				"path", fmt.Sprintf("terms[%d].%s", i, violation.Path),
+				"token", violation.Token,
+			)
+			rej := reject(uri, RejectionReasonInvalidTerms)
+			rej.Detail = violation.Message
+			return nil, rej
 		}
-		warnings = append(warnings, w...)
+		for _, w := range termWarnings {
+			warnings = append(warnings, w.Message)
+		}
 	}
 	return warnings, nil
+}
+
+// asRuleViolation unwraps the error helpers.ValidateLicenseTerm returns into the
+// *helpers.RuleViolation it documents. Any other error type is still a refusal
+// — the entry must not persist — carried with its message alone.
+func asRuleViolation(err error) *helpers.RuleViolation {
+	var violation *helpers.RuleViolation
+	if errors.As(err, &violation) {
+		return violation
+	}
+	return &helpers.RuleViolation{Message: err.Error()}
 }
 
 // rebuild reloads the WHOLE catalog (all tenants) into the in-memory radix trie.
@@ -408,7 +476,7 @@ func (s *CatalogService) rebuild(ctx context.Context) error {
 	snap := newEmptySnapshot()
 	for _, row := range rows {
 		snap.trie.Insert(row.URIPrefix, row)
-		snap.byID[row.ResourceID] = row
+		snap.byURI[row.URI] = row
 		snap.tenant[row.ResourceID] = row.TenantID
 		// Decode the row's terms ONCE here. A row whose stored JSONB fails
 		// to decode is cached as zero terms (decodeRowTerms logs + returns nil), so

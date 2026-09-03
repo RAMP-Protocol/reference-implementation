@@ -11,342 +11,29 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"sync/atomic"
+	"strings"
 	"testing"
 	"time"
 
 	connect "connectrpc.com/connect"
-	"connectrpc.com/validate"
+	"github.com/RAMP-Protocol/protocol/gen/go/ramp/admin/v1/rampadminv1connect"
 	rampconnect "github.com/RAMP-Protocol/protocol/gen/go/ramp/v1/rampv1connect"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	sdkconnect "github.com/RAMP-Protocol/protocol/sdk/go/connect"
-	"github.com/RAMP-Protocol/protocol/sdk/go/connectserver"
-	"github.com/RAMP-Protocol/protocol/sdk/go/core"
 	"github.com/RAMP-Protocol/protocol/sdk/go/helpers"
 
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/clock"
 	sharedb "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/db"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampauth"
 	rwtestutil "gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/rampwellknown/testutil"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/replay"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/runhttp"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/internal/testutil"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/agentreg"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/billing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/db/sqlc"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/ingest"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/repo"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/service"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/signing"
 	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/sor"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/transport"
-	"gitlab.postindustria.com/pi-ai/prebid-agentic-content-access/src/exchange/internal/wellknown"
 )
-
-// exchangeServerFixture bundles an httptest server wired with the Exchange
-// Connect-Go handlers for CatalogService + ExchangeService, along with the
-// baseTransport callers use to build signing HTTP clients on top.
-type exchangeServerFixture struct {
-	server        *httptest.Server
-	baseTransport http.RoundTripper
-	exchange      *service.ExchangeService
-	catalogSvc    *service.CatalogService
-	// resolver exposed so multi-agent tests (cross-tenant, broker-relay)
-	// can register additional keyIDs dynamically via resolver.Put after
-	// server start.
-	resolver *helpers.StaticKeyResolver
-	// rsaPub / rsaKid carry the CloudFront RSA verify key. RAMP v1 no longer
-	// publishes it at a well-known route, so onboarding tests read it from the
-	// fixture to verify CloudFront-signed URLs.
-	rsaPub *rsa.PublicKey
-	rsaKid string
-}
-
-// exchangeServerDeps names the pieces startExchangeServer needs; grouping them
-// here keeps the call site readable and stops the argument list from growing
-// past the per-file function-arg lint budget.
-type exchangeServerDeps struct {
-	pool      *pgxpool.Pool
-	queries   sqlc.Querier
-	registry  agentreg.Registry
-	manifests service.ManifestCache
-	bill      billing.Adapter
-	signer    *signing.Ed25519Signer
-	keystore  *signing.InMemoryKeyStore
-	logger    *slog.Logger
-	// httpsigKeys registers caller pubkeys with the connectserver verify
-	// middleware that wraps the mux (mirror of production wiring in
-	// cmd/server/main.go::buildWrapped). Tests that issue any /ramp.* RPC
-	// MUST register the signer's keyID + pubkey here; the global gate
-	// will reject the request with helpers.ErrUnknownKey otherwise.
-	httpsigKeys map[string]ed25519.PublicKey
-	// clk is optional. nil → clock.System{}. Pass a DeterministicClock to
-	// control time in tests that exercise window-expiry logic.
-	clk clock.Clock
-	// txRunner overrides the service's transaction runner. nil →
-	// PoolRunner{Pool}. A failing runner drives the persist-failure hot path
-	txRunner sharedb.TxRunner
-	// keystoreOverride replaces the KeyStore the ExchangeService consults
-	// when minting signed URLs. nil → deps.keystore. A failing keystore drives
-	// the URL-sign-failure hot path. The well-known RSA wiring
-	// still uses deps.keystore.
-	keystoreOverride signing.KeyStore
-	// maxSignatures bounds the inbound signature (hop) chain depth, mirroring
-	// the production ceiling (cmd/server/main.go: max_intermediary_hops + 1).
-	// 0 → unbounded — the default for tests that do not exercise the hop bound.
-	maxSignatures int
-	// sor is the account System of Record the Register flow depends on. nil → a
-	// fresh in-memory SoR so every harness constructs a valid service even when it
-	// never calls Register (production wiring is ST-5's job; the harness needs the
-	// dep now). Register tests inject their own to assert account state.
-	sor sor.Adapter
-	// defaultTenantDomain names the single tenant Register reads its
-	// activate_new_agents_by_default policy from (ADR-021 §5 decision 1). Empty for
-	// harnesses that do not exercise Register.
-	defaultTenantDomain string
-	// billingRefGen overrides the billing_ref generator; nil → uuid.NewString
-	// inside NewExchangeService. Register tests inject a deterministic counter.
-	billingRefGen service.BillingRefGen
-	// trustProxyHeaders mirrors RAMP_TRUST_PROXY_HEADERS: wire the
-	// forwarded-header rewrite into WrapPublicSurface, the proxied deployment
-	// shape (client signs https, service socket sees plain HTTP).
-	trustProxyHeaders bool
-}
-
-// startExchangeServer wires the Exchange's public HTTP surface — Connect-Go
-// CatalogService + ExchangeService, the three /.well-known/ routes, and the
-// public agents/register handler — onto a fresh mux behind
-// RequestIDMiddleware + the connectserver verify middleware + CatalogSignatureMiddleware,
-// serves it via httptest, and returns the fixture. Mirror of
-// cmd/server/main.go::buildWrapped so the integration tests exercise the
-// SAME middleware chain as production (per ADR-008 D1). Admin-plane
-// routes are deliberately absent; the admin_removed_e2e_test asserts that.
-//
-// Callers still own DB bring-up, tenant seeding, and any post-wiring
-// bootstrap (e.g. catalog.Bootstrap). Callers MUST also register every
-// signer's keyID + pubkey via deps.httpsigKeys; the global gate rejects
-// unknown keyids with helpers.ErrUnknownKey.
-func startExchangeServer(t *testing.T, deps exchangeServerDeps) *exchangeServerFixture {
-	t.Helper()
-	catalogSvc := service.NewCatalogService(
-		repo.NewCatalogRepo(deps.queries), repo.NewTenantReadRepo(deps.queries),
-		deps.registry, deps.manifests, sharedb.PoolRunner{Pool: deps.pool},
-		harnessExchangeDomain,
-	)
-	// Mirror production (cmd/server exchangeSupportedProfiles): the CatalogService
-	// must know the advertised profiles so rebuild() pre-renders CoMP — set
-	// before any Bootstrap/push, else the comp cache is empty and the
-	// CoMP integration suite goes red.
-	catalogSvc.SetSupportedProfiles([]string{"ramp-news-v1", "ramp-comp-v1"})
-	// NOTE: the SetOfferRepo / FREE-offer materialisation bridge was
-	// removed by the proto-rename wave W3 along with src/exchange/internal/repo/offers.go.
-	// Obligation 04's anonymous public-resource flow is now served by
-	// DiscoverResources directly; no parallel offer-row seed runs here.
-	txRunner := sharedb.TxRunner(sharedb.PoolRunner{Pool: deps.pool})
-	if deps.txRunner != nil {
-		txRunner = deps.txRunner
-	}
-	var svcKeyStore signing.KeyStore = deps.keystore
-	if deps.keystoreOverride != nil {
-		svcKeyStore = deps.keystoreOverride
-	}
-	sorAdapter := deps.sor
-	if sorAdapter == nil {
-		sorAdapter = sor.NewInMemoryAdapter()
-	}
-	exchangeSvc := service.NewExchangeService(service.ExchangeDeps{
-		TxRunner:      txRunner,
-		Catalog:       catalogSvc,
-		Tenants:       repo.NewTenantReadRepo(deps.queries),
-		Agents:        repo.NewAgentRepo(deps.queries),
-		AgentReg:      deps.registry,
-		Transactions:  repo.NewTransactionRepo(deps.queries),
-		Obligations:   repo.NewObligationRepo(deps.queries),
-		Evidence:      repo.NewEvidenceRepo(deps.queries),
-		FeeOverrides:  repo.NewFeeOverrideRepo(deps.queries),
-		Billing:       deps.bill,
-		OfferSigner:   deps.signer,
-		KeyStore:      svcKeyStore,
-		SoR:           sorAdapter,
-		BillingRefGen: deps.billingRefGen,
-		// SupportedProfiles mirrors production (cmd/server/main.go
-		// exchangeSupportedProfiles): the Exchange advertises + projects
-		// ramp-comp-v1, so profile-aware discovery renders the CoMP ext.
-		Config: service.ExchangeConfig{
-			Exchange:            harnessExchangeDomain,
-			SupportedProfiles:   []string{"ramp-news-v1", "ramp-comp-v1"},
-			DefaultTenantDomain: deps.defaultTenantDomain,
-		},
-		Clk: deps.clk,
-	})
-
-	// Production parity (cmd/server/main.go::registerConnect): the ExchangeService
-	// Connect handler is built via connectserver.NewExchangeServiceHandler which
-	// wraps request-id (outermost) → RFC 9421 verify middleware → connect
-	// interceptors (protovalidate bidirectional). The resolver and replay store for
-	// the ExchangeService surface are constructed inline from httpsigKeys +
-	// maxSignatures, mirroring cmd/server buildHTTPSigDeps / registerConnect.
-	// CatalogService uses its own per-contributor signature check and is registered
-	// with plain rampconnect.NewCatalogServiceHandler (no global verify gate).
-	// Omitting protovalidate or the EmitUnpopulated codec made the harness silently
-	// accept production-invalid requests OR fork the response wire shape; the wiring
-	// below is the EXACT ServerOption set the production ExchangeService handler
-	// wires (cmd/server/main.go::registerConnect). WithValidation(Strict) ALONE
-	// installs the SDK's bidirectional protovalidate interceptor (requests +
-	// responses + error details, via sdkconnect.NewValidateInterceptor) — a separate
-	// WithInterceptors(validate...) would only re-add the same shared engine, so
-	// production wires none and neither does this harness. WithEmitUnpopulated keeps
-	// zero-valued response fields on the JSON wire (the platform JSON contract), and
-	// WithOnReject audit-logs gate rejections — both present in production.
-	resolver := helpers.NewStaticKeyResolver(deps.httpsigKeys)
-	replayAdapter := replay.NewCoreAdapter(replay.NewMemoryStore(time.Now))
-	svrOpts := []connectserver.ServerOption{
-		connectserver.WithKeyResolver(resolver),
-		connectserver.WithReplayStore(replayAdapter),
-		connectserver.WithMaxSignatures(deps.maxSignatures),
-		connectserver.WithValidation(sdkconnect.ValidationStrict),
-		connectserver.WithEmitUnpopulated(),
-		connectserver.WithOnReject(transport.LogHTTPSigReject),
-		// Production parity: the same request-body read cap the server wires
-		// (cmd/server/main.go::registerConnect), so the harness enforces
-		// WithReadMaxBytes exactly as production does.
-		connectserver.WithHandlerOptions(connect.WithReadMaxBytes(transport.MaxRPCReadBytes)),
-	}
-	mux := http.NewServeMux()
-	exchangePath, exchangeHandler := connectserver.NewExchangeServiceHandler(
-		transport.NewExchangeHandler(exchangeSvc), svrOpts...,
-	)
-	mux.Handle(exchangePath, exchangeHandler)
-	codecOpt := connect.WithCodec(connectserver.EmitUnpopulatedJSONCodec())
-	validateOpt := connect.WithInterceptors(validate.NewInterceptor())
-	// The read cap rides on the catalog mount too, matching production
-	// (cmd/server/main.go). Without it an over-cap catalog push is refused in
-	// production and accepted in every integration test.
-	readCapOpt := connect.WithReadMaxBytes(transport.MaxRPCReadBytes)
-	catalogPath, catalogHandler := rampconnect.NewCatalogServiceHandler(
-		transport.NewCatalogHandler(catalogSvc, deps.registry), codecOpt, validateOpt, readCapOpt)
-	mux.Handle(catalogPath, catalogHandler)
-
-	rsaPriv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("rsa: %v", err)
-	}
-	const rsaKid = "cf-test"
-	// The keystore entry under rsaKid lets tests whose tenant uses
-	// AWS_CLOUDFRONT_RSA resolve the RSA key when minting CloudFront URLs.
-	// RAMP v1 no longer publishes it at a well-known route (CloudFront verifies
-	// natively against a trusted key group); tests read fixture.rsaPub instead.
-	deps.keystore.PutRSA(rsaKid, rsaPriv)
-	wk, err := wellknown.New(wellknown.Config{
-		Domain:            harnessExchangeDomain,
-		Endpoint:          "/ramp.v1.ExchangeService",
-		CatalogEndpoint:   "/ramp.v1.CatalogService",
-		BaseCurrency:      "USD",
-		SupportedProfiles: []string{"ramp-news-v1"},
-		OfferKey:          deps.signer.PublicKey(),
-		Clock:             clock.NewDeterministic(time.Unix(1700000000, 0).UTC()),
-		KeyLifetime:       10 * 365 * 24 * time.Hour,
-	})
-	if err != nil {
-		t.Fatalf("wellknown: %v", err)
-	}
-	wk.RegisterRoutes(mux)
-
-	transport.NewAgentsRegisterHandler(deps.registry, transport.AgentsRegisterOptions{}).
-		RegisterRoutes(mux)
-
-	// ExchangeService verification is handled by
-	// connectserver.NewExchangeServiceHandler registered above;
-	// CatalogSignatureMiddleware handles the Catalog path. trustProxyHeaders
-	// wires the same forwarded-header rewrite production wires under
-	// RAMP_TRUST_PROXY_HEADERS.
-	server := httptest.NewServer(transport.WrapPublicSurface(deps.logger, mux,
-		runhttp.PublicSurfaceOptions{TrustProxyHeaders: deps.trustProxyHeaders}))
-	t.Cleanup(server.Close)
-
-	base := server.Client().Transport
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	return &exchangeServerFixture{
-		server:        server,
-		baseTransport: base,
-		exchange:      exchangeSvc,
-		catalogSvc:    catalogSvc,
-		resolver:      resolver,
-		rsaPub:        &rsaPriv.PublicKey,
-		rsaKid:        rsaKid,
-	}
-}
-
-// newSigningTransport builds the canonical RAMP RFC 9421 signing
-// http.RoundTripper (sdk/go/core.NewSigningTransport) so tests exercise the
-// real middleware path with byte-identical signatures to production. Both
-// ExchangeService and CatalogService /ramp.* paths are signed (the
-// CatalogService gets verified by CatalogSignatureMiddleware downstream;
-// the global httpsig gate excludes Catalog via the predicate but the
-// per-contributor signer still requires the same outbound signature).
-// Non-/ramp.* paths (e.g. /exchange/v1/agents/register) pass through
-// unsigned — the shared transport skips them.
-//
-// expires is sourced from a per-transport monotonic counter
-// (seeded at the wall-clock second) rather than the wall clock. The signing
-// library stamps created=now() itself (no caller override), so expires is
-// the sole caller-controlled freshness axis; a strictly-increasing expires
-// is what keeps each on-the-wire signature unique. Without it, two
-// back-to-back calls within the same second carry identical body +
-// identical created + identical expires, producing the same signature, and
-// the replay store at the global httpsig
-// middleware rejects the second as a replay — even when the test is
-// exercising service-layer idempotency (e.g.
-// TestExecuteTransaction_Idempotency). Real clients retrying after a
-// network blip naturally advance the clock per retry; the counter
-// simulates that. The +3600 keeps the value inside the verifier's window
-// check while the increment guarantees signature uniqueness.
-func newSigningTransport(base http.RoundTripper, keyID string, priv ed25519.PrivateKey) http.RoundTripper {
-	var counter atomic.Int64
-	counter.Store(time.Now().Unix())
-	// Both axes derive from the monotonic counter so back-to-back signatures
-	// stay unique (the replay-store dodge). The +3600 keeps expires inside the
-	// verifier's freshness window; created is the counter base so created ≤ expires.
-	win := core.Window(func() (created, expires int64) {
-		base := counter.Add(1)
-		return base, base + 3600
-	})
-	// After the WBA split keyID names the signer's directory (Signature-Agent);
-	// the RFC 9421 keyid is priv's RFC 7638 thumbprint.
-	return core.NewSigningTransport(mustSigner(priv), base,
-		core.WithSignPredicate(rampauth.IsRAMPProcedure),
-		core.WithSignatureAgent(keyID),
-		core.WithWindow(win),
-	)
-}
-
-// mustSigner derives the thumbprint keyid and builds the Ed25519 signer.
-func mustSigner(priv ed25519.PrivateKey) helpers.Signer {
-	keyid, err := helpers.Thumbprint(priv.Public().(ed25519.PublicKey))
-	if err != nil {
-		panic(err)
-	}
-	signer, err := helpers.NewEd25519Signer(keyid, priv)
-	if err != nil {
-		panic(err)
-	}
-	return signer
-}
-
-// mustSigningClient wires the ingest push path's signed client for tests.
-func mustSigningClient(t *testing.T, kid string, priv ed25519.PrivateKey) *http.Client {
-	t.Helper()
-	client, err := ingest.NewSigningClient(kid, priv, nil)
-	if err != nil {
-		t.Fatalf("build signing client: %v", err)
-	}
-	return client
-}
 
 // testHarness bundles the live server + handles used by each test.
 type testHarness struct {
@@ -363,8 +50,16 @@ type testHarness struct {
 	billing        *billing.InMemoryAdapter
 	keystore       *signing.InMemoryKeyStore
 	clk            *clock.DeterministicClock // nil when harness uses real clock
-	tenantID       string
-	tenantDomain   string
+	// adminURL caches the operator admin surface once a test has needed it, so
+	// an assertion helper can read an obligation through the same RPC an
+	// operator uses without every caller standing the surface up itself. Empty
+	// until the first adminBaseURL call.
+	adminURL string
+	// adminClient is the client for adminURL, cached with it so one bring-up
+	// serves both the tests that read evidence and the tests that write policy.
+	adminClient  rampadminv1connect.AdminServiceClient
+	tenantID     string
+	tenantDomain string
 	// billingRef is the account handle the default agent-test caller was
 	// registered under during bring-up (ADR-021 D5): the charge path
 	// keys the ledger account on this ref, not on the agent id, so every test that
@@ -388,6 +83,12 @@ type testHarness struct {
 	// baseTransport is the underlying RoundTripper Connect-Go clients
 	// chain their signing transports onto.
 	baseTransport http.RoundTripper
+	// callerID is the directory the default caller presents as its
+	// Signature-Agent, which in this harness is also its seeded agent_id. It is
+	// NOT the RFC 9421 keyid — that is the key's RFC 7638 thumbprint, derived
+	// from callerPriv. Kept so a test can build a second client over the same
+	// signed transport.
+	callerID string
 }
 
 // exchangeDBFixture carries the shared test infrastructure produced by
@@ -436,7 +137,11 @@ func setupExchangeTestDBDeferredRSA(t *testing.T, agentID string, deferredRSA bo
 
 	queries := sqlc.New(pool)
 	tenantID := "t_" + uuid.NewString()
-	tenantDomain := tenantID + ".example"
+	// The tenant id is a database key and carries an underscore; the domain is a
+	// host and may not (ResourceEntry.domain is a bare-host wire rule, and the
+	// catalog URI is built from it), so the fixture domain is derived from the
+	// uuid alone, never from the id.
+	tenantDomain := "tenant-" + strings.TrimPrefix(tenantID, "t_") + ".example"
 
 	keystore := signing.NewInMemoryKeyStore()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -449,7 +154,6 @@ func setupExchangeTestDBDeferredRSA(t *testing.T, agentID string, deferredRSA bo
 	insert := sqlc.InsertTenantParams{
 		TenantID:        tenantID,
 		Domain:          tenantDomain,
-		HmacSecretRef:   "unused",
 		Ed25519KeyRef:   ed25519Ref,
 		ReportingPolicy: []byte(`{}`),
 		SigningScheme:   sqlc.RampSigningSchemeED25519,
@@ -462,7 +166,8 @@ func setupExchangeTestDBDeferredRSA(t *testing.T, agentID string, deferredRSA bo
 		keystore.PutRSAFunc(deferredRSAKeyRef, func() (*rsa.PrivateKey, error) {
 			return nil, fmt.Errorf(
 				"%w — set RAMP_RSA_PRIVATE_PEM or RAMP_RSA_PRIVATE_PEM_FILE",
-				signing.ErrRSAKeyUnavailable)
+				signing.ErrRSAKeyUnavailable,
+			)
 		})
 	}
 	if _, err := queries.InsertTenant(ctx, insert); err != nil {
@@ -507,17 +212,69 @@ func newTestHarnessWithClock(t *testing.T, clk *clock.DeterministicClock) *testH
 	return newTestHarnessWith(t, harnessOptions{clk: clk})
 }
 
+// now returns the instant the service under test is reading. A test that moved
+// a DeterministicClock must compare against this, not the wall clock: deadlines
+// and expiries are written from the service clock, so the two have drifted
+// apart on purpose. Falls back to the wall clock for a harness built without a
+// deterministic one, where the two agree.
+func (h *testHarness) now() time.Time {
+	if h.clk != nil {
+		return h.clk.Now()
+	}
+	return time.Now().UTC()
+}
+
+// adminSurface starts the operator admin surface on first use and returns the
+// client beside its base URL, reusing both afterwards. The allowlist is the
+// loopback range every other admin test uses, because the request comes from the
+// test process.
+//
+// The client is cached and not just the URL: a test that needs the client used
+// to call startAdminServer itself, which gave the package two bring-up paths for
+// one surface and started a second listener the moment such a test also read an
+// obligation through the cached one.
+func (h *testHarness) adminSurface(t *testing.T) (rampadminv1connect.AdminServiceClient, string) {
+	t.Helper()
+	if h.adminURL == "" {
+		h.adminClient, h.adminURL = startAdminServer(t, h, "127.0.0.0/8")
+	}
+	return h.adminClient, h.adminURL
+}
+
+// adminBaseURL is adminSurface for the readers that need only the URL.
+func (h *testHarness) adminBaseURL(t *testing.T) string {
+	t.Helper()
+	_, url := h.adminSurface(t)
+	return url
+}
+
 // newRecordingHarnessCapturingLogs is newRecordingHarness with the service
 // logger wired to a JSON handler over the returned safeBuffer, so one test can
 // assert BOTH billing-call observations (via the recordingAdapter) and
 // audit-log lines (via the buffer). Bring-up delegates to newRecordingHarnessWith
 // (Testing Doctrine #7). The buffer is safe for concurrent server/test access.
-func newRecordingHarnessCapturingLogs(t *testing.T) (*testHarness, *recordingAdapter, *safeBuffer) {
+//
+// clk is the service clock, and may be nil for a harness that does not drive
+// time. It is a parameter rather than a second constructor because a test that
+// needs a deterministic clock alongside the recorder and the log buffer wants
+// this same bring-up, and a private copy of it in one test file is the shape
+// Testing Doctrine #7 exists to prevent.
+func newRecordingHarnessCapturingLogs(
+	t *testing.T, clk *clock.DeterministicClock,
+) (*testHarness, *recordingAdapter, *safeBuffer) {
 	t.Helper()
 	buf := &safeBuffer{}
-	h, rec := newRecordingHarnessWith(t, harnessOptions{logger: slog.New(slog.NewJSONHandler(buf, nil))})
+	h, rec := newRecordingHarnessWith(t, harnessOptions{
+		clk:    clk,
+		logger: slog.New(slog.NewJSONHandler(buf, nil)),
+	})
 	return h, rec, buf
 }
+
+// pastReportingWindow is how far a deterministic clock is moved to put an
+// obligation's deadline behind it. The default reporting window is 24h, so any
+// value above that works; an hour of margin keeps the intent obvious.
+const pastReportingWindow = 25 * time.Hour
 
 // harnessOptions parameterises newTestHarnessWith. All fields are optional.
 type harnessOptions struct {
@@ -534,6 +291,12 @@ type harnessOptions struct {
 	// txRunner overrides the service's transaction runner; nil → PoolRunner.
 	// A failing runner drives the persist-failure hot path.
 	txRunner sharedb.TxRunner
+	// txRunnerWrap decorates the real PoolRunner instead of replacing it, so a
+	// test runner can delegate to a working transaction during harness bring-up
+	// and start failing only afterwards. It is handed the pool runner and returns
+	// what the service gets. nil leaves txRunner (or the plain PoolRunner) in
+	// place; setting both is a wiring mistake and fails the test.
+	txRunnerWrap func(sharedb.TxRunner) sharedb.TxRunner
 	// keystore overrides the service's KeyStore; nil → the harness's real
 	// InMemoryKeyStore. A failing keystore drives the URL-sign-failure hot
 	// path.
@@ -554,7 +317,7 @@ type harnessOptions struct {
 	// skipRegister, when true, leaves the default agent-test caller UNregistered
 	// (no billing_ref on its agents row). Bring-up neither calls the Register RPC
 	// nor sets h.billingRef, so a paid transaction denies before Authorize
-	// (DENIAL_REASON_BILLING_REF_INACTIVE). Used by the unregistered-agent negative
+	// (DENIAL_REASON_ACCOUNT_NOT_REGISTERED). Used by the unregistered-agent negative
 	// path; the default (false) registers the caller so paid tests can charge.
 	skipRegister bool
 	// sor overrides the account System of Record the service is wired with;
@@ -567,6 +330,21 @@ type harnessOptions struct {
 	// (see setupExchangeTestDBDeferredRSA), driving the FailedPrecondition
 	// refusal through the full transport surface.
 	deferredRSATenant bool
+}
+
+// harnessTxRunner resolves the transaction runner the service gets: a wrapper
+// around the real pool runner when txRunnerWrap is set, the replacement when
+// txRunner is set, and the plain pool runner otherwise.
+func harnessTxRunner(t *testing.T, opts harnessOptions, pool *pgxpool.Pool) sharedb.TxRunner {
+	t.Helper()
+	if opts.txRunnerWrap == nil {
+		return opts.txRunner
+	}
+	if opts.txRunner != nil {
+		t.Fatal("harnessOptions sets both txRunner and txRunnerWrap; the wrapper would have " +
+			"nothing to decorate")
+	}
+	return opts.txRunnerWrap(sharedb.PoolRunner{Pool: pool})
 }
 
 // newTestHarnessWith is the shared bring-up behind every transport integration
@@ -595,10 +373,12 @@ func newTestHarnessWith(t *testing.T, opts harnessOptions) *testHarness {
 		t.Fatalf("offer signer: %v", err)
 	}
 
-	// callerID is BOTH the httpsig keyID AND the seeded agent_id, mirroring
-	// the production trust model where keyID == agent_id (implementation
-	// plan Q1 decision). Catalog contributions, ExecuteTransaction, and
-	// ReportUsage all sign with this key and authorize as this agent.
+	// callerID is BOTH the caller's Signature-Agent directory AND the seeded
+	// agent_id, mirroring the production trust model where the directory names
+	// the agent. It is not the RFC 9421 keyid: after the Web Bot Auth split that
+	// is callerPriv's RFC 7638 thumbprint, which is what the httpsig resolver
+	// keys on below. Catalog contributions, ExecuteTransaction, and ReportUsage
+	// all sign with this key and authorize as this agent.
 	callerID := "agent-test"
 	callerPub, callerPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -646,7 +426,7 @@ func newTestHarnessWith(t *testing.T, opts harnessOptions) *testHarness {
 		// after the WBA split — not by the caller's directory identity.
 		httpsigKeys:      map[string]ed25519.PublicKey{rwtestutil.MustThumbprintPriv(callerPriv): callerPub},
 		clk:              srvClk,
-		txRunner:         opts.txRunner,
+		txRunner:         harnessTxRunner(t, opts, pool),
 		keystoreOverride: opts.keystore,
 		maxSignatures:    opts.maxSignatures,
 		// Register (bring-up below) needs the default tenant to resolve
@@ -694,6 +474,7 @@ func newTestHarnessWith(t *testing.T, opts harnessOptions) *testHarness {
 		callerPriv:     callerPriv,
 		resolver:       srv.resolver,
 		baseTransport:  srv.baseTransport,
+		callerID:       callerID,
 	}
 }
 
