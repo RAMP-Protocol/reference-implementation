@@ -1,5 +1,9 @@
 # RAMP — Reference Implementation
 
+> **RAMP is now FORA.** Same protocol, new name. The spec and docs moved to
+> [fora-protocol.org](https://fora-protocol.org), and development continues in
+> [FORA-Protocol/reference-implementation](https://github.com/FORA-Protocol/reference-implementation). This repository is no longer updated.
+
 A working multi-language implementation of the [RAMP protocol](https://github.com/RAMP-Protocol/protocol) for licensed AI content access.
 
 The reference implementation pairs an Exchange (offer signing, transaction execution, signed-URL minting), a Broker (discovery, marketplace routing), an Edge worker (bot detection, signed-URL gate), and an MCP shim (`ramp_fetch` tool for MCP-aware agents). Together they let an autonomous agent discover, negotiate, and pay for licensed content access without exposing the underlying delivery URL to the agent and without sharing secrets across tenants.
